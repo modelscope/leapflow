@@ -101,6 +101,13 @@ _EVENT_CLASS_MAP: dict[str, str] = {
     "calibration_completed": HardwareEventClass.RECORD,
     "calibration_failed": HardwareEventClass.RECORD,
     "calibration_expired": HardwareEventClass.RECORD,
+    "calibration_candidate": HardwareEventClass.RECORD,
+    "calibration_rejected": HardwareEventClass.RECORD,
+    "calibration_no_op": HardwareEventClass.RECORD,
+    "calibration_activated": HardwareEventClass.RECORD,
+    "calibration_rolled_back": HardwareEventClass.RECORD,
+    "calibration_invalidated": HardwareEventClass.RECORD,
+    "calibration_drift": HardwareEventClass.DELIBERATIVE,
 }
 
 
@@ -164,6 +171,13 @@ class EventKind:
     """A calibration procedure failed before producing a valid correction."""
     CALIBRATION_EXPIRED = "calibration_expired"
     """The last successful calibration has exceeded its validity period."""
+    CALIBRATION_CANDIDATE = "calibration_candidate"
+    CALIBRATION_REJECTED = "calibration_rejected"
+    CALIBRATION_NO_OP = "calibration_no_op"
+    CALIBRATION_ACTIVATED = "calibration_activated"
+    CALIBRATION_ROLLED_BACK = "calibration_rolled_back"
+    CALIBRATION_INVALIDATED = "calibration_invalidated"
+    CALIBRATION_DRIFT = "calibration_drift"
 
 
 @dataclass(frozen=True)

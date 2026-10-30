@@ -1,0 +1,11 @@
+{
+  "methods": [
+    "metric_motion.v1",
+    "task_response.v1"
+  ],
+  "numpy_loaded": false,
+  "leapflow_loaded": false,
+  "final_startup_binding_packaged": true,
+  "wheel_sha256": "84a07a011383257a941280081d241bccfd7983c8bd972a4d1e92e0c422cb2180",
+  "wheel_bytes": 3314527
+}

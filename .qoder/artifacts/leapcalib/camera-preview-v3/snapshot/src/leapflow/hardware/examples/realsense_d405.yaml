@@ -1,0 +1,96 @@
+# RealSense D405 wrist camera, admitted only on its owning LHP node.
+# Replace the SDK serial before deployment; never select by USB index.
+# Uses the existing optional leapflow-realsense transport, not a second driver.
+# D405 color is ISP-processed left IR. IR 1/2 are the raw stereo pair.
+# No projector: do not declare emitter or laser-power writes.
+hc_version: "hc.v1"
+device_id: "sensor_realsense_d405"
+display_name: "RealSense D405 (wrist)"
+device_class: "camera"
+vendor: "Intel"
+model: "D405"
+location: "yahboom"
+halt_supported: false
+
+capabilities:
+  affordances: ["observe_rgb", "observe_depth", "observe_infrared"]
+  notes: "Close-range wrist-mounted stereo depth camera; color is ISP-processed left IR. Observation requires privacy approval."
+
+transport:
+  kind: "realsense"
+  config:
+    serial_number: "REPLACE_WITH_REAL_DEVICE_SERIAL"
+    expected_product: "D405"
+    minimum_usb: "3.0"
+    align_depth_to_color: true
+    frame_timeout_ms: 5000
+    # No qualification is implied by these placeholders.
+    mount_digest: ""
+    calibration_digest: ""
+    # Optional measurement: {roi, background_roi, limits, mount_digest,
+    # calibration_digest, uncertainty_mm}. Configure from independent metrology;
+    # there is no default ROI or assumed accuracy.
+    # Optional geometry_measurement adds object/jaws BGR selectors, cuboid_seeds,
+    # surface_sigma_mm, contour_sigma_px, jaw_radius_px, jaw_min_samples,
+    # jaw_dispersion_mm and scene_id. Color selectors are segmentation priors,
+    # not contact or holding certificates. All raw metric processing stays local.
+    # Read depth_scale per device: D405 typically reports 0.0001 m/unit.
+    # All four profiles verified on a D405; bandwidth includes both IR streams.
+    color: {width: 640, height: 480, fps: 30}
+    depth: {width: 640, height: 480, fps: 30}
+    infrared: {width: 640, height: 480, fps: 30}
+
+channels:
+  - channel_id: "camera.color.preview"
+    direction: "read"
+    quantity: "image_frame"
+    representation: "frame"
+    media_type: "image/jpeg"
+    effect: "read"
+    privacy: "environment"
+    description: "ISP-processed color preview encoded on the owning node."
+  - channel_id: "camera.depth.preview"
+    direction: "read"
+    quantity: "depth_preview"
+    representation: "frame"
+    media_type: "image/jpeg"
+    effect: "read"
+    privacy: "environment"
+    description: "Colorized aligned depth; not metric depth evidence."
+  - channel_id: "camera.infrared_left.preview"
+    direction: "read"
+    quantity: "infrared_image"
+    representation: "frame"
+    media_type: "image/jpeg"
+    effect: "read"
+    privacy: "environment"
+    description: "Raw left stereo sensor (infrared index 1)."
+  - channel_id: "camera.infrared_right.preview"
+    direction: "read"
+    quantity: "infrared_image"
+    representation: "frame"
+    media_type: "image/jpeg"
+    effect: "read"
+    privacy: "environment"
+    description: "Raw right stereo sensor (infrared index 2)."
+  - channel_id: "camera.metadata"
+    direction: "read"
+    quantity: "camera_metadata"
+    representation: "state"
+    effect: "read"
+    privacy: "environment"
+    description: "Per-device scale, factory intrinsics, extrinsics, and capture profile."
+  - channel_id: "camera.rgbd.quality"
+    direction: "read"
+    quantity: "depth_quality"
+    representation: "state"
+    effect: "read"
+    privacy: "environment"
+    description: "Node-local lossless depth qualification; unavailable until measurement is configured."
+  - channel_id: "camera.rgbd.geometry"
+    direction: "read"
+    quantity: "geometry_proposal"
+    representation: "state"
+    effect: "read"
+    privacy: "environment"
+    description: "Metric cuboid alternatives and observed inner-pad midpoint; not a holding certificate."

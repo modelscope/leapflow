@@ -1,0 +1,465 @@
+{
+  "observed_at_s": 1793276713.4753308,
+  "head": {
+    "returncode": 0,
+    "stdout": "b3883a1d21b00ee21f136dcffe52556b194fb62e\n",
+    "stderr": ""
+  },
+  "files": [
+    {
+      "path": "pyproject.toml",
+      "sha256": "8d42fdecfeefa2d50ce84e7943c2035e1f638e016220cd022f06b239f9fdc0bb",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/cli.py",
+      "sha256": "7ba15c48242b63a30726c797c949bb5d0f8143a040de85507049f94368cd303a",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/contracts/estimates.py",
+      "sha256": "36563ee1769c5a273642ce6f04aa46b5477e460f5e3a69165f8f25192bffaab9",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/contracts/failures.py",
+      "sha256": "2386023a34c3957eb9e6d45f9d0052652d0e76479eb469ad942fadb5159c232a",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/contracts/identity.py",
+      "sha256": "6d655ccea84d0f9cda853e43801c9c465407cc0ad6e7b5deb2b4608d3ece05d4",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/contracts/observations.py",
+      "sha256": "5686d80a2e0796c313a8eb8f0b7277f15bda224e59cec8e153b2b2f94632698d",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/contracts/parameters.py",
+      "sha256": "c814d27fa6b14dbfadd5649103612acdb789bc4f3ea0a34db78173d67dcc64bf",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/contracts/raw_task.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/contracts/tracking.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/estimation/raw_response.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/estimation/tracking.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/runtime/__init__.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/runtime/protocol.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/runtime/server.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/validation/bundle.py",
+      "sha256": "04d803084f7b69ca040260c4f5162241c3304fbe1c6454c9e812b2a34ba81195",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapcalib/validation/evaluation.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/cache/manager.py",
+      "sha256": "7da900786f2ff456a67c89695cd9e265287e5009a112a74b070fc3835c051f89",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/config.py",
+      "sha256": "56f3fbe41ec14c1685920ffe682e83dfd2eedf2ea00b0466fa3f56700f0265a9",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/config_service.py",
+      "sha256": "20d04166a6f69ce3cf16cd4f224f06896c4a4c8a56a3f9aaaf9d5fbc2663be75",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/acquisition.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/adapter.py",
+      "sha256": "3af55e6c5f5da77113c2d2078667f9eebea129f41cc3be3a605b8086d3f197a2",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/alignment.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/collection.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/command_safety.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/evidence.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/factors.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/generations.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/lifecycle.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/measurements.py",
+      "sha256": "3b0bbbe46e9212a66cf41b954ee2eeab9a1e008600251d0e8ea7b60d9853a331",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/physical_model.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/pose_policy.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/poses.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/provenance.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/raw_assessment.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/reference.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/rollback.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/scene.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/trial.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/trial_port.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/worker.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/control_bus.py",
+      "sha256": "2c881324a80be83d611be989bc6873d329d0431525f18a786c3f6c24a874c729",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/health_monitor.py",
+      "sha256": "2accec6e9b52aedc21f100656ca4f253ec41efec3a91d0dfaa8b7f81b8220528",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/authority.py",
+      "sha256": "43f40a0c36af9eb0a267533fbb2e5220f6a6406088e33342ce6942ad41f06ef8",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/control_sessions.py",
+      "sha256": "4d02092bbd309ae0793da890675c2d4d55eab50466846519b661dc999a4180b4",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/permit.py",
+      "sha256": "959b735b3306b6413593f84055cc86b81fa2abc1d206b7e809ad35e98260d1ab",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/protocol.py",
+      "sha256": "ff7e319248792bee00c99d5e2af0097bedb181df57ef67eded6324df557011d5",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/runtime.py",
+      "sha256": "7d44321901e2ad8b79f51e3c67a0769985ec179aeec22e0a532a9454702c30c6",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/server.py",
+      "sha256": "fa23cc16f558eeb416648e1002c42f5ef2dc6b1cc2124485e62a045db0f8aa5e",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/skill_methods.py",
+      "sha256": "80f78edcde84d1fa80af7eda6b0e2579fc4daf91c1ce8c6607cb8598f2ab57f7",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/node_gate.py",
+      "sha256": "2b45e41fdb5c1f275cc638110ff16c740999762c4894a00b81a60bfc2f7a292a",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/registry.py",
+      "sha256": "a07dcc567925a636ad88c07c45fe935d44528a6239ffdf0410a983e6622dcd25",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/adapt/ik.py",
+      "sha256": "d1dc97b81d5de1a2b352ecec69466204f8d2825ab27825b20e3cb3b4c66f371d",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/admission.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/builtin/governed_calibration.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/context.py",
+      "sha256": "7eca3030dd68f52c383cf70ce5eae137a40389e968d4e52530f048f3972f6474",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/kinematics.py",
+      "sha256": "fe7e8780c1c3d4cc660ecc580e9c9fe6a98b67ecaf9755b3fd2b965da87baaa7",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/ports.py",
+      "sha256": "c36d27e3541d29e9821ac7cb6459058555571a10a359a70d1e3fec104764bc0d",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/protocol.py",
+      "sha256": "2131bd4385ea1fbdb3806d2cf03f2449614bc8f1e554a4aaee7c3d5810c2e176",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/runs.py",
+      "sha256": "27488ee29149e9c2e47421fced8dfe6574709d33f061273af1f15d774c9f8b26",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/runtime.py",
+      "sha256": "adc8e909865bda41df44161895fd832be6e6ac2682ed787760ae74c13e08a80f",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/vision.py",
+      "sha256": "ffa4b5986ddb5fe84adf0f3fd57a989aa48b5e7195aff48a0b66e05e1a8f9dbb",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/workcell.py",
+      "sha256": "1dfecd030486ae04e20e0e214058335b7fe91f40acae1888bf9b6b3460f38ca7",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/skills/workcell_reload.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/stream.py",
+      "sha256": "1e4afe972494ff80341b2face0e2a652700615c506b1628d3370094a9e2b4ab9",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/hardware/transports/lhp.py",
+      "sha256": "4f727fe064adb8b4a0266a6353732ddece0d1b0bff468825ed61cff64c44816c",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "src/leapflow/layout.py",
+      "sha256": "8d405c39030407427a8a24c37c8da850b69b7375af59e9030c26a208a7def8be",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "tools/calib_prepare.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "tools/calib_preview.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "tools/calib_probe.py",
+      "sha256": null,
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "tools/piper/piper_ops/calibration.py",
+      "sha256": "1f99cb53a5c39bf2424abe149a86c269dc89a555550caf7d06291338b49e8e2f",
+      "matches_before": true,
+      "matches_after": false
+    },
+    {
+      "path": "tools/piper/piper_ops/cli.py",
+      "sha256": "2e1d398b2797405c8b5a96e71ff0fb03f66e285ba39a854b82ac6f55424ce662",
+      "matches_before": true,
+      "matches_after": false
+    }
+  ],
+  "service": {
+    "returncode": 0,
+    "stdout": "MainPID=1467\nExecMainStartTimestamp=Wed 2026-10-28 23:08:07 CST\nActiveState=active\nSubState=running\nFragmentPath=/home/jetson/.config/systemd/user/leap-lhp-node.service\n",
+    "stderr": ""
+  },
+  "selected_config": {
+    "workcell_sha256": "bcc71db8cb20181b0644f030f4aba73324b1b904576fd747aa90994620f0613e",
+    "camera_sha256": "06d193db000b431216f6d0c6278580a6d5321dba82415b8ecd789bb20d4d5825",
+    "runtime_sha256": "6319d2039895cdd92631b021f84821fdd6211d2ed454dda5592e5d8b0c7f15f5",
+    "calibration_acquisition_present": false,
+    "calibration_motion_present": false,
+    "mount_digest": "",
+    "calibration_worker_enabled": null
+  },
+  "destinations_exist": {
+    "/home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-backup": false,
+    "/home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage": false,
+    "/home/jetson/leap_work/leapcalib-camera-v3-35bca0b9.tar.gz": false
+  },
+  "remote_changes_performed": false,
+  "host_inventory_sha256": "32662bdd3cb479ea83b5dc5fe117c1c1c6038bf7282ec6fbd20e3c28824b0b48",
+  "host_matches_packet_inventory": true,
+  "target_matches_packet_before": true,
+  "target_head_matches_packet": true,
+  "archive_sha256": "989dbb9c21c893d25e0214b8ec6f063cc44d61d81cb2fd21d0448ea2e8fa714a",
+  "source_ops_sha256": "5ad0ad166fbc915a6b8adc19053482521b25c9a8d7de8da9dff3e5bde5782d6a",
+  "source_plan_sha256": "9543a374c9384fb4819d7017031c14615d06a1e6ccbfc56f10c443cf73c8efec",
+  "point_in_time_only": true,
+  "deployment_approved": false
+}

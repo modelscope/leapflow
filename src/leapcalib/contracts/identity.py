@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field
 from typing import Any, Mapping, Sequence
 
 from leapcalib.contracts.units import canonical_number
@@ -90,8 +90,30 @@ def digest_of(payload: Mapping[str, Any]) -> str:
 
 
 def _require_id(value: str, what: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{what} needs a nonempty identifier")
+    if not isinstance(value, str) or not value.strip() or len(value) > 256:
+        raise ValueError(f"{what} needs a bounded nonempty identifier")
+    return value
+
+
+def _text(value: Any) -> None:
+    if not isinstance(value, str) or len(value) > 4096:
+        raise ValueError("identity fields must be bounded typed strings")
+
+
+def _fields(data: Mapping[str, Any], cls: Any) -> None:
+    fields = cls.__dataclass_fields__
+    required = {
+        name
+        for name, value in fields.items()
+        if value.default is MISSING and value.default_factory is MISSING
+    }
+    if not isinstance(data, Mapping) or set(data) - set(fields) or not required <= set(data):
+        raise ValueError("missing or unknown identity fields")
+
+
+def _array(value: Any, maximum: int) -> list[Any] | tuple[Any, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) > maximum:
+        raise ValueError("bounded identity array required before decoding")
     return value
 
 
@@ -106,6 +128,8 @@ class DeviceIdentity:
 
     def __post_init__(self) -> None:
         _require_id(self.device_id, "device")
+        for value in (self.vendor, self.model, self.firmware_profile):
+            _text(value)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -153,8 +177,12 @@ class StreamProfile:
     def __post_init__(self) -> None:
         _require_id(self.device_id, "stream profile device")
         _require_id(self.stream, "stream profile name")
-        if self.width <= 0 or self.height <= 0:
-            raise ValueError("a stream profile needs a positive image size")
+        if any(
+            type(size) is not int or not 1 <= size <= 16384 for size in (self.width, self.height)
+        ):
+            raise ValueError("a stream profile needs a bounded positive integer image size")
+        for value in (self.distortion_model, self.role, self.source):
+            _text(value)
         for name in ("fx_px", "fy_px", "ppx_px", "ppy_px", "depth_scale_m"):
             object.__setattr__(self, name, canonical_number(getattr(self, name)))
         if self.fx_px <= 0 or self.fy_px <= 0:
@@ -162,7 +190,9 @@ class StreamProfile:
         if self.depth_scale_m <= 0:
             raise ValueError("depth scale must be positive metres per depth unit")
         object.__setattr__(
-            self, "distortion_coeffs", tuple(canonical_number(c) for c in self.distortion_coeffs)
+            self,
+            "distortion_coeffs",
+            tuple(canonical_number(c) for c in _array(self.distortion_coeffs, 32)),
         )
         object.__setattr__(self, "valid_min_m", canonical_number(self.valid_min_m))
         object.__setattr__(self, "valid_max_m", canonical_number(self.valid_max_m))
@@ -207,22 +237,24 @@ class StreamProfile:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "StreamProfile":
+        _fields(data, cls)
+        coefficients = _array(data.get("distortion_coeffs", ()), 32)
         return cls(
-            device_id=str(data["device_id"]),
-            stream=str(data["stream"]),
-            width=int(data["width"]),
-            height=int(data["height"]),
-            fx_px=float(data["fx_px"]),
-            fy_px=float(data["fy_px"]),
-            ppx_px=float(data["ppx_px"]),
-            ppy_px=float(data["ppy_px"]),
-            depth_scale_m=float(data["depth_scale_m"]),
-            distortion_model=str(data.get("distortion_model") or "none"),
-            distortion_coeffs=tuple(float(c) for c in data.get("distortion_coeffs") or ()),
-            valid_min_m=float(data.get("valid_min_m") or 0.0),
-            valid_max_m=float(data.get("valid_max_m") or 0.0),
-            role=str(data.get("role") or ROLE_FIXED),
-            source=str(data.get("source") or SOURCE_FACTORY),
+            device_id=data["device_id"],
+            stream=data["stream"],
+            width=data["width"],
+            height=data["height"],
+            fx_px=data["fx_px"],
+            fy_px=data["fy_px"],
+            ppx_px=data["ppx_px"],
+            ppy_px=data["ppy_px"],
+            depth_scale_m=data["depth_scale_m"],
+            distortion_model=data.get("distortion_model", "none"),
+            distortion_coeffs=tuple(coefficients),
+            valid_min_m=data.get("valid_min_m", 0.0),
+            valid_max_m=data.get("valid_max_m", 0.0),
+            role=data.get("role", ROLE_FIXED),
+            source=data.get("source", SOURCE_FACTORY),
         )
 
     @property
@@ -248,6 +280,8 @@ class MountIdentity:
     def __post_init__(self) -> None:
         _require_id(self.mount_id, "mount")
         _require_id(self.parent_frame, "mount parent frame")
+        _text(self.notes)
+        _text(self.source)
         if self.source not in PARAMETER_SOURCES:
             raise ValueError(f"mount source must be one of {sorted(PARAMETER_SOURCES)}")
         object.__setattr__(self, "seated_at_s", canonical_number(self.seated_at_s))
@@ -277,6 +311,8 @@ class ToolIdentity:
 
     def __post_init__(self) -> None:
         _require_id(self.tool_id, "tool")
+        _text(self.reference)
+        _text(self.source)
         if self.reference not in TOOL_REFERENCES:
             raise ValueError(f"tool reference must be one of {sorted(TOOL_REFERENCES)}")
         object.__setattr__(self, "jaw_stroke_m", canonical_number(self.jaw_stroke_m))
@@ -318,8 +354,10 @@ class ModelIdentity:
     def __post_init__(self) -> None:
         _require_id(self.model_id, "kinematic model")
         _require_id(self.chain_digest, "kinematic chain digest")
-        if type(self.dof) is not int or self.dof < 1:
-            raise ValueError("a kinematic model needs a positive integer dof")
+        if type(self.dof) is not int or not 1 <= self.dof <= 128:
+            raise ValueError("a kinematic model needs a bounded positive integer dof")
+        for value in (self.joint_unit, self.dh_convention, self.source):
+            _text(value)
         if self.joint_unit != "rad":
             raise ValueError("LeapCalib joint angles are radians")
         if self.source not in PARAMETER_SOURCES:
@@ -354,8 +392,18 @@ class TopologyIdentity:
 
     def __post_init__(self) -> None:
         _require_id(self.workcell_id, "workcell")
-        object.__setattr__(self, "streams", tuple(self.streams))
-        object.__setattr__(self, "mounts", tuple(self.mounts))
+        if not isinstance(self.device, DeviceIdentity) or not isinstance(self.model, ModelIdentity):
+            raise ValueError("typed topology device and nominal model required")
+        if self.tool is not None and not isinstance(self.tool, ToolIdentity):
+            raise ValueError("typed optional topology tool required")
+        if not isinstance(self.metadata, Mapping):
+            raise ValueError("topology metadata must be a mapping")
+        object.__setattr__(self, "streams", tuple(_array(self.streams, 32)))
+        object.__setattr__(self, "mounts", tuple(_array(self.mounts, 64)))
+        if any(not isinstance(s, StreamProfile) for s in self.streams) or any(
+            not isinstance(m, MountIdentity) for m in self.mounts
+        ):
+            raise ValueError("typed topology streams and mounts required")
         for name, values in (("stream", self.streams), ("mount", self.mounts)):
             keys = [s.digest for s in values]
             if len(set(keys)) != len(keys):
@@ -408,15 +456,27 @@ class TopologyIdentity:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "TopologyIdentity":
+        _fields(data, cls)
+        streams = _array(data.get("streams", ()), 32)
+        mounts = _array(data.get("mounts", ()), 64)
         tool = data.get("tool")
+        _fields(data["device"], DeviceIdentity)
+        _fields(data["model"], ModelIdentity)
+        for mount in mounts:
+            _fields(mount, MountIdentity)
+        if tool is not None:
+            _fields(tool, ToolIdentity)
+        metadata = data.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise ValueError("topology metadata must be a mapping")
         return cls(
-            workcell_id=str(data["workcell_id"]),
-            device=DeviceIdentity(**dict(data["device"])),
-            model=ModelIdentity(**dict(data["model"])),
-            streams=tuple(StreamProfile.from_mapping(s) for s in data.get("streams") or ()),
-            mounts=tuple(MountIdentity(**dict(m)) for m in data.get("mounts") or ()),
-            tool=ToolIdentity(**dict(tool)) if tool else None,
-            metadata=dict(data.get("metadata") or {}),
+            workcell_id=data["workcell_id"],
+            device=DeviceIdentity(**data["device"]),
+            model=ModelIdentity(**data["model"]),
+            streams=tuple(StreamProfile.from_mapping(s) for s in streams),
+            mounts=tuple(MountIdentity(**m) for m in mounts),
+            tool=ToolIdentity(**tool) if tool is not None else None,
+            metadata=dict(metadata),
         )
 
 

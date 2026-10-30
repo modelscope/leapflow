@@ -1,0 +1,197 @@
+[project]
+name = "leapflow"
+dynamic = ["version"]
+description = "LeapFlow — Learning and Evolving from Actual Practice"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "LeapFlow Team" }]
+keywords = ["agent", "ai", "macos", "automation", "imitation-learning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "openai>=1.40",
+    # Declared explicitly rather than relied on through openai: web_fetch imports
+    # it directly, so a transitive-only dependency would break the moment openai
+    # changed its own HTTP client.
+    "httpx>=0.27",
+    "msgpack>=1.0.8",
+    "duckdb>=1.0.0",
+    "pyyaml>=6.0",
+    "cryptography>=42.0",
+    "Pillow>=10.0",
+    "mcp>=1.26.0",
+    "watchdog>=3.0",
+    "gnureadline>=8.0; sys_platform == 'darwin'",
+    "pyreadline3>=3.5; sys_platform == 'win32'",
+    "rich>=13.0",
+    "prompt_toolkit>=3.0.40",
+    "pyobjc-framework-Quartz>=12.2; sys_platform == 'darwin'",
+    "pynput>=1.8.0",
+    # LeapBoard web server. Part of the core surface (`leap board`), so it ships
+    # with the base install rather than behind an extra.
+    "aiohttp>=3.9",
+    # Python 3.10 backports of otherwise 3.11-only modules, used behind the
+    # conditional imports in domain/tool_pipeline.py and tools/repo_map.py.
+    # Declared explicitly rather than relied on transitively, for the same
+    # reason as httpx above; the tool execution deadline is adapted to
+    # async-timeout's scope API (deadline/update/reject), verified against 5.0.
+    "async-timeout>=5.0; python_version < '3.11'",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+    # Parallel execution for the mock-heavy suite, and coverage for the
+    # impact map that drives change-scoped selection (tools/impact.py).
+    "pytest-xdist>=3.5",
+    "pytest-cov>=5.0",
+]
+hub = ["modelscope-hub>=0.4.5"]
+huggingface = ["huggingface-hub>=0.20.0"]
+# Native Anthropic Messages API provider. Optional: the core install uses the
+# OpenAI-compatible transport by default; this extra enables AnthropicChat for
+# endpoints that speak the Anthropic wire format (api.anthropic.com, DeepSeek
+# /anthropic compat endpoint, etc.).
+anthropic = ["anthropic>=0.39"]
+# Better main-content extraction for web_fetch. Optional because the stdlib
+# extractor always ships: this upgrades quality, it does not enable the feature.
+web = ["trafilatura>=2.2"]
+# LeapSpace (src/leapspace) — the optional CUA-sandbox app environment and
+# evaluation harness. Its code ships inside the leapflow distribution, but the
+# heavy PyQt6/cua-sandbox/pydantic stack is opt-in through this extra so the
+# default install stays light. Install it with
+# `pip install 'leapflow[leapspace]'` or `uv sync --extra leapspace`. The
+# default `--all-extras` syncs deliberately exclude it (`--no-extra leapspace`,
+# see Makefile/CI/setup.sh); `make space-sync` opts back in. cua-sandbox itself
+# supports Python 3.11–3.13 only, so it is marker-gated to that range; the rest
+# of the extra installs on every supported Python.
+leapspace = [
+    "pyqt6>=6.7",
+    "cua-sandbox; python_version >= '3.11' and python_version < '3.14'",
+    "pydantic>=2",
+]
+# Contracts/inspection remain stdlib-only. NumPy is loaded only during bounded
+# motion/response solves; no SciPy/OpenCV dependency is needed by these methods.
+leapcalib = ["numpy>=1.24"]
+# Lightweight opt-in preview encoder; no policy-learning or ROS dependencies.
+vision = ["numpy>=1.24", "opencv-python>=4.8"]
+robot = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "safetensors>=0.4",
+    "huggingface-hub>=0.20",
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "pyserial>=3.5",
+    "Pillow>=10.0",
+]
+# Intentionally no robot-ros2 extra: rclpy ships with the ROS 2 distribution
+# (apt or conda channel) and is not published on PyPI, so it cannot be a pip
+# dependency.  The ros2 hardware transport activates whenever rclpy is
+# importable; see src/leapflow/hardware/transports/ros2.py.
+benchmark = [
+    "gymnasium>=0.29",
+    "numpy>=1.24",
+    "pyarrow>=14.0",
+]
+
+[project.scripts]
+leap = "leapflow.__main__:main"
+leap-bench = "benchmarks.cli:main"
+leap-calib = "leapcalib.cli:main"
+
+# RealSense is a node-local optional transport.  Its module imports the Intel
+# SDK only when opened, so host-only installations stay dependency-free; the
+# Jetson installs the compatible pyrealsense2 binding alongside LeapFlow.
+[project.entry-points."leapflow.hardware.transports"]
+realsense = "leapflow.hardware.drivers.realsense:build_transport"
+# Piper follows the same node-local placement: pyAgxArm (the model/firmware-
+# aware AgileX SDK) is imported only when a declared arm is opened, so the
+# CAN-owning node owns the vendor SDK while host-only installations stay
+# dependency-free.
+piper = "leapflow.hardware.drivers.piper:build_transport"
+
+# Numerical method discovery grants no acquisition, motion or activation authority.
+[project.entry-points."leapcalib.methods"]
+metric_motion = "leapcalib.estimation.handeye:MotionMethod"
+task_response = "leapcalib.estimation.response:ResponseMethod"
+raw_joint_response = "leapcalib.estimation.raw_response:RawResponseMethod"
+
+# Node skills (S1.5). Built-ins register exactly like third-party skill packs.
+[project.entry-points."leapflow.hardware.skills"]
+builtin_motion = "leapflow.hardware.skills.builtin.motion:skills"
+builtin_calibration = "leapflow.hardware.skills.builtin.calibration:skills"
+builtin_camera_calibration = "leapflow.hardware.skills.builtin.camera_calibration:skills"
+builtin_metric_readiness = "leapflow.hardware.skills.builtin.metric_readiness:skills"
+builtin_governed_calibration = "leapflow.hardware.skills.builtin.governed_calibration:skills"
+builtin_grasp_verify = "leapflow.hardware.skills.builtin.grasp_verify:skills"
+builtin_grasp_cycle = "leapflow.hardware.skills.builtin.grasp_cycle:skills"
+builtin_scene = "leapflow.hardware.skills.builtin.scene:skills"
+builtin_sequence = "leapflow.hardware.skills.builtin.sequence:skills"
+builtin_policy = "leapflow.hardware.skills.builtin.policy:skills"
+builtin_episode = "leapflow.hardware.skills.builtin.episode:skills"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = {attr = "leapflow.version.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["leapflow*", "leapspace*", "leapcalib*", "benchmarks*"]
+
+[tool.setuptools.package-data]
+"leapflow.gateway.action_packs" = ["*.yaml"]
+"leapflow.dashboard.templates" = ["*.yaml"]
+"leapflow.dashboard.static" = ["*"]
+"leapflow.plugins.dsh" = ["*.js"]
+"benchmarks.manifests" = ["*.yaml"]
+"benchmarks.manifests.native" = ["*.yaml"]
+"benchmarks.manifests.external" = ["*.yaml"]
+"benchmarks.manifests.hardware" = ["*.yaml"]
+# LeapSpace task directories are data, not importable packages (note the
+# non-identifier `task-001`). Auto-discovery already ships each task's
+# action.py; this keeps its config.yaml beside it so an installed example task
+# stays runnable rather than half-packaged.
+"leapspace.app_space.tasks.task-001" = ["*.yaml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src", "tests", "tools/piper"]
+testpaths = ["tests"]
+# Markers are applied by path in tests/conftest.py, so existing files need no
+# edit. Only files that do real local IO opt in explicitly with `pytestmark`.
+markers = [
+    "unit: hermetic — no real IO, no LLM. Default for tests/*.py",
+    "component: real local IO (DuckDB, tmp profile) in-process; LLM via cassette replay",
+    "integration: real DB/storage, stub LLM — synonym for component",
+    "e2e: real leapd subprocess driven over RPC; LLM via cassette replay",
+    "live: real LLM provider, requires credentials (nightly/manual lane only)",
+    "invariant: always-on guard — never skipped by impact selection",
+    "slow: takes more than a few seconds",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Pinned explicitly so a ruff upgrade cannot silently change the enforced set.
+# Matches the previously implicit default (pycodestyle errors + pyflakes).
+select = ["E4", "E7", "E9", "F"]

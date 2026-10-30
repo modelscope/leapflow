@@ -27,16 +27,20 @@ outlives the work it protects.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Protocol, TypeVar, runtime_checkable
 
 from leapflow.hardware.lhp.protocol import FAILURE_DEVICE_BUSY
+from leapflow.hardware.transport import WriteOutcome
 
 logger = logging.getLogger(__name__)
+_Result = TypeVar("_Result")
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -157,13 +161,17 @@ class ControlLoopBody:
     def finished(self) -> bool:
         return False  # a control loop runs until its owner closes it or goes silent
 
-    def start(self) -> None:
+    def start(self, *, reservation_token: str) -> None:
         from leapflow.hardware.control_bus import ControlBusConfig
 
+        kwargs: dict[str, Any] = {}
+        if getattr(self._registry, "node_sessions", None) is not None:
+            kwargs["reservation_token"] = reservation_token
         self._registry.start_control_loop(
             self._device_id,
             _HoldPolicy(self._mode),
             config=ControlBusConfig(frequency_hz=self._frequency_hz),
+            **kwargs,
         )
 
     async def close(self, reason: str) -> dict[str, Any]:
@@ -252,7 +260,7 @@ class _HoldPolicy:
     def compute(self, state: Any) -> Any:
         from leapflow.hardware.control_bus import ControlCommand
 
-        return ControlCommand(joint_commands={}, metadata={})
+        return ControlCommand(joint_commands={})
 
     def reset(self) -> None:
         pass
@@ -264,29 +272,253 @@ class _HoldPolicy:
 class NodeSessions:
     """Lease, device mutex, and ownership for every session on one node."""
 
-    def __init__(self, registry: Any, *, device_busy: Callable[[str], bool] | None = None) -> None:
+    def __init__(self, registry: Any, *, device_busy: Callable[[str], bool] | None = None,
+                 transaction_run_owner: Callable[[str], str] | None = None) -> None:
         self._registry = registry
         self._device_busy = device_busy
+        self._transaction_run_owner = transaction_run_owner
+        self._mutex = threading.RLock()
+        self._controls: dict[str, tuple[str, Callable[[], None]]] = {}
         self._sessions: dict[str, LeasedSession] = {}
+        self._reservations: dict[str, tuple[str, ...]] = {}
+        self._dispatches: dict[str, str] = {}
+        self._uncertain_devices: set[str] = set()
+        self._reserved_tasks: set[asyncio.Task[Any]] = set()
+        self._closing = False
 
     # ── Mutex ──
 
     def holds_device(self, device_id: str) -> bool:
         """Whether a live session holds *device_id*."""
-        return any(
-            device_id in session.body.device_ids
-            for session in self._sessions.values()
-            if session.live
-        )
+        with self._mutex:
+            return any(
+                device_id in session.body.device_ids
+                for session in self._sessions.values()
+                if session.live
+            )
 
     def busy_device(self, device_ids: Iterable[str]) -> str:
         """The first of *device_ids* that is held by a session or a node-local holder."""
-        for device_id in device_ids:
-            if self.holds_device(device_id):
-                return device_id
-            if self._device_busy is not None and self._device_busy(device_id):
-                return device_id
-        return ""
+        with self._mutex:
+            for device_id in device_ids:
+                if self.unsettled_device(device_id):
+                    return device_id
+                status = getattr(self._registry, "control_loop_status", lambda _: None)(device_id)
+                if status and status.get("running"):
+                    return device_id
+                if self.holds_device(device_id):
+                    return device_id
+                if self._device_busy is not None and self._device_busy(device_id):
+                    return device_id
+            return ""
+
+    def reserved_device(self, device_id: str) -> bool:
+        with self._mutex:
+            return any(device_id in devices for devices in self._reservations.values())
+
+    def unsettled_device(self, device_id: str) -> bool:
+        """Pending or uncertain effects, excluding a caller's ordinary run lease."""
+        with self._mutex:
+            return (
+                self._closing or self.reserved_device(device_id)
+                or device_id in self._dispatches.values()
+                or device_id in self._uncertain_devices
+                or any(device == device_id for device, _ in self._controls.values())
+            )
+
+    def reserve(self, device_ids: Iterable[str], *, owner_id: str, run_id: str = "") -> str:
+        """Atomically reserve devices/consumer IDs before any async transaction work.
+
+        Reservations are NOT leases. Expiry/cancellation cannot release a DB commit
+        whose settlement is still uncertain; only the owner releases the token.
+        """
+        devices = tuple(dict.fromkeys(device_ids))
+        if not devices or len(devices) > 64 or not isinstance(owner_id, str) or not owner_id or any(not isinstance(d, str) or not d for d in devices):
+            raise ValueError("bounded explicit reservation identities required")
+        with self._mutex:
+            if run_id:
+                self._check_transaction_run(devices, run_id)
+            elif busy := self.busy_device(devices):
+                raise ValueError(f"device/consumer {busy!r} is busy or has unsettled effects")
+            token = str(uuid.uuid4())
+            self._reservations[token] = devices
+            return token
+
+    def _check_transaction_run(self, devices: tuple[str, ...], run_id: str) -> None:
+        """Exclude only the runtime-verified non-motion run, never a named stranger."""
+        if not isinstance(run_id, str) or not run_id or self._transaction_run_owner is None:
+            raise ValueError("owner-verified non-motion run required for reservation")
+        for device in devices:
+            if self._transaction_run_owner(device) != run_id or self.unsettled_device(device):
+                raise ValueError("transaction does not own the exact hold or has unsettled effects")
+            status = getattr(self._registry, "control_loop_status", lambda _: None)(device)
+            if status and status.get("running"):
+                raise ValueError("active control blocks a model transaction")
+            for session in self._sessions.values():
+                if session.live and device in session.body.device_ids:
+                    if session.body.kind != "skill" or session.body.describe().get("run_id") != run_id:
+                        raise ValueError("another session blocks a model transaction")
+
+    def release_reservation(self, token: str) -> None:
+        with self._mutex:
+            if token not in self._reservations:
+                raise ValueError("unknown reservation token")
+            del self._reservations[token]
+
+    async def run_reserved(
+        self, device_ids: Iterable[str], *, owner_id: str,
+        operation: Callable[[], _Result],
+        on_settle: Callable[[_Result], None] | None = None,
+        run_id: str = "",
+        preflight: Callable[[], Awaitable[None]] | None = None,
+    ) -> _Result:
+        """Owner-internal admitted persistence, reserved before its first await.
+
+        This grants no admission or actuator authority. The callable runs off-loop;
+        cancellation cannot abandon its DB settlement or release its reservation.
+        Node shutdown drains the same tasks before storage can close.
+        """
+        if not callable(operation) or (on_settle is not None and not callable(on_settle)):
+            raise ValueError("concrete owner persistence operation and settlement callback required")
+        if on_settle is not None and (
+            inspect.iscoroutinefunction(on_settle)
+            or inspect.iscoroutinefunction(getattr(on_settle, "__call__", None))
+        ):
+            raise ValueError("settlement publication must be synchronous on the owner loop")
+        if preflight is not None and not callable(preflight):
+            raise ValueError("owner transaction preflight must be callable")
+        token = self.reserve(device_ids, owner_id=owner_id, run_id=run_id)
+        caller = asyncio.current_task()
+        if caller is not None:
+            self._reserved_tasks.add(caller)
+        try:
+            if preflight is not None:
+                await preflight()
+        except BaseException:
+            # No persistence was dispatched. Cancellation of observational
+            # preflight releases only after its own bounded work has settled.
+            self.release_reservation(token)
+            raise
+        finally:
+            if caller is not None:
+                self._reserved_tasks.discard(caller)
+        task = asyncio.create_task(self._settle_reserved(token, operation, on_settle), name="reserved-owner-transaction")
+        self._reserved_tasks.add(task)
+        task.add_done_callback(self._reserved_tasks.discard)
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                if cancelled:
+                    raise asyncio.CancelledError
+                return result
+            except asyncio.CancelledError:
+                if task.done():
+                    # Consume an error even when cancellation wins the caller's result.
+                    if not task.cancelled():
+                        task.exception()
+                    raise
+                cancelled = True
+            except Exception:
+                if cancelled:
+                    raise asyncio.CancelledError from None
+                raise
+
+    async def _settle_reserved(
+        self, token: str, operation: Callable[[], _Result],
+        on_settle: Callable[[_Result], None] | None,
+    ) -> _Result:
+        try:
+            try:
+                result = await asyncio.to_thread(operation)
+            except BaseException:
+                # A callable can commit and then fail before returning. An exception
+                # alone cannot establish that persistence left the prior state intact.
+                with self._mutex:
+                    self._uncertain_devices.update(self._reservations[token])
+                raise
+            # Publish the committed owner snapshot on this loop BEFORE releasing
+            # resources, including when the original requesting lease has ended.
+            if on_settle is not None:
+                try:
+                    published = on_settle(result)
+                    if published is not None:
+                        if inspect.iscoroutine(published):
+                            published.close()
+                        raise ValueError("settlement publication must finish synchronously and return None")
+                except BaseException:  # publication cancellation also leaves a committed projection uncertain
+                    # Persistence landed but its safety projection did not. Keep
+                    # every affected consumer closed until owner reconciliation.
+                    with self._mutex:
+                        self._uncertain_devices.update(self._reservations[token])
+                    raise
+            return result
+        finally:
+            self.release_reservation(token)
+
+    async def settle_transactions(self) -> None:
+        """Drain admitted transactions; never cancel a thread holding the shared DB."""
+        cancelled = False
+        while self._reserved_tasks:
+            tasks = tuple(self._reserved_tasks)
+            waiter = asyncio.gather(*tasks, return_exceptions=True)
+            while not waiter.done():
+                try:
+                    await asyncio.shield(waiter)
+                except asyncio.CancelledError:
+                    cancelled = True
+            self._reserved_tasks.difference_update(task for task in tasks if task.done())
+        if cancelled:
+            raise asyncio.CancelledError
+
+    def begin_dispatch(self, device_id: str) -> str:
+        """Cover precheck through transport settlement; caller already owns authority."""
+        with self._mutex:
+            if (
+                self._closing or self.reserved_device(device_id)
+                or device_id in self._uncertain_devices
+                or any(device == device_id for device, _ in self._controls.values())
+            ):
+                raise ValueError("device reserved for model transaction, control or uncertain prior action")
+            token = str(uuid.uuid4())
+            self._dispatches[token] = device_id
+            return token
+
+    def finish_dispatch(self, token: str, *, settled: bool) -> None:
+        with self._mutex:
+            device = self._dispatches.pop(token)
+            if not settled:
+                self._uncertain_devices.add(device)
+
+    def begin_control(
+        self, device_id: str, *, stop: Callable[[], None], reservation_token: str | None = None,
+    ) -> str:
+        """Claim direct control before transport opening; NOT authority or a lease.
+
+        The short mutex also serializes synchronous controller starts with owner-loop
+        reservations. No I/O, await, thread join or callback runs under this mutex.
+        The ControlBus releases only after its transport/halt thread settles.
+        """
+        if not isinstance(device_id, str) or not device_id or not callable(stop):
+            raise ValueError("explicit device and synchronous control stop required")
+        with self._mutex:
+            if reservation_token is not None:
+                if self._closing or self._reservations.get(reservation_token) != (device_id,):
+                    raise ValueError("exact owner control-start reservation required")
+            elif self.busy_device((device_id,)):
+                raise ValueError("device is busy or has unsettled effects")
+            token = str(uuid.uuid4())
+            self._controls[token] = (device_id, stop)
+            if reservation_token is not None:
+                del self._reservations[reservation_token]
+            return token
+
+    def finish_control(self, token: str, *, settled: bool) -> None:
+        """Thread settlement, retaining uncertain halt as a shared owner refusal."""
+        with self._mutex:
+            device, _ = self._controls.pop(token)
+            if not settled:
+                self._uncertain_devices.add(device)
 
     # ── Lifecycle ──
 
@@ -296,6 +528,12 @@ class NodeSessions:
         The caller checks ``busy_device`` first, with no await in between, so the
         check and the adoption are atomic on the event loop.
         """
+        with self._mutex:
+            return self._adopt(body, lease_s=lease_s, connection_id=connection_id)
+
+    def _adopt(self, body: SessionBody, *, lease_s: Any, connection_id: str) -> LeasedSession:
+        if self._closing:
+            raise ValueError("node sessions are shutting down")
         self._purge()
         session = LeasedSession(
             control_id=str(uuid.uuid4()),
@@ -316,7 +554,10 @@ class NodeSessions:
         )
         return session
 
-    async def open(self, params: Mapping[str, Any], *, connection_id: str) -> dict[str, Any]:
+    async def open(
+        self, params: Mapping[str, Any], *, connection_id: str,
+        authorize: Callable[[], WriteOutcome | None] | None = None,
+    ) -> dict[str, Any]:
         """``control.open``: precheck, start a control loop, and lease it."""
         device_id = str(params.get("device_id") or "")
         comm_loss = str(params.get("comm_loss_policy") or "halt")
@@ -334,6 +575,11 @@ class NodeSessions:
             return _error("unknown_device", f"unknown device {device_id!r}")
         if self.busy_device((device_id,)):
             return _error(FAILURE_DEVICE_BUSY, f"device {device_id!r} is held by another session")
+        from leapflow.hardware.node_gate import control_safety_refusal
+        from leapflow.hardware.lhp.protocol import FAILURE_SAFETY_DENIED
+
+        if reason := control_safety_refusal(self._registry, device_id):
+            return _error(FAILURE_SAFETY_DENIED, reason)
         precheck = await self._precheck(context)
         if precheck is not None:
             return precheck
@@ -350,12 +596,32 @@ class NodeSessions:
         # Re-check after the awaited precheck: another open may have won the device.
         if self.busy_device((device_id,)):
             return _error(FAILURE_DEVICE_BUSY, f"device {device_id!r} is held by another session")
+        if self._registry.context(device_id) is not context:
+            return _error(FAILURE_SAFETY_DENIED, "device declaration changed during control precheck")
+        if reason := control_safety_refusal(self._registry, device_id):
+            return _error(FAILURE_SAFETY_DENIED, reason)
+        # Claim before authority, atomically against synchronous direct-controller
+        # starts as well as owner-loop transactions. The bus converts this exact
+        # reservation into its lifetime claim without an unowned interval.
         try:
-            body.start()
-        except (RuntimeError, ValueError) as exc:
-            return _error("control_start_failed", str(exc))
-        session = self.adopt(body, lease_s=params.get("lease_s"), connection_id=connection_id)
-        return {"ok": True, **session.lease()}
+            token = self.reserve((device_id,), owner_id=control_id)
+        except ValueError as exc:
+            return _error(FAILURE_DEVICE_BUSY, str(exc))
+        try:
+            if authorize is not None:
+                verdict = authorize()
+                if verdict is not None:
+                    return verdict.to_dict()
+            try:
+                body.start(reservation_token=token)
+            except (RuntimeError, ValueError) as exc:
+                return _error("control_start_failed", str(exc))
+            session = self.adopt(body, lease_s=params.get("lease_s"), connection_id=connection_id)
+            return {"ok": True, **session.lease()}
+        finally:
+            with self._mutex:
+                if token in self._reservations:
+                    self.release_reservation(token)
 
     async def renew(self, params: Mapping[str, Any], *, connection_id: str) -> dict[str, Any]:
         session, refusal = self._owned(params, connection_id, "renew")
@@ -406,12 +672,24 @@ class NodeSessions:
                 await self._lose(session, "disconnect")
 
     async def shutdown(self) -> None:
-        """Close every live session (node shutdown)."""
+        """Close incoming work, settle leased runs and transactions (node shutdown)."""
+        with self._mutex:
+            self._closing = True
+            controls = tuple(stop for _, stop in self._controls.values())
         for session in list(self._sessions.values()):
             if session.live:
                 self._end(session)
                 await session.body.close("shutdown")
-        self._sessions.clear()
+        with self._mutex:
+            self._sessions.clear()
+        # Includes independently constructed buses, not just registry._control_buses.
+        # A timed-out join retains its claim; storage/device release must refuse.
+        for stop in controls:
+            await asyncio.to_thread(stop)
+        with self._mutex:
+            if self._controls:
+                raise RuntimeError("control startup/thread has not settled; retain node devices and retry shutdown")
+        await self.settle_transactions()
 
     # ── Internals ──
 
@@ -443,8 +721,9 @@ class NodeSessions:
         await session.body.lose(reason)
 
     def _purge(self) -> None:
-        for control_id in [cid for cid, s in self._sessions.items() if not s.live]:
-            del self._sessions[control_id]
+        with self._mutex:
+            for control_id in [cid for cid, s in self._sessions.items() if not s.live]:
+                del self._sessions[control_id]
 
     async def _watchdog(self, session: LeasedSession) -> None:
         try:

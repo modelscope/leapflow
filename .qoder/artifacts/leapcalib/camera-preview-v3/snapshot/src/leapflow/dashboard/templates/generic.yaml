@@ -1,0 +1,149 @@
+template: generic
+version: 1
+title: "{{ title }}"
+domain: generic
+meta:
+  title: "Session analysis"
+  description: "Default, general-purpose lens: user-facing conversation intelligence."
+# Refresh policy is consumed by the session producer; harmless elsewhere.
+refresh:
+  batch_turns: 6
+  use_model_salience: true
+layout:
+  - type: Page
+    props:
+      title: "{{ title }}"
+    children:
+      # KPI metric band: compact, hairline-divided, always-meaningful numbers.
+      - type: Row
+        props:
+          variant: metrics
+        children:
+          - type: Stat
+            props:
+              label: "Turns"
+              value: "{{ analysis.usage.turns }}"
+          - type: Stat
+            props:
+              label: "Tokens"
+              value: "{{ analysis.usage.tokens }}"
+          - type: Stat
+            props:
+              label: "Artifacts"
+              value: "{{ observation.artifact_count }}"
+      # 01 Executive brief: wide abstract beside the severity figure.
+      - type: Section
+        props:
+          title: "Executive brief"
+          subtitle: "Coverage · storyline · severity"
+        children:
+          - type: Grid
+            props:
+              cols: 3
+            children:
+              - type: StoryPanel
+                props:
+                  title: "Abstract"
+                  text: "{{ analysis.story }}"
+                  span: 2
+              - type: BarChart
+                props:
+                  title: "Severity mix"
+                  caption: "Insight count by severity."
+                  bind: analysis.insights
+      # File artifacts: only rendered when the session actually produced files.
+      - type: Card
+        when: artifact_context
+        props:
+          title: "File artifacts"
+          kicker: "Observation"
+        children:
+          - type: Table
+            props:
+              caption: "Session file artifacts."
+              bind: artifact_context
+              columns:
+                - key: name
+                  label: File
+                - key: status
+                  label: Status
+                - key: reason
+                  label: Note
+      # Data series: its own titled section, only when the session captured
+      # numeric series. The chart names each line and cites its provenance.
+      - type: Section
+        when: analysis.charts.series
+        props:
+          title: "Series"
+        children:
+          - type: LineChart
+            props:
+              caption: "Extracted from this session's tool/file output (not model-generated)."
+              bind: analysis.charts.series
+      # Insights: key observations, one card each (grid fills the width).
+      - type: Section
+        props:
+          title: "Insights"
+          subtitle: "Key observations"
+        children:
+          - type: Grid
+            children:
+              - type: InsightCard
+                repeat: analysis.insights
+                as: i
+                props:
+                  title: "{{ i.title }}"
+                  summary: "{{ i.summary }}"
+                  severity: "{{ i.severity }}"
+                  bind: i
+      # Operating agenda: decisions, actions, open questions.
+      - type: Section
+        props:
+          title: "Operating agenda"
+          subtitle: "Decisions and actions"
+        children:
+          - type: Grid
+            children:
+              - type: Card
+                props:
+                  title: "Action items"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.action_items
+              - type: Card
+                props:
+                  title: "Decisions"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.decisions
+              - type: Card
+                props:
+                  title: "Open questions"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.open_questions
+      # Context map: entities and recommended follow-ups.
+      - type: Section
+        props:
+          title: "Context map"
+          subtitle: "Entities and follow-ups"
+        children:
+          - type: Grid
+            children:
+              - type: Card
+                props:
+                  title: "Entities"
+                children:
+                  - type: EntityGraph
+                    props:
+                      bind: analysis.entities
+              - type: Card
+                props:
+                  title: "Next prompts"
+                children:
+                  - type: SuggestionChips
+                    props:
+                      bind: analysis.next_prompts

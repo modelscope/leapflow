@@ -1,0 +1,40 @@
+id: native_control_jitter
+version: "1.0.0"
+source: "leapflow://native"
+adapter: native_control_jitter
+tier: 1
+tags:
+  - native
+  - control
+  - jitter
+required: true
+note: "overrun_detection intentionally injects an overrun for diagnostic validation; its result and evidence remain reportable but do not contribute to production release gates."
+dependencies: []
+timeouts:
+  availability: 5.0
+  trial: 60.0
+seeds:
+  - 42
+metrics:
+  - jitter_p50
+  - jitter_p95
+  - jitter_p99
+  - overrun
+  - halt_latency
+gates: {}
+scenarios:
+  - scenario_id: logical_clock_jitter
+    name: "Logical-clock PID jitter percentiles"
+    tags: [native, control, tier1]
+    timeout_seconds: 30.0
+    required: true
+  - scenario_id: overrun_detection
+    name: "ControlBusConfig cycle overrun detection"
+    tags: [native, control, tier1, diagnostic]
+    timeout_seconds: 30.0
+    required: true
+  - scenario_id: halt_latency
+    name: "Simulated emergency halt latency"
+    tags: [native, control, tier1]
+    timeout_seconds: 30.0
+    required: true

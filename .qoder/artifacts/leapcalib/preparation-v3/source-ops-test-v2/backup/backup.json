@@ -1,0 +1,17 @@
+{
+  "plan_sha256": "c6882cafcbd661b90a598e76fed5205b85529d46e3dd0b161c03320b170f2db1",
+  "files": [
+    {
+      "path": "src/existing.py",
+      "before_sha256": "2b2aa6e8026076315da7c288f20a19955f04ebc7cf0668fd2c42fdbb82a4689f",
+      "before_mode": 416,
+      "after_sha256": "d1fee184537b01a2a222d2ea1297575a828d712cc7f72c041a1062dbf1c884bf"
+    },
+    {
+      "path": "src/added.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "9c1f0172404596acf2b1a64dc3380ba534f5e41936c32cd2eac05059aaff3d16"
+    }
+  ]
+}

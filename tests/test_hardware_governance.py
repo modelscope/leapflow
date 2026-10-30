@@ -1875,6 +1875,8 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.skills_episode_fps",
         "hardware.skills_episode_min_free_mb",
         "hardware.share_frames",
+        "hardware.calibration_worker_enabled",
+        "hardware.calibration_worker_budgets",
     }
     for key in keys:
         view = service.describe(key)

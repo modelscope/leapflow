@@ -1,0 +1,492 @@
+# Sub-Agent Monitor template for LeapBoard.
+#
+# Five questions this page answers, matching the sophistication of the evolution
+# dashboard:
+#
+#   Q1 Is delegation healthy?         -> Alert band (outside tabs, always visible)
+#   Q2 What is the executive summary? -> KPI band + delegation frequency trend
+#   Q3 What is running right now?     -> Active subagents table
+#   Q4 What happened recently?        -> History tab: timeline + hourly pattern
+#   Q5 How efficient is delegation?   -> Performance Analytics tab: percentiles,
+#                                        duration/tool/outcome/depth distributions
+#
+# The alert band, KPI strip, and active table sit outside the tabs because a
+# running problem and a running subagent must be visible whichever tab is open.
+# The four tabs serve distinct investigation paths and can be explored
+# independently.
+#
+# Component choices follow the shipped renderer capabilities (verified):
+#   - BarChart for all distributions (Heatmap is a BarChart alias)
+#   - AreaChart for time-series trends
+#   - EntityGraph for delegation badge cloud (flat badge list)
+#   - Timeline for recent completions
+#   - Table for detailed drill-down
+#   - Gauge for ratio metrics
+#   - ProgressBar for active elapsed visualization
+template: subagents
+version: 2
+title: "Sub-Agent Monitor"
+domain: subagent
+meta:
+  title: "Sub-Agent Monitor"
+  description: "Statistically rich subagent execution monitoring: KPIs, delegation trends, percentile analysis, depth/tool/outcome distributions, and alert detection."
+layout:
+  - type: Page
+    props:
+      title: "Sub-Agent Monitor"
+    children:
+      # ── Empty state ───────────────────────────────────────────────────────
+      - type: Section
+        when: empty
+        props:
+          title: "No subagent activity"
+          subtitle: "This board reports delegated task execution. No subagent has been dispatched yet."
+        children:
+          - type: Card
+            props:
+              title: "What are subagents?"
+              kicker: "Subagents execute delegated tasks with isolated context, restricted tools, and depth limits."
+            children:
+              - type: Markdown
+                props:
+                  text: >-
+                    > Subagents are spawned when the main agent delegates a task via
+                    `delegate_task`. Each runs in an isolated context with its own tool
+                    set and message history. Only the summary flows back to the parent.
+                    Activity will appear here once a delegation occurs.
+
+          - type: Grid
+            when: subagent.config
+            props:
+              cols: 3
+            children:
+              - type: Stat
+                props:
+                  label: "Max depth"
+                  value: "{{ subagent.config.max_depth }}"
+              - type: Stat
+                props:
+                  label: "Max concurrent"
+                  value: "{{ subagent.config.max_concurrent }}"
+              - type: Stat
+                props:
+                  label: "Summary budget"
+                  value: "{{ subagent.config.summary_max_chars }}"
+
+          - type: Markdown
+            props:
+              text: >-
+                > **Tip:** Delegations appear automatically when the agent calls
+                `delegate_task`. Check that the subagent executor is configured and
+                that the task requires delegation depth > 0.
+
+      # ── Alert band: outside tabs, always visible when triggered ─────────
+      - type: Section
+        when: subagent.alerts
+        props:
+          title: "Attention required"
+          subtitle: "Health anomalies detected across recent delegations. Shown regardless of the open tab."
+        children:
+          - type: Row
+            props:
+              variant: metrics
+            children:
+              - type: Stat
+                props:
+                  label: "High failure rate"
+                  value: "{{ subagent.alerts.high_failure_rate }}"
+              - type: Stat
+                props:
+                  label: "Timeout detected"
+                  value: "{{ subagent.alerts.has_timeouts }}"
+              - type: Stat
+                props:
+                  label: "Depth saturation"
+                  value: "{{ subagent.alerts.depth_saturation }}"
+          - type: Markdown
+            when: subagent.alerts.message
+            props:
+              text: "> **Alert:** {{ subagent.alerts.message }}"
+
+      # ── Executive Summary KPI band ──────────────────────────────────────
+      - type: Section
+        when: subagent.stats
+        props:
+          title: "Delegation overview"
+          subtitle: "Aggregate counters and success metrics for all subagent executions in this daemon lifetime."
+        children:
+          - type: Row
+            props:
+              variant: metrics
+            children:
+              - type: Stat
+                props:
+                  label: "Active"
+                  value: "{{ subagent.active_count }}"
+              - type: Stat
+                props:
+                  label: "Completed"
+                  value: "{{ subagent.stats.completed }}"
+              - type: Stat
+                props:
+                  label: "Failed"
+                  value: "{{ subagent.stats.failed }}"
+              - type: Stat
+                props:
+                  label: "Avg duration"
+                  value: "{{ subagent.stats.avg_duration }}s"
+              - type: Gauge
+                props:
+                  label: "Success rate"
+                  value: "{{ subagent.stats.success_rate }}"
+
+          # Delegation frequency trend — the only time-shaped element outside
+          # the tabs, answering "is delegation increasing or decreasing?"
+          - type: AreaChart
+            when: subagent.delegation_trend
+            props:
+              title: "Delegation frequency"
+              bind: subagent.delegation_trend
+              caption: "Delegations aggregated by time window. Rising trend indicates increasing task complexity or workload."
+
+          - type: Row
+            when: subagent.stats
+            props:
+              variant: meta
+            children:
+              - type: Stat
+                props:
+                  label: "Total delegated"
+                  value: "{{ subagent.stats.total_delegated }}"
+              - type: Stat
+                props:
+                  label: "Total tool calls"
+                  value: "{{ subagent.total_tool_calls }}"
+              - type: Stat
+                props:
+                  label: "Total duration"
+                  value: "{{ subagent.total_duration }}s"
+              - type: Stat
+                props:
+                  label: "Unique goals"
+                  value: "{{ subagent.unique_goals }}"
+              - type: Stat
+                props:
+                  label: "Samples"
+                  value: "{{ subagent.sample_count }}"
+
+      # ── Active subagents table ──────────────────────────────────────────
+      - type: Section
+        when: subagent.active
+        props:
+          title: "Active delegations"
+          subtitle: "Currently running subagent tasks. Elapsed time updates on each refresh cycle."
+        children:
+          - type: Table
+            props:
+              bind: subagent.active
+              columns:
+                - key: subagent_id
+                  label: "ID"
+                - key: goal
+                  label: "Goal"
+                - key: depth
+                  label: "Depth"
+                - key: parent_session_id
+                  label: "Parent"
+                - key: elapsed_s
+                  label: "Elapsed (s)"
+
+      # ── Tabs: four academic-style analysis panels ───────────────────────
+      - type: Tabs
+        when: subagent.stats.total_delegated
+        children:
+          # ═══ Tab 1 · Execution History ═════════════════════════════════
+          - type: Tab
+            props:
+              title: "Execution History"
+            children:
+              - type: Section
+                when: subagent.hourly_distribution
+                props:
+                  title: "Temporal distribution"
+                  subtitle: "When delegations occur within the day. Helps identify burst patterns and quiet periods."
+                children:
+                  - type: BarChart
+                    props:
+                      title: "Hourly delegation pattern"
+                      bind: subagent.hourly_distribution
+                      caption: "Delegations by hour-of-day (00:00–23:00). Peaks indicate active work sessions."
+
+              - type: Section
+                when: subagent.recent_timeline
+                props:
+                  title: "Recent completions"
+                  subtitle: "Last 50 subagent executions, newest first. Each entry shows outcome, duration, and tool usage."
+                children:
+                  - type: Timeline
+                    props:
+                      bind: subagent.recent_timeline
+
+              - type: Section
+                when: subagent.recent
+                props:
+                  title: "Execution detail"
+                  subtitle: "Tabular view with full execution metadata. Error column populated for failed delegations."
+                children:
+                  - type: Table
+                    props:
+                      bind: subagent.recent
+                      columns:
+                        - key: subagent_id
+                          label: "ID"
+                        - key: goal
+                          label: "Goal"
+                        - key: status
+                          label: "Status"
+                        - key: duration_s
+                          label: "Duration (s)"
+                        - key: tool_calls
+                          label: "Tools"
+                        - key: depth
+                          label: "Depth"
+                        - key: parent_session_id
+                          label: "Parent"
+                        - key: error
+                          label: "Error"
+
+          # ═══ Tab 2 · Delegation Graph ═════════════════════════════════
+          - type: Tab
+            props:
+              title: "Delegation Graph"
+            children:
+              - type: Section
+                when: subagent.delegation_badges
+                props:
+                  title: "Delegation topology"
+                  subtitle: "Visual map of parent→child delegation pairs. Badge color reflects execution outcome."
+                children:
+                  - type: EntityGraph
+                    props:
+                      bind: subagent.delegation_badges
+
+              - type: Section
+                when: subagent.delegation_tree
+                props:
+                  title: "Parent → child relationships"
+                  subtitle: "How tasks were delegated across depth levels, with execution outcome and duration."
+                children:
+                  - type: Table
+                    props:
+                      bind: subagent.delegation_tree
+                      columns:
+                        - key: parent_session_id
+                          label: "Parent"
+                        - key: subagent_id
+                          label: "Child"
+                        - key: goal
+                          label: "Goal"
+                        - key: depth
+                          label: "Depth"
+                        - key: status
+                          label: "Outcome"
+                        - key: duration_s
+                          label: "Duration (s)"
+
+              - type: Row
+                when: subagent.stats
+                props:
+                  variant: meta
+                children:
+                  - type: Stat
+                    props:
+                      label: "Max observed depth"
+                      value: "{{ subagent.max_observed_depth }}"
+                  - type: Stat
+                    props:
+                      label: "Avg delegation depth"
+                      value: "{{ subagent.avg_depth }}"
+
+          # ═══ Tab 3 · Performance Analytics ═════════════════════════════
+          - type: Tab
+            props:
+              title: "Performance Analytics"
+            children:
+              # ─── Duration Analysis ─────────────────────────────────────
+              - type: Section
+                when: subagent.duration_distribution
+                props:
+                  title: "Duration analysis"
+                  subtitle: "Statistical breakdown of execution times across all completed delegations."
+                children:
+                  - type: Grid
+                    props:
+                      cols: 2
+                    children:
+                      - type: Col
+                        children:
+                          - type: BarChart
+                            props:
+                              title: "Duration distribution"
+                              bind: subagent.duration_distribution
+                              caption: "Bucketed execution times. A right-skewed distribution is normal; heavy >60s tail warrants investigation."
+                      - type: Col
+                        when: subagent.duration_percentiles
+                        children:
+                          - type: Section
+                            props:
+                              title: "Percentile summary"
+                              subtitle: "Latency percentiles computed from all recent execution durations."
+                            children:
+                              - type: Row
+                                props:
+                                  variant: metrics
+                                children:
+                                  - type: Stat
+                                    props:
+                                      label: "P50"
+                                      value: "{{ subagent.duration_percentiles.p50 }}s"
+                                  - type: Stat
+                                    props:
+                                      label: "P75"
+                                      value: "{{ subagent.duration_percentiles.p75 }}s"
+                                  - type: Stat
+                                    props:
+                                      label: "P90"
+                                      value: "{{ subagent.duration_percentiles.p90 }}s"
+                                  - type: Stat
+                                    props:
+                                      label: "P95"
+                                      value: "{{ subagent.duration_percentiles.p95 }}s"
+                  - type: Markdown
+                    props:
+                      text: >-
+                        > **Reading guide:** P50 is the median — half of all delegations
+                        complete faster. P90 and P95 capture tail latency, the durations
+                        that affect perceived responsiveness. A large gap between P50 and
+                        P95 suggests bimodal execution: some tasks are fast lookups, others
+                        are deep multi-step operations.
+
+              # ─── Efficiency Metrics ────────────────────────────────────
+              - type: Section
+                when: subagent.tool_calls_distribution
+                props:
+                  title: "Efficiency metrics"
+                  subtitle: "Tool usage patterns and outcome ratios across delegations."
+                children:
+                  - type: Grid
+                    props:
+                      cols: 2
+                    children:
+                      - type: Col
+                        children:
+                          - type: BarChart
+                            props:
+                              title: "Tool calls per delegation"
+                              bind: subagent.tool_calls_distribution
+                              caption: "How many tool calls each delegation required. High counts may indicate task complexity or inefficient tool use."
+                      - type: Col
+                        when: subagent.outcome_distribution
+                        children:
+                          - type: BarChart
+                            props:
+                              title: "Outcome distribution"
+                              bind: subagent.outcome_distribution
+                              caption: "Success vs failure ratio. A healthy system shows predominantly 'completed' outcomes."
+                  - type: Row
+                    props:
+                      variant: meta
+                    children:
+                      - type: Stat
+                        props:
+                          label: "Avg tools/task"
+                          value: "{{ subagent.avg_tools_per_task }}"
+                      - type: Stat
+                        props:
+                          label: "Median duration"
+                          value: "{{ subagent.median_duration }}s"
+                      - type: Stat
+                        props:
+                          label: "Failure rate"
+                          value: "{{ subagent.failure_rate_pct }}%"
+
+              # ─── Depth Analysis ────────────────────────────────────────
+              - type: Section
+                when: subagent.depth_distribution
+                props:
+                  title: "Depth analysis"
+                  subtitle: "How deeply tasks are delegated. Depth saturation indicates potential recursion limits."
+                children:
+                  - type: BarChart
+                    props:
+                      title: "Executions by depth level"
+                      bind: subagent.depth_distribution
+                      caption: "Distribution of delegation recursion depth. Most delegations should cluster at depth 0-1; deeper levels indicate multi-step decomposition."
+                  - type: Row
+                    props:
+                      variant: meta
+                    children:
+                      - type: Stat
+                        props:
+                          label: "Max depth reached"
+                          value: "{{ subagent.max_observed_depth }}"
+                      - type: Stat
+                        props:
+                          label: "Avg depth"
+                          value: "{{ subagent.avg_depth }}"
+                      - type: Stat
+                        props:
+                          label: "Deepest goal"
+                          value: "{{ subagent.deepest_goal_summary }}"
+
+          # ═══ Tab 4 · Configuration ═════════════════════════════════════
+          - type: Tab
+            props:
+              title: "Configuration"
+            children:
+              - type: Section
+                when: subagent.config
+                props:
+                  title: "Effective subagent configuration"
+                  subtitle: "Current isolation settings governing all subagent delegations."
+                children:
+                  - type: Row
+                    props:
+                      variant: metrics
+                    children:
+                      - type: Stat
+                        props:
+                          label: "Max depth"
+                          value: "{{ subagent.config.max_depth }}"
+                      - type: Stat
+                        props:
+                          label: "Max concurrent"
+                          value: "{{ subagent.config.max_concurrent }}"
+                      - type: Stat
+                        props:
+                          label: "Summary budget"
+                          value: "{{ subagent.config.summary_max_chars }}"
+
+                  - type: Markdown
+                    props:
+                      text: >-
+                        > **Configuration tuning guide:**
+                        `max_depth` controls recursion — increase for complex multi-step
+                        tasks, decrease to prevent runaway delegation chains.
+                        `max_concurrent` bounds parallelism — higher values improve
+                        throughput but increase resource contention.
+                        `summary_max_chars` limits the summary flowing back to the parent;
+                        too low truncates critical context, too high wastes the parent's
+                        context budget.
+
+                  - type: Table
+                    when: subagent.config_table
+                    props:
+                      bind: subagent.config_table
+                      columns:
+                        - key: setting
+                          label: "Setting"
+                        - key: value
+                          label: "Value"
+                        - key: description
+                          label: "Description"

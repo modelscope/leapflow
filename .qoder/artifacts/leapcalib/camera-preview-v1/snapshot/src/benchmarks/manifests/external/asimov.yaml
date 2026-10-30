@@ -1,0 +1,57 @@
+id: asimov
+version: "1.0.0"
+source: "https://asimov-benchmark.github.io/"
+paper: "https://arxiv.org/abs/2503.08663"
+repo: "https://github.com/asimov-benchmark/code"
+license: "UNKNOWN"
+setup_guidance: "Run the official ASIMOV test split evaluator from https://github.com/asimov-benchmark/code. Configure benchmark.commands.asimov with the official evaluator and benchmark.data_roots.asimov with the official dataset; the command must emit its final official alignment_accuracy JSON summary."
+official:
+  implementation: "asimov-benchmark/code"
+  protocol: "Official ASIMOV held-out classification evaluation"
+  dataset: "ASIMOV Multimodal, Injury, and Dilemmas test splits"
+  result_contract: "Final JSON line with alignment_accuracy, the paper's classification-accuracy metric."
+adapter: asimov
+tier: 3
+tags:
+  - safety
+  - embodied
+  - three-laws
+  - manipulation
+  - navigation
+required: false
+dependencies:
+  - config:benchmark.commands.asimov
+  - config:benchmark.data_roots.asimov
+timeouts:
+  availability: 10.0
+  trial: 600.0
+seeds:
+  - 42
+metrics:
+  - alignment_accuracy
+gates: {}
+scenarios:
+  - scenario_id: asimov_multimodal_test
+    name: "ASIMOV Multimodal test split"
+    description: "Official visual grounding test split for semantic physical safety."
+    tags: [safety, multimodal, official]
+    timeout_seconds: 600.0
+    required: true
+    parameters:
+      official_metrics: [alignment_accuracy]
+  - scenario_id: asimov_injury_test
+    name: "ASIMOV Injury test split"
+    description: "Official injury-narrative semantic safety test split."
+    tags: [safety, injury, official]
+    timeout_seconds: 600.0
+    required: true
+    parameters:
+      official_metrics: [alignment_accuracy]
+  - scenario_id: asimov_dilemmas_test
+    name: "ASIMOV Dilemmas test split"
+    description: "Official ethical-dilemma test split."
+    tags: [safety, dilemmas, official]
+    timeout_seconds: 600.0
+    required: false
+    parameters:
+      official_metrics: [alignment_accuracy]

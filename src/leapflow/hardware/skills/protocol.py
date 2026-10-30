@@ -198,8 +198,11 @@ class SkillSpec:
     consent: str = CONSENT_SESSION
     leased: bool = False
     region: str = REGION_WORKSPACE
+    motion_allowed: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.motion_allowed) is not bool:
+            raise ValueError("motion permission must be an explicit boolean")
         if self.effect not in SKILL_EFFECTS:
             raise ValueError(
                 f"skill {self.skill_id!r} effect must be one of {sorted(SKILL_EFFECTS)}"
@@ -218,6 +221,11 @@ class SkillSpec:
     @property
     def is_actuating(self) -> bool:
         return self.effect == EFFECT_ACTUATE
+
+    @property
+    def uses_motion(self) -> bool:
+        """Effectful persistence still needs a permit, but cannot command an actuator."""
+        return self.is_actuating and self.motion_allowed
 
     @property
     def runs_leased(self) -> bool:

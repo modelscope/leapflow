@@ -134,6 +134,7 @@ SKILL_METHODS: tuple[str, ...] = (
     "skill.status",
     "skill.stop",
     "skill.label",
+    "skill.reload",
 )
 
 LHP_METHODS: tuple[str, ...] = (

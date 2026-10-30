@@ -217,7 +217,12 @@ class HighFrequencyControlBus:
 
         self._thread: threading.Thread | None = None
         self._running = threading.Event()
+        self._ready = threading.Event()
         self._stop_requested = threading.Event()
+        self._lifecycle_lock = threading.RLock()
+        self._claimed = False
+        self._ownership: tuple[Any, str] | None = None
+        self._halt_settled = True
 
         self._device_id: str = ""
         self._policy: ControlPolicy | None = None
@@ -235,7 +240,9 @@ class HighFrequencyControlBus:
 
     # -- Public interface --------------------------------------------------
 
-    def start(self, device_id: str, policy: ControlPolicy) -> None:
+    def start(
+        self, device_id: str, policy: ControlPolicy, *, reservation_token: str | None = None,
+    ) -> None:
         """Start the control loop in a dedicated thread.
 
         Synchronous — can be called from async via ``asyncio.to_thread``
@@ -243,15 +250,62 @@ class HighFrequencyControlBus:
 
         Raises ``RuntimeError`` if the bus is already running.
         """
-        if self._running.is_set():
-            raise RuntimeError(
-                "HighFrequencyControlBus is already running; call stop() before starting again"
-            )
+        self._claim(device_id, reservation_token=reservation_token)
+        try:
+            self._start_owned(device_id, policy)
+        except BaseException:
+            self.stop()
+            self._release_if_idle()
+            raise
+
+    def _claim(self, device_id: str, *, reservation_token: str | None = None) -> None:
+        """Own startup and lifetime before any await or thread can touch transport."""
+        from leapflow.hardware.node_gate import control_safety_refusal
+
+        with self._lifecycle_lock:
+            if self._claimed or self._thread is not None and self._thread.is_alive():
+                raise RuntimeError("HighFrequencyControlBus is already running or starting; call stop() first")
+            if reason := control_safety_refusal(self._registry, device_id):
+                raise RuntimeError(reason)
+            sessions = getattr(self._registry, "node_sessions", None)
+            if sessions is not None:
+                try:
+                    token = sessions.begin_control(device_id, stop=self.stop, reservation_token=reservation_token)
+                except ValueError as exc:
+                    raise RuntimeError(str(exc)) from exc
+                self._ownership = (sessions, token)
+            self._claimed = True
+            self._device_id = device_id
+            self._stop_requested.clear()
+            self._ready.clear()
+            self._halt_settled = True
+
+    def _release_if_idle(self) -> None:
+        """Never discard ownership while a startup/transport thread is alive."""
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._release_owned()
+
+    def _release_owned(self) -> None:
+        with self._lifecycle_lock:
+            ownership, self._ownership = self._ownership, None
+            if ownership is not None:
+                sessions, token = ownership
+                sessions.finish_control(token, settled=self._halt_settled)
+            self._claimed = False
+
+    def _start_owned(self, device_id: str, policy: ControlPolicy) -> None:
+        from leapflow.hardware.node_gate import control_safety_refusal
+
+        if self._stop_requested.is_set():
+            raise RuntimeError("control startup stopped before dispatch")
+        if reason := control_safety_refusal(self._registry, device_id):
+            raise RuntimeError(reason)
         self._device_id = device_id
         self._policy = policy
         self._latest_state = None
         self._stats = ControlBusStats(started_at=time.monotonic())
-        self._stop_requested.clear()
         self._last_commands.clear()
         self._pending_tick_expectations.clear()
         self._channel_tolerances.clear()
@@ -279,31 +333,44 @@ class HighFrequencyControlBus:
             if tol and tol > 0:
                 self._channel_tolerances[ch.channel_id] = float(tol)
 
-        self._thread = threading.Thread(
-            target=self._control_thread_main,
-            name=f"control-bus-{device_id}",
-            daemon=True,
-        )
-        self._thread.start()
-        # Wait until the thread signals that it is running (transport opened).
-        if not self._running.wait(timeout=10.0):
+        with self._lifecycle_lock:
+            if self._stop_requested.is_set():
+                raise RuntimeError("control startup stopped before dispatch")
+            self._thread = threading.Thread(
+                target=self._control_thread_main,
+                name=f"control-bus-{device_id}",
+                daemon=True,
+            )
+            self._thread.start()
+        # Readiness is distinct from running: failed transport acquisition must
+        # wake the starter without advertising an active controller.
+        if not self._ready.wait(timeout=10.0):
             raise RuntimeError(f"control thread for {device_id!r} did not start within 10s")
+        if not self._running.is_set() or self._stop_requested.is_set():
+            raise RuntimeError(f"control startup for {device_id!r} failed or stopped; inspect transport and safety")
+        if reason := control_safety_refusal(self._registry, device_id):
+            self.stop()
+            raise RuntimeError(reason)
 
     def stop(self, timeout_s: float = 2.0) -> None:
         """Request graceful stop: finishes current cycle, halts device, joins thread."""
-        if not self._running.is_set():
-            return
         self._stop_requested.set()
-        thread = self._thread
-        if thread is not None:
+        with self._lifecycle_lock:
+            thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=timeout_s)
             if thread.is_alive():
                 logger.warning(
-                    "Control thread for %s did not join within %.1fs",
+                    "Control thread for %s did not join within %.1fs; ownership retained",
                     self._device_id,
                     timeout_s,
                 )
-        self._thread = None
+                return
+            with self._lifecycle_lock:
+                if self._thread is thread:
+                    self._thread = None
+        # A pending async transport-open task still owns startup, even with no
+        # RT thread yet. Its settlement path releases the claim, not stop().
 
     def emergency_stop(self) -> None:
         """Immediate halt: sets stop flag, calls transport.halt() from calling thread.
@@ -340,6 +407,12 @@ class HighFrequencyControlBus:
         return self._running.is_set()
 
     @property
+    def is_active(self) -> bool:
+        """Startup, running, or unsettled stop; distinct from running telemetry."""
+        with self._lifecycle_lock:
+            return self._claimed or self._thread is not None and self._thread.is_alive()
+
+    @property
     def latest_state(self) -> ControlState | None:
         """Latest sensor state from the control thread.  Lock-free (GIL atomic)."""
         return self._latest_state
@@ -360,17 +433,63 @@ class HighFrequencyControlBus:
         thread then retrieves the already-open transport via the lock-free
         ``get_open_transport()``.
         """
-        # Pre-open the transport in the caller's (main) event loop.
-        await self._registry.transport(device_id)
-        await asyncio.to_thread(self.start, device_id, policy)
+        self._claim(device_id)
+        task = asyncio.create_task(self._async_launch(device_id, policy))
+        await self._settle_bridge(task, stop_on_cancel=True)
+
+    async def _async_launch(self, device_id: str, policy: ControlPolicy) -> None:
+        try:
+            await self._registry.transport(device_id)
+            await asyncio.to_thread(self._start_owned, device_id, policy)
+        except BaseException:
+            await asyncio.to_thread(self.stop)
+            raise
+        finally:
+            # Success retains an active thread's claim; pre-dispatch failure or
+            # cancellation releases only after transport opening/start settles.
+            self._release_if_idle()
+
+    async def _settle_bridge(self, task: asyncio.Task[Any], *, stop_on_cancel: bool) -> None:
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if stop_on_cancel:
+                    self._stop_requested.set()
+                if task.done():
+                    if not task.cancelled():
+                        task.exception()
+                    break
+            except Exception:
+                if not cancelled:
+                    raise
+                break
+        if cancelled:
+            # The starter may have won the race with cancellation. Stop and join
+            # that one controller; never launch/replay a second one.
+            if stop_on_cancel:
+                await self._settle_bridge(asyncio.create_task(asyncio.to_thread(self.stop)), stop_on_cancel=False)
+            raise asyncio.CancelledError
 
     async def async_stop(self) -> None:
-        """Async wrapper: stop the control loop."""
-        await asyncio.to_thread(self.stop)
+        """Async wrapper: retain ownership through cancellation of the join."""
+        await self._settle_bridge(asyncio.create_task(asyncio.to_thread(self.stop)), stop_on_cancel=False)
 
     # -- Control thread internals ------------------------------------------
 
     def _control_thread_main(self) -> None:
+        """Settle ownership on every thread exit, including failed startup."""
+        try:
+            self._run_control_thread()
+        finally:
+            self._running.clear()
+            self._ready.set()
+            self._release_owned()
+
+    def _run_control_thread(self) -> None:
         """Main function of the dedicated control thread.
 
         1. Set thread priority (SCHED_FIFO on Linux, high priority on macOS)
@@ -408,10 +527,11 @@ class HighFrequencyControlBus:
                 exc,
                 exc_info=True,
             )
+            loop.close()
             return
-        finally:
-            # Signal the starting thread regardless of success/failure.
-            self._running.set()
+        self._halt_settled = False
+        self._running.set()
+        self._ready.set()
 
         consecutive_read_failures = 0
         comm_loss_start: float | None = None
@@ -596,10 +716,7 @@ class HighFrequencyControlBus:
             )
         finally:
             # Ensure the device is halted on any exit path.
-            try:
-                self._sync_halt(loop, transport)
-            except Exception:  # noqa: BLE001
-                pass
+            self._halt_settled = self._sync_halt(loop, transport)
             loop.close()
             stats.stopped_at = time.monotonic()
             self._running.clear()
@@ -758,12 +875,19 @@ class HighFrequencyControlBus:
         return loop.run_until_complete(_seq_write())
 
     @staticmethod
-    def _sync_halt(loop: asyncio.AbstractEventLoop, transport: Any) -> None:
-        """Synchronous halt wrapper — called on every exit path."""
+    def _sync_halt(loop: asyncio.AbstractEventLoop, transport: Any) -> bool:
+        """Synchronous halt wrapper; failed settlement keeps owner writes closed."""
+        from leapflow.hardware.transport import TransportStatus
+
         try:
-            loop.run_until_complete(transport.halt())
+            result = loop.run_until_complete(transport.halt())
         except Exception as exc:  # noqa: BLE001
             logger.warning("Control bus halt failed: %s", exc, exc_info=True)
+            return False
+        if not isinstance(result, TransportStatus) or not result.connected or not result.halt_supported:
+            logger.error("Control bus halt lacks connected, supported transport settlement")
+            return False
+        return True
 
     # -- Precise timing ----------------------------------------------------
 
@@ -846,6 +970,11 @@ class HighFrequencyControlBus:
         check_device_policy: bool = True,
     ) -> bool:
         """Enforce per-command hardlines and optional device-level policy."""
+        from leapflow.hardware.node_gate import control_safety_refusal
+
+        if reason := control_safety_refusal(self._registry, self._device_id):
+            logger.error("Control compatibility refusal on %s: %s", self._device_id, reason)
+            return False
         degradation_query = getattr(self._registry, "is_device_degraded", None)
         if callable(degradation_query) and degradation_query(self._device_id) is True:
             logger.error("Device %s is degraded — halting control loop", self._device_id)

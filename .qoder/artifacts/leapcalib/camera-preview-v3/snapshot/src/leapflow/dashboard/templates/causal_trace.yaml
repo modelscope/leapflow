@@ -1,0 +1,87 @@
+# Read-only causal trace lens for the AAAI demonstration and audit sessions.
+#
+# It consumes the existing framework_evolution payload. The template introduces no
+# actions and therefore cannot approve, install, reload, or otherwise mutate a plugin.
+template: causal_trace
+version: 1
+hidden: true
+title: "Causal trace"
+domain: framework_evolution
+meta:
+  title: "Causal trace"
+  description: "Read-only environment-to-governance evidence for one framework-evolution snapshot."
+layout:
+  - type: Page
+    props:
+      title: "Causal trace"
+    children:
+      - type: Section
+        when: evolution.summary
+        props:
+          title: "Evidence boundary"
+          subtitle: "A causal trace shows recorded facts; it does not infer missing approval or observed effect."
+        children:
+          - type: Grid
+            props:
+              cols: 4
+            children:
+              - type: Stat
+                props:
+                  label: "Episodes"
+                  value: "{{ evolution.summary.episode_count }}"
+              - type: Stat
+                props:
+                  label: "Self-acquired"
+                  value: "{{ evolution.summary.self_acquired_count }}"
+              - type: Stat
+                props:
+                  label: "Pipeline evidence"
+                  value: "{{ evolution.summary.segments_with_evidence }}/{{ evolution.summary.segments_total }}"
+              - type: Stat
+                props:
+                  label: "Declared-fitness closures"
+                  value: "{{ evolution.summary.resolved_count }}"
+      - type: Section
+        when: evolution.mutation_matrix
+        props:
+          title: "Counterfactual / mutation matrix"
+          subtitle: "Each row preserves the driver, decision, registry delta, and verification tier."
+        children:
+          - type: Table
+            props:
+              bind: evolution.mutation_matrix
+              columns:
+                - key: driver
+                  label: "Trigger"
+                - key: capability
+                  label: "Capability"
+                - key: policy_action
+                  label: "Decision"
+                - key: mutation_action
+                  label: "Mutation"
+                - key: registry_delta
+                  label: "Registry"
+                - key: lifecycle_status
+                  label: "Lifecycle"
+                - key: verification_tier
+                  label: "Evidence tier"
+                - key: gap_closure
+                  label: "Gap closure"
+      - type: Section
+        when: evolution.timeline
+        props:
+          title: "Episode timeline"
+          subtitle: "Rebuilt from existing decision and observation records."
+        children:
+          - type: Timeline
+            props:
+              bind: evolution.timeline
+      - type: Section
+        when: evolution.trace_feed
+        props:
+          title: "Durable trace feed"
+          subtitle: "Rejected and no-op decisions remain visible when their trace sink is installed."
+        children:
+          - type: Timeline
+            props:
+              bind: evolution.trace_feed

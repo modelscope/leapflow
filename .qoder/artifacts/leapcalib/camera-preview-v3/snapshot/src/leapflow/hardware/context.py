@@ -1,0 +1,1191 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""Hardware context: the declarative half of the Hardware Context Protocol.
+
+This module is deliberately free of any transport, vendor, or upstream-standard
+concept. It describes what an agent must know to operate a device safely --
+facts determined by physics and by LeapFlow's governance requirements, not by
+whatever wire protocol eventually carries the command.
+
+Keeping it that way is the single architectural red line of the protocol: an
+upstream hardware standard changes ``providers/`` and ``transports/`` only, never
+this module. A test in ``tests/test_architecture_contracts.py`` enforces it.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Mapping
+
+HC_VERSION = "hc.v0"
+"""Protocol version of a device declaration.
+
+``hc.v0`` is a pre-standard draft and makes no backward-compatibility promise.
+The registry refuses declarations carrying an unknown version rather than
+guessing: declarations are durable user assets, and silently rewriting one is
+worse than rejecting it with a reason.
+"""
+
+SUPPORTED_HC_VERSIONS: frozenset[str] = frozenset({HC_VERSION, "hc.v1"})
+
+_DEFAULT_HYSTERESIS_SPAN_FRACTION = 0.01
+"""Settle band used when a channel declares no quantization, as a share of span."""
+
+_MAX_HYSTERESIS_SPAN_FRACTION = 0.25
+"""Upper bound on the settle band, so a coarse quantization cannot close it.
+
+Without the cap, a channel whose quantization approaches its own span would
+produce a settle band wider than the range itself: the value could never clear
+it, and a breach would be reported as permanent.
+"""
+
+
+class ContextSource(str, Enum):
+    """Where a hardware context came from -- drives how much it is trusted."""
+
+    DECLARED = "declared"
+    """Hand-written declaration file."""
+
+    INTERVIEW = "interview"
+    """Captured by asking the operator; awaiting human confirmation."""
+
+    DISCOVERED = "discovered"
+    """Introspected from a transport (e.g. a CLI's own help output)."""
+
+    IMPORTED = "imported"
+    """Mapped from an upstream hardware standard's device descriptor."""
+
+
+class Direction(str, Enum):
+    """Available channel operations; demotion never grants a new operation."""
+
+    READ = "read"
+    WRITE = "write"
+    READWRITE = "readwrite"
+    DISABLED = "disabled"
+    """A write-only channel whose write capability has been revoked."""
+
+
+class HardwareEffect(str, Enum):
+    """Physical effect class of a channel operation.
+
+    Separate from ``ActionEffect`` because these risk profiles have no software
+    analogue: dispensing consumes an irreversible resource, actuating carries
+    kinetic energy, emitting radiates. Each maps to its own ``ActionKind`` so the
+    risk classifier dispatches on a decision rather than on a fallback value.
+    """
+
+    READ = "read"
+    CONFIGURE = "configure"
+    ACTUATE = "actuate"
+    DISPENSE = "dispense"
+    EMIT = "emit"
+
+    @classmethod
+    def writable(cls) -> frozenset[str]:
+        """Return the effect classes that change the physical world."""
+        return frozenset(
+            {cls.CONFIGURE.value, cls.ACTUATE.value, cls.DISPENSE.value, cls.EMIT.value}
+        )
+
+
+class Quality(str, Enum):
+    """Verdict on whether a sample can be trusted."""
+
+    OK = "ok"
+    SUSPECT = "suspect"
+    STALE = "stale"
+    SATURATED = "saturated"
+
+
+class Representation(str, Enum):
+    """Shape of the value a channel carries.
+
+    Declared, never inferred from the quantity string: guessing that a channel
+    named ``frame`` produces an image is exactly the substring reasoning this
+    protocol exists to avoid, and it would be wrong the first time somebody
+    declared a *frame rate*.
+
+    ``SCALAR`` and ``STATE`` already existed implicitly -- a numeric envelope
+    versus an enumerated one -- so they are named here rather than introduced.
+    ``FRAME`` is the new fact: the value is a reference to bytes held outside the
+    reading path, because a raw frame must never enter a ``Reading`` (they are
+    persisted as NDJSON) or a finding payload (byte-capped).
+    """
+
+    SCALAR = "scalar"
+    STATE = "state"
+    FRAME = "frame"
+
+    @classmethod
+    def media(cls) -> frozenset[str]:
+        """Return the representations whose value is a reference to bytes."""
+        return frozenset({cls.FRAME.value})
+
+
+class PrivacyTier(str, Enum):
+    """How much of the world a *read* of this channel discloses.
+
+    Orthogonal to ``HardwareEffect``, which classifies what a write changes. A
+    camera read has no physical effect and is still the most consequential
+    operation on the device, so effect class cannot express it and a separate
+    declared tier is the only honest place to put it.
+
+    ``ENVIRONMENT`` observes the space around the machine (camera, microphone).
+    ``PERSONAL`` observes the person using it (screen contents, location,
+    biometrics). Both require consent before the first read; ``NONE`` does not,
+    which is what keeps a CPU gauge free.
+    """
+
+    NONE = "none"
+    ENVIRONMENT = "environment"
+    PERSONAL = "personal"
+
+    @classmethod
+    def gated(cls) -> frozenset[str]:
+        """Return the tiers whose reads require consent before proceeding."""
+        return frozenset({cls.ENVIRONMENT.value, cls.PERSONAL.value})
+
+
+@dataclass(frozen=True)
+class ContextProvenance:
+    """Provenance and verification state of one hardware context.
+
+    A pseudo-implementation of an unpublished standard must be honest about
+    being a guess, and this type is that honesty. An unverified context cannot
+    authorize a write under the default policy, and a lossy import records
+    exactly which upstream fields could not be mapped -- so a downgrade in
+    fidelity is visible in ``hw_describe`` instead of being silently absorbed.
+    """
+
+    source: str = ContextSource.DECLARED.value
+    verified_by: str = ""
+    verified_at: float = 0.0
+    upstream_version: str = ""
+    lossy_fields: tuple[str, ...] = ()
+    notes: str = ""
+
+    @property
+    def is_verified(self) -> bool:
+        """Return whether a human has taken responsibility for this context."""
+        return bool(self.verified_by.strip())
+
+    @property
+    def is_lossy(self) -> bool:
+        return bool(self.lossy_fields)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "verified_by": self.verified_by,
+            "verified_at": iso_utc(self.verified_at) if self.verified_at else "",
+            "upstream_version": self.upstream_version,
+            "lossy_fields": list(self.lossy_fields),
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "ContextProvenance":
+        data = data or {}
+        return cls(
+            source=str(data.get("source") or ContextSource.DECLARED.value),
+            verified_by=str(data.get("verified_by") or ""),
+            verified_at=epoch_seconds(data.get("verified_at")),
+            upstream_version=str(data.get("upstream_version") or ""),
+            lossy_fields=tuple(str(item) for item in data.get("lossy_fields") or ()),
+            notes=str(data.get("notes") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class Envelope:
+    """Declared physical operating limits for one channel.
+
+    This is the machine-readable form of knowledge that previously lived in
+    paper manuals and tacit expertise. It is consumed by the risk classifier
+    *before* approval and never enforced inside a transport: a transport that
+    policed itself could not be audited, and would be bypassed by every other
+    control plane that reaches the same device.
+
+    ``declared`` is explicit rather than inferred from "all fields are None",
+    because an undeclared envelope and an intentionally unbounded one must not
+    look alike. An undeclared envelope on a writable channel is a hardline deny.
+    """
+
+    declared: bool = False
+    min_value: float | None = None
+    max_value: float | None = None
+    max_rate: float | None = None
+    max_accel: float | None = None
+    """Largest change of rate per second (units/s^2) a streamed command may ask for.
+
+    Only the streaming safety shield consumes it; a discrete move is paced by
+    the device's own planner. Absent, the shield bounds the rate alone.
+    """
+    max_jump: float | None = None
+    """Largest discontinuity a streamed command may request, in channel units."""
+    quantization: float | None = None
+    settling_time_s: float = 0.0
+    tolerance: float = 0.0
+    """Absolute measurement precision, in the same units as the channel.
+
+    When positive, ``normalized_delta`` divides by this instead of by the
+    envelope span.  Bias is an absolute quantity that does not scale with the
+    declared range, so span-normalisation makes a tight-tolerance channel look
+    better than it is (G-1, confirmed by E3-T0).  Zero (default) preserves the
+    existing span-based normalisation.
+    """
+    settling_model: str = "step"
+    """How the channel reaches its commanded value.
+
+    ``step`` (default): fixed wait of ``settling_time_s``.
+    ``first_order``: first-order exponential approach with time constant
+    ``settling_tau_s``; the effective wait is ``5 * settling_tau_s``
+    (99 % convergence).  G-2, confirmed by E2-T0.
+    """
+    settling_tau_s: float = 0.0
+    """First-order time constant in seconds (used when ``settling_model`` is
+    ``first_order``).  Ignored for the default ``step`` model."""
+    reversible: bool = False
+    requires_interlocks: tuple[str, ...] = ()
+    notes: str = ""
+    allowed_values: tuple[Any, ...] = ()
+
+    @property
+    def effective_settling_s(self) -> float:
+        """Return the effective settling time considering the declared model.
+
+        - ``step`` (default): uses ``settling_time_s`` directly.
+        - ``first_order``: uses ``5 * settling_tau_s`` (99 % convergence of a
+          first-order system).
+
+        When both ``settling_time_s`` and a model-derived wait are positive,
+        the larger value is used so neither declared constraint is violated.
+        """
+        tau_wait = (
+            self.settling_tau_s * 5.0
+            if self.settling_model == "first_order" and self.settling_tau_s > 0.0
+            else 0.0
+        )
+        step_wait = max(0.0, self.settling_time_s)
+        if tau_wait > 0.0 and step_wait > 0.0:
+            return max(tau_wait, step_wait)
+        return tau_wait if tau_wait > 0.0 else step_wait
+
+    @property
+    def is_numeric(self) -> bool:
+        """Return whether this envelope constrains a numeric quantity.
+
+        Derived from the presence of numeric bounds rather than declared
+        separately, so a state channel (a boolean, a mode) simply omits them
+        instead of having to say it is not numeric.
+        """
+        return any(
+            bound is not None
+            for bound in (
+                self.min_value,
+                self.max_value,
+                self.max_rate,
+                self.max_accel,
+                self.max_jump,
+                self.quantization,
+            )
+        )
+
+    def contains(self, value: Any, *, margin: float = 0.0) -> bool:
+        """Return True when *value* lies inside the declared bounds.
+
+        Four cases:
+
+        1. An undeclared envelope admits nothing.
+        2. An *enumerated* envelope (``allowed_values`` is non-empty) checks
+           membership directly -- numeric range logic is bypassed because the
+           value domain is a discrete set, not a continuous interval.
+        3. A *numeric* envelope handed a non-numeric value (a string, a boolean,
+           NaN, infinity) admits nothing: the bounds cannot be evaluated, and
+           "cannot evaluate" must carry the same weight as "out of range".
+        4. An envelope with no numeric bounds and no enumerated set -- a state
+           channel -- admits an arbitrary value.
+
+        ``margin`` narrows the band inward. It exists so a breach can end on a
+        stricter test than it began on (see ``settle_margin``); every safety
+        caller leaves it at zero, because a hardline must be evaluated against
+        the limit a human actually declared.
+        """
+        if not self.declared:
+            return False
+        # Enumerated domain: discrete membership check replaces range logic.
+        if self.allowed_values:
+            return value in self.allowed_values
+        numeric = as_numeric(value)
+        if numeric is None:
+            return not self.is_numeric
+        inward = max(0.0, margin)
+        if self.min_value is not None and numeric < self.min_value + inward:
+            return False
+        if self.max_value is not None and numeric > self.max_value - inward:
+            return False
+        return True
+
+    @property
+    def settle_margin(self) -> float:
+        """Return the inward margin a value must clear before a breach is over.
+
+        Derived, never declared. A boundary crossing and a boundary *hover* are
+        different observations, but a plain in/out test cannot tell them apart:
+        a sensor resting on its limit alternates threshold_exceeded and settled
+        at the sampling rate, which is the same flood the event layer exists to
+        prevent -- and it buries the one crossing that mattered.
+
+        ``quantization`` is the natural width when declared: a change smaller
+        than the device's own resolution is not a change. Absent it, a small
+        fraction of the declared span is used. The result is capped so the
+        settle band can never collapse to nothing on a narrow envelope, which
+        would replace flapping with a breach that never clears.
+        """
+        span = _declared_span(self)
+        cap = span * _MAX_HYSTERESIS_SPAN_FRACTION
+        if self.quantization is not None and self.quantization > 0:
+            return min(self.quantization, cap) if cap > 0 else self.quantization
+        return span * _DEFAULT_HYSTERESIS_SPAN_FRACTION
+
+    def rate_wait_s(self, *, delta: float, elapsed_s: float) -> float:
+        """Return how long to wait before a change of *delta* respects ``max_rate``.
+
+        Zero means it may proceed now. This is the single implementation of the slew
+        constraint, kept on the envelope because it is a property of the declaration
+        rather than of whoever happens to be enforcing it.
+
+        A zero or negative interval cannot be measured, so it is treated as no time
+        having passed rather than as time enough: an unmeasurable rate must not pass
+        as a safe one.
+        """
+        if self.max_rate is None or self.max_rate <= 0.0:
+            return 0.0
+        magnitude = abs(delta)
+        if magnitude == 0.0:
+            return 0.0
+        required = magnitude / self.max_rate
+        return max(0.0, required - max(0.0, elapsed_s))
+
+    def rate_exceeded(self, *, delta: float, elapsed_s: float) -> bool:
+        """Return True when a change of *delta* over *elapsed_s* is too fast."""
+        return self.rate_wait_s(delta=delta, elapsed_s=elapsed_s) > 0.0
+
+    def band_key(self) -> str:
+        """Return a stable identifier for this envelope band.
+
+        Participates in the approval grant identity, so widening a declared
+        envelope invalidates the narrower grant it was given under instead of
+        silently inheriting it.
+        """
+        if not self.declared:
+            return "undeclared"
+        if self.allowed_values:
+            return "enum:" + ",".join(str(v) for v in sorted(self.allowed_values, key=str))
+        parts = (
+            _format_bound(self.min_value),
+            _format_bound(self.max_value),
+            _format_bound(self.max_rate),
+            _format_bound(self.max_accel),
+            _format_bound(self.max_jump),
+            "rev" if self.reversible else "irrev",
+        )
+        return ":".join(parts)
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "declared": self.declared,
+            "min_value": self.min_value,
+            "max_value": self.max_value,
+            "max_rate": self.max_rate,
+            "quantization": self.quantization,
+            "settling_time_s": self.settling_time_s,
+            "tolerance": self.tolerance,
+            "settling_model": self.settling_model,
+            "settling_tau_s": self.settling_tau_s,
+            "reversible": self.reversible,
+            "requires_interlocks": list(self.requires_interlocks),
+            "notes": self.notes,
+        }
+        if self.allowed_values:
+            result["allowed_values"] = list(self.allowed_values)
+        if self.max_accel is not None:  # streamed channels only; absent elsewhere
+            result["max_accel"] = self.max_accel
+        if self.max_jump is not None:
+            result["max_jump"] = self.max_jump
+        return result
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "Envelope":
+        data = data or {}
+        raw_allowed = data.get("allowed_values")
+        allowed: tuple[Any, ...] = (
+            tuple(raw_allowed) if isinstance(raw_allowed, (list, tuple)) else ()
+        )
+        return cls(
+            declared=bool(data.get("declared", False)),
+            min_value=_as_float(data.get("min_value")),
+            max_value=_as_float(data.get("max_value")),
+            max_rate=_as_float(data.get("max_rate")),
+            max_accel=_as_float(data.get("max_accel")),
+            max_jump=_as_float(data.get("max_jump")),
+            quantization=_as_float(data.get("quantization")),
+            settling_time_s=_as_float(data.get("settling_time_s"), default=0.0) or 0.0,
+            tolerance=_as_float(data.get("tolerance"), default=0.0) or 0.0,
+            settling_model=str(data.get("settling_model") or "step"),
+            settling_tau_s=_as_float(data.get("settling_tau_s"), default=0.0) or 0.0,
+            reversible=bool(data.get("reversible", False)),
+            requires_interlocks=tuple(str(item) for item in data.get("requires_interlocks") or ()),
+            notes=str(data.get("notes") or ""),
+            allowed_values=allowed,
+        )
+
+
+@dataclass(frozen=True)
+class Channel:
+    """One readable or writable endpoint on a device.
+
+    ``sample_rate_hz > 0`` is the only switch that matters downstream: it decides
+    whether this channel becomes a streaming signal source or stays a
+    request/response tool call. No device-type enumeration is involved anywhere.
+
+    ``representation`` and ``privacy`` are declared facts about the value, not
+    about the vendor, so they belong here beside the unit and the envelope. Both
+    default to the pre-existing behaviour, which is what lets every declaration
+    written before they existed keep its exact meaning.
+    """
+
+    channel_id: str
+    direction: str = Direction.READ.value
+    quantity: str = ""
+    unit: str = ""
+    effect: str = HardwareEffect.READ.value
+    envelope: Envelope = field(default_factory=Envelope)
+    sample_rate_hz: float = 0.0
+    verify_after_write: bool = False
+    verification_channel_id: str = ""
+    """Readable channel whose settled value verifies this write.
+
+    Empty means the command channel itself. A distinct channel supports effects
+    such as a heater command verified by a temperature sensor without teaching
+    callers a device-specific relationship.
+    """
+    description: str = ""
+    representation: str = Representation.SCALAR.value
+    privacy: str = PrivacyTier.NONE.value
+    media_type: str = ""
+    """IANA type of a ``frame`` channel's bytes (e.g. ``image/jpeg``). Empty otherwise."""
+
+    @property
+    def is_writable(self) -> bool:
+        return self.direction in {Direction.WRITE.value, Direction.READWRITE.value}
+
+    @property
+    def is_readable(self) -> bool:
+        return self.direction in {Direction.READ.value, Direction.READWRITE.value}
+
+    @property
+    def is_streaming(self) -> bool:
+        """Return whether this channel is sampled on a schedule into stored history.
+
+        A declared rate is necessary but not sufficient: on a media channel the rate
+        is a *capture ceiling*, not a sampling cadence. Treating it as one would build
+        a loop that appends every frame to the raw NDJSON segment and asks the
+        downsampler for the mean of a JPEG. Deriving it here rather than at each
+        consumer means the stream builder, the digest counts and the reference
+        document cannot disagree about what streaming means.
+        """
+        return self.sample_rate_hz > 0.0 and not self.is_media
+
+    @property
+    def max_frame_rate_hz(self) -> float:
+        """Return the declared capture ceiling for a media channel, else 0.0.
+
+        Where the rate on a frame channel actually lives: a preview must not ask the
+        device for frames faster than its declaration says it can produce them.
+        """
+        return self.sample_rate_hz if self.is_media else 0.0
+
+    @property
+    def is_media(self) -> bool:
+        """Return whether reading this channel yields bytes rather than a value."""
+        return self.representation in Representation.media()
+
+    @property
+    def is_privacy_gated(self) -> bool:
+        """Return whether a read of this channel needs consent first."""
+        return self.privacy in PrivacyTier.gated()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "channel_id": self.channel_id,
+            "direction": self.direction,
+            "quantity": self.quantity,
+            "unit": self.unit,
+            "effect": self.effect,
+            "envelope": self.envelope.to_dict(),
+            "sample_rate_hz": self.sample_rate_hz,
+            "verify_after_write": self.verify_after_write,
+            "verification_channel_id": self.verification_channel_id,
+            "description": self.description,
+            "representation": self.representation,
+            "privacy": self.privacy,
+            "media_type": self.media_type,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "Channel":
+        return cls(
+            channel_id=str(data.get("channel_id") or ""),
+            direction=str(data.get("direction") or Direction.READ.value),
+            quantity=str(data.get("quantity") or ""),
+            unit=str(data.get("unit") or ""),
+            effect=str(data.get("effect") or HardwareEffect.READ.value),
+            envelope=Envelope.from_mapping(data.get("envelope")),
+            sample_rate_hz=_as_float(data.get("sample_rate_hz"), default=0.0) or 0.0,
+            verify_after_write=bool(data.get("verify_after_write", False)),
+            verification_channel_id=str(data.get("verification_channel_id") or ""),
+            description=str(data.get("description") or ""),
+            representation=str(data.get("representation") or Representation.SCALAR.value),
+            privacy=str(data.get("privacy") or PrivacyTier.NONE.value),
+            media_type=str(data.get("media_type") or ""),
+        )
+
+    def without_write(self) -> "Channel":
+        """Revoke write capability, preserving only already-declared reads.
+
+        Read/write channels remain readable for diagnosis. Write-only channels become
+        disabled: admission must not invent a getter that the transport never declared.
+
+        ``effect`` is preserved rather than reset to ``read``. The declared effect is
+        what the channel is *for*, and erasing it would make a demoted channel report
+        an effect-class mismatch instead of the demotion that actually blocked it --
+        sending whoever reads the error to the wrong place.
+
+        ``representation``/``privacy``/``media_type`` are carried through for the same
+        reason: a demotion revokes one capability, it does not reclassify the value.
+        Dropping the privacy tier here would silently ungate a demoted camera.
+        """
+        if not self.is_writable:
+            return self
+        return Channel(
+            channel_id=self.channel_id,
+            direction=Direction.READ.value if self.is_readable else Direction.DISABLED.value,
+            quantity=self.quantity,
+            unit=self.unit,
+            effect=self.effect,
+            envelope=self.envelope,
+            sample_rate_hz=self.sample_rate_hz,
+            verify_after_write=False,
+            verification_channel_id=self.verification_channel_id,
+            description=self.description,
+            representation=self.representation,
+            privacy=self.privacy,
+            media_type=self.media_type,
+        )
+
+
+@dataclass(frozen=True)
+class Interlock:
+    """A precondition that must hold before a guarded write is permitted.
+
+    Expressed as a channel comparison rather than free text so it can be
+    evaluated deterministically. Natural-language conditions are not accepted:
+    a safety precondition that needs interpretation is not a precondition.
+    """
+
+    interlock_id: str
+    channel_id: str
+    operator: str = "eq"
+    value: Any = True
+    description: str = ""
+
+    def evaluate(self, reading: Any) -> bool:
+        """Return True when *reading* satisfies this interlock.
+
+        An unknown operator or an incomparable pair returns False. Interlocks
+        fail closed: "cannot tell" and "not satisfied" must have the same
+        consequence, or an unevaluable interlock would become an open door.
+        """
+        comparator = _OPERATORS.get(self.operator)
+        if comparator is None:
+            return False
+        try:
+            return bool(comparator(reading, self.value))
+        except TypeError:
+            return False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "interlock_id": self.interlock_id,
+            "channel_id": self.channel_id,
+            "operator": self.operator,
+            "value": self.value,
+            "description": self.description,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "Interlock":
+        return cls(
+            interlock_id=str(data.get("interlock_id") or ""),
+            channel_id=str(data.get("channel_id") or ""),
+            operator=str(data.get("operator") or "eq"),
+            value=data.get("value", True),
+            description=str(data.get("description") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class TransportRef:
+    """Reference to the transport that executes operations for a device."""
+
+    kind: str = ""
+    config: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "config": dict(self.config)}
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "TransportRef":
+        data = data or {}
+        config = data.get("config")
+        return cls(
+            kind=str(data.get("kind") or ""),
+            config=dict(config) if isinstance(config, Mapping) else {},
+        )
+
+
+@dataclass(frozen=True)
+class KinematicsDeclaration:
+    """Robot kinematics declaration for motion planning and safety.
+
+    Describes the physical structure of a robot manipulator: degrees of
+    freedom, joint limits, and workspace bounds.  This information is
+    consumed by safety checks (workspace violation detection) and by
+    the LLM context assembler (task feasibility assessment).
+    """
+
+    chain_type: str = ""  # "serial", "parallel", "mobile", "humanoid"
+    dof: int = 0
+    joint_limits: tuple[tuple[float, float], ...] = ()  # per-joint (min, max) in rad
+    workspace_bounds: tuple[float, ...] = ()  # (x_min, x_max, y_min, y_max, z_min, z_max) in meters
+    base_frame: str = ""  # reference frame name
+    tool_frame: str = ""  # end-effector frame name
+    home_joint_targets: Mapping[str, float] = field(default_factory=dict)
+    notes: str = ""
+    dh: Mapping[str, Any] = field(default_factory=dict)
+    """Raw Denavit-Hartenberg table; parsed by ``hardware.skills.kinematics.DhChain``."""
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "chain_type": self.chain_type,
+            "dof": self.dof,
+            "joint_limits": [list(pair) for pair in self.joint_limits],
+            "workspace_bounds": list(self.workspace_bounds),
+            "base_frame": self.base_frame,
+            "tool_frame": self.tool_frame,
+            "home_joint_targets": dict(self.home_joint_targets),
+            "notes": self.notes,
+        }
+        if self.dh:
+            result["dh"] = dict(self.dh)
+        return result
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "KinematicsDeclaration":
+        data = data or {}
+        raw_limits = data.get("joint_limits") or ()
+        joint_limits = tuple(
+            (float(pair[0]), float(pair[1]))
+            for pair in raw_limits
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2
+        )
+        raw_bounds = data.get("workspace_bounds") or ()
+        workspace_bounds = tuple(float(v) for v in raw_bounds)
+        return cls(
+            chain_type=str(data.get("chain_type") or ""),
+            dof=int(data.get("dof") or 0),
+            joint_limits=joint_limits,
+            workspace_bounds=workspace_bounds,
+            base_frame=str(data.get("base_frame") or ""),
+            tool_frame=str(data.get("tool_frame") or ""),
+            home_joint_targets={
+                str(channel_id): float(target)
+                for channel_id, target in (data.get("home_joint_targets") or {}).items()
+            }
+            if isinstance(data.get("home_joint_targets"), Mapping)
+            else {},
+            notes=str(data.get("notes") or ""),
+            dh=dict(data["dh"]) if isinstance(data.get("dh"), Mapping) else {},
+        )
+
+
+@dataclass(frozen=True)
+class CapabilityDeclaration:
+    """Declared physical capabilities of a device (payload, reach, tooling).
+
+    What a device can *do* is not declared here: tasks are node skills, and the
+    skill cards (``hw_skill_list``) are the single source of that declaration.
+    """
+
+    tool_slots: int = 0  # number of tool change positions
+    payload_kg: float = 0.0  # maximum payload in kilograms
+    reach_m: float = 0.0  # maximum reach in meters
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tool_slots": self.tool_slots,
+            "payload_kg": self.payload_kg,
+            "reach_m": self.reach_m,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "CapabilityDeclaration":
+        data = data or {}
+        return cls(
+            tool_slots=int(data.get("tool_slots") or 0),
+            payload_kg=_as_float(data.get("payload_kg"), default=0.0) or 0.0,
+            reach_m=_as_float(data.get("reach_m"), default=0.0) or 0.0,
+            notes=str(data.get("notes") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class SafetyPolicy:
+    """Declared safety constraints for a device.
+
+    These constraints are enforced at runtime by the registry before
+    any write command reaches the transport.  They complement the
+    per-channel Envelope (which constrains individual values) with
+    device-level spatial and force limits.
+    """
+
+    max_velocity_rad_s: float = 0.0  # global joint velocity limit
+    max_force_n: float = 0.0  # global force limit
+    collision_zones: tuple[
+        tuple[float, ...], ...
+    ] = ()  # axis-aligned boxes (x_min,x_max,y_min,y_max,z_min,z_max)
+    emergency_decel_s: float = 0.0  # time to reach zero velocity on e-stop
+    require_safety_interlock: bool = False
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_velocity_rad_s": self.max_velocity_rad_s,
+            "max_force_n": self.max_force_n,
+            "collision_zones": [list(zone) for zone in self.collision_zones],
+            "emergency_decel_s": self.emergency_decel_s,
+            "require_safety_interlock": self.require_safety_interlock,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "SafetyPolicy":
+        data = data or {}
+        raw_zones = data.get("collision_zones") or ()
+        collision_zones = tuple(
+            tuple(float(v) for v in zone) for zone in raw_zones if isinstance(zone, (list, tuple))
+        )
+        return cls(
+            max_velocity_rad_s=_as_float(data.get("max_velocity_rad_s"), default=0.0) or 0.0,
+            max_force_n=_as_float(data.get("max_force_n"), default=0.0) or 0.0,
+            collision_zones=collision_zones,
+            emergency_decel_s=_as_float(data.get("emergency_decel_s"), default=0.0) or 0.0,
+            require_safety_interlock=bool(data.get("require_safety_interlock", False)),
+            notes=str(data.get("notes") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class TrustConfig:
+    """Per-device trust progression configuration.
+
+    Overrides the global HardwareTrustGate defaults for this specific
+    device.  A high-risk industrial arm may require more successes to
+    promote, while a simple sensor may start at a higher level.
+    """
+
+    initial_level: str = ""  # "UNTRUSTED", "CANDIDATE", "VERIFIED", "PRODUCTION"
+    promotion_thresholds: tuple[int, ...] = ()  # successes needed per level
+    demotion_threshold: int = 0  # consecutive failures to demote
+    approval_override: str = ""  # "always", "never", "" (use default)
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "initial_level": self.initial_level,
+            "promotion_thresholds": list(self.promotion_thresholds),
+            "demotion_threshold": self.demotion_threshold,
+            "approval_override": self.approval_override,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "TrustConfig":
+        data = data or {}
+        raw_thresholds = data.get("promotion_thresholds") or ()
+        return cls(
+            initial_level=str(data.get("initial_level") or ""),
+            promotion_thresholds=tuple(int(t) for t in raw_thresholds),
+            demotion_threshold=int(data.get("demotion_threshold") or 0),
+            approval_override=str(data.get("approval_override") or ""),
+            notes=str(data.get("notes") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class DegradationPolicy:
+    """Declared behavior when components degrade or fail.
+
+    Tells the runtime what to do when a sensor stops reporting, when
+    communication is lost, or when the device cannot maintain its
+    declared performance.
+    """
+
+    sensor_loss_policy: str = "halt"  # "halt", "continue_blind", "switch_sensor"
+    comm_loss_policy: str = "halt"  # "halt", "hold_position", "safe_return"
+    sensor_fallbacks: Mapping[str, str] = field(default_factory=dict)
+    max_comm_loss_s: float = 1.0  # max seconds of communication loss before policy triggers
+    safe_return_timeout_s: float = 5.0  # bounded duration for a verified home trajectory
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sensor_loss_policy": self.sensor_loss_policy,
+            "comm_loss_policy": self.comm_loss_policy,
+            "sensor_fallbacks": dict(self.sensor_fallbacks),
+            "max_comm_loss_s": self.max_comm_loss_s,
+            "safe_return_timeout_s": self.safe_return_timeout_s,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "DegradationPolicy":
+        data = data or {}
+        return cls(
+            sensor_loss_policy=str(data.get("sensor_loss_policy") or "halt"),
+            comm_loss_policy=str(data.get("comm_loss_policy") or "halt"),
+            sensor_fallbacks={
+                str(source): str(target)
+                for source, target in (data.get("sensor_fallbacks") or {}).items()
+            }
+            if isinstance(data.get("sensor_fallbacks"), Mapping)
+            else {},
+            max_comm_loss_s=_as_float(data.get("max_comm_loss_s"), default=1.0) or 1.0,
+            safe_return_timeout_s=_as_float(data.get("safe_return_timeout_s"), default=5.0) or 5.0,
+            notes=str(data.get("notes") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class HardwareContext:
+    """Everything an agent must know about one device. The SSOT of the protocol.
+
+    Tools, gate rules, stream sources, and the reference document are all
+    derived from this object deterministically -- no model call, no heuristics --
+    which is what makes each of them testable in isolation.
+    """
+
+    device_id: str
+    hc_version: str = HC_VERSION
+    display_name: str = ""
+    transport: TransportRef = field(default_factory=TransportRef)
+    channels: tuple[Channel, ...] = ()
+    interlocks: tuple[Interlock, ...] = ()
+    vendor: str = ""
+    model: str = ""
+    location: str = ""
+    halt_supported: bool = False
+    notes: str = ""
+    provenance: ContextProvenance = field(default_factory=ContextProvenance)
+    device_class: str = ""
+    """Free-form grouping label for presentation only -- never a behaviour switch.
+
+    Deliberately not an enum and deliberately not consulted by admission, risk
+    classification, or any transport: the moment a device *type* decides what is
+    permitted, every new peripheral needs a core edit and an unrecognised one gets
+    a wrong default. It exists so the board can group a fleet into compute,
+    camera, storage and sensor sections instead of one flat list.
+    """
+
+    # hc.v1 extensions — optional, None for hc.v0 declarations
+    kinematics: KinematicsDeclaration | None = None
+    capabilities: CapabilityDeclaration | None = None
+    safety: SafetyPolicy | None = None
+    trust_config: TrustConfig | None = None
+    degradation: DegradationPolicy | None = None
+    control_bindings: Mapping[str, Any] | None = None
+    """Raw control_bindings section from the YAML declaration.
+
+    Parsed by :class:`~leapflow.hardware.control_binding_resolver.ControlBindingResolver`
+    into executable transport configurations.  Stored as-is so the resolver
+    can operate after ``from_mapping`` without a second YAML parse pass.
+    """
+
+    def channel(self, channel_id: str) -> Channel | None:
+        return next((c for c in self.channels if c.channel_id == channel_id), None)
+
+    def interlock(self, interlock_id: str) -> Interlock | None:
+        return next((i for i in self.interlocks if i.interlock_id == interlock_id), None)
+
+    @property
+    def writable_channels(self) -> tuple[Channel, ...]:
+        return tuple(c for c in self.channels if c.is_writable)
+
+    @property
+    def streaming_channels(self) -> tuple[Channel, ...]:
+        return tuple(c for c in self.channels if c.is_streaming)
+
+    @property
+    def media_channels(self) -> tuple[Channel, ...]:
+        """Return the channels whose reads yield bytes (previewable channels)."""
+        return tuple(c for c in self.channels if c.is_media)
+
+    @property
+    def privacy_gated_channels(self) -> tuple[Channel, ...]:
+        """Return the channels whose reads require consent."""
+        return tuple(c for c in self.channels if c.is_privacy_gated)
+
+    @property
+    def label(self) -> str:
+        """Return a human-facing name, falling back to the id."""
+        return self.display_name or self.device_id
+
+    def with_channels(self, channels: tuple[Channel, ...]) -> "HardwareContext":
+        """Return a copy carrying *channels*, used by admission demotions."""
+        return HardwareContext(
+            device_id=self.device_id,
+            hc_version=self.hc_version,
+            display_name=self.display_name,
+            transport=self.transport,
+            channels=channels,
+            interlocks=self.interlocks,
+            vendor=self.vendor,
+            model=self.model,
+            location=self.location,
+            halt_supported=self.halt_supported,
+            notes=self.notes,
+            provenance=self.provenance,
+            device_class=self.device_class,
+            kinematics=self.kinematics,
+            capabilities=self.capabilities,
+            safety=self.safety,
+            trust_config=self.trust_config,
+            degradation=self.degradation,
+            control_bindings=self.control_bindings,
+        )
+
+    def read_only(self) -> "HardwareContext":
+        """Return a copy with every channel demoted to read-only."""
+        return self.with_channels(tuple(c.without_write() for c in self.channels))
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "hc_version": self.hc_version,
+            "device_id": self.device_id,
+            "display_name": self.display_name,
+            "vendor": self.vendor,
+            "model": self.model,
+            "location": self.location,
+            "device_class": self.device_class,
+            "halt_supported": self.halt_supported,
+            "notes": self.notes,
+            "transport": self.transport.to_dict(),
+            "provenance": self.provenance.to_dict(),
+            "channels": [c.to_dict() for c in self.channels],
+            "interlocks": [i.to_dict() for i in self.interlocks],
+        }
+        # hc.v1 extensions — omit when absent for backward-compatible output
+        if self.kinematics is not None:
+            result["kinematics"] = self.kinematics.to_dict()
+        if self.capabilities is not None:
+            result["capabilities"] = self.capabilities.to_dict()
+        if self.safety is not None:
+            result["safety"] = self.safety.to_dict()
+        if self.trust_config is not None:
+            result["trust_config"] = self.trust_config.to_dict()
+        if self.degradation is not None:
+            result["degradation"] = self.degradation.to_dict()
+        if self.control_bindings is not None:
+            result["control_bindings"] = dict(self.control_bindings)
+        return result
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "HardwareContext":
+        """Build a context from a parsed declaration.
+
+        Structural validation lives in the registry, not here: this constructor
+        is a faithful reader so that a malformed declaration can be reported
+        with a reason instead of raising during parse.
+        """
+        channels = tuple(
+            Channel.from_mapping(item)
+            for item in data.get("channels") or ()
+            if isinstance(item, Mapping)
+        )
+        interlocks = tuple(
+            Interlock.from_mapping(item)
+            for item in data.get("interlocks") or ()
+            if isinstance(item, Mapping)
+        )
+        # hc.v1 extensions — parse when present, leave None otherwise
+        raw_kin = data.get("kinematics")
+        kinematics = (
+            KinematicsDeclaration.from_mapping(raw_kin) if isinstance(raw_kin, Mapping) else None
+        )
+        raw_cap = data.get("capabilities")
+        capabilities = (
+            CapabilityDeclaration.from_mapping(raw_cap) if isinstance(raw_cap, Mapping) else None
+        )
+        raw_safety = data.get("safety")
+        safety = SafetyPolicy.from_mapping(raw_safety) if isinstance(raw_safety, Mapping) else None
+        raw_trust = data.get("trust_config")
+        trust_config = (
+            TrustConfig.from_mapping(raw_trust) if isinstance(raw_trust, Mapping) else None
+        )
+        raw_degrad = data.get("degradation")
+        degradation = (
+            DegradationPolicy.from_mapping(raw_degrad) if isinstance(raw_degrad, Mapping) else None
+        )
+        raw_bindings = data.get("control_bindings")
+        control_bindings = dict(raw_bindings) if isinstance(raw_bindings, Mapping) else None
+        return cls(
+            device_id=str(data.get("device_id") or ""),
+            hc_version=str(data.get("hc_version") or ""),
+            display_name=str(data.get("display_name") or ""),
+            transport=TransportRef.from_mapping(data.get("transport")),
+            channels=channels,
+            interlocks=interlocks,
+            vendor=str(data.get("vendor") or ""),
+            model=str(data.get("model") or ""),
+            location=str(data.get("location") or ""),
+            halt_supported=bool(data.get("halt_supported", False)),
+            notes=str(data.get("notes") or ""),
+            provenance=ContextProvenance.from_mapping(data.get("provenance")),
+            device_class=str(data.get("device_class") or ""),
+            kinematics=kinematics,
+            capabilities=capabilities,
+            safety=safety,
+            trust_config=trust_config,
+            degradation=degradation,
+            control_bindings=control_bindings,
+        )
+
+
+_OPERATORS: dict[str, Any] = {
+    "eq": lambda left, right: left == right,
+    "ne": lambda left, right: left != right,
+    "lt": lambda left, right: left < right,
+    "le": lambda left, right: left <= right,
+    "gt": lambda left, right: left > right,
+    "ge": lambda left, right: left >= right,
+}
+
+
+def as_numeric(value: Any, *, default: float | None = None) -> float | None:
+    """Coerce *value* to a finite float, returning *default* when it is not one.
+
+    Booleans are rejected on purpose: ``True`` is a state, not the number 1, and
+    silently treating it as one would let a boolean slip through a range check on
+    a numeric channel. NaN and infinity are rejected for the same reason -- they
+    compare in ways that make every bound look satisfied.
+    """
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return default if math.isnan(numeric) or math.isinf(numeric) else numeric
+    if isinstance(value, str):
+        try:
+            numeric = float(value.strip())
+        except ValueError:
+            return default
+        return default if math.isnan(numeric) or math.isinf(numeric) else numeric
+    return default
+
+
+_as_float = as_numeric
+"""Internal alias used by the declaration readers above."""
+
+
+_ISO_EPOCH_FORMATS = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z")
+"""Stamp formats a confirmation record or a declaration may carry.
+
+The first is what ``hardware.attestation`` writes: a confirmation is read by
+humans and audited long after the fact, so the record keeps an ISO-8601 UTC
+stamp instead of an opaque epoch number.
+"""
+
+
+def epoch_seconds(value: Any, *, default: float = 0.0) -> float:
+    """Coerce an attestation timestamp to Unix seconds.
+
+    Both wire forms are accepted -- the ISO stamp a confirmation is written
+    with, and the numeric form a caller may already hold -- because a reader
+    that understood only numbers silently turned every real stamp into ``0.0``
+    and reported a re-attested device as never verified.  An unparseable value
+    degrades to *default* rather than raising: provenance is reported, and a
+    malformed timestamp must not fail admission.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            for fmt in _ISO_EPOCH_FORMATS:
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                except ValueError:
+                    continue
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp()
+    return as_numeric(value, default=default) or default
+
+
+def iso_utc(value: float) -> str:
+    """Render Unix seconds in the stamp format confirmations are written in."""
+    return datetime.fromtimestamp(value, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _format_bound(value: float | None) -> str:
+    return "-" if value is None else f"{value:g}"
+
+
+def _declared_span(envelope: "Envelope") -> float:
+    """Return the width of a two-sided declared range, or 0.0 when there isn't one.
+
+    A one-sided or unbounded envelope has no span, and every caller must treat
+    that as "no scale available" rather than as zero width.
+    """
+    if envelope.min_value is None or envelope.max_value is None:
+        return 0.0
+    span = envelope.max_value - envelope.min_value
+    return span if span > 0 else 0.0
+
+
+__all__ = [
+    "HC_VERSION",
+    "SUPPORTED_HC_VERSIONS",
+    "CapabilityDeclaration",
+    "Channel",
+    "ContextProvenance",
+    "ContextSource",
+    "DegradationPolicy",
+    "Direction",
+    "Envelope",
+    "HardwareContext",
+    "HardwareEffect",
+    "Interlock",
+    "KinematicsDeclaration",
+    "PrivacyTier",
+    "Quality",
+    "Representation",
+    "SafetyPolicy",
+    "TransportRef",
+    "TrustConfig",
+    "as_numeric",
+]

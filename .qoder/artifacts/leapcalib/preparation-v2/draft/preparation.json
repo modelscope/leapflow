@@ -1,0 +1,125 @@
+{
+  "schema": "leapflow.camera_preparation.v1",
+  "state": "draft_requires_evidence_and_approval",
+  "workcell": "piper_cell",
+  "node_id": "yahboom",
+  "stage_a_overlay": {
+    "calibration_acquisition": {
+      "camera_role": "camera.wrist",
+      "camera_method": "wrist",
+      "allowed_modes": [
+        "can"
+      ],
+      "settled": {
+        "max_feedback_age_s": 0.1,
+        "max_coherence_s": 0.08,
+        "feedback_uncertainty_s": 0.01,
+        "exposure_uncertainty_s": 0.04,
+        "receipt_uncertainty_s": 0.02,
+        "max_joint_drift_rad": 0.003,
+        "max_tcp_drift_mm": 2.0,
+        "max_tcp_rotation_deg": 0.5,
+        "joint_uncertainty_rad": 0.0005,
+        "tcp_uncertainty_mm": 0.5,
+        "rotation_uncertainty_deg": 0.1,
+        "poll_s": 0.05,
+        "timeout_s": 3.0,
+        "min_samples": 3,
+        "span_s": 0.5
+      },
+      "ttl_s": 3600,
+      "quota_bytes": 67108864,
+      "max_frames": 16
+    }
+  },
+  "device_config_patch": {
+    "device_id": "sensor_realsense_d405",
+    "transport.config.mount_digest": "d452133cbc8c79a4f29df4364f1f7a76a17ec710d3c7fc01ce1b70f3c3da66fe"
+  },
+  "runtime_config_patch": {
+    "hardware.calibration_worker_enabled": true
+  },
+  "mount": {
+    "mount_id": "sensor_realsense_d405:260422273928:seat-1",
+    "parent_frame": "flange",
+    "source": "declared",
+    "seated_at_s": 0.0,
+    "notes": "Installation seat identity; last disturbance time unrecorded"
+  },
+  "collect_args": {
+    "region": [
+      160,
+      120,
+      320,
+      240
+    ],
+    "frames": 1
+  },
+  "trial_args": {
+    "pairs": null,
+    "training": null,
+    "mount": {
+      "mount_id": "sensor_realsense_d405:260422273928:seat-1",
+      "parent_frame": "flange",
+      "source": "declared",
+      "seated_at_s": 0.0,
+      "notes": "Installation seat identity; last disturbance time unrecorded"
+    },
+    "prior": null,
+    "prior_uncertainty": null,
+    "tracking": {},
+    "solve": {},
+    "evaluation": {}
+  },
+  "stage_b_overlay": null,
+  "pose_batches": [],
+  "inflation_requirements": null,
+  "unresolved": [
+    "mount_confirmation",
+    "uncertainty_evidence",
+    "whole_link_geometry_evidence",
+    "rate_bound_evidence",
+    "wrist_prior_evidence",
+    "geometry",
+    "joint_rate_bounds_rad_s",
+    "endpoint_rate_bound_mm_s",
+    "rate_provenance_digest",
+    "reference_acquisition",
+    "reference_joints_deg",
+    "tool_transform"
+  ],
+  "proposed_settled_not_measured": true,
+  "not_human_work": [
+    "device IDs/streams/DH/limits",
+    "profile paths/overlay merge",
+    "mount digest encoding",
+    "same-session indexed anchor",
+    "rate and uncertainty evidence collection after authorization",
+    "pose targets, source-disjoint split and exact approval previews"
+  ],
+  "human_confirmation": [
+    "Rigid unchanged wrist seat; two scaled orthogonal views of camera/bracket/flange axes",
+    "Current clear work volume/table/obstacles; remove chair or include it in the measured keepouts",
+    "Static textured target in wrist view; empty jaws and accessible emergency stop with onsite supervision"
+  ],
+  "approval_sequence": [
+    "Backed-up exact source/tool deployment, config patches and one owner restart before anchor",
+    "Separately approved enable/reference positioning/speed setup; no blind return to stopped feedback",
+    "Stationary collection, exact Stage B config write then same-runtime skill.reload",
+    "Fresh bounded pose run approvals, then leased READ shadow trial; no activation"
+  ],
+  "physical_qualification": false,
+  "live_configuration_written": false,
+  "motion_performed": false,
+  "source_files": [
+    {
+      "file": "probe.json",
+      "sha256": "f430fd66618d78dc0d76cddaf4fd94a156e88105b6b4102139429990776d8c54"
+    }
+  ],
+  "artifact_sha256": {
+    "stage-a.overlay.draft.yaml": "5f7d5d28539b421fbcc741c934719857bd2825df72bc1e774d6e186a324b3880",
+    "collect.args.json": "ac38abc41d54fdecbbb38a69e5ede2f3b606d91caf6c5e853c636bb6fa9052c1",
+    "trial.args.draft.json": "eee77463bde90638552b9ba4bdd7f614e26461116c32c6e828e642db776e4b39"
+  }
+}

@@ -111,6 +111,9 @@ WORKCELL_FIELDS = frozenset(
         "policy",
         "policies",
         "calibration_target",
+        "calibration_acquisition",
+        "calibration_reference",
+        "calibration_motion",
         "skills",
         "share_frames",
         "vision",
@@ -176,6 +179,9 @@ class WorkcellSpec:
     policy: Mapping[str, float] = field(default_factory=dict)
     policies: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     calibration_target: Mapping[str, Any] = field(default_factory=dict)
+    calibration_acquisition: Mapping[str, Any] = field(default_factory=dict)
+    calibration_reference: Mapping[str, Any] = field(default_factory=dict)
+    calibration_motion: Mapping[str, Any] = field(default_factory=dict)
     vision: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_VISION))
     skills: tuple[str, ...] = ()
     # Whether camera frames may leave the node for the model to look at
@@ -238,6 +244,9 @@ class WorkcellSpec:
             "policy": dict(self.policy),
             "policies": {name: dict(decl) for name, decl in self.policies.items()},
             "calibration_target": dict(self.calibration_target),
+            "calibration_acquisition": dict(self.calibration_acquisition),
+            "calibration_reference": dict(self.calibration_reference),
+            "calibration_motion": dict(self.calibration_motion),
             "vision": dict(self.vision),
             "share_frames": self.share_frames,
         }
@@ -294,6 +303,9 @@ class WorkcellSpec:
                 calibration_target=_mapping(
                     data.get("calibration_target") or {}, "calibration_target"
                 ),
+                calibration_acquisition=_parse_acquisition(data.get("calibration_acquisition") or {}, roles=roles, frames=frames),
+                calibration_reference=_parse_reference(data.get("calibration_reference") or {}, acquisition=data.get("calibration_acquisition") or {}),
+                calibration_motion=_parse_motion_collection(data.get("calibration_motion") or {}),
                 vision=_parse_vision(data.get("vision") or {}),
                 skills=tuple(str(item) for item in data.get("skills") or ()),
                 share_frames=_flag(data.get("share_frames", False), "share_frames"),
@@ -303,6 +315,41 @@ class WorkcellSpec:
             raise
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkcellError(f"workcell {workcell_id!r}: {exc}") from exc
+
+
+def _parse_acquisition(data: Mapping[str, Any], *, roles: Mapping[str, str], frames: Mapping[str, FrameDecl]) -> dict[str, Any]:
+    if not data:
+        return {}
+    from leapflow.hardware.calibration.acquisition import CollectionProfile
+
+    profile = CollectionProfile.from_mapping(data)
+    if profile.camera_role not in roles:
+        raise WorkcellError("calibration_acquisition camera role is not bound")
+    frame = frames.get(profile.camera_role)
+    if frame is None or frame.parent != ("flange" if profile.camera_method == "wrist" else "base"):
+        raise WorkcellError("calibration_acquisition method must match the declared camera frame parent")
+    return profile.to_dict()
+
+
+def _parse_reference(data: Mapping[str, Any], *, acquisition: Mapping[str, Any]) -> dict[str, Any]:
+    if not data:
+        return {}
+    from leapflow.hardware.calibration.acquisition import CollectionProfile
+    from leapflow.hardware.calibration.reference import ReferenceProfile
+
+    profile = ReferenceProfile.from_mapping(data)
+    collection = CollectionProfile.from_mapping(acquisition)
+    if profile.max_frames > collection.max_frames:
+        raise WorkcellError("reference frame budget exceeds the acquisition declaration")
+    return profile.to_dict()
+
+
+def _parse_motion_collection(data: Mapping[str, Any]) -> dict[str, Any]:
+    if not data:
+        return {}
+    from leapflow.hardware.calibration.pose_policy import PoseCollectionPolicy
+
+    return PoseCollectionPolicy.from_mapping(data).to_dict()
 
 
 # ── Admission ────────────────────────────────────────────────────────────────

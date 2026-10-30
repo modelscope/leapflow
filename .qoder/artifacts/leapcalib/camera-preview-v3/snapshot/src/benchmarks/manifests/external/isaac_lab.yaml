@@ -1,0 +1,58 @@
+id: isaac_lab
+version: "1.0.0"
+source: "https://isaac-sim.github.io/IsaacLab/"
+paper: "https://arxiv.org/abs/2511.04831"
+repo: "https://github.com/isaac-sim/IsaacLab"
+license: "BSD-3-Clause (core); some components Apache-2.0; assets require NVIDIA/per-asset terms revalidation"
+setup_guidance: "Use a version-pinned Isaac Lab task evaluator from the official checkout. Configure benchmark.commands.isaac_lab to emit a final JSON summary of official episode return and termination metrics; supported placeholders are {scenario_id}, {seed}, {timeout}, and {data_root}."
+official:
+  implementation: "isaac-sim/IsaacLab"
+  protocol: "Version-pinned official Isaac Lab task rollout"
+  dataset: "Task assets and Isaac Sim version matching the selected Isaac Lab release"
+  result_contract: "Final JSON line with mean_episode_return and termination_rate from the official task rollout."
+adapter: isaac_lab
+tier: 3
+tags:
+  - simulation
+  - gpu-accelerated
+  - nvidia
+  - isaac-sim
+  - manipulation
+  - locomotion
+required: false
+dependencies:
+  - config:benchmark.commands.isaac_lab
+timeouts:
+  availability: 30.0
+  trial: 1800.0
+seeds:
+  - 42
+metrics:
+  - mean_episode_return
+  - termination_rate
+gates: {}
+scenarios:
+  - scenario_id: Isaac-Lift-Cube-Franka-v0
+    name: "Lift Cube (Franka)"
+    description: "Franka arm lifts a cube in Isaac Sim"
+    tags: [manipulation, gpu-accelerated]
+    timeout_seconds: 600.0
+    required: true
+    parameters:
+      official_metrics: [mean_episode_return, termination_rate]
+  - scenario_id: Isaac-Reach-Franka-v0
+    name: "Reach (Franka)"
+    description: "Franka arm reaches a target position"
+    tags: [manipulation, gpu-accelerated]
+    timeout_seconds: 600.0
+    required: true
+    parameters:
+      official_metrics: [mean_episode_return, termination_rate]
+  - scenario_id: Isaac-Velocity-Flat-Anymal-D-v0
+    name: "Velocity Flat (Anymal-D)"
+    description: "Anymal-D quadruped velocity tracking on flat terrain"
+    tags: [locomotion, gpu-accelerated]
+    timeout_seconds: 600.0
+    required: false
+    parameters:
+      official_metrics: [mean_episode_return, termination_rate]

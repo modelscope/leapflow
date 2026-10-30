@@ -1,0 +1,113 @@
+{
+  "observed_at_s": 1793276713.373296,
+  "previews_are_diagnostic_only": true,
+  "calibration_factor_sources": [],
+  "remote_changes_performed": false,
+  "frames": [
+    {
+      "device_id": "sensor_realsense_d405",
+      "channel_id": "camera.color.preview",
+      "media_type": "image/jpeg",
+      "width": 640,
+      "height": 480,
+      "observed_at": 1793276713.5593956,
+      "sequence": 1,
+      "quality": "ok",
+      "size_bytes": 27448,
+      "metadata": {
+        "sdk_frame_number": 645953,
+        "sdk_timestamp_ms": 1793276713519.19,
+        "session_id": "0da51e92f6634e2a9bb6d18c5f6af85b",
+        "depth_scale_m": 9.999999747378752e-05,
+        "aligned_to_color": false,
+        "preview_depth": "native",
+        "preview_encoder": "opencv",
+        "active_profile": {
+          "product": "RealSense D405",
+          "usb_type": "3.2",
+          "color": {
+            "width": 640,
+            "height": 480,
+            "fps": 30
+          },
+          "depth": {
+            "width": 640,
+            "height": 480,
+            "fps": 30
+          },
+          "infrared": {
+            "width": 640,
+            "height": 480,
+            "fps": 30
+          },
+          "depth_aligned_to_color": true,
+          "color_options": {}
+        },
+        "encoding": "bgr8",
+        "source_width": 640,
+        "source_height": 480,
+        "passthrough": false
+      },
+      "file": "wrist-diagnostic.jpg",
+      "sha256": "5402e877de5ce2ddd99fc0c28c1d272694469b44c51d27775e15e0ef8f95a3c1",
+      "not_an_indexed_acquisition": true
+    },
+    {
+      "device_id": "sensor_realsense_435if",
+      "channel_id": "camera.color.preview",
+      "media_type": "image/jpeg",
+      "width": 640,
+      "height": 480,
+      "observed_at": 1793276713.5729754,
+      "sequence": 1,
+      "quality": "ok",
+      "size_bytes": 21955,
+      "metadata": {
+        "sdk_frame_number": 645653,
+        "sdk_timestamp_ms": 1793276713525.4023,
+        "session_id": "fe52da67deb9435abf2f56786ba76518",
+        "depth_scale_m": 0.0010000000474974513,
+        "aligned_to_color": false,
+        "preview_depth": "native",
+        "preview_encoder": "opencv",
+        "active_profile": {
+          "product": "RealSense D435IF",
+          "usb_type": "3.2",
+          "color": {
+            "width": 640,
+            "height": 480,
+            "fps": 30
+          },
+          "depth": {
+            "width": 848,
+            "height": 480,
+            "fps": 30
+          },
+          "infrared": {
+            "width": 848,
+            "height": 480,
+            "fps": 30
+          },
+          "depth_aligned_to_color": true,
+          "color_options": {}
+        },
+        "encoding": "bgr8",
+        "source_width": 640,
+        "source_height": 480,
+        "passthrough": false
+      },
+      "file": "global-diagnostic.jpg",
+      "sha256": "9ef27483c8563403269d59b6a8ac1fd33e618c90080f97b5ac4389271e00c35c",
+      "not_an_indexed_acquisition": true
+    }
+  ],
+  "node_id": "yahboom",
+  "write_mode": "permit_required",
+  "control.status": {
+    "ok": true,
+    "sessions": []
+  },
+  "skill.status": {
+    "runs": []
+  }
+}

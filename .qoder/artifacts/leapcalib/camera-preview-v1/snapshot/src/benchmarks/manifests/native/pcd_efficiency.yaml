@@ -1,0 +1,46 @@
+id: native_pcd_efficiency
+version: "1.0.0"
+source: "leapflow://native"
+adapter: native_pcd_efficiency
+tier: 1
+tags:
+  - native
+  - pcd
+  - token_budget
+required: true
+dependencies: []
+timeouts:
+  availability: 5.0
+  trial: 60.0
+seeds:
+  - 42
+metrics:
+  - tokens
+  - tokens_per_success
+  - budget_utilization
+gates: {}
+scenarios:
+  - scenario_id: minimal
+    name: "PCD minimal token budget"
+    tags: [native, pcd, tier1]
+    timeout_seconds: 30.0
+    required: true
+    parameters:
+      level: minimal
+      budget: 50
+  - scenario_id: task_relevant
+    name: "PCD task_relevant token budget"
+    tags: [native, pcd, tier1]
+    timeout_seconds: 30.0
+    required: true
+    parameters:
+      level: task_relevant
+      budget: 150
+  - scenario_id: rich_context
+    name: "PCD rich_context token budget"
+    tags: [native, pcd, tier1]
+    timeout_seconds: 30.0
+    required: true
+    parameters:
+      level: rich_context
+      budget: 400

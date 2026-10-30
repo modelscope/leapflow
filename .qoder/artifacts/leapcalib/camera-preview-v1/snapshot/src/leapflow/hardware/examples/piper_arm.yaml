@@ -1,0 +1,555 @@
+# AgileX Piper X -- 6-DOF CAN-controlled arm with a parallel gripper.
+#
+# hc.v1 declaration for the node-local Piper transport
+# (leapflow.hardware.drivers.piper, built on the pyAgxArm SDK).
+#
+# Provenance (refreshed against the vendor manual, revision V1.1.0). Page
+# references below are pages of the 59-page figure-carrying export. The manual
+# and the pyAgxArm "piper_x" preset publish the same kinematics, but disagree on
+# how far the joints travel; where they disagree this file declares the
+# *narrower* bound, so a target is either executable as planned or refused
+# before a frame leaves the host:
+#
+#   joint   manual (p5)   pyAgxArm preset   declared here
+#   j1      +-154         +-150             +-150   (preset binds)
+#   j2      0..195        0..180            0..180  (preset binds)
+#   j3      -175..0       -170..0           -170..0 (preset binds)
+#   j4      +-90          +-89              +-89    (preset binds)
+#   j5      +-90          +-89              +-89    (preset binds)
+#   j6      +-165         +-170             +-165   (MANUAL binds)
+#
+# End-effector (ee.*) envelopes are the reachable workspace box in the arm base
+# frame (mm) and the orientation range (deg). A batch may command joint.* or
+# ee.* targets, never both. Every writable numeric channel declares
+# `tolerance` explicitly: write verification defaults to an exact match
+# when tolerance is unset, and a servos' readback never matches a target
+# to the last bit.
+
+hc_version: "hc.v1"
+# Registry admission (V2) only admits [a-z0-9_]+ device ids -- no dots.
+device_id: "robot_piper_arm"
+display_name: "AgileX Piper X Arm"
+device_class: "robot_arm"
+vendor: "AgileX"
+model: "Piper X"
+location: "workbench_1"
+halt_supported: true
+
+kinematics:
+  chain_type: "serial"
+  dof: 6
+  # Piper X joint limits, in radians. The header table explains why each bound
+  # is the narrower of its two sources. The firmware narrows this further at
+  # bring-up: the vendor host software can rewrite per-joint min/max angle,
+  # maximum speed and maximum acceleration (manual p36), so a limit read back
+  # from the arm -- not this block -- is authoritative before a move.
+  #
+  # j2 = 0 and j3 = 0 are mechanical rest stops, not free space: the vendor's
+  # zero pose has both joints resting against their limit (manual p14). They
+  # stay reachable because the initialized origin sits there, but driving *into*
+  # the stop is a stall, not a position.
+  joint_limits:
+    - [-2.618, 2.618]    # j1: -150..150 deg (manual allows ±154)
+    - [0.0, 3.142]       # j2: 0..180 deg (manual allows 0..195)
+    - [-2.967, 0.0]      # j3: -170..0 deg (manual allows -175..0)
+    - [-1.553, 1.553]    # j4: ±89 deg (manual allows ±90)
+    - [-1.553, 1.553]    # j5: ±89 deg (manual allows ±90)
+    - [-2.8798, 2.8798]  # j6: ±165 deg (manual p5); the preset's ±170 would
+                         # allow commanding 5 deg past the mechanical limit
+  # Base frame, mm. The vendor's maximum reach is 669.59 mm (manual p5) measured
+  # along a single axis, so a corner of this box is not reachable; the box stays
+  # inside that reach instead of being stretched to it. z < 0 is below the base
+  # mounting face.
+  workspace_bounds: [-0.65, 0.65, -0.65, 0.65, -0.3, 0.9]
+  # Modified (Craig) DH, base to flange: published by the vendor (manual p7-8)
+  # and identical to pyAgxArm ROBOT_MDH_PRESET["piper_x"] (m/rad converted to
+  # mm/deg), so it is vendor-documented rather than an SDK reading. Verified on
+  # the Piper X (S-V1.9-0): forward kinematics of the reported joints matched the
+  # firmware flange pose with 0.0 mm / 0.0 deg error. The node checks this table
+  # against the reported flange pose before predicting with it, so a mismatch
+  # fails closed. The arm dimension drawing (p51) prints 271.75 mm for the
+  # forearm against a4 = 273.64 here; the MDH value is the one that reproduces
+  # the firmware pose.
+  dh:
+    convention: modified
+    links:
+      - {a: 0.0, alpha: 0.0, d: 123.0, theta_offset: 180.0}
+      - {a: 0.0, alpha: 90.0, d: 0.0, theta_offset: 7.78}
+      - {a: 285.03, alpha: 0.0, d: 0.0, theta_offset: 162.61}
+      - {a: 273.64, alpha: 0.0, d: 0.0, theta_offset: 4.62}
+      - {a: 74.66, alpha: -90.0, d: 0.0, theta_offset: 90.0}
+      - {a: 0.0, alpha: 90.0, d: 35.26, theta_offset: 0.0}
+
+capabilities:
+  # Manual p5: 1.5 kg nominal payload, 4.5 kg arm mass, ±0.1 mm repeatability.
+  # The nominal figure only holds close in: p15 publishes the reach-versus-
+  # payload envelope (1.5 kg keeps full height at L ~= 0 and about 500 mm at
+  # L ~= 565 mm; 2 kg only reaches L ~= 395 mm). Re-check that chart before
+  # fitting a heavier tool, rather than the 1.5 kg headline.
+  payload_kg: 1.5
+  reach_m: 0.66959
+  tool_slots: 1
+
+safety:
+  # Global floor over every angular-velocity channel. The vendor table is per
+  # joint -- 180 / 195 / 180 / 225 / 225 / 225 deg/s for j1-j6 (manual p6) -- so
+  # 3.14 rad/s (180 deg/s) is the slowest joint's ceiling: a single scalar can
+  # only express the minimum, and the firmware applies the real per-joint limit.
+  max_velocity_rad_s: 3.14
+  # Applies to force/torque channels. The gripper's own 5 N envelope is the
+  # binding cap; the vendor rates the gripper at 40 N continuous / 50 N peak
+  # (manual p6).
+  max_force_n: 30.0
+  emergency_decel_s: 0.2
+  notes: >-
+    halt() maps to pyAgxArm electronic_emergency_stop() (a damped stop).
+    Resume (reset()) is a separate governed write on arm.enable; disable()
+    releases torque and drops the arm, so neither is ever part of a halt.
+    Nothing in software brakes the joints without power: unplugging the
+    aviation plug is the vendor's emergency stop and drops the arm at once
+    (manual p49-50), so it is never a routine stop. IP22 (p3) means splash
+    resistance, not washdown.
+
+trust_config:
+  initial_level: "UNTRUSTED"
+  promotion_thresholds: [3, 8, 20]
+  demotion_threshold: 3
+
+degradation:
+  sensor_loss_policy: "halt"
+  comm_loss_policy: "halt"
+  max_comm_loss_s: 1.0
+
+transport:
+  kind: "piper"
+  config:
+    # The node-local CAN interface the arm answers on: the native mttcan
+    # controller on some carriers, or the interface a USB-CAN adapter creates
+    # (``can1`` on JetPack, where gs_usb must be installed).
+    can_name: "can0"
+    # pyAgxArm model + firmware profile. Bring-up reads the arm's firmware
+    # version and refuses to open when it resolves to a different profile
+    # (S-V1.8-9 and later -> v189).
+    robot: "piper_x"
+    firmware_profile: "v189"
+    default_speed_pct: 20
+    # Bound on the confirmation that the arm entered CAN control.
+    mode_switch_timeout_s: 0.6
+    # ee.* targets until arm.pose_path selects otherwise: "linear" (move_l,
+    # straight-line) or "point" (move_p).
+    pose_move_mode: "linear"
+    warmup_timeout_s: 5.0
+    stale_after_s: 1.0
+    receive_max_skew_s: 0.15
+    # How long a write waits for every decoder group to be freshly received
+    # before it refuses. Reception is a state: a camera capture decoded in the
+    # same process holds the interpreter long enough for one group to lag the
+    # others by a few hundred milliseconds, which one sample reads as a dead
+    # bus. Nothing has been sent while this waits, so only a ledger that stays
+    # incoherent for the whole budget is a refusal.
+    receive_requalify_s: 1.0
+    default_gripper_force_n: 1.0
+    # Bound on one governed enable. Resuming a latched stop, energizing and
+    # confirming the arm holds CAN control may have to be retried, so the
+    # budget covers several attempts rather than one.
+    enable_timeout_s: 6.0
+    # How long an enable must hold before it counts as one. A controller that
+    # has just been reset accepts CAN control and then, about half a second
+    # later, reports a joint communication error and drops back to standby with
+    # the drives released -- the arm sags away and later commands find a posture
+    # nobody commanded. This observation window must outlast that.
+    enable_settle_s: 1.0
+    # Bus and firmware facts this declaration cannot own:
+    # - CAN is 2.0B at 1000 kbit/s with Motorola (MSB) byte order (p49). A wrong
+    #   bitrate shows up as total silence, not as bad frames.
+    # - can_name is a probe-order slot, not a device identity: the native mttcan
+    #   and a USB-CAN adapter can swap can0/can1 between boots, so confirm the
+    #   interface answers before trusting the name.
+    # - Firmware state is mutable outside LeapFlow and only partly readable.
+    #   Joint min/max/speed/acceleration (p36) and the collision level 1-8 (p38)
+    #   are settable from the vendor host software; get_joint_angle_vel_limits,
+    #   get_joint_acc_limits and get_crash_protection_rating read them back.
+    #   Installation orientation (p20, which gravity compensation depends on)
+    #   and the payload class have NO getter in the SDK -- record what was set
+    #   and when, and never infer either from behaviour.
+
+channels:
+  - channel_id: "arm.telemetry"
+    direction: "read"
+    quantity: "arm_diagnostics"
+    representation: "state"
+    effect: "read"
+    description: "Per-motor receive age/counters, current-derived effort, speed, voltage, motor/driver temperature, enable and faults; not measured force."
+  - channel_id: "joint.j1.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 1 (base yaw) position"
+    envelope:
+      declared: true
+      min_value: -150.0
+      max_value: 150.0
+      max_rate: 36.0
+      max_jump: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "joint.j2.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 2 (shoulder) position"
+    envelope:
+      declared: true
+      min_value: 0.0
+      max_value: 180.0
+      max_rate: 36.0
+      max_jump: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "joint.j3.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 3 (elbow) position"
+    envelope:
+      declared: true
+      min_value: -170.0
+      max_value: 0.0
+      max_rate: 36.0
+      max_jump: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "joint.j4.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 4 (wrist pitch) position"
+    envelope:
+      declared: true
+      min_value: -89.0
+      max_value: 89.0
+      max_rate: 36.0
+      max_jump: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "joint.j5.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 5 (wrist roll) position"
+    envelope:
+      declared: true
+      min_value: -89.0
+      max_value: 89.0
+      max_rate: 36.0
+      max_jump: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "joint.j6.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 6 (flange rotation) position"
+    envelope:
+      declared: true
+      min_value: -165.0
+      max_value: 165.0
+      max_rate: 36.0
+      max_jump: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "ee.x"
+    direction: "readwrite"
+    quantity: "linear_position"
+    unit: "mm"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector X in the arm base frame"
+    envelope:
+      declared: true
+      min_value: -650.0
+      max_value: 650.0
+      max_rate: 150.0
+      max_jump: 150.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 2.0
+      reversible: true
+
+  - channel_id: "ee.y"
+    direction: "readwrite"
+    quantity: "linear_position"
+    unit: "mm"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector Y in the arm base frame"
+    envelope:
+      declared: true
+      min_value: -650.0
+      max_value: 650.0
+      max_rate: 150.0
+      max_jump: 150.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 2.0
+      reversible: true
+
+  - channel_id: "ee.z"
+    direction: "readwrite"
+    quantity: "linear_position"
+    unit: "mm"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector Z in the arm base frame"
+    envelope:
+      declared: true
+      min_value: -300.0
+      max_value: 900.0
+      max_rate: 150.0
+      max_jump: 150.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 2.0
+      reversible: true
+
+  - channel_id: "ee.rx"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector roll (RX) in the arm base frame"
+    envelope:
+      declared: true
+      min_value: -180.0
+      max_value: 180.0
+      max_rate: 45.0
+      max_jump: 45.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 1.0
+      reversible: true
+
+  - channel_id: "ee.ry"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector pitch (RY) in the arm base frame; the SDK pose codec bounds pitch to ±90 deg"
+    envelope:
+      declared: true
+      min_value: -90.0
+      max_value: 90.0
+      max_rate: 45.0
+      max_jump: 45.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 1.0
+      reversible: true
+
+  - channel_id: "ee.rz"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector yaw (RZ) in the arm base frame"
+    envelope:
+      declared: true
+      min_value: -180.0
+      max_value: 180.0
+      max_rate: 45.0
+      max_jump: 45.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 1.0
+      reversible: true
+
+  - channel_id: "gripper.position"
+    direction: "readwrite"
+    quantity: "linear_position"
+    unit: "mm"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Gripper stroke"
+    envelope:
+      declared: true
+      # Manual p6: 0-100 mm nominal stroke, ±0.5 mm. The jaws fitted on the arm
+      # in this cell open to a measured 69.5 mm, which the workcell declares as
+      # gripper_spec.max_width_mm; this channel keeps the model's nominal range
+      # so the declaration stays a device-class fact.
+      min_value: 0.0
+      max_value: 100.0
+      max_jump: 70.0
+      quantization: 0.001
+      settling_time_s: 0.3
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "gripper.effort"
+    direction: "readwrite"
+    quantity: "force"
+    unit: "N"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: false
+    description: "Gripper grip force; move_gripper_m always carries stroke and force together"
+    envelope:
+      declared: true
+      # 5 N against the vendor's 40 N continuous / 50 N peak (manual p6): the
+      # firmware's grip force is not calibrated against a force sensor, so a
+      # larger number would be a claim this arm cannot verify. Raise it only
+      # with a measured force-versus-command curve.
+      min_value: 0.0
+      max_value: 5.0
+      quantization: 0.001
+      tolerance: 0.05
+      reversible: true
+
+  - channel_id: "arm.enable"
+    direction: "write"
+    quantity: "state"
+    representation: "state"
+    effect: "configure"
+    description: >-
+      Energize (1) or release (0) all motors. Energize first resumes a latched
+      emergency stop (reset()), enables every motor and enters CAN control,
+      under one approval; this is the only resume path. Release (disable())
+      drops torque and the arm can fall; neither direction is ever part of a
+      halt.
+    envelope:
+      declared: true
+      allowed_values: [0, 1]
+      reversible: true
+
+  - channel_id: "arm.speed_pct"
+    direction: "readwrite"
+    quantity: "ratio"
+    unit: "percent"
+    representation: "scalar"
+    effect: "configure"
+    description: >-
+      Motion speed rate (set_speed_percent, 1-100 % of the firmware maximum)
+      applied before the next move. 100 % means the per-joint maximum from the
+      manual (180 / 195 / 180 / 225 / 225 / 225 deg/s, p6), not a velocity.
+      Sends no frame on its own.
+    envelope:
+      declared: true
+      min_value: 1.0
+      max_value: 100.0
+      quantization: 1.0
+      reversible: true
+
+  - channel_id: "arm.pose_path"
+    direction: "readwrite"
+    quantity: "state"
+    representation: "state"
+    effect: "configure"
+    description: >-
+      Path shape of later end-effector pose targets: "linear" (move_l,
+      straight-line) or "point" (move_p, joint-interpolated). Sends no frame on
+      its own; the next pose move applies it. The first allowed value is the
+      path a move uses when it names none.
+    envelope:
+      declared: true
+      allowed_values: ["linear", "point"]
+      reversible: true
+
+  - channel_id: "arm.enabled"
+    direction: "read"
+    quantity: "state"
+    representation: "state"
+    effect: "read"
+    description: >-
+      True when every motor reports enabled. The motor flags survive an
+      emergency stop and a controller fault, so this alone is not evidence that
+      the arm is holding posture -- arm.status is.
+
+  - channel_id: "arm.status"
+    direction: "read"
+    quantity: "state"
+    representation: "state"
+    effect: "read"
+    description: >-
+      Vendor feedback status: ctrl_mode, arm_status, mode_feedback,
+      motion_status, and the firmware fault word decoded as error_code,
+      joint_limit_errors and joint_communication_errors (joint numbers, so a
+      reported arm_status 0x05 names the motors that went silent).
+
+  - channel_id: "arm.ctrl_mode"
+    direction: "read"
+    quantity: "state"
+    representation: "state"
+    effect: "read"
+    description: >-
+      Control mode the firmware reports: "standby", "can" or "teach" (other
+      modes read as "other(0xNN)"). Host commands are only accepted in "can".
+      Teach mode is entered only by the physical button (p22-23), never by a
+      host write, and its indicator is a separate LED with three states: dark
+      (idle), steady green (recording) and 500 ms blink (replaying, capped at
+      3 minutes). Host control resumes only from a dark LED via standby.
+
+  - channel_id: "arm.motion"
+    direction: "read"
+    quantity: "state"
+    representation: "state"
+    effect: "read"
+    description: "True when the arm reports it arrived at the commanded target"

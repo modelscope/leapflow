@@ -38,6 +38,11 @@ Per workcell the runtime also keeps what outlives one run: the scene memory
 (what perception last saw, the grasps proposed, and what the gripper holds).
 The declared grasp planner is validated at admission and built per context,
 bound to that context's sensing.
+
+This lifecycle orchestrator retains the run/dispatch settlement ordering in one
+place; declaration reload and run admission are delegated to focused helpers.
+The file remains near the 800-line soft limit to keep stop/late-landing ownership
+and the single execution path auditable without splitting their shared state.
 """
 
 from __future__ import annotations
@@ -52,8 +57,9 @@ from typing import Any, Callable, Iterable, Mapping
 
 from leapflow.hardware.node_gate import NodeWriteGate
 from leapflow.hardware.skills.args import validate_args
+from leapflow.hardware.skills.admission import RunAdmission, effective_limits, ensure_model_use, execution_basis, generation_basis, seal_plan
 from leapflow.hardware.skills.context import RunContext
-from leapflow.hardware.skills.digest import plan_digest, run_permit_digest
+from leapflow.hardware.skills.digest import run_permit_digest
 from leapflow.hardware.skills.episodes import (
     NULL_TAP,
     EpisodeRecorder,
@@ -91,7 +97,7 @@ from leapflow.hardware.skills.protocol import (
     SkillOutcome,
     SkillPlan,
 )
-from leapflow.hardware.skills.runs import SkillRun, merge_outcome, needs_halt
+from leapflow.hardware.skills.runs import SkillRun, drain_runs, merge_outcome, needs_halt
 from leapflow.hardware.skills.runtime_settings import DEFAULT_PLAN_TTL_S, SkillRuntimeSettings
 from leapflow.hardware.skills.policy_binding import policy_problems
 from leapflow.hardware.skills.vision import CharucoTarget
@@ -99,8 +105,8 @@ from leapflow.hardware.skills.workcell import (
     ROLE_GRIPPER,
     WorkcellLoadReport,
     WorkcellSpec,
-    load_workcells,
 )
+from leapflow.hardware.skills import workcell_reload
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +148,7 @@ class SkillRuntime:
         planners: Mapping[str, PlannerFactory] | None = None,
     ) -> None:
         self._registry = registry
+        self._node_session_id = uuid.uuid4().hex
         self._settings = settings or SkillRuntimeSettings()
         self._gate = gate or NodeWriteGate(registry)
         self._clock = clock
@@ -160,6 +167,7 @@ class SkillRuntime:
         self._plans: dict[str, tuple[SkillPlan, float]] = {}
         self._runs: dict[str, SkillRun] = {}
         self._held: dict[str, str] = {}  # device_id -> run_id
+        self._closing = False
 
     # ── Catalog ──
 
@@ -176,21 +184,17 @@ class SkillRuntime:
         self._skills[skill_id] = skill
 
     def reload_workcells(self) -> WorkcellLoadReport:
-        directory = self._settings.workcells_dir
-        if directory is None:
-            self._workcells, self._report = {}, WorkcellLoadReport()
-        else:
-            self._workcells, self._report = load_workcells(
-                directory,
-                self._registry,
-                checks=(
-                    self._grasp_problems,
-                    self._perception_problems,
-                    self._vision_problems,
-                    self._policy_problems,
-                ),
-            )
+        """Startup admission only; live replacement uses the digest-bound wire gate."""
+        if hasattr(self, "_plans"):
+            raise SkillError(FAILURE_PLAN_STALE, "live reload requires a preview and skill.reload permit")
+        self._workcells, self._report = workcell_reload.load(self)
         return self._report
+
+    def prepare_workcell_reload(self, workcell: str) -> workcell_reload.PreparedReload | SkillOutcome:
+        return workcell_reload.prepare(self, workcell)
+
+    def commit_workcell_reload(self, prepared: workcell_reload.PreparedReload) -> dict[str, Any]:
+        return workcell_reload.commit(self, prepared)
 
     def _grasp_problems(self, spec: WorkcellSpec) -> list[str]:
         if not spec.role(ROLE_GRIPPER):
@@ -298,6 +302,9 @@ class SkillRuntime:
             limits = self._effective_limits(spec, {})
             if not skill.spec.runs_leased:
                 return await self._run_read(spec, skill, frames, limits, arguments)
+            model_basis = await self._generation_basis(spec)
+            if skill.spec.uses_motion:
+                ensure_model_use(self._registry, spec, model_basis)
             ctx = self._context(
                 spec,
                 frames,
@@ -316,26 +323,19 @@ class SkillRuntime:
         if isinstance(planned, SkillOutcome):
             return planned
         try:
-            return self._seal(spec, skill, planned, frames)
+            if model_basis != await self._generation_basis(spec):
+                raise SkillError(FAILURE_PLAN_STALE, "physical model generation changed during planning")
+            if self._workcells.get(workcell) is not spec:
+                raise SkillError(FAILURE_PLAN_STALE, "workcell changed during planning; plan again")
+            return self._seal(spec, skill, planned, frames, model_basis=model_basis)
         except SkillError as error:
             return SkillOutcome.from_error(error)
 
     def _seal(
-        self, spec: WorkcellSpec, skill: NodeSkill, planned: SkillPlan, frames: FrameGraph
+        self, spec: WorkcellSpec, skill: NodeSkill, planned: SkillPlan, frames: FrameGraph,
+        *, model_basis: Mapping[str, Any],
     ) -> SkillPlan:
-        sealed = replace(
-            planned,
-            skill_id=skill.spec.skill_id,
-            workcell=spec.workcell_id,
-            version=skill.spec.version,
-            limits=self._effective_limits(spec, planned.limits),
-            basis={**dict(planned.basis), "calibration": dict(frames.versions)},
-            digest="",
-        )
-        sealed = replace(sealed, digest=plan_digest(sealed))
-        self._evict_expired()
-        self._plans[sealed.digest] = (sealed, self._clock())
-        return sealed
+        return seal_plan(self, spec, skill, planned, frames, model_basis=model_basis)
 
     def permit_digest(self, plan: SkillPlan) -> str:
         """The action digest a run-scoped permit for *plan* must bind."""
@@ -356,28 +356,7 @@ class SkillRuntime:
         self, spec: WorkcellSpec, requested: Mapping[str, float]
     ) -> dict[str, float]:
         """Requested limits bounded by the workcell and node caps -- never raised by a floor."""
-        cap = min(float(spec.limits["speed_pct_max"]), self._settings.speed_pct_max)
-        speed = min(cap, float(requested.get("speed_pct", spec.limits["default_speed_pct"])))
-        duration = min(
-            self._settings.max_duration_s,
-            float(requested.get("max_duration_s", self._settings.max_duration_s)),
-        )
-        if not speed > 0.0 or not duration > 0.0:
-            raise SkillError(
-                FAILURE_INVALID_ARGS,
-                f"speed {speed:g} % and duration {duration:g} s must both be positive",
-            )
-        return {
-            "speed_pct": speed,
-            "speed_pct_max": cap,
-            "move_timeout_s": float(spec.limits["move_timeout_s"]),
-            "fk_tolerance_mm": float(spec.limits["fk_tolerance_mm"]),
-            "fk_tolerance_deg": float(spec.limits["fk_tolerance_deg"]),
-            "joint_path_step_deg": float(spec.limits["joint_path_step_deg"]),
-            "max_duration_s": duration,
-            "max_steps": float(spec.limits["max_steps"]),
-            "max_wait_s": float(spec.limits["max_wait_s"]),
-        }
+        return effective_limits(self, spec, requested)
 
     async def _run_read(
         self,
@@ -398,12 +377,21 @@ class SkillRuntime:
 
     # ── Execute ──
 
-    async def execute(self, digest: str, *, intent: str = "") -> SkillRun | SkillOutcome:
+    async def execution_basis(self, plan: SkillPlan) -> Mapping[str, Any] | SkillOutcome:
+        """Settle owner feasibility before the wire consumes its one-shot permit."""
+        return await execution_basis(self, plan)
+
+    async def execute(
+        self, digest: str, *, intent: str = "", admission: RunAdmission | None = None,
+        model_basis: Mapping[str, Any] | None = None,
+    ) -> SkillRun | SkillOutcome:
         """Start the cached plan *digest*; a refusal is a NONE outcome, not a run.
 
         *intent* is the host's sub-goal for the run (its episode's language
         annotation); it is not part of the approved plan and changes nothing it does.
         """
+        if self._closing:
+            return SkillOutcome.failed(FAILURE_SKILL_UNAVAILABLE, "node skill runtime is shutting down")
         plan = self.cached_plan(digest)
         if plan is None:
             return SkillOutcome.failed(
@@ -413,6 +401,27 @@ class SkillRuntime:
         skill = self._skills.get(plan.skill_id)
         if spec is None or skill is None or skill.spec.version != plan.version:
             return SkillOutcome.failed(FAILURE_PLAN_STALE, "the skill or workcell changed")
+        if model_basis is None:
+            prepared = await self.execution_basis(plan)
+            if isinstance(prepared, SkillOutcome):
+                return prepared
+            model_basis = prepared
+        if self._workcells.get(plan.workcell) is not spec:
+            return SkillOutcome.failed(FAILURE_PLAN_STALE, "workcell changed during admission; plan again")
+        if model_basis != plan.basis.get("physical_model"):
+            return SkillOutcome.failed(FAILURE_PLAN_STALE, "physical model generation changed since planning; plan again")
+        try:
+            if skill.spec.uses_motion:
+                ensure_model_use(self._registry, spec, model_basis)
+        except SkillError as error:
+            return SkillOutcome.from_error(error)
+        # Recheck after the snapshot await. Competing starts and owner transactions
+        # must still be refused before this runtime consumes the cached intention.
+        sessions = getattr(self._registry, "node_sessions", None)
+        if sessions is not None and (reserved := sessions.busy_device(spec.device_ids)):
+            return SkillOutcome.failed(FAILURE_DEVICE_BUSY, f"{reserved} held by a session, transaction or unsettled action")
+        if self.cached_plan(digest) is not plan:
+            return SkillOutcome.failed(FAILURE_PLAN_UNKNOWN, "plan expired or was executed while checking its model")
         busy = [device for device in spec.device_ids if device in self._held]
         if busy:
             return SkillOutcome.failed(
@@ -423,12 +432,14 @@ class SkillRuntime:
             return SkillOutcome.failed(
                 FAILURE_PLAN_STALE, "calibration changed since planning; plan again"
             )
+        if admission is not None and (not isinstance(admission, RunAdmission) or admission.action_digest != self.permit_digest(plan)):
+            return SkillOutcome.failed(FAILURE_PLAN_STALE, "run admission differs from the exact approved plan")
         del self._plans[digest]
         run = SkillRun(
             run_id=uuid.uuid4().hex,
             plan=plan,
             devices=spec.device_ids,
-            actuators=spec.actuator_ids,
+            actuators=spec.actuator_ids if skill.spec.uses_motion else (),
             intent=intent,
         )
         recorder = self._recorder(spec, run)
@@ -439,9 +450,12 @@ class SkillRuntime:
             plan.limits,
             run.cancel,
             skill.spec.region,
-            writes=skill.spec.is_actuating,
+            writes=skill.spec.uses_motion,
             tap=tap,
             recording=lambda: tap.recording,
+            admission=admission,
+            run_id=run.run_id,
+            plan=plan,
         )
         run.motion = ctx.motion
         for device in run.devices:
@@ -509,6 +523,7 @@ class SkillRuntime:
             outcome = SkillOutcome.failed(
                 FAILURE_INTERNAL_DEFECT, f"{type(exc).__name__}: {exc}", status=STATUS_HALTED
             )
+        await ctx.settle_effects()
         if run.cancel.is_set():
             if outcome.ok:
                 outcome = self._stopped(run)
@@ -635,6 +650,15 @@ class SkillRuntime:
     def holds_device(self, device_id: str) -> bool:
         return device_id in self._held
 
+    def transaction_run_owner(self, device_id: str) -> str:
+        """Only an admitted non-motion run may reserve its own existing hold."""
+        run_id = self._held.get(device_id, "")
+        run = self._runs.get(run_id)
+        skill = self._skills.get(run.plan.skill_id) if run is not None else None
+        if run is None or not run.running or skill is None or skill.spec.uses_motion:
+            return ""
+        return run_id
+
     def plan_devices(self, plan: SkillPlan) -> tuple[str, ...]:
         """Devices a run of *plan* would hold (empty when its workcell is gone)."""
         spec = self._workcells.get(plan.workcell)
@@ -646,11 +670,15 @@ class SkillRuntime:
         return skill.spec.consent if skill is not None else CONSENT_EACH_RUN
 
     async def close(self) -> None:
-        await self.stop_all("node shutting down")
+        """Stop new runs and drain existing holds before the owner releases storage."""
+        self._closing = True
+        await drain_runs(tuple(self._runs.values()), self.stop_all)
 
     # ── Internals ──
 
     def _resolve(self, workcell: str, skill_id: str) -> tuple[WorkcellSpec, NodeSkill]:
+        if self._closing:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, "node skill runtime is shutting down")
         spec = self._workcells.get(workcell)
         if spec is None:
             known = ", ".join(sorted(self._workcells)) or "none"
@@ -663,6 +691,10 @@ class SkillRuntime:
                 FAILURE_UNKNOWN_SKILL, f"workcell {workcell!r} offers no skill {skill_id!r}"
             )
         return spec, skill
+
+    async def _generation_basis(self, spec: WorkcellSpec) -> Mapping[str, Any]:
+        """Owner-committed structural generation, distinct from legacy frame versions."""
+        return await generation_basis(self._registry, spec)
 
     def _frames(self, spec: WorkcellSpec) -> FrameGraph:
         return FrameGraph.snapshot(spec, getattr(self._registry, "calibration_store", None))
@@ -705,6 +737,9 @@ class SkillRuntime:
         writes: bool,
         tap: EpisodeTap = NULL_TAP,
         recording: Callable[[], bool] = lambda: False,
+        admission: RunAdmission | None = None,
+        run_id: str = "",
+        plan: SkillPlan | None = None,
     ) -> RunContext:
         motion = self._motion(spec, frames, limits, cancel, region, writes=writes, tap=tap)
         return RunContext(
@@ -717,6 +752,10 @@ class SkillRuntime:
             memory=self._scenes.setdefault(spec.workcell_id, SceneMemory(self._clock)),
             planner=lambda sensing: self._planner(spec, sensing),
             recording=recording,
+            admission=admission,
+            run_id=run_id,
+            node_session_id=self._node_session_id,
+            plan=plan,
         )
 
     def _planner(self, spec: WorkcellSpec, sensing: GraspSensing) -> GraspPlanner:

@@ -1,0 +1,56 @@
+# A VLA policy served as a model device (task ``action_chunk``).
+#
+# The server runs the forward pass only and answers in the model's *native*
+# space, which its ``model_info`` declares as ``action_space`` /
+# ``observation_space`` (normalisation stats with a checksum, units, rotation,
+# reference, frame, fps) plus an ``instruction_policy``. Mapping those vectors
+# onto the arm is the node's job: the workcell's ``policies.<name>`` binds the
+# model's groups to channels and cameras, the adapter pipeline converts, and
+# the SafetyShield bounds every tick from the device declarations alone.
+#
+# The Jetson deployment ships a reference server (LeRobot SmolVLA) and a fake
+# answering the same contract for offline bring-up. A workcell binds it as
+# ``models: {pick_cube: policy_smolvla}`` next to ``policies: {pick_cube: ...}``.
+
+hc_version: "hc.v1"
+device_id: "policy_smolvla"
+display_name: "SmolVLA policy (LeRobot)"
+device_class: "model"
+location: "yahboom"
+halt_supported: false
+
+transport:
+  kind: "model_service"
+  config:
+    url: "http://127.0.0.1:8000"
+    task: "action_chunk"
+    # A fine-tuned checkpoint is a different device: pin it. Copy the values
+    # from `curl -s 127.0.0.1:8000/v1/health` after deploying the weights.
+    expect:
+      name: "smolvla_piper"
+      # version: "2026.01"
+      # checksum: "sha256:..."
+    # One chunk must arrive well inside the chunk's own duration.
+    timeout_s: 2.0
+    max_retries: 1
+    retry_backoff_s: 0.1
+
+channels:
+  - channel_id: "model.info"
+    direction: "read"
+    quantity: "model_metadata"
+    representation: "state"
+    effect: "read"
+    description: "The verified model_info, including the declared action/observation spaces."
+  - channel_id: "model.health"
+    direction: "read"
+    quantity: "model_metadata"
+    representation: "state"
+    effect: "read"
+    description: "Reachable and still serving the verified identity."
+  - channel_id: "model.latency"
+    direction: "read"
+    quantity: "model_metadata"
+    representation: "state"
+    effect: "read"
+    description: "Round-trip and inference latency percentiles over recent calls."

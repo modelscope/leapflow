@@ -17,7 +17,7 @@ whether a value is *physically admissible right now*.
 from __future__ import annotations
 
 import time
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence, runtime_checkable
 
 from leapflow.hardware.context import HardwareContext, as_numeric
 from leapflow.hardware.lhp.protocol import (
@@ -38,6 +38,7 @@ from leapflow.hardware.transport import (
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_PARTIAL,
+    SIDE_EFFECT_UNKNOWN,
     BatchTransport,
     TransportError,
     WriteOutcome,
@@ -107,6 +108,45 @@ def merged_batch_state(ok: bool, outcomes: Sequence[WriteOutcome]) -> str:
     return merged
 
 
+@runtime_checkable
+class CommandSafety(Protocol):
+    """Owner-published command constraints, evaluated under the device I/O lock.
+
+    Implementations use the already-open transport for fresh reads; acquiring the
+    registry lock again would deadlock. Numerical safety grants no write authority.
+    """
+
+    async def check_write(
+        self, context: HardwareContext, transport: Any, commands: Sequence[tuple[str, Any]],
+    ) -> WriteOutcome | None: ...
+
+    def control_refusal(self, device_id: str) -> str | None: ...
+
+
+@runtime_checkable
+class CommandRecovery(Protocol):
+    """Owner-cached restart stop-use, with no persistence I/O in control consumers."""
+
+    def command_recovery_refusal(self, device_id: str) -> str | None: ...
+
+
+def recovery_safety_refusal(registry: Any, device_id: str) -> str | None:
+    """Read only cached startup feasibility, never query persistence on a control tick."""
+    return registry.command_recovery_refusal(device_id) if isinstance(registry, CommandRecovery) else None
+
+
+def control_safety_refusal(registry: Any, device_id: str) -> str | None:
+    """One shared compatibility check for leased and local streaming consumers."""
+    if reason := recovery_safety_refusal(registry, device_id):
+        return reason
+    safety = getattr(registry, "command_safety", None)
+    if safety is None:
+        return None
+    if not isinstance(safety, CommandSafety):
+        return "owner command safety contract unavailable"
+    return safety.control_refusal(device_id)
+
+
 class NodeWriteGate:
     """Physical admissibility and execution for writes against one registry.
 
@@ -132,6 +172,8 @@ class NodeWriteGate:
         """
         if not channel.is_writable:
             return refusal(f"channel {channel.channel_id!r} is not writable", FAILURE_NOT_WRITABLE)
+        if reason := recovery_safety_refusal(self._registry, context.device_id):
+            return refusal(reason, FAILURE_SAFETY_DENIED)
         if not channel.envelope.contains(value):
             return refusal(
                 f"value {value!r} is outside the admitted envelope for "
@@ -191,7 +233,25 @@ class NodeWriteGate:
     # ── Execution ──
 
     async def write(self, device_id: str, channel_id: str, value: Any) -> WriteOutcome:
-        """Precheck and execute one channel write."""
+        """Track one-shot dispatch from precheck through transport settlement."""
+        sessions = getattr(self._registry, "node_sessions", None)
+        token = None
+        attempted = [False]
+        settled = False
+        if sessions is not None:
+            try:
+                token = sessions.begin_dispatch(device_id)
+            except ValueError as error:
+                return refusal(str(error), FAILURE_SAFETY_DENIED)
+        try:
+            outcome = await self._write(device_id, channel_id, value, attempted)
+            settled = outcome.side_effect_state != SIDE_EFFECT_UNKNOWN
+            return outcome
+        finally:
+            if token is not None:
+                sessions.finish_dispatch(token, settled=settled or not attempted[0])
+
+    async def _write(self, device_id: str, channel_id: str, value: Any, attempted: list[bool]) -> WriteOutcome:
         context, channel = self._resolve(device_id, channel_id)
         if channel is None:
             return refusal(
@@ -202,6 +262,10 @@ class NodeWriteGate:
             return verdict
         async with self._registry.device_io(device_id):
             transport = await self._registry.transport(device_id)
+            verdict = await self._command_safety(context, transport, ((channel_id, value),))
+            if verdict is not None:
+                return verdict
+            attempted[0] = True
             outcome = await transport.write(channel_id, value)
         if outcome.readback is not None:
             verify_reading_identity(outcome.readback, device_id, channel_id)
@@ -211,6 +275,27 @@ class NodeWriteGate:
 
     async def write_batch(
         self, device_id: str, commands: Sequence[tuple[str, Any]]
+    ) -> tuple[bool, tuple[WriteOutcome, ...]]:
+        sessions = getattr(self._registry, "node_sessions", None)
+        token = None
+        attempted = [False]
+        settled = False
+        if sessions is not None:
+            try:
+                token = sessions.begin_dispatch(device_id)
+            except ValueError as error:
+                outcome = refusal(str(error), FAILURE_SAFETY_DENIED)
+                return False, tuple(outcome for _ in commands)
+        try:
+            ok, outcomes = await self._write_batch(device_id, commands, attempted)
+            settled = all(o.side_effect_state != SIDE_EFFECT_UNKNOWN for o in outcomes)
+            return ok, outcomes
+        finally:
+            if token is not None:
+                sessions.finish_dispatch(token, settled=settled or not attempted[0])
+
+    async def _write_batch(
+        self, device_id: str, commands: Sequence[tuple[str, Any]], attempted: list[bool]
     ) -> tuple[bool, tuple[WriteOutcome, ...]]:
         """Precheck every command atomically, then execute the vector.
 
@@ -242,6 +327,10 @@ class NodeWriteGate:
             return False, tuple(v if v is not None else aborted for v in verdicts)
         async with self._registry.device_io(device_id):
             transport = await self._registry.transport(device_id)
+            verdict = await self._command_safety(context, transport, commands)
+            if verdict is not None:
+                return False, tuple(verdict for _ in commands)
+            attempted[0] = True
             if isinstance(transport, BatchTransport):
                 batch = await transport.write_batch(commands)
                 outcomes, ok = tuple(batch.outcomes), bool(batch.ok)
@@ -256,6 +345,18 @@ class NodeWriteGate:
             if outcome.ok:
                 self.record_accepted(device_id, channel_id, value)
         return ok, outcomes
+
+    async def _command_safety(
+        self, context: HardwareContext, transport: Any, commands: Sequence[tuple[str, Any]],
+    ) -> WriteOutcome | None:
+        if reason := recovery_safety_refusal(self._registry, context.device_id):
+            return refusal(reason, FAILURE_SAFETY_DENIED)
+        safety = getattr(self._registry, "command_safety", None)
+        if safety is None:
+            return None
+        if not isinstance(safety, CommandSafety):
+            return refusal("owner command safety contract unavailable", FAILURE_SAFETY_DENIED)
+        return await safety.check_write(context, transport, commands)
 
     def record_accepted(self, device_id: str, channel_id: str, value: Any) -> None:
         """Move the rate baseline -- only for a value known to have reached the device."""
@@ -293,6 +394,10 @@ async def _sequential(
 
 __all__ = [
     "NodeWriteGate",
+    "CommandSafety",
+    "CommandRecovery",
+    "control_safety_refusal",
+    "recovery_safety_refusal",
     "ReadingIdentityError",
     "is_cyclic",
     "merged_batch_state",

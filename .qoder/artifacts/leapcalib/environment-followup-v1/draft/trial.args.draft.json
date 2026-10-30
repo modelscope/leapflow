@@ -1,0 +1,16 @@
+{
+  "pairs": null,
+  "training": null,
+  "mount": {
+    "mount_id": "sensor_realsense_d405:260422273928:seat-1",
+    "parent_frame": "flange",
+    "source": "declared",
+    "seated_at_s": 0.0,
+    "notes": "Installation seat identity; last disturbance time unrecorded"
+  },
+  "prior": null,
+  "prior_uncertainty": null,
+  "tracking": {},
+  "solve": {},
+  "evaluation": {}
+}

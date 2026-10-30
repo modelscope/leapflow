@@ -1,0 +1,25 @@
+# DRAFT ONLY: partial overlay; merge into existing declaration only after approval.
+calibration_acquisition:
+  camera_role: camera.wrist
+  camera_method: wrist
+  allowed_modes:
+  - can
+  settled:
+    max_feedback_age_s: 0.1
+    max_coherence_s: 0.08
+    feedback_uncertainty_s: 0.01
+    exposure_uncertainty_s: 0.04
+    receipt_uncertainty_s: 0.02
+    max_joint_drift_rad: 0.003
+    max_tcp_drift_mm: 2.0
+    max_tcp_rotation_deg: 0.5
+    joint_uncertainty_rad: 0.0005
+    tcp_uncertainty_mm: 0.5
+    rotation_uncertainty_deg: 0.1
+    poll_s: 0.05
+    timeout_s: 3.0
+    min_samples: 3
+    span_s: 0.5
+  ttl_s: 3600
+  quota_bytes: 67108864
+  max_frames: 16

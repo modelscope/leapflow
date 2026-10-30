@@ -1,0 +1,20 @@
+{
+  "workcell": null,
+  "skill": "calib.assess_motion",
+  "args": {
+    "pairs": null,
+    "training": null,
+    "mount": null,
+    "prior": null,
+    "prior_uncertainty": null,
+    "tracking": {},
+    "solve": {},
+    "evaluation": {}
+  },
+  "instructions": [
+    "Copy distinct indexed digests from factor_pairs; freeze split before tracking.",
+    "Use the exact acquisition mount identity and an independently bounded SI prior.",
+    "Fit and evaluate before raw expiry, in the same node boot/session.",
+    "Approval is required for this leased READ skill; no activation is authorized."
+  ]
+}

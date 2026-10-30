@@ -84,12 +84,9 @@ leapspace = [
     "cua-sandbox; python_version >= '3.11' and python_version < '3.14'",
     "pydantic>=2",
 ]
-# LeapCalib (src/leapcalib) — target-free software calibration — ships through
-# the same root package finder as LeapSpace but has no extra yet: what it
-# delivers today (typed contracts, SI geometry, error budgets, evidence replay)
-# is stdlib-only. The numerical backend its solvers will need (numpy/scipy)
-# becomes a `leapcalib` extra when a solver imports it; declaring it now would
-# add a large wheel to every `--all-extras` sync for code nobody imports.
+# Contracts/inspection remain stdlib-only. NumPy is loaded only during bounded
+# motion/response solves; no SciPy/OpenCV dependency is needed by these methods.
+leapcalib = ["numpy>=1.24"]
 # Lightweight opt-in preview encoder; no policy-learning or ROS dependencies.
 vision = ["numpy>=1.24", "opencv-python>=4.8"]
 robot = [
@@ -128,11 +125,19 @@ realsense = "leapflow.hardware.drivers.realsense:build_transport"
 # dependency-free.
 piper = "leapflow.hardware.drivers.piper:build_transport"
 
+# Numerical method discovery grants no acquisition, motion or activation authority.
+[project.entry-points."leapcalib.methods"]
+metric_motion = "leapcalib.estimation.handeye:MotionMethod"
+task_response = "leapcalib.estimation.response:ResponseMethod"
+raw_joint_response = "leapcalib.estimation.raw_response:RawResponseMethod"
+
 # Node skills (S1.5). Built-ins register exactly like third-party skill packs.
 [project.entry-points."leapflow.hardware.skills"]
 builtin_motion = "leapflow.hardware.skills.builtin.motion:skills"
 builtin_calibration = "leapflow.hardware.skills.builtin.calibration:skills"
 builtin_camera_calibration = "leapflow.hardware.skills.builtin.camera_calibration:skills"
+builtin_metric_readiness = "leapflow.hardware.skills.builtin.metric_readiness:skills"
+builtin_governed_calibration = "leapflow.hardware.skills.builtin.governed_calibration:skills"
 builtin_grasp_verify = "leapflow.hardware.skills.builtin.grasp_verify:skills"
 builtin_grasp_cycle = "leapflow.hardware.skills.builtin.grasp_cycle:skills"
 builtin_scene = "leapflow.hardware.skills.builtin.scene:skills"

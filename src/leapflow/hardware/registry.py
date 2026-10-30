@@ -359,6 +359,17 @@ class HardwareRegistry:
         self._alert_policy: Any = None
         self._reading_store: Any = None
         self._calibration_store: Any = None
+        self._calibration_generations: Any = None
+        self._calibration_evidence: Any = None
+        self._calibration_worker: Any = None
+        self._approval_keys: tuple[Mapping[str, Any], str] | None = None
+        self._command_safety: Any = None
+        # Recovery only stops use. It never reconstructs physical qualification from
+        # model JSON, nor opens the instrument DB on a control thread or write tick.
+        self._command_recovery: dict[str, tuple[str, Any, bool]] = {}
+        self._command_recovery_error = ""
+        self._command_recovery_pending = False
+        self._node_sessions: Any = None
         self._preview_broker: Any = None
         # One holder for instrument.duckdb, shared by the reading and calibration stores.
         # A single process must not open two independent read-write connections to the
@@ -381,6 +392,128 @@ class HardwareRegistry:
     @property
     def settings(self) -> HardwareSettings:
         return self._settings
+
+    @property
+    def evidence_cache(self) -> Any:
+        """The bound node cache index; diagnostic adapters never create a competing owner."""
+        return self._cache_manager
+
+    @property
+    def calibration_worker(self) -> Any:
+        """The owner-bound compute worker, or None when this node has none bound."""
+        return self._calibration_worker
+
+    @property
+    def node_sessions(self) -> Any:
+        return self._node_sessions
+
+    def bind_node_sessions(self, sessions: Any) -> None:
+        if self._node_sessions is not None and self._node_sessions is not sessions:
+            raise ValueError("one registry cannot bind competing node session owners")
+        self._node_sessions = sessions
+
+    @property
+    def command_safety(self) -> Any:
+        """Owner-published immutable physical constraints; absent means nominal only."""
+        return self._command_safety
+
+    def bind_command_safety(self, safety: Any) -> None:
+        from leapflow.hardware.node_gate import CommandSafety
+        if not isinstance(safety, CommandSafety):
+            raise ValueError("runtime-checkable owner command safety required")
+        if self._command_safety is not None and self._command_safety is not safety:
+            raise ValueError("one registry cannot bind competing physical safety owners")
+        self._command_safety = safety
+
+    def command_recovery_refusal(self, device_id: str) -> str | None:
+        """Cached owner startup verdict shared by discrete and continuous consumers."""
+        if self._command_recovery_pending:
+            return "physical model restart reconciliation is pending; inspect owner status before commands"
+        if self._command_recovery_error:
+            return self._command_recovery_error
+        entry = self._command_recovery.get(device_id)
+        return entry[0] if entry is not None else None
+
+    def _restore_command_recovery(self) -> None:
+        """Read-only recovery during provider loading, never a physical admission or dispatch.
+
+        Unknown/corrupt model scope cannot be assigned to an arbitrary device, so
+        writes fail closed profile-wide while device reads and halt remain usable.
+        A known affected device is stopped alone; unrelated nominal devices survive.
+        """
+        path = self._settings.instrument_db_path
+        if not path or not Path(path).exists():
+            if self._command_recovery_pending:
+                self._command_recovery_error = "persisted physical model database is missing; inspect owner storage before commands"
+                self._command_recovery_pending = False
+            return
+        self._command_recovery_pending = True
+        try:
+            states = self.calibration_generations.states()
+            recovered: dict[str, tuple[str, Any, bool]] = {}
+            for state in states:
+                generation = state.generation or state.stopped_generation
+                if generation is None:
+                    continue
+                device_id = generation.model.get("device_id")
+                if not isinstance(device_id, str) or not device_id or len(device_id) > 256:
+                    raise ValueError("persisted physical model has no independently bound device scope")
+                if device_id in recovered:
+                    raise ValueError("overlapping persisted physical model consumers need owner reconciliation")
+                reason = (
+                    "physical correction invalidated; requalify dependencies before precision/control use"
+                    if state.invalidation is not None else
+                    f"committed generation {generation.generation} requires owner requalification and safety publication after restart"
+                )
+                recovered[device_id] = (reason, generation, state.invalidation is not None)
+            self._command_recovery = recovered
+            self._command_recovery_error = ""
+        except Exception:  # noqa: BLE001 - unreadable state must never authorize commands
+            logger.error("Physical model restart reconciliation failed", exc_info=True)
+            self._command_recovery_error = (
+                "physical model restart reconciliation unavailable; inspect persisted model/dependency state before commands"
+            )
+        finally:
+            self._command_recovery_pending = False
+
+    def clear_command_recovery_reserved(self, device_id: str, generation: Any) -> None:
+        """Owner publication callback only; clearing does not qualify or approve a model."""
+        if self._node_sessions is None or not self._node_sessions.reserved_device(device_id):
+            raise ValueError("restart safety publication requires the owner's reservation")
+        if self._command_recovery_error or self._command_recovery_pending:
+            raise ValueError("restart reconciliation must succeed before physical publication")
+        entry = self._command_recovery.get(device_id)
+        if entry is not None:
+            prior = entry[1]
+            if (generation.workcell_id != prior.workcell_id or generation.generation < prior.generation
+                or (entry[2] and generation.generation == prior.generation)):
+                raise ValueError("restart safety publication differs from the recovered or invalidated consumer")
+            if generation.generation == prior.generation and generation != prior:
+                raise ValueError("restart safety publication changed a committed generation")
+            self._command_recovery.pop(device_id)
+
+    def bind_calibration_worker(self, worker: Any) -> None:
+        if self._calibration_worker is not None and self._calibration_worker is not worker:
+            raise ValueError("one node owner cannot bind competing calibration workers")
+        self._calibration_worker = worker
+
+    @property
+    def approval_keys(self) -> tuple[Mapping[str, Any], str] | None:
+        """Owner permit public keys and node id, for historical evidence checks only."""
+        return self._approval_keys
+
+    def bind_approval_keys(self, keys: Mapping[str, Any], *, node_id: str) -> None:
+        """Publish a read-only copy of the verifier's keys; this grants no authority."""
+        from types import MappingProxyType
+
+        if not isinstance(keys, Mapping) or not isinstance(node_id, str) or not node_id:
+            raise ValueError("typed public keys and node identity required")
+        bound = (MappingProxyType(dict(keys)), node_id)
+        if self._approval_keys is not None and (
+            dict(self._approval_keys[0]) != dict(bound[0]) or self._approval_keys[1] != node_id
+        ):
+            raise ValueError("one registry cannot bind competing permit verifier keys")
+        self._approval_keys = bound
 
     def set_alert_orchestrator(self, orchestrator: Any) -> None:
         """Bind the live approval route used by non-estop alert actions."""
@@ -427,6 +560,10 @@ class HardwareRegistry:
         Idempotent: calling it again re-runs discovery and replaces the admitted
         set, which is what makes a declaration edit visible without a restart.
         """
+        self._command_recovery_pending = bool(
+            self._command_recovery or self._command_recovery_error
+            or (self._settings.instrument_db_path and Path(self._settings.instrument_db_path).exists())
+        )
         self._contexts.clear()
         self._degradation_latches.clear()
         # Discarded so the next request rebuilds them against the new declarations; a
@@ -469,6 +606,12 @@ class HardwareRegistry:
                 source_contexts, notes=notes, admitted=admitted, rejected=rejected
             )
 
+        self._restore_command_recovery()
+        if self._command_recovery_error:
+            notes.append(AdmissionNote("", "physical_model_recovery", "warning", self._command_recovery_error))
+        else:
+            notes.extend(AdmissionNote(device_id, "physical_model_recovery", "warning", entry[0])
+                         for device_id, entry in self._command_recovery.items())
         self._report = LoadReport(
             admitted=tuple(admitted), rejected=tuple(rejected), notes=tuple(notes)
         )
@@ -983,9 +1126,7 @@ class HardwareRegistry:
                 await self._retire(device_id, transport)
             return status
 
-    async def _cache_if_still_open(
-        self, device_id: str, transport: HardwareTransport
-    ) -> None:
+    async def _cache_if_still_open(self, device_id: str, transport: HardwareTransport) -> None:
         """Re-cache *transport* only if its driver still reports an open link.
 
         Used when a halt failed. The cache may hold only open links, so an
@@ -996,9 +1137,7 @@ class HardwareRegistry:
         try:
             status = await transport.probe()
         except Exception as exc:  # noqa: BLE001 - liveness is unknown, so do not cache
-            logger.debug(
-                "re-caching %r after a failed halt: probe failed: %s", device_id, exc
-            )
+            logger.debug("re-caching %r after a failed halt: probe failed: %s", device_id, exc)
             await self._retire(device_id, transport)
             return
         if status.connected:
@@ -1146,6 +1285,32 @@ class HardwareRegistry:
         return self._calibration_store
 
     @property
+    def calibration_generations(self) -> Any:
+        """Lazy additive store sharing the existing registry-owned instrument holder.
+
+        Construction performs no SQL or worker launch. Callers run its persistence
+        operations off-loop and perform qualification/reservations before mutation.
+        """
+        if not self._settings.instrument_db_path:
+            return None
+        if self._calibration_generations is None:
+            from leapflow.hardware.calibration.generations import GenerationStore
+            self._calibration_generations = GenerationStore(
+                self._instrument_holder(), cache_manager=self._cache_manager
+            )
+        return self._calibration_generations
+
+    @property
+    def calibration_evidence(self) -> Any:
+        """Lazy private acquisition index sharing the registry's instrument holder."""
+        if not self._settings.instrument_db_path:
+            return None
+        if self._calibration_evidence is None:
+            from leapflow.hardware.calibration.evidence import CalibrationEvidenceStore
+            self._calibration_evidence = CalibrationEvidenceStore(self._instrument_holder(), self._cache_manager)
+        return self._calibration_evidence
+
+    @property
     def preview_broker(self) -> Any:
         """Return the shared preview broker, building it on first use.
 
@@ -1212,6 +1377,10 @@ class HardwareRegistry:
         targets_changed = False
         if cache_manager is not None:
             self._cache_manager = cache_manager
+            if self._calibration_generations is not None:
+                self._calibration_generations.bind_cache(cache_manager)
+            if self._calibration_evidence is not None:
+                self._calibration_evidence.bind_cache(cache_manager)
             targets_changed = True
         if session_id and session_id != self._session_id:
             self._session_id = session_id
@@ -1374,7 +1543,7 @@ class HardwareRegistry:
                 exc_info=True,
             )
 
-    def publish_event(self, event: Any) -> None:
+    def publish_event(self, event: Any) -> bool:
         """Record an event and put it on the signal path.
 
         Classification is applied here so every downstream consumer -- EventBus,
@@ -1389,7 +1558,8 @@ class HardwareRegistry:
         Not paced here: a command is a human-scale act and each refusal is one the
         operator asked for, so suppressing repeats would hide the very thing that
         makes a stalled bench visible. Downstream deduplication remains free to
-        collapse them.
+        collapse them. Return whether the existing signal sink accepted the event;
+        durable producers retain their outbox when routing is absent or fails.
         """
         event = self._ensure_classified(event)
         self.record_event(event)
@@ -1397,11 +1567,13 @@ class HardwareRegistry:
         self._notify_deliberative_observer(event)
         emit = self._event_emitter
         if emit is None:
-            return
+            return False
         try:
-            emit(event)
+            accepted = emit(event)
+            return accepted is not False
         except Exception as exc:  # noqa: BLE001 - a sink must not fail the command
             logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
+            return False
 
     @staticmethod
     def _ensure_classified(event: Any) -> Any:
@@ -1659,6 +1831,7 @@ class HardwareRegistry:
         policy: Any,
         *,
         config: Any = None,
+        reservation_token: str | None = None,
     ) -> None:
         """Start a real-time control loop on a device.
 
@@ -1677,13 +1850,17 @@ class HardwareRegistry:
                     "not run a ControlBus across the network. Use RemoteControlTransport "
                     "(control.v1) instead."
                 )
+        from leapflow.hardware.node_gate import control_safety_refusal
+        reason = control_safety_refusal(self, device_id)
+        if reason is not None:
+            raise RuntimeError(reason)
         bus = self.create_control_bus(device_id, config)
         if bus.is_running:
             raise RuntimeError(
                 f"device {device_id!r} already has a running control loop; "
                 "stop it before starting another"
             )
-        bus.start(device_id, policy)
+        bus.start(device_id, policy, reservation_token=reservation_token)
         logger.info("Control loop started on %s", device_id)
 
     def stop_control_loop(self, device_id: str) -> dict[str, Any]:
@@ -1692,12 +1869,12 @@ class HardwareRegistry:
         Returns ``{"status": "no_loop"}`` if no loop was running.
         """
         bus = self._control_buses.get(device_id)
-        if bus is None or not bus.is_running:
+        if bus is None or not bus.is_active:
             return {"status": "no_loop", "device_id": device_id}
         bus.stop()
         stats = bus.stats.to_dict()
         return {
-            "status": "stopped",
+            "status": "stopping" if bus.is_active else "stopped",
             "device_id": device_id,
             "stats": stats,
         }
@@ -1796,19 +1973,29 @@ class HardwareRegistry:
         preview holds a device claimed, and releasing it here is what powers a camera
         down on shutdown rather than at interpreter exit.
         """
+        if self._node_sessions is not None:
+            # Stop incoming work and settle every control owner, including a
+            # standalone bus or an async startup not cached in this registry.
+            # Failure leaves transports/storage owned for a later safe shutdown.
+            await self._node_sessions.shutdown()
+        if self._calibration_evidence is not None:
+            await self._calibration_evidence.close()
         await self.stop_streams()
         # Stop any running control loops before closing transports.
         for device_id, bus in list(self._control_buses.items()):
             try:
-                if bus.is_running:
-                    bus.stop()
-            except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+                if bus.is_active:
+                    await asyncio.to_thread(bus.stop)
+                if bus.is_active:
+                    raise RuntimeError("control startup/thread has not settled; retain device ownership")
+            except Exception as exc:  # noqa: BLE001 - retain devices after failed settlement
                 logger.warning(
                     "Control bus stop failed for %r during close_all: %s",
                     device_id,
                     exc,
                     exc_info=True,
                 )
+                raise
         self._control_buses.clear()
         if self._preview_broker is not None:
             await self._preview_broker.close()

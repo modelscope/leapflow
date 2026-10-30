@@ -1,0 +1,41 @@
+id: native_approval_and_trust
+version: "1.0.0"
+source: "leapflow://native"
+adapter: native_approval_and_trust
+tier: 1
+tags:
+  - native
+  - approval
+  - trust
+required: true
+dependencies: []
+timeouts:
+  availability: 5.0
+  trial: 60.0
+seeds:
+  - 42
+metrics:
+  - approval_trust_compliance
+gates:
+  approval_trust_compliance: 1.0
+scenarios:
+  - scenario_id: approval_fail_closed
+    name: "Missing approval gate fails closed"
+    tags: [native, approval, tier0]
+    timeout_seconds: 30.0
+    required: true
+  - scenario_id: trust_promotion_demotion
+    name: "TrustConfig promotion and demotion"
+    tags: [native, trust, tier1]
+    timeout_seconds: 30.0
+    required: true
+  - scenario_id: approval_override_always
+    name: "Always override requires approval"
+    tags: [native, trust, tier1]
+    timeout_seconds: 30.0
+    required: true
+  - scenario_id: approval_override_never
+    name: "Never override skips reversible approval"
+    tags: [native, trust, tier1]
+    timeout_seconds: 30.0
+    required: true

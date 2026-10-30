@@ -1,0 +1,47 @@
+id: calvin
+version: "1.0.0"
+source: "http://calvin.cs.uni-freiburg.de/"
+paper: "https://arxiv.org/abs/2112.03227"
+repo: "https://github.com/mees/calvin"
+license: "MIT"
+setup_guidance: "Use the official CALVIN evaluator at calvin_models/calvin_agent/evaluation/evaluate_policy.py against the task_D_D split. Configure benchmark.commands.calvin with that evaluator and a final JSON summary containing the declared official horizon metrics; pass {data_root}, {scenario_id}, {seed}, and {timeout}."
+official:
+  implementation: "mees/calvin"
+  evaluator: "calvin_models/calvin_agent/evaluation/evaluate_policy.py"
+  protocol: "LH-MTLC five-instruction sequence evaluation"
+  dataset: "Official CALVIN task_D_D evaluation split"
+  result_contract: "Final JSON line from the official evaluator summary with success_rate_1 through success_rate_5."
+adapter: calvin
+tier: 2
+tags:
+  - manipulation
+  - language-conditioned
+  - long-horizon
+  - simulation
+  - tabletop
+required: false
+dependencies:
+  - config:benchmark.commands.calvin
+  - config:benchmark.data_roots.calvin
+timeouts:
+  availability: 10.0
+  trial: 600.0
+seeds:
+  - 42
+  - 123
+metrics:
+  - success_rate_1
+  - success_rate_2
+  - success_rate_3
+  - success_rate_4
+  - success_rate_5
+gates: {}
+scenarios:
+  - scenario_id: lh_mtlc_task_d_d
+    name: "CALVIN LH-MTLC task_D_D"
+    description: "Official long-horizon five-instruction evaluation over CALVIN task_D_D."
+    tags: [manipulation, long-horizon, official]
+    timeout_seconds: 1800.0
+    required: true
+    parameters:
+      official_metrics: [success_rate_1, success_rate_2, success_rate_3, success_rate_4, success_rate_5]

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from leapflow.hardware.skills.geometry import Pose, Transform, rpy_to_matrix
 
@@ -52,6 +52,16 @@ def _number(data: Mapping[str, Any], key: str, where: str, default: float | None
     if not math.isfinite(value):
         raise ValueError(f"{where} {key!r} must be finite")
     return value
+
+
+@runtime_checkable
+class KinematicModel(Protocol):
+    """Pure forward transforms in mm as a function of ordered raw joint degrees."""
+
+    @property
+    def dof(self) -> int: ...
+
+    def transform(self, joints_deg: Sequence[float]) -> Transform: ...
 
 
 @dataclass(frozen=True)
@@ -136,4 +146,4 @@ class DhChain:
         return cls(links=tuple(links), convention=convention)
 
 
-__all__ = ["CONVENTION_MODIFIED", "CONVENTION_STANDARD", "DhChain", "DhLink"]
+__all__ = ["CONVENTION_MODIFIED", "CONVENTION_STANDARD", "DhChain", "DhLink", "KinematicModel"]

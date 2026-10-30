@@ -1,0 +1,31 @@
+# Generic sensor — the absolute minimal valid hc.v0 declaration.
+#
+# Demonstrates backward compatibility: just device_id, transport, and one
+# read channel.  No hc.v1 sections are present; the provider must load
+# this without error and leave all v1 fields as None.
+
+hc_version: "hc.v0"
+device_id: "sensor.generic_temp"
+display_name: "Generic Temperature Sensor"
+device_class: "sensor"
+
+transport:
+  kind: "modbus"
+  config:
+    address: 1
+    port: "/dev/ttyUSB1"
+    baudrate: 9600
+
+channels:
+  - channel_id: "temperature"
+    direction: "read"
+    quantity: "temperature"
+    unit: "degC"
+    representation: "scalar"
+    effect: "read"
+    sample_rate_hz: 1.0
+    description: "Ambient temperature reading"
+    envelope:
+      declared: true
+      min_value: -40.0
+      max_value: 125.0

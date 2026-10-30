@@ -1,0 +1,87 @@
+id: embodyguard
+version: "1.0.0"
+source: "https://embodied-llms-safety.github.io/"
+paper: "https://aclanthology.org/2025.emnlp-main.1305/"
+repo: "https://github.com/Yonsei-MIR/EAI-safety"
+license: "UNKNOWN"
+setup_guidance: "Use the official EAI-safety eai-eval CLI against the behavior1k dataset. Configure benchmark.commands.embodyguard to invoke eai-eval with --dataset behavior1k and --eval-type {scenario_id}; configure benchmark.data_roots.embodyguard to the official checkout/data root; emit the declared official evaluation score as JSON."
+official:
+  implementation: "Yonsei-MIR/EAI-safety"
+  evaluator: "eai-eval --dataset behavior1k --mode evaluate_results"
+  protocol: "SAFEL/EMBODYGUARD per-eval-type evaluation"
+  dataset: "Official EMBODYGUARD behavior1k PDDL scenarios"
+  result_contract: "Final JSON line whose metric key is the selected official eval type."
+adapter: embodyguard
+tier: 3
+tags:
+  - safety
+  - embodied
+  - household
+  - refusal
+required: false
+dependencies:
+  - config:benchmark.commands.embodyguard
+  - config:benchmark.data_roots.embodyguard
+timeouts:
+  availability: 10.0
+  trial: 600.0
+seeds:
+  - 42
+  - 123
+metrics:
+  - refusal
+  - risky_goal_interpretation
+  - risky_effect_modeling
+  - safe_goal_interpretation
+  - safe_precondition_modeling
+  - safe_action_planning
+gates: {}
+scenarios:
+  - scenario_id: refusal
+    name: "EMBODYGUARD refusal"
+    description: "Official SAFEL refusal evaluation on behavior1k."
+    tags: [safety, refusal, official]
+    timeout_seconds: 600.0
+    required: true
+    parameters:
+      official_metrics: [refusal]
+  - scenario_id: risky_goal_interpretation
+    name: "EMBODYGUARD risky goal interpretation"
+    description: "Official SAFEL risky-goal interpretation evaluation."
+    tags: [safety, official]
+    timeout_seconds: 600.0
+    required: true
+    parameters:
+      official_metrics: [risky_goal_interpretation]
+  - scenario_id: risky_effect_modeling
+    name: "EMBODYGUARD risky effect modeling"
+    description: "Official SAFEL risky-effect modeling evaluation."
+    tags: [safety, official]
+    timeout_seconds: 600.0
+    required: true
+    parameters:
+      official_metrics: [risky_effect_modeling]
+  - scenario_id: safe_goal_interpretation
+    name: "EMBODYGUARD safe goal interpretation"
+    description: "Official SAFEL safe-goal interpretation evaluation."
+    tags: [safety, official]
+    timeout_seconds: 600.0
+    required: false
+    parameters:
+      official_metrics: [safe_goal_interpretation]
+  - scenario_id: safe_precondition_modeling
+    name: "EMBODYGUARD safe precondition modeling"
+    description: "Official SAFEL safe-precondition modeling evaluation."
+    tags: [safety, official]
+    timeout_seconds: 600.0
+    required: false
+    parameters:
+      official_metrics: [safe_precondition_modeling]
+  - scenario_id: safe_action_planning
+    name: "EMBODYGUARD safe action planning"
+    description: "Official SAFEL safe-action planning evaluation."
+    tags: [safety, official]
+    timeout_seconds: 600.0
+    required: false
+    parameters:
+      official_metrics: [safe_action_planning]

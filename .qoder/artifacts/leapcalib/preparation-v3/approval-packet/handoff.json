@@ -1,0 +1,155 @@
+{
+  "schema": "leapflow.private_camera_handoff.v1",
+  "state": "ready_for_minimal_inputs_and_explicit_approvals",
+  "executing_plan": "/Users/jason/Library/Application Support/Qoder/SharedClientCache/cache/plans/LeapCalib_Governed_Alignment_Activation_cd98b49c.md",
+  "scope": "Camera-only stationary acquisition, separately approved bounded raw-joint collection, one shadow extrinsic and disjoint withheld evaluation; nominal geometry unchanged.",
+  "preview": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/camera-preview-v3/deployment-preview.json",
+  "wheel": "leapflow-0.7.0+main-py3-none-any.whl",
+  "wheel_sha256": "35bca0b9c131e264655f2d1acd3370f461afec9b13932cd91091d53266472893",
+  "verification": [
+    {
+      "file": "offline-final.xml",
+      "sha256": "dacb96469a4ba7efbc0171c7cddd021da79ad1d4b5fc5560bb673a7d3a0d98cb",
+      "tests": 8339,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 20
+    },
+    {
+      "file": "camera-final.xml",
+      "sha256": "17b70d6bb2102251cfdf6d6f887b408daa3c9ea6d35002e87fef49212adf0a00",
+      "tests": 1196,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  ],
+  "source_decisions_resolved": 19,
+  "manifest_source_files": 71,
+  "target_dirty_entries": 123,
+  "source_plan_sha256": "9543a374c9384fb4819d7017031c14615d06a1e6ccbfc56f10c443cf73c8efec",
+  "archive_sha256": "989dbb9c21c893d25e0214b8ec6f063cc44d61d81cb2fd21d0448ea2e8fa714a",
+  "source_ops_sha256": "5ad0ad166fbc915a6b8adc19053482521b25c9a8d7de8da9dff3e5bde5782d6a",
+  "source_ops_verification": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/preparation-v3/source-ops-verification.json",
+  "target_snapshot_is_point_in_time": true,
+  "commands_not_executed": [
+    {
+      "id": "upload",
+      "command": "scp /Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/preparation-v3/approval-packet/leapcalib-camera-v3-35bca0b9.tar.gz jetson@192.168.55.1:/home/jetson/leap_work/leapcalib-camera-v3-35bca0b9.tar.gz",
+      "impact": "New private non-owning staging archive only; no source or service replacement."
+    },
+    {
+      "id": "stage",
+      "command": "umask 077 && mkdir /home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage && tar -xzf /home/jetson/leap_work/leapcalib-camera-v3-35bca0b9.tar.gz -C /home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage",
+      "impact": "Creates private source staging only; never launches an owner."
+    },
+    {
+      "id": "backup",
+      "command": "/home/jetson/miniconda3/envs/leap/bin/python /home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage/source_ops.py --plan /home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage/source-plan.json --operation backup --execute --approved-plan-sha256 9543a374c9384fb4819d7017031c14615d06a1e6ccbfc56f10c443cf73c8efec --approval-note camera-v3-backup",
+      "impact": "Creates exact original-file backup; target source unchanged."
+    },
+    {
+      "id": "stop",
+      "command": "systemctl --user stop leap-lhp-node.service",
+      "impact": "Disconnects the sole hardware owner; requires fresh idle/no-hold/no-dispatch confirmation first."
+    },
+    {
+      "id": "apply",
+      "command": "/home/jetson/miniconda3/envs/leap/bin/python /home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage/source_ops.py --plan /home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage/source-plan.json --operation apply --execute --approved-plan-sha256 9543a374c9384fb4819d7017031c14615d06a1e6ccbfc56f10c443cf73c8efec --approval-note camera-v3-source-apply",
+      "impact": "Fingerprint-bound manifest source replacement, only while supervisor is inactive; no configuration/motion."
+    },
+    {
+      "id": "metadata",
+      "command": "/home/jetson/miniconda3/envs/leap/bin/python -m pip install --no-index --no-deps --no-build-isolation -e /home/jetson/leap_work/leapflow",
+      "impact": "Refreshes editable package/entry-point metadata from preserved canonical source, no dependency download."
+    },
+    {
+      "id": "start",
+      "command": "systemctl --user start leap-lhp-node.service",
+      "impact": "Starts the sole existing supervisor before any stationary anchor; new owner session, no implicit enable/motion."
+    }
+  ],
+  "read_only_after_staging": "/home/jetson/miniconda3/envs/leap/bin/python /home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage/source_ops.py --plan /home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage/source-plan.json",
+  "rollback_separately_approved": {
+    "command": "/home/jetson/miniconda3/envs/leap/bin/python /home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage/source_ops.py --plan /home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage/source-plan.json --operation restore --execute --approved-plan-sha256 9543a374c9384fb4819d7017031c14615d06a1e6ccbfc56f10c443cf73c8efec --approval-note camera-v3-source-restore",
+    "prerequisites": [
+      "Separate exact rollback approval",
+      "Sole supervisor explicitly stopped",
+      "No later source drift"
+    ],
+    "impact": "Restore original files/modes, quarantine new source files without deletion; then separately approve metadata refresh and supervisor start. Does not restore physical posture."
+  },
+  "preconditions": [
+    "Staging/archive/backup destinations must not exist; no overwrite/reuse.",
+    "Recheck all target hashes and HEAD immediately before approved staging/backup/apply.",
+    "SHA-256-check staged archive/helper/plan before any approved helper operation.",
+    "Fresh existing-owner idle/no active lease/run/dispatch evidence before service stop.",
+    "Inspect exact installed source, entry points, sole supervisor, hello/list and worker readiness after start.",
+    "Existing stale deployment scripts are excluded and must not be executed."
+  ],
+  "human_inputs": [
+    "Rigid unchanged wrist seat; two scaled orthogonal views of camera/bracket/flange axes",
+    "Current clear work volume/table/obstacles; remove chair or include it in the measured keepouts",
+    "Static textured target in wrist view; empty jaws and accessible emergency stop with onsite supervision"
+  ],
+  "not_human_work": [
+    "device IDs/streams/DH/limits",
+    "profile paths/overlay merge",
+    "mount digest encoding",
+    "same-session indexed anchor",
+    "rate and uncertainty evidence collection after authorization",
+    "pose targets, source-disjoint split and exact approval previews"
+  ],
+  "draft_readiness_blockers": [
+    "Proposed receipt + exposure uncertainty exceeds the trial stamp gate; obtain defensible bounds before collection, do not relax the gate"
+  ],
+  "unresolved_real_evidence": [
+    "mount_confirmation",
+    "uncertainty_evidence",
+    "whole_link_geometry_evidence",
+    "rate_bound_evidence",
+    "wrist_prior_evidence",
+    "geometry",
+    "joint_rate_bounds_rad_s",
+    "endpoint_rate_bound_mm_s",
+    "rate_provenance_digest",
+    "reference_acquisition",
+    "reference_joints_deg",
+    "tool_transform",
+    "pairs",
+    "training",
+    "prior",
+    "prior_uncertainty"
+  ],
+  "config_targets": [
+    {
+      "path": "/home/jetson/.leapflow/profiles/default/hardware/workcells/piper_cell.yaml",
+      "stage_a": "Merge calibration_acquisition only; no calibration_motion before original indexed anchor.",
+      "stage_b": "Merge genuine anchor/mount/geometry/rates into calibration_motion, then approve skill.reload without restart."
+    },
+    {
+      "path": "/home/jetson/.leapflow/profiles/default/hardware/devices/realsense_d405.yaml",
+      "field": "transport.config.mount_digest"
+    },
+    {
+      "path": "/home/jetson/.leapflow/profiles/default/config/runtime.yaml",
+      "field": "hardware.calibration_worker_enabled"
+    }
+  ],
+  "future_approval_gates": [
+    "Exact nonsecret config diffs after measured inputs; never apply current draft thresholds as evidence.",
+    "Any config-owner restart before anchor",
+    "Enable/reference positioning/speed setup",
+    "Stationary indexed collection",
+    "Exact Stage B write and same-runtime skill.reload",
+    "Each fresh bounded pose-run preview",
+    "Leased READ shadow trial before raw expiry"
+  ],
+  "approval_strings_are_not_authority": true,
+  "deployment_approved": false,
+  "remote_changes_performed_by_this_continuation": false,
+  "physical_motion_performed": false,
+  "physical_qualification": false,
+  "activation": "none",
+  "auto_return": false
+}

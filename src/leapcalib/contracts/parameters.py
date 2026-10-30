@@ -158,16 +158,31 @@ class ParameterBlock:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ParameterBlock":
+        if not isinstance(data, Mapping) or set(data) - set(cls.__dataclass_fields__):
+            raise ValueError("unknown parameter block fields")
+        dimension = data.get("dimension")
+        if type(dimension) is not int or not 1 <= dimension <= 1024:
+            raise ValueError("bounded integer parameter dimension required before decoding")
+        for name in ("units", "prerequisites"):
+            values = data.get(name, ())
+            if not isinstance(values, (list, tuple)) or len(values) > 1024:
+                raise ValueError("bounded typed parameter array required")
+            if any(not isinstance(value, str) or len(value) > 4096 for value in values):
+                raise ValueError("parameter array values must be typed strings")
+        for name in ("block_id", "kind", "parent_frame", "child_frame", "composition", "notes"):
+            value = data.get(name, "")
+            if not isinstance(value, str) or len(value) > 4096:
+                raise ValueError("parameter identity and convention must be typed strings")
         return cls(
-            block_id=str(data["block_id"]),
-            kind=str(data["kind"]),
-            dimension=int(data["dimension"]),
-            units=tuple(str(u) for u in data["units"]),
-            parent_frame=str(data.get("parent_frame") or ""),
-            child_frame=str(data.get("child_frame") or ""),
-            composition=str(data.get("composition") or COMPOSE_RIGHT),
-            prerequisites=tuple(str(p) for p in data.get("prerequisites") or ()),
-            notes=str(data.get("notes") or ""),
+            block_id=data["block_id"],
+            kind=data["kind"],
+            dimension=dimension,
+            units=tuple(data["units"]),
+            parent_frame=data.get("parent_frame", ""),
+            child_frame=data.get("child_frame", ""),
+            composition=data.get("composition", COMPOSE_RIGHT),
+            prerequisites=tuple(data.get("prerequisites", ())),
+            notes=data.get("notes", ""),
         )
 
     @property

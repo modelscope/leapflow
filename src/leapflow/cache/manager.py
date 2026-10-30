@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import threading
 import time
 from dataclasses import dataclass, field
@@ -79,6 +81,28 @@ class CacheManager:
         ) / source
         cache_path.mkdir(parents=True, exist_ok=True)
         return cache_path
+
+    def private_path(self, *, category: str, source: str) -> Path:
+        """Layout-owned profile cache directory for private evidence.
+
+        Refuse symlink ancestors before creating anything, and never repair a
+        foreign-owned directory. This does not alter permissions of shared roots.
+        """
+        for component in (category, source):
+            if not component or Path(component).name != component or component in (".", ".."):
+                raise ValueError("private cache category/source must be path components")
+        directory = self._layout.category_dir(scope="profile", category=category) / source
+        if not directory.is_absolute():
+            raise ValueError("private cache requires an absolute layout root")
+        for ancestor in (*reversed(directory.parents), directory):
+            if ancestor.is_symlink():
+                raise ValueError("private cache refuses symlink ancestors")
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("private cache directory must be owner-controlled")
+        os.chmod(directory, 0o700)
+        return directory
 
     def register(
         self,

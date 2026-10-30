@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 
 from leapflow.hardware.skills.motion import GovernedMotion
 from leapflow.hardware.skills.protocol import (
@@ -116,4 +116,24 @@ def needs_halt(outcome: SkillOutcome, sent_any: bool) -> bool:
     )
 
 
-__all__ = ["RUN_RUNNING", "SkillRun", "merge_outcome", "needs_halt"]
+async def drain_runs(runs: tuple[SkillRun, ...], stop: Callable[[str], Awaitable[None]]) -> None:
+    """Stop admitted runs, then shield settlement until their tasks have finished."""
+    async def drain() -> None:
+        await stop("node shutting down")
+        tasks = tuple(run.task for run in runs if run.task is not None and not run.task.done())
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    task = asyncio.create_task(drain(), name="skill-runtime-shutdown")
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+__all__ = ["RUN_RUNNING", "SkillRun", "drain_runs", "merge_outcome", "needs_halt"]

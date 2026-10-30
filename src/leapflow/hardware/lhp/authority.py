@@ -15,11 +15,13 @@ any request.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping
 
 from leapflow.hardware.lhp.permit import PERMIT_PARAM, ExecutionPermit, request_digest
 from leapflow.hardware.lhp.protocol import FAILURE_PERMIT_REQUIRED, FAILURE_WRITES_DISABLED
 from leapflow.hardware.transport import SIDE_EFFECT_NONE, WriteOutcome
+from leapflow.hardware.skills.admission import RunAdmission
 
 WRITE_MODE_PERMIT_REQUIRED = "permit_required"
 WRITE_MODE_TRUSTED_V1 = "trusted_v1"
@@ -69,6 +71,37 @@ class WriteAuthority:
             return None
         return self._verify(params, expected_digest or request_digest(method, params))
 
+    def admit_run(
+        self, params: Mapping[str, Any], *, expected_digest: str
+    ) -> tuple[WriteOutcome | None, RunAdmission | None]:
+        """Check once through the same gate, then retain exact private run provenance."""
+        if self.mode == WRITE_MODE_OBSERVE_ONLY:
+            return self.check("skill.execute", params, expected_digest=expected_digest), None
+        # Bound/serialize the receipt before consuming a single-use nonce. The
+        # existing gate alone still verifies and authorizes the actual request.
+        try:
+            proof = ""
+            receipt_digest = expected_digest
+            if self.mode == WRITE_MODE_PERMIT_REQUIRED:
+                data = params.get(PERMIT_PARAM)
+                if not isinstance(data, Mapping):
+                    return self.check(
+                        "skill.execute", params, expected_digest=expected_digest
+                    ), None
+                permit = ExecutionPermit.from_dict(data)
+                proof = json.dumps(
+                    permit.to_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False
+                )
+                # Preflight only the proof's structure. The shared verifier below
+                # compares against the independently computed expected digest and
+                # preserves its typed refusal without consuming a mismatched nonce.
+                receipt_digest = permit.action_digest
+            receipt = RunAdmission(self.mode, receipt_digest, proof)
+        except (TypeError, ValueError, KeyError) as exc:
+            return _refused(f"malformed run admission: {exc}", FAILURE_PERMIT_REQUIRED), None
+        refusal = self.check("skill.execute", params, expected_digest=expected_digest)
+        return (refusal, None) if refusal is not None else (None, receipt)
+
     def _verify(self, params: Mapping[str, Any], expected: str) -> WriteOutcome | None:
         verifier = self._verifier
         permit_data = params.get(PERMIT_PARAM)
@@ -95,6 +128,7 @@ class WriteAuthority:
 
 __all__ = [
     "VALID_WRITE_MODES",
+    "RunAdmission",
     "WRITE_MODE_OBSERVE_ONLY",
     "WRITE_MODE_PERMIT_REQUIRED",
     "WRITE_MODE_TRUSTED_V1",

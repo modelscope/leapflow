@@ -1,0 +1,37 @@
+id: native_fleet_isolation
+version: "1.0.0"
+source: "leapflow://native"
+adapter: native_fleet_isolation
+tier: 1
+tags:
+  - native
+  - fleet
+  - isolation
+required: true
+dependencies: []
+timeouts:
+  availability: 5.0
+  trial: 60.0
+seeds:
+  - 42
+metrics:
+  - fleet_isolation_score
+  - halt_latency
+gates:
+  fleet_isolation_score: 1.0
+scenarios:
+  - scenario_id: single_node_failure
+    name: "One node failure does not block peers"
+    tags: [native, fleet, tier1]
+    timeout_seconds: 30.0
+    required: true
+  - scenario_id: halt_all_concurrent
+    name: "Fleet halt_all reaches every node"
+    tags: [native, fleet, tier1]
+    timeout_seconds: 30.0
+    required: true
+  - scenario_id: heartbeat_timeout
+    name: "Heartbeat timeout marks a node offline"
+    tags: [native, fleet, tier1]
+    timeout_seconds: 30.0
+    required: true

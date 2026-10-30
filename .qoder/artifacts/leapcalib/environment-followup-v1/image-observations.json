@@ -1,0 +1,77 @@
+{
+  "schema": "leapflow.private_environment_image_review.v1",
+  "state": "visual_topology_reviewed_metric_and_operator_gates_open",
+  "evidence_kind": "operator_supplied_environment_photographs_plus_owner_diagnostic_previews",
+  "operator_message": "Environmental confirmation images supplied in temp/devices/env_images; continue calibration and explicitly identify any further collaboration.",
+  "supplied_images": [
+    {
+      "file": "微信图片_20261029201439_2_3.jpg",
+      "observations": ["Front close-up of a compact two-lens wrist camera, fitted jaws and supporting seat", "USB connector and cable extend to one side", "No object visibly held between jaws"],
+      "not_established": ["T_flange_camera in metres/radians", "Seat rigidity or last disturbance", "Metric camera/bracket/cable outer bounds"]
+    },
+    {
+      "file": "微信图片_20261029201443_3_3.jpg",
+      "observations": ["Oblique whole-cell view includes wrist mount and elevated fixed-camera pole", "Rear cable hatch/lid, power supply and loose cables are present"],
+      "not_established": ["Table/base coordinates", "Pole/hatch/obstacle metric keepouts", "Clearance over an entire future sweep"]
+    },
+    {
+      "file": "微信图片_20261029201446_4_3.jpg",
+      "observations": ["Side view shows arm folded beside front tabletop edge with clamped base plate", "External camera pole rises behind wrist area", "Loose cable loops pass below and above arm segments"],
+      "not_established": ["Certified safe reference posture", "Whole-link/camera/tool material envelopes", "Cable slack and snag safety over motion"]
+    },
+    {
+      "file": "微信图片_20261029201448_5_3.jpg",
+      "observations": ["Overhead view shows base area, loose cable loops, rear hatch/lid and a small printed gum box", "Most visible table area has little texture"],
+      "not_established": ["Metric table edge/hatch/pole coordinates", "A static trackable wrist ROI", "Independent prior uncertainty"]
+    }
+  ],
+  "metric_scale_available": false,
+  "metric_dimensions_derived": false,
+  "mount_candidate": {
+    "camera_device_id": "sensor_realsense_d405",
+    "serial_from_authenticated_owner": "260422273928",
+    "parent_frame_from_admitted_workcell": "flange",
+    "seat_description": "Bracket next to fitted gripper on wrist assembly",
+    "operator_rigidity_and_unchanged_confirmation": null,
+    "last_disturbance": null,
+    "prior": null,
+    "prior_uncertainty": null
+  },
+  "diagnostic_wrist_review": {
+    "file": "wrist-diagnostic.jpg",
+    "observations": ["Central area is mostly blank tabletop", "Printed box is near left border, outside default central ROI", "Jaws occlude lower view", "Right portion includes table edge and floor"],
+    "default_region": [160, 120, 320, 240],
+    "region_verified_for_tracking": false,
+    "target_acceptance": "pending matte textured scene placement and fresh owner read"
+  },
+  "minimal_operator_actions": [
+    "Confirm camera seat and clamped base are rigid and unchanged since the supplied photos; report last remount if known, or explicitly unknown. Do not loosen/reseat to find it.",
+    "Add two close-ups from front and side with a ruler/tape adjacent to the camera/bracket in the measured plane, showing the visible flange-to-gripper mounting seam and screw positions. Include a readable scale and note ruler resolution; report inaccessible landmarks instead of moving the arm.",
+    "Add one scaled overhead view tying the base mounting plate, front/rear/side table edges, cable hatch rectangle and camera pole foot to the same visible references. Include tabletop-to-base mounting-plane height if not flush. Measurements or CAD may replace ruler photos; unscaled photos remain topology evidence only.",
+    "Place and secure matte high-contrast printed/textured paper on the table in the wrist camera's central view, away from jaws. The small glossy gum box alone is not an adequate scene. Do not move/enable the arm to aim it; automation rechecks view and depth before choosing ROI.",
+    "Before any separately approved motion, keep jaws empty, clear loose items/chair from the swept region, and manage cable loops without disconnecting peripherals or disturbing mounts. Stop if routing requires moving the arm. Confirm accessible emergency stop and onsite supervision."
+  ],
+  "automation_responsibilities": [
+    "Combine scaled evidence with existing mechanical records; derive SI prior/uncertainty and outer capsule bounds without guessing optical or flange frame conventions",
+    "Construct conservative obstacle bounds and assess whole-link sweep against actual approved reference",
+    "Merge exact field-only configuration diffs after evidence and consent; operator does not edit YAML or compute digests",
+    "Collect defensible timing/rate evidence through existing governed owner after any necessary exact approvals",
+    "Create original indexed anchor, bounded pose plans and source-disjoint split only through production seams"
+  ],
+  "unresolved_machine_gates": [
+    "Approved source/metadata deployment and verified sole owner",
+    "Calibration acquisition declaration, mount_digest and worker setting",
+    "Timing uncertainty bound compatible with 0.05 s solver gate; 0.06 s proposal remains unqualified",
+    "Independent joint/endpoint rate upper bounds; speed percentage is not a bound",
+    "Valid enabled reference posture; current disabled raw J2/J3 are outside command bounds",
+    "Indexed stationary anchor and original disjoint acquired motion pairs"
+  ],
+  "approval_boundary": "General continuation and photographs do not authorize upload, staging, backup, source/config write, package metadata change, service transition, enable, speed setup or motion. Exact command and impact approval required.",
+  "calibration_factor_sources": [],
+  "physical_qualification": false,
+  "activation": "none",
+  "nominal_geometry_changed": false,
+  "remote_changes_performed": false,
+  "physical_motion_performed": false,
+  "auto_return": false
+}

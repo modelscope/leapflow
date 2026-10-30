@@ -38,6 +38,11 @@ FAILURE_EVIDENCE_CORRUPT = "evidence_corrupt"
 FAILURE_NOT_IMPLEMENTED = "not_implemented"
 """A declared-but-undelivered stage was invoked; P0 ships no solver and no service."""
 
+FAILURE_WORKER_UNAVAILABLE = "worker_unavailable"
+"""Compute worker disabled, crashed, or exhausted its bounded fresh-launch allowance."""
+FAILURE_DEADLINE = "deadline"
+"""Compute request expired; any late output is discarded, never replaying motion."""
+
 FAILURE_CODES = frozenset(
     {
         FAILURE_INSUFFICIENT_EVIDENCE,
@@ -49,6 +54,8 @@ FAILURE_CODES = frozenset(
         FAILURE_SCHEMA,
         FAILURE_EVIDENCE_CORRUPT,
         FAILURE_NOT_IMPLEMENTED,
+        FAILURE_WORKER_UNAVAILABLE,
+        FAILURE_DEADLINE,
     }
 )
 
@@ -80,6 +87,8 @@ __all__ = [
     "FAILURE_BUDGET_EXCEEDED",
     "FAILURE_CLOCK_DOMAIN_MISMATCH",
     "FAILURE_CODES",
+    "FAILURE_WORKER_UNAVAILABLE",
+    "FAILURE_DEADLINE",
     "FAILURE_EVIDENCE_CORRUPT",
     "FAILURE_GEOMETRY_ASSET_MISSING",
     "FAILURE_INSUFFICIENT_EVIDENCE",

@@ -1,0 +1,440 @@
+{
+  "schema": "leapflow.private_source_operations.v1",
+  "target_root": "/home/jetson/leap_work/leapflow",
+  "staged_root": "/home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-stage/snapshot",
+  "backup_root": "/home/jetson/leap_work/leapcalib-camera-v3-35bca0b9-backup",
+  "supervisor": "leap-lhp-node.service",
+  "target_head": "b3883a1d21b00ee21f136dcffe52556b194fb62e",
+  "source_inventory_sha256": "32662bdd3cb479ea83b5dc5fe117c1c1c6038bf7282ec6fbd20e3c28824b0b48",
+  "files": [
+    {
+      "path": "pyproject.toml",
+      "before_sha256": "8d42fdecfeefa2d50ce84e7943c2035e1f638e016220cd022f06b239f9fdc0bb",
+      "before_mode": 420,
+      "after_sha256": "2ebaeaea924cc6207f7d737984fd713c64db046902292f66eb7d51bcdfaea3b0"
+    },
+    {
+      "path": "src/leapcalib/cli.py",
+      "before_sha256": "7ba15c48242b63a30726c797c949bb5d0f8143a040de85507049f94368cd303a",
+      "before_mode": 384,
+      "after_sha256": "77fc24f6dcdbc7c3f7c2e2c4d40254e93fa6e6e7a9b8249ce403dfdd64449c9a"
+    },
+    {
+      "path": "src/leapcalib/contracts/estimates.py",
+      "before_sha256": "36563ee1769c5a273642ce6f04aa46b5477e460f5e3a69165f8f25192bffaab9",
+      "before_mode": 384,
+      "after_sha256": "b19b67149ed9df59ab2054f6f8aa17f7b4fc43d852de076d209f8262c4beb1c2"
+    },
+    {
+      "path": "src/leapcalib/contracts/failures.py",
+      "before_sha256": "2386023a34c3957eb9e6d45f9d0052652d0e76479eb469ad942fadb5159c232a",
+      "before_mode": 384,
+      "after_sha256": "b4d4cab0c71046f77b04d6493008f42fa88378ee6ba72b7dd4eadb696c9316f2"
+    },
+    {
+      "path": "src/leapcalib/contracts/identity.py",
+      "before_sha256": "6d655ccea84d0f9cda853e43801c9c465407cc0ad6e7b5deb2b4608d3ece05d4",
+      "before_mode": 384,
+      "after_sha256": "0b628992d6703c3549c3ae255ca5d3ee3af127de2e07be796c5e34379d2a01a9"
+    },
+    {
+      "path": "src/leapcalib/contracts/observations.py",
+      "before_sha256": "5686d80a2e0796c313a8eb8f0b7277f15bda224e59cec8e153b2b2f94632698d",
+      "before_mode": 384,
+      "after_sha256": "90ca374c42cb4db670591975367339f31e9cb65448b3620122fe8d3e1dd44aa8"
+    },
+    {
+      "path": "src/leapcalib/contracts/parameters.py",
+      "before_sha256": "c814d27fa6b14dbfadd5649103612acdb789bc4f3ea0a34db78173d67dcc64bf",
+      "before_mode": 384,
+      "after_sha256": "a4d96cf56b81454be2c12d54cfc9442a9a8a87b753f25e876d7e708b40f32fa1"
+    },
+    {
+      "path": "src/leapcalib/contracts/raw_task.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "38c6f93db6b5f316349d6e3bf66748a64f3df1db5931d94e3239e682a72c5e2b"
+    },
+    {
+      "path": "src/leapcalib/contracts/tracking.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "aae7b42565ed470811578873c5f1949a01b115b41f64795689b522e251cb5b33"
+    },
+    {
+      "path": "src/leapcalib/estimation/raw_response.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "e8d5eb7bcb2ae6edbe31f856128c1f08207cb76ba6cf280e2bde5f2a943f7fc6"
+    },
+    {
+      "path": "src/leapcalib/estimation/tracking.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "fb41ab7f92ba0b6b39ffe60e1c18a082a4b35220830b44a3372eb640ef967c51"
+    },
+    {
+      "path": "src/leapcalib/runtime/__init__.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "5666c13b732afb71071c0b46779665ca33ddffad9797c97fcfc538520a8a3520"
+    },
+    {
+      "path": "src/leapcalib/runtime/protocol.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "55d25135b0d161b34ecf1f5cae5b399e2561aa3272b6b9223ff3c47f87b7302f"
+    },
+    {
+      "path": "src/leapcalib/runtime/server.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "cd0a3264f96cfaf974f10d12223ca75ca817a4c9599831e95a2e0d703bf12d94"
+    },
+    {
+      "path": "src/leapcalib/validation/bundle.py",
+      "before_sha256": "04d803084f7b69ca040260c4f5162241c3304fbe1c6454c9e812b2a34ba81195",
+      "before_mode": 384,
+      "after_sha256": "d888818ba25af441201bcd1814a0e971e4d78db6ad2dca1ed961265325f223c0"
+    },
+    {
+      "path": "src/leapcalib/validation/evaluation.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "044ee4aae2319615f99c702c6fa5ba2b0d3a128a9fa31bba24149bea622b6c9e"
+    },
+    {
+      "path": "src/leapflow/cache/manager.py",
+      "before_sha256": "7da900786f2ff456a67c89695cd9e265287e5009a112a74b070fc3835c051f89",
+      "before_mode": 420,
+      "after_sha256": "e406de38972787c01bc332271f1189052b6f302a4da90c3eb9f0a4e52992981a"
+    },
+    {
+      "path": "src/leapflow/config.py",
+      "before_sha256": "56f3fbe41ec14c1685920ffe682e83dfd2eedf2ea00b0466fa3f56700f0265a9",
+      "before_mode": 420,
+      "after_sha256": "afab3dc1fff3bf24b8e81ec8e69e4a3b8d773e5f4dd07c273ec5a48a0ed7935b"
+    },
+    {
+      "path": "src/leapflow/config_service.py",
+      "before_sha256": "20d04166a6f69ce3cf16cd4f224f06896c4a4c8a56a3f9aaaf9d5fbc2663be75",
+      "before_mode": 420,
+      "after_sha256": "5f1073d14250eb7bfe5d2a6680a698eaf90780afef008e21fb97db43acad45ec"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/acquisition.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "8f1d35aa8c072a18209e2f7620d95a9fb0086c2c4e49e9076f654419cc0b35c3"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/adapter.py",
+      "before_sha256": "3af55e6c5f5da77113c2d2078667f9eebea129f41cc3be3a605b8086d3f197a2",
+      "before_mode": 384,
+      "after_sha256": "1972aca21065316ef14e4255f352520f1cebc742f655298ba9020eb295684b7e"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/alignment.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "b2e44877146c4a3b9b41eaa7d665a51e9aecb88fc68fd179681d57ed5e6c455e"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/collection.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "cb9b3c5114553a005a09721acbfa849ba20d8cd3a002fa1c9660a491e9a6f20c"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/command_safety.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "25bbd7eeb0bf538737c52992d5e8033f3a0185e61d44d191d17df5fd3bc68b62"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/evidence.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "2d75bc12631a623daffc26cbffc258558b283ab38ab9acb427ae0c6d1ee7dbca"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/factors.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "555c3091e2abb99bf970843d828f8bd04748d1dcd06161738c1f4a86ea85191d"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/generations.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "0d66723681cdb464599e7e01499f951840c5be85e7e7d91d2a25dcd209ac80d2"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/lifecycle.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "ae61320742c9982d4feab9327a309b6f3ef924dd1c4259dcb82c09b4619bcdfe"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/measurements.py",
+      "before_sha256": "3b0bbbe46e9212a66cf41b954ee2eeab9a1e008600251d0e8ea7b60d9853a331",
+      "before_mode": 384,
+      "after_sha256": "d3dd744d7a2b0bc8090afbb64d0fca92b59837f0337152186df092c76e5d2e36"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/physical_model.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "7ff3ea30744c728bc9a6a369affacc3029009c4d882ae7eac8186d850a792525"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/pose_policy.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "b777d589525f3e5bfa7560bf9489f1e72d9177c0b111e9759e0a17ebae199ef4"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/poses.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "1d04e1326e424e645c4c997593e1d4dbba25d892804da40c9163012268778b44"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/provenance.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "7b87b16f368e3fc5530986dc3227120ff7cda53272ec0b5f6817916d20407f1c"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/raw_assessment.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "30303baa61593e6aada7e9a730325b955f2c9d5074e1fd654173e2fb3801603c"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/reference.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "32c1d6189d1e507d3b21fd47d10ca8fcbcd8467263121d68a02038848c313083"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/rollback.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "fb837b0af61f6bc6a497c9decf6db4787e4a5ef07dc4443cc8046eec099e127c"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/scene.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "2cb8162bc143c51673b746283d50f686cfd123eeb5e87c9a0a13d183e90b193b"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/trial.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "82a49d1a43f2ed05278407bd521e64687f6bcfc16b6873b35425393484b16b5b"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/trial_port.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "8d48e3738afe2e522628239be47551e5fa23a377a78bbdde271d22e903eec6d4"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/worker.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "98fd683f05d6c5b2cefc51329423098a672c7b9299ce4d543d97bf03301cc6d2"
+    },
+    {
+      "path": "src/leapflow/hardware/control_bus.py",
+      "before_sha256": "2c881324a80be83d611be989bc6873d329d0431525f18a786c3f6c24a874c729",
+      "before_mode": 420,
+      "after_sha256": "4efbbe82487703eb6252a4e357e2b609540eb0aca4184e58342276ac8c87c023"
+    },
+    {
+      "path": "src/leapflow/hardware/health_monitor.py",
+      "before_sha256": "2accec6e9b52aedc21f100656ca4f253ec41efec3a91d0dfaa8b7f81b8220528",
+      "before_mode": 420,
+      "after_sha256": "f504a5fc7f8bf6f8413c4b9288edb2f4dfe2ae023347604af6cc089d21143c7e"
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/authority.py",
+      "before_sha256": "43f40a0c36af9eb0a267533fbb2e5220f6a6406088e33342ce6942ad41f06ef8",
+      "before_mode": 420,
+      "after_sha256": "39a155a1dbe48b3d2a9fe65dad29c15e831d95489b4c88de02e07cf3c181058b"
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/control_sessions.py",
+      "before_sha256": "4d02092bbd309ae0793da890675c2d4d55eab50466846519b661dc999a4180b4",
+      "before_mode": 420,
+      "after_sha256": "877c190a5bdd5184a320a9c897abaa098dea20c4a07fb7b42b07e99c7d7cfb8b"
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/permit.py",
+      "before_sha256": "959b735b3306b6413593f84055cc86b81fa2abc1d206b7e809ad35e98260d1ab",
+      "before_mode": 420,
+      "after_sha256": "cb63ec40382c1dc702da1ae785d1193ff0f0518705a9d8bc77bd1fd336435667"
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/protocol.py",
+      "before_sha256": "ff7e319248792bee00c99d5e2af0097bedb181df57ef67eded6324df557011d5",
+      "before_mode": 420,
+      "after_sha256": "486e6e4757161d90c97a4db1d728857c7fa95e533469a17ca912d6b922da6fc6"
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/runtime.py",
+      "before_sha256": "7d44321901e2ad8b79f51e3c67a0769985ec179aeec22e0a532a9454702c30c6",
+      "before_mode": 420,
+      "after_sha256": "6dea416f6f230db0b876ea9563ff3d899129ce8916fab854ab9e313d27d2aed8"
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/server.py",
+      "before_sha256": "fa23cc16f558eeb416648e1002c42f5ef2dc6b1cc2124485e62a045db0f8aa5e",
+      "before_mode": 420,
+      "after_sha256": "4a0a32123ed62c823b2e22f66f5379552a41cf44fc3fb26059c553852f6c13c7"
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/skill_methods.py",
+      "before_sha256": "80f78edcde84d1fa80af7eda6b0e2579fc4daf91c1ce8c6607cb8598f2ab57f7",
+      "before_mode": 420,
+      "after_sha256": "365a228d81d0ee648366a5d25657b234303eea2976ef3492b01be07b45c5cec3"
+    },
+    {
+      "path": "src/leapflow/hardware/node_gate.py",
+      "before_sha256": "2b45e41fdb5c1f275cc638110ff16c740999762c4894a00b81a60bfc2f7a292a",
+      "before_mode": 420,
+      "after_sha256": "40f76425fd0dc7c9942ed9beeb09d623acc01b57d47dde7a0ee58837e6d420d9"
+    },
+    {
+      "path": "src/leapflow/hardware/registry.py",
+      "before_sha256": "a07dcc567925a636ad88c07c45fe935d44528a6239ffdf0410a983e6622dcd25",
+      "before_mode": 420,
+      "after_sha256": "8c6c1b4fba4547228e487a2b22a709e0c13dd8074ec191e7e7ed0d62d061c161"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/adapt/ik.py",
+      "before_sha256": "d1dc97b81d5de1a2b352ecec69466204f8d2825ab27825b20e3cb3b4c66f371d",
+      "before_mode": 420,
+      "after_sha256": "03b0654486e178c32b84df6df0a492bbc09e6010eadc1b0688d0127229384d30"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/admission.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "0de40326a5e7baa7160a3747bcd5a714049217e2bceb652a8afe3d4ec941ae14"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/builtin/governed_calibration.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "61ae87331acd90fb7013931769b246e74409e298670959bc45ae5a782a572cbe"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/context.py",
+      "before_sha256": "7eca3030dd68f52c383cf70ce5eae137a40389e968d4e52530f048f3972f6474",
+      "before_mode": 420,
+      "after_sha256": "f29561d3b2e79272fa4b4caa677e3454e1a11ee7a44cf6699f3ee5c8f54a9090"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/kinematics.py",
+      "before_sha256": "fe7e8780c1c3d4cc660ecc580e9c9fe6a98b67ecaf9755b3fd2b965da87baaa7",
+      "before_mode": 420,
+      "after_sha256": "d4b9cf70b3f47fcd42f4eb1d69b0da6797121c220344c914d859e0ed18d5b9e5"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/ports.py",
+      "before_sha256": "c36d27e3541d29e9821ac7cb6459058555571a10a359a70d1e3fec104764bc0d",
+      "before_mode": 420,
+      "after_sha256": "ceeab0feb3ebd51d7ca34ef709acb59a08af140fb80b78eac14359b767dce2a8"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/protocol.py",
+      "before_sha256": "2131bd4385ea1fbdb3806d2cf03f2449614bc8f1e554a4aaee7c3d5810c2e176",
+      "before_mode": 420,
+      "after_sha256": "61f28568a038d5b3ca46263fa47ff2473dc2a08a01fa8121144f47f45d88b838"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/runs.py",
+      "before_sha256": "27488ee29149e9c2e47421fced8dfe6574709d33f061273af1f15d774c9f8b26",
+      "before_mode": 420,
+      "after_sha256": "663776b4d61a6f5e394ddd5de507c3e6c6ce672f1103dcbe1e3a0b01a301456b"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/runtime.py",
+      "before_sha256": "adc8e909865bda41df44161895fd832be6e6ac2682ed787760ae74c13e08a80f",
+      "before_mode": 420,
+      "after_sha256": "848e5409c98ebe5794ede4a0f2394cf8be7ee323d5e663394994af60eef0873d"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/vision.py",
+      "before_sha256": "ffa4b5986ddb5fe84adf0f3fd57a989aa48b5e7195aff48a0b66e05e1a8f9dbb",
+      "before_mode": 420,
+      "after_sha256": "a905c8f75394e13bd42aaa25fb9aba9cf9f4306683266ec29af73c79d1e6b0f0"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/workcell.py",
+      "before_sha256": "1dfecd030486ae04e20e0e214058335b7fe91f40acae1888bf9b6b3460f38ca7",
+      "before_mode": 420,
+      "after_sha256": "3f5e219af3fc589142eb0f0e7e7f17322bd9bc4fffd5a14644b3e48e32299d9d"
+    },
+    {
+      "path": "src/leapflow/hardware/skills/workcell_reload.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "a5dfd689adf6af6b0f0d1f4c3ed7975d39599b899acdc63831329beee76fab8f"
+    },
+    {
+      "path": "src/leapflow/hardware/stream.py",
+      "before_sha256": "1e4afe972494ff80341b2face0e2a652700615c506b1628d3370094a9e2b4ab9",
+      "before_mode": 420,
+      "after_sha256": "73e96e4525feb9c5ce41461d8ee493a5d8c5b11381d7f22e3da701b725d0aec9"
+    },
+    {
+      "path": "src/leapflow/hardware/transports/lhp.py",
+      "before_sha256": "4f727fe064adb8b4a0266a6353732ddece0d1b0bff468825ed61cff64c44816c",
+      "before_mode": 420,
+      "after_sha256": "2924df0a145e3a57acaacc3ff043cfdc6ca6ac1148b24aa987c913d284edc84b"
+    },
+    {
+      "path": "src/leapflow/layout.py",
+      "before_sha256": "8d405c39030407427a8a24c37c8da850b69b7375af59e9030c26a208a7def8be",
+      "before_mode": 420,
+      "after_sha256": "31fdfe4a999c59e12a2b65fc984283cc3349770cb46dacb76a1e51519e412b31"
+    },
+    {
+      "path": "tools/calib_prepare.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "60afec5fa05e572a1ee872d2519c8e4fede741819bf5a486a689d18807c4bdd7"
+    },
+    {
+      "path": "tools/calib_preview.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "4f76071845f98e08c56fd34f74d30f150c7f251012356ceacc75fc5cf7fa6567"
+    },
+    {
+      "path": "tools/calib_probe.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "8f56a9b47455c21da8644ae654c4c1f75a990f589f8b0c3661a24d649749f02d"
+    },
+    {
+      "path": "tools/piper/piper_ops/calibration.py",
+      "before_sha256": "1f99cb53a5c39bf2424abe149a86c269dc89a555550caf7d06291338b49e8e2f",
+      "before_mode": 420,
+      "after_sha256": "f5682d6e0c79ad3fcdb273e27319246b860bfa31f6d5a9f2e896fa47433f9e48"
+    },
+    {
+      "path": "tools/piper/piper_ops/cli.py",
+      "before_sha256": "2e1d398b2797405c8b5a96e71ff0fb03f66e285ba39a854b82ac6f55424ce662",
+      "before_mode": 420,
+      "after_sha256": "2287db7c94333e061bb27c68d25a62ec24cbaf33d1d4325103487d913438840c"
+    }
+  ],
+  "scope": "Only manifest-listed source/tools; no engine, config, database, keys, CAN or firmware writes.",
+  "remote_changes_performed": false,
+  "deployment_approved": false
+}

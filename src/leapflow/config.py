@@ -280,6 +280,9 @@ class Settings:
     # Node-local skills (S1.5). Comma-separated fnmatch patterns of enabled skill
     # ids; empty enables every discovered skill. The speed cap bounds every
     # skill plan; the duration cap bounds one skill execution end to end.
+    # Compute-only calibration defaults off; JSON budgets may tighten initial ceilings.
+    hardware_calibration_worker_enabled: bool = False
+    hardware_calibration_worker_budgets: str = "{}"
     hardware_skills_enabled: str = ""
     hardware_skills_speed_pct_max: float = 30.0
     hardware_skills_max_duration_s: float = 120.0
@@ -1501,6 +1504,8 @@ def _build_settings_from_env(
     # LEAPFLOW_FLEET_NODES fallback is applied later, in fleet_config.
     hardware_fleet_nodes = os.getenv("LEAPFLOW_HARDWARE_FLEET_NODES", "").strip()
     hardware_alert_policies = os.getenv("LEAPFLOW_HARDWARE_ALERT_POLICIES", "").strip()
+    hardware_calibration_worker_enabled = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+    hardware_calibration_worker_budgets = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_BUDGETS", "{}").strip() or "{}"
     hardware_skills_enabled = os.getenv("LEAPFLOW_HARDWARE_SKILLS_ENABLED", "").strip()
     hardware_skills_speed_pct_max = float(
         os.getenv("LEAPFLOW_HARDWARE_SKILLS_SPEED_PCT_MAX", "30") or 30.0
@@ -2043,6 +2048,8 @@ def _build_settings_from_env(
         hardware_preview_idle_timeout_s=hardware_preview_idle_timeout_s,
         hardware_fleet_nodes=hardware_fleet_nodes,
         hardware_alert_policies=hardware_alert_policies,
+        hardware_calibration_worker_enabled=hardware_calibration_worker_enabled,
+        hardware_calibration_worker_budgets=hardware_calibration_worker_budgets,
         hardware_skills_enabled=hardware_skills_enabled,
         hardware_skills_speed_pct_max=hardware_skills_speed_pct_max,
         hardware_skills_max_duration_s=hardware_skills_max_duration_s,

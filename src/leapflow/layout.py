@@ -216,6 +216,15 @@ class HardwareLayout:
         return self.root / "episodes"
 
     @property
+    def calibration_worker_dir(self) -> Path:
+        """Owner-private compute endpoint directory, created lazily in mode 0700."""
+        return self.root / "calib-runtime"
+
+    @property
+    def calibration_worker_socket(self) -> Path:
+        return self.calibration_worker_dir / "compute.sock"
+
+    @property
     def verified_path(self) -> Path:
         """Human confirmations of device contexts (ContextProvenance records)."""
         return self.root / "verified.json"
