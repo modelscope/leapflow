@@ -224,6 +224,94 @@ def test_a_model_identity_is_radians_only() -> None:
         ModelIdentity(model_id="piper_x", dof=6, chain_digest="abc", joint_unit="deg")
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("width", True),
+        ("width", 640.5),
+        ("height", "480"),
+        ("width", 16385),
+        ("fx_px", True),
+        ("fy_px", "600"),
+        ("ppx_px", False),
+        ("ppy_px", "240"),
+        ("depth_scale_m", "0.001"),
+        ("valid_min_m", False),
+        ("valid_max_m", "3.0"),
+        ("distortion_coeffs", [True]),
+        ("distortion_coeffs", ["0.0"]),
+        ("distortion_coeffs", [0.0] * 33),
+        ("distortion_coeffs", None),
+        ("device_id", 42),
+        ("stream", False),
+        ("distortion_model", None),
+        ("role", None),
+        ("source", False),
+        ("qualified", True),
+    ],
+)
+def test_stream_wire_never_coerces_intrinsics_depth_scale_or_counts(field, value) -> None:
+    payload = _profile().to_dict()
+    payload[field] = value
+    with pytest.raises(ValueError):
+        StreamProfile.from_mapping(payload)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("workcell_id", 42),
+        ("tool", {}),
+        ("metadata", None),
+        ("streams", None),
+        ("streams", [None] * 33),
+        ("mounts", [None] * 65),
+        ("qualified", True),
+    ],
+)
+def test_topology_wire_bounds_nested_arrays_before_decoding(field, value) -> None:
+    payload = _topology().to_dict()
+    payload[field] = value
+    with pytest.raises(ValueError):
+        TopologyIdentity.from_mapping(payload)
+
+
+@pytest.mark.parametrize(
+    "component,field,value",
+    [
+        ("device", "device_id", False),
+        ("device", "firmware_profile", 42),
+        ("model", "dof", True),
+        ("model", "dof", 6.5),
+        ("model", "dof", 129),
+        ("model", "dh_convention", False),
+        ("tool", "jaw_stroke_m", "0.085"),
+        ("tool", "reference", 42),
+        ("mount", "seated_at_s", False),
+        ("mount", "notes", None),
+        ("model", "qualified", True),
+    ],
+)
+def test_topology_nested_fields_remain_typed(component, field, value) -> None:
+    payload = _topology().to_dict()
+    nested = payload["mounts"][0] if component == "mount" else payload[component]
+    nested[field] = value
+    with pytest.raises(ValueError):
+        TopologyIdentity.from_mapping(payload)
+
+
+def test_identity_valid_legacy_defaults_keep_the_original_digest() -> None:
+    profile = _profile()
+    payload = profile.to_dict()
+    for name in ("distortion_model", "distortion_coeffs", "role", "source"):
+        payload.pop(name)
+    assert StreamProfile.from_mapping(payload).digest == profile.digest
+    topology = _topology()
+    payload = topology.to_dict()
+    payload.pop("metadata")
+    assert TopologyIdentity.from_mapping(payload).digest == topology.digest
+
+
 # ── Observations ─────────────────────────────────────────────────────────────
 
 
@@ -472,6 +560,115 @@ def test_estimate_bundle_keeps_the_evidence_split_disjoint() -> None:
         )
 
 
+def _wire_estimate() -> ParameterEstimate:
+    return ParameterEstimate(
+        block=joint_zero_block("zeros", dof=2),
+        values=(0.01, 0.0),
+        prior=(0.0, 0.0),
+        support=SUPPORT_PARTIAL,
+        uncertainty=(0.001, 0.01),
+        prior_uncertainty=(0.01, 0.01),
+        supported_components=(0,),
+        method_id="measured-method.v1",
+        accepted_count=3,
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("values", [True, 0.0]),
+        ("values", ["0.01", 0.0]),
+        ("prior", [False, 0.0]),
+        ("uncertainty", ["0.001", 0.01]),
+        ("prior_uncertainty", [False, 0.01]),
+        ("supported_components", [0.5]),
+        ("supported_components", [False]),
+        ("supported_components", ["0"]),
+        ("accepted_count", 3.5),
+        ("accepted_count", True),
+        ("accepted_count", "3"),
+        ("gauge_anchors", [42]),
+        ("limitations", [False]),
+        ("method_id", 42),
+        ("qualified", True),
+        ("values", "01"),
+        ("supported_components", None),
+    ],
+)
+def test_estimate_wire_never_coerces_counts_support_or_si_values(field, value) -> None:
+    payload = _wire_estimate().to_dict()
+    payload[field] = value
+    with pytest.raises((ValueError, TypeError)):
+        ParameterEstimate.from_mapping(payload)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("bundle_id", 42),
+        ("accepted_ids", [42]),
+        ("holdout_ids", [False]),
+        ("rejected_ids", "o1"),
+        ("limitations", [42]),
+        ("method_id", False),
+        ("metadata", False),
+        ("estimates", [None] * 129),
+        ("accepted_ids", ["o"] * 4097),
+        ("schema_version", ""),
+        ("qualified", True),
+    ],
+)
+def test_bundle_wire_requires_bounded_typed_identity_and_no_qualification_flag(
+    field, value
+) -> None:
+    payload = EstimateBundle(
+        "wire", _topology(), (_wire_estimate(),), accepted_ids=("o1",)
+    ).to_dict()
+    payload[field] = value
+    with pytest.raises((ValueError, TypeError)):
+        EstimateBundle.from_mapping(payload)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("dimension", 2.5),
+        ("dimension", True),
+        ("dimension", "2"),
+        ("dimension", 1025),
+        ("block_id", 42),
+        ("parent_frame", False),
+        ("units", "rad"),
+        ("units", [42, "rad"]),
+        ("prerequisites", [42]),
+        ("composition", ""),
+        ("units", ["rad"] * 1025),
+        ("qualified", True),
+    ],
+)
+def test_nested_parameter_blocks_do_not_coerce_dimensions_or_conventions(field, value) -> None:
+    payload = _wire_estimate().to_dict()
+    payload["block"][field] = value
+    with pytest.raises((ValueError, TypeError)):
+        ParameterEstimate.from_mapping(payload)
+
+
+def test_valid_v0_estimates_keep_digest_and_legacy_optional_defaults() -> None:
+    estimate = _wire_estimate()
+    assert ParameterEstimate.from_mapping(estimate.to_dict()) == estimate
+    bundle = EstimateBundle(
+        "wire", _topology(), (estimate,), accepted_ids=("o1",), holdout_ids=("o2",)
+    )
+    assert EstimateBundle.from_mapping(bundle.to_dict()).digest == bundle.digest
+    payload = bundle.to_dict()
+    for field in ("schema_version", "method_id", "metadata", "rejected_ids", "limitations"):
+        payload.pop(field)
+    assert EstimateBundle.from_mapping(payload).digest == bundle.digest
+    with pytest.raises(ValueError, match="before decoding"):
+        ParameterEstimate.from_mapping({**estimate.to_dict(), "values": [0.0] * 1025})
+
+
 def test_insufficient_evidence_is_a_reportable_result() -> None:
     block = camera_extrinsic_block("cam", parent_frame="base", child_frame="cam_g")
     estimate = retained_estimate(
@@ -495,10 +692,13 @@ def test_leapcalib_never_imports_leapflow() -> None:
     An accidental ``leapflow`` import would make the package unusable standalone
     and would be invisible in a repository where both always resolve.
     """
-    forbidden = ("leapflow", "numpy", "scipy", "cv2", "torch", "rclpy")
+    forbidden = ("leapflow", "scipy", "torch", "rclpy", "pyrealsense2")
     offenders: list[str] = []
     for path in sorted(LEAPCALIB_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
         for node in ast.walk(tree):
             names: list[str] = []
             if isinstance(node, ast.Import):
@@ -506,15 +706,39 @@ def test_leapcalib_never_imports_leapflow() -> None:
             elif isinstance(node, ast.ImportFrom) and node.module:
                 names = [node.module]
             for name in names:
-                if name.split(".")[0] in forbidden:
+                root = name.split(".")[0]
+                if root in forbidden:
                     offenders.append(f"{path.name}: {name}")
+                if root in ("numpy", "cv2"):
+                    ancestor = parents.get(node)
+                    while ancestor is not None and not isinstance(
+                        ancestor, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ):
+                        ancestor = parents.get(ancestor)
+                    allowed = path.parent.name == "estimation" and ancestor is not None
+                    if root == "cv2":
+                        allowed = allowed and path.name == "tracking.py"
+                    if not allowed:
+                        offenders.append(f"{path.name}: eager or misplaced {name}")
     assert not offenders, f"leapcalib must stay standalone: {offenders}"
 
 
-def test_no_solver_or_service_package_is_advertised() -> None:
-    """P0 ships no solver and no worker, so neither may exist as a hollow module."""
-    assert not (LEAPCALIB_ROOT / "estimation").exists()
-    assert not (LEAPCALIB_ROOT / "runtime").exists()
+def test_candidate_methods_and_compute_only_runtime_exist() -> None:
+    """Offline solvers remain available beside the bounded compute-only worker."""
+    assert (LEAPCALIB_ROOT / "estimation" / "handeye.py").exists()
+    assert (LEAPCALIB_ROOT / "estimation" / "response.py").exists()
+    assert (LEAPCALIB_ROOT / "estimation" / "raw_response.py").exists()
+    assert (LEAPCALIB_ROOT / "runtime" / "server.py").exists()
+    forbidden = {"duckdb", "sqlite3", "leapflow", "pyrealsense2", "pyAgxArm", "rclpy"}
+    for path in (LEAPCALIB_ROOT / "runtime").glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module]
+            else:
+                continue
+            assert not forbidden.intersection(name.split(".")[0] for name in names), path
 
 
 def test_failure_codes_are_closed() -> None:

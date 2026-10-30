@@ -588,13 +588,13 @@ def test_cli_turns_a_missing_file_into_an_error_line_not_a_traceback(
     assert "error:" in capsys.readouterr().err
 
 
-def test_cli_advertises_only_the_three_implemented_verbs() -> None:
-    """A hollow ``estimate`` or ``serve`` in --help would be scripted against."""
-    for implemented in ("inspect", "replay", "budget"):
+def test_cli_advertises_implemented_compute_verbs_without_activation() -> None:
+    """Offline verbs and compute-only serve exist; activation stays owner-side."""
+    for implemented in ("inspect", "replay", "budget", "estimate", "shadow", "serve"):
         with pytest.raises(SystemExit) as caught:
             main([implemented, "--help"])
         assert caught.value.code == EXIT_OK
-    for absent in ("estimate", "serve"):
+    for absent in ("activate",):
         with pytest.raises(SystemExit) as caught:
             main([absent, "--help"])
         assert caught.value.code == EXIT_USAGE

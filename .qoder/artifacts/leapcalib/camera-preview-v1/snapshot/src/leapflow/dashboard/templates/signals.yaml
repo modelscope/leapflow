@@ -1,0 +1,221 @@
+# Signal Flow Observation template for LeapBoard
+# Provides real-time visibility into the signal processing pipeline.
+template: signals
+version: 1
+title: "Signal flow"
+domain: signals
+meta:
+  title: "Signal flow"
+  description: "Real-time signal processing pipeline health and live event stream."
+layout:
+  - type: Page
+    props:
+      title: "Signal flow"
+    children:
+      # Top health band: fan-out, trigger coverage, pressure, and observation yield.
+      - type: Row
+        props:
+          variant: metrics
+        children:
+          - type: Stat
+            props:
+              label: "Subscribers"
+              value: "{{ signal_metrics.event_subscriber_count }}"
+          - type: Stat
+            props:
+              label: "Active triggers"
+              value: "{{ signal_metrics.active_trigger_count }}"
+          - type: Stat
+            props:
+              label: "Active watches"
+              value: "{{ signal_metrics.active_watch_count }}"
+          - type: Stat
+            props:
+              label: "Stream events"
+              value: "{{ signal_metrics.signal_stream_count }}"
+          - type: Stat
+            props:
+              label: "Recent findings"
+              value: "{{ signal_metrics.recent_findings_count }}"
+          - type: Stat
+            props:
+              label: "Noise suppressed"
+              value: "{{ signal_metrics.signal_noise_suppressed }}"
+          - type: Stat
+            props:
+              label: "Buffer dropped"
+              value: "{{ signal_metrics.signal_buffer_dropped }}"
+          - type: Stat
+            props:
+              label: "Source dropped"
+              value: "{{ signal_metrics.composite_source_dropped }}"
+          - type: Stat
+            props:
+              label: "Reorder pending"
+              value: "{{ signal_metrics.reorder_buffer_pending }}"
+          - type: Stat
+            props:
+              label: "Debounced"
+              value: "{{ signal_metrics.total_debounced }}"
+
+      - type: Section
+        props:
+          title: "Signal health summary"
+          subtitle: "Ingress fan-out, pipeline pressure, and recent dimensional mix."
+        children:
+          - type: Grid
+            props:
+              cols: 3
+            children:
+              - type: Card
+                props:
+                  title: "Ingress"
+                children:
+                  - type: Row
+                    props:
+                      variant: meta
+                    children:
+                      - type: Stat
+                        props:
+                          label: "Subscribers"
+                          value: "{{ signal_metrics.event_subscriber_count }}"
+                      - type: Stat
+                        props:
+                          label: "Triggers"
+                          value: "{{ signal_metrics.active_trigger_count }}"
+                      - type: Stat
+                        props:
+                          label: "Watches"
+                          value: "{{ signal_metrics.active_watch_count }}"
+                      - type: Stat
+                        props:
+                          label: "Findings"
+                          value: "{{ signal_metrics.recent_findings_count }}"
+              - type: Card
+                props:
+                  title: "Pressure"
+                children:
+                  - type: Row
+                    props:
+                      variant: meta
+                    children:
+                      - type: Stat
+                        props:
+                          label: "Noise suppressed"
+                          value: "{{ signal_metrics.signal_noise_suppressed }}"
+                      - type: Stat
+                        props:
+                          label: "Buffer dropped"
+                          value: "{{ signal_metrics.signal_buffer_dropped }}"
+                      - type: Stat
+                        props:
+                          label: "Source dropped"
+                          value: "{{ signal_metrics.composite_source_dropped }}"
+                      - type: Stat
+                        props:
+                          label: "Reorder pending"
+                          value: "{{ signal_metrics.reorder_buffer_pending }}"
+                      - type: Stat
+                        props:
+                          label: "Debounced"
+                          value: "{{ signal_metrics.total_debounced }}"
+              - type: BarChart
+                when: event_family_distribution
+                props:
+                  title: "Recent event families"
+                  caption: "Event count by normalized family in the live ring buffer."
+                  bind: event_family_distribution
+              - type: BarChart
+                when: finding_severity_distribution
+                props:
+                  title: "Finding severity mix"
+                  caption: "Observation count by severity across recent findings."
+                  bind: finding_severity_distribution
+
+      - type: Grid
+        props:
+          cols: 3
+        children:
+          - type: Section
+            when: signal_stream
+            props:
+              title: "Live signal stream"
+              subtitle: "Latest daemon events · grouped by signal family · newest first."
+              span: 2
+            children:
+              - type: Custom
+                props:
+                  render: signalTimeline
+                  bind: signal_stream
+                  max_items: 12
+          - type: Section
+            when: watch_state_distribution
+            props:
+              title: "Watch state mix"
+              subtitle: "Current monitor lifecycle states."
+            children:
+              - type: BarChart
+                props:
+                  title: "Watch states"
+                  bind: watch_state_distribution
+
+      - type: Grid
+        props:
+          cols: 3
+        children:
+          - type: Section
+            when: watches
+            props:
+              title: "Watch portfolio"
+              subtitle: "Active and completed event-driven monitors."
+              span: 2
+            children:
+              - type: Table
+                props:
+                  bind: watches
+                  columns:
+                    - key: name
+                      label: "Name"
+                    - key: domain
+                      label: "Domain"
+                    - key: trigger
+                      label: "Trigger"
+                    - key: state
+                      label: "Status"
+                    - key: finding_count
+                      label: "Findings"
+          - type: Section
+            when: findings
+            props:
+              title: "Recent findings"
+              subtitle: "Latest observation results."
+            children:
+              - type: Grid
+                children:
+                  - type: FindingCard
+                    repeat: findings
+                    as: f
+                    props:
+                      title: "{{ f.title }}"
+                      summary: "{{ f.summary }}"
+                      severity: "{{ f.severity }}"
+                      bind: f
+
+      - type: Section
+        when: trigger_rows
+        props:
+          title: "Trigger coverage"
+          subtitle: "Event patterns registered with the monitor event bridge."
+        children:
+          - type: Table
+            props:
+              bind: trigger_rows
+              columns:
+                - key: watch
+                  label: "Watch"
+                - key: pattern
+                  label: "Pattern"
+                - key: triggered
+                  label: "Triggered"
+                - key: last_event
+                  label: "Last event"

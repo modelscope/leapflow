@@ -20,8 +20,10 @@ from leapflow.hardware.skills.args import validate_args
 from leapflow.hardware.skills.builtin.calibration import skills as calibration_skills
 from leapflow.hardware.skills.builtin.camera_calibration import skills as camera_skills
 from leapflow.hardware.skills.builtin.episode import skills as episode_skills
+from leapflow.hardware.skills.builtin.governed_calibration import skills as governed_calibration_skills
 from leapflow.hardware.skills.builtin.grasp_cycle import skills as cycle_skills
 from leapflow.hardware.skills.builtin.grasp_verify import skills as verify_skills
+from leapflow.hardware.skills.builtin.metric_readiness import skills as readiness_skills
 from leapflow.hardware.skills.builtin.motion import skills as motion_skills
 from leapflow.hardware.skills.builtin.policy import skills as policy_skills
 from leapflow.hardware.skills.builtin.scene import skills as scene_skills
@@ -111,6 +113,8 @@ def _builtin_skills() -> tuple[NodeSkill, ...]:
         *sequence_skills(),
         *calibration_skills(),
         *camera_skills(),
+        *readiness_skills(),
+        *governed_calibration_skills(),
         *scene_skills(),
         *policy_skills(),
         *episode_skills(),
@@ -127,6 +131,9 @@ def test_builtin_skills_satisfy_the_protocol_with_unique_ids() -> None:
     reads = {skill.spec.skill_id for skill in found if skill.spec.effect == EFFECT_READ}
     assert reads == {
         "arm.state",
+        "calib.metric_readiness",
+        "calib.inspect",
+        "calib.assess_motion",
         "perceive.locate",
         "perceive.snapshot",
         "perceive.lift",
@@ -255,7 +262,11 @@ def _example(schema: dict[str, object]) -> object:
     if kind == "array":
         item = _example(schema.get("items") or {})  # type: ignore[arg-type]
         return [item] * int(schema.get("minItems") or 1)  # type: ignore[call-overload]
-    return {"boolean": False, "string": "x", "integer": schema.get("minimum", 0)}.get(kind, schema.get("minimum", 0.0))  # type: ignore[arg-type]
+    if kind == "string":
+        return "x" * int(schema.get("minLength", 1))  # type: ignore[call-overload]
+    return {"boolean": False, "integer": schema.get("minimum", 0)}.get(
+        kind, schema.get("minimum", 0.0)
+    )  # type: ignore[arg-type]
 
 
 def test_every_builtin_schema_validates_its_own_example_shape() -> None:

@@ -1,0 +1,290 @@
+{
+  "schema": "leapflow.camera_preparation.v1",
+  "state": "draft_requires_evidence_and_approval",
+  "workcell": "piper_cell",
+  "node_id": "yahboom",
+  "stage_a_overlay": {
+    "calibration_acquisition": {
+      "camera_role": "camera.wrist",
+      "camera_method": "wrist",
+      "allowed_modes": [
+        "can"
+      ],
+      "settled": {
+        "max_feedback_age_s": 0.1,
+        "max_coherence_s": 0.08,
+        "feedback_uncertainty_s": 0.01,
+        "exposure_uncertainty_s": 0.04,
+        "receipt_uncertainty_s": 0.02,
+        "max_joint_drift_rad": 0.003,
+        "max_tcp_drift_mm": 2.0,
+        "max_tcp_rotation_deg": 0.5,
+        "joint_uncertainty_rad": 0.0005,
+        "tcp_uncertainty_mm": 0.5,
+        "rotation_uncertainty_deg": 0.1,
+        "poll_s": 0.05,
+        "timeout_s": 3.0,
+        "min_samples": 3,
+        "span_s": 0.5
+      },
+      "ttl_s": 3600,
+      "quota_bytes": 67108864,
+      "max_frames": 16
+    }
+  },
+  "device_config_patch": {
+    "device_id": "sensor_realsense_d405",
+    "transport.config.mount_digest": "d452133cbc8c79a4f29df4364f1f7a76a17ec710d3c7fc01ce1b70f3c3da66fe"
+  },
+  "runtime_config_patch": {
+    "hardware.calibration_worker_enabled": true
+  },
+  "mount": {
+    "mount_id": "sensor_realsense_d405:260422273928:seat-1",
+    "parent_frame": "flange",
+    "source": "declared",
+    "seated_at_s": 0.0,
+    "notes": "Installation seat identity; last disturbance time unrecorded"
+  },
+  "collect_args": {
+    "region": [
+      160,
+      120,
+      320,
+      240
+    ],
+    "frames": 1
+  },
+  "trial_args": {
+    "pairs": null,
+    "training": null,
+    "mount": {
+      "mount_id": "sensor_realsense_d405:260422273928:seat-1",
+      "parent_frame": "flange",
+      "source": "declared",
+      "seated_at_s": 0.0,
+      "notes": "Installation seat identity; last disturbance time unrecorded"
+    },
+    "prior": null,
+    "prior_uncertainty": null,
+    "tracking": {},
+    "solve": {},
+    "evaluation": {}
+  },
+  "stage_b_overlay": null,
+  "pose_batches": [],
+  "inflation_requirements": null,
+  "unresolved": [
+    "mount_confirmation",
+    "uncertainty_evidence",
+    "whole_link_geometry_evidence",
+    "rate_bound_evidence",
+    "wrist_prior_evidence",
+    "geometry",
+    "joint_rate_bounds_rad_s",
+    "endpoint_rate_bound_mm_s",
+    "rate_provenance_digest",
+    "reference_acquisition",
+    "reference_joints_deg",
+    "tool_transform",
+    "pairs",
+    "training",
+    "prior",
+    "prior_uncertainty"
+  ],
+  "readiness_blockers": [
+    "Proposed receipt + exposure uncertainty exceeds the trial stamp gate; obtain defensible bounds before collection, do not relax the gate"
+  ],
+  "trial_stamp_bound_s": 0.06,
+  "trial_stamp_gate_s": 0.05,
+  "deferred_inputs_template": {
+    "geometry": null,
+    "joint_rate_bounds_rad_s": null,
+    "endpoint_rate_bound_mm_s": null,
+    "rate_provenance_digest": null,
+    "reference_acquisition": null,
+    "reference_joints_deg": null,
+    "tool_transform": null,
+    "mount_confirmation": null,
+    "uncertainty_evidence": null,
+    "whole_link_geometry_evidence": null,
+    "rate_bound_evidence": null,
+    "wrist_prior_evidence": null,
+    "prior": null,
+    "prior_uncertainty": null,
+    "settled": {
+      "max_feedback_age_s": 0.1,
+      "max_coherence_s": 0.08,
+      "feedback_uncertainty_s": 0.01,
+      "exposure_uncertainty_s": 0.04,
+      "receipt_uncertainty_s": 0.02,
+      "max_joint_drift_rad": 0.003,
+      "max_tcp_drift_mm": 2.0,
+      "max_tcp_rotation_deg": 0.5,
+      "joint_uncertainty_rad": 0.0005,
+      "tcp_uncertainty_mm": 0.5,
+      "rotation_uncertainty_deg": 0.1,
+      "poll_s": 0.05,
+      "timeout_s": 3.0,
+      "min_samples": 3,
+      "span_s": 0.5
+    },
+    "mount": {
+      "mount_id": "sensor_realsense_d405:260422273928:seat-1",
+      "parent_frame": "flange",
+      "source": "declared",
+      "seated_at_s": 0.0,
+      "notes": "Installation seat identity; last disturbance time unrecorded"
+    },
+    "pose_step_deg": 1.0,
+    "run_timeout_s": 120.0
+  },
+  "run_timeout_assumption_requires_node_preview": true,
+  "proposed_settled_not_measured": true,
+  "not_human_work": [
+    "device IDs/streams/DH/limits",
+    "profile paths/overlay merge",
+    "mount digest encoding",
+    "same-session indexed anchor",
+    "rate and uncertainty evidence collection after authorization",
+    "pose targets, source-disjoint split and exact approval previews"
+  ],
+  "human_confirmation": [
+    "Rigid unchanged wrist seat; two scaled orthogonal views of camera/bracket/flange axes",
+    "Current clear work volume/table/obstacles; remove chair or include it in the measured keepouts",
+    "Static textured target in wrist view; empty jaws and accessible emergency stop with onsite supervision"
+  ],
+  "approval_sequence": [
+    "Backed-up exact source/tool deployment, config patches and one owner restart before anchor",
+    "Separately approved enable/reference positioning/speed setup; no blind return to stopped feedback",
+    "Stationary collection, exact Stage B config write then same-runtime skill.reload",
+    "Fresh bounded pose run approvals, then leased READ shadow trial; no activation"
+  ],
+  "physical_qualification": false,
+  "live_configuration_written": false,
+  "motion_performed": false,
+  "supporting_image_evidence": {
+    "schema": "leapflow.private_environment_evidence_manifest.v1",
+    "images": [
+      {
+        "path": "/Users/jason/work/leap_work/leapflow/temp/devices/env_images/\u5fae\u4fe1\u56fe\u7247_20261029201439_2_3.jpg",
+        "sha256": "406bf63f139f015207d09f14a2478a501a14eb76c7ceb06f0a11b1459e8ee9fa",
+        "size_bytes": 4912449,
+        "dimensions_px": [
+          5712,
+          4284
+        ],
+        "is_metric_measurement": false,
+        "is_calibration_factor_source": false
+      },
+      {
+        "path": "/Users/jason/work/leap_work/leapflow/temp/devices/env_images/\u5fae\u4fe1\u56fe\u7247_20261029201443_3_3.jpg",
+        "sha256": "e336c69b1d0020998e3e4d38809cc668e6eef7201c8455daadf489fcc07055ba",
+        "size_bytes": 5556869,
+        "dimensions_px": [
+          5712,
+          4284
+        ],
+        "is_metric_measurement": false,
+        "is_calibration_factor_source": false
+      },
+      {
+        "path": "/Users/jason/work/leap_work/leapflow/temp/devices/env_images/\u5fae\u4fe1\u56fe\u7247_20261029201446_4_3.jpg",
+        "sha256": "0817a59b06241f6d15ea3117c7a2680ad0045edb6ca574cf9c10c791f313e495",
+        "size_bytes": 5185290,
+        "dimensions_px": [
+          5712,
+          4284
+        ],
+        "is_metric_measurement": false,
+        "is_calibration_factor_source": false
+      },
+      {
+        "path": "/Users/jason/work/leap_work/leapflow/temp/devices/env_images/\u5fae\u4fe1\u56fe\u7247_20261029201448_5_3.jpg",
+        "sha256": "0f4264c118eebd35e58fd009aa3c5c07e31d850ef24403d4c6b4e3e7bdcb0936",
+        "size_bytes": 5165508,
+        "dimensions_px": [
+          5712,
+          4284
+        ],
+        "is_metric_measurement": false,
+        "is_calibration_factor_source": false
+      }
+    ],
+    "review_sha256": "ab8811da00d93d09335ca99aade7c5b89f477f63c98f5ef400f0549f3628951b",
+    "diagnostics": [
+      {
+        "path": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/environment-followup-v1/wrist-diagnostic.jpg",
+        "sha256": "5402e877de5ce2ddd99fc0c28c1d272694469b44c51d27775e15e0ef8f95a3c1",
+        "size_bytes": 27448,
+        "dimensions_px": [
+          640,
+          480
+        ],
+        "is_metric_measurement": false,
+        "is_calibration_factor_source": false
+      },
+      {
+        "path": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/environment-followup-v1/global-diagnostic.jpg",
+        "sha256": "9ef27483c8563403269d59b6a8ac1fd33e618c90080f97b5ac4389271e00c35c",
+        "size_bytes": 21955,
+        "dimensions_px": [
+          640,
+          480
+        ],
+        "is_metric_measurement": false,
+        "is_calibration_factor_source": false
+      }
+    ],
+    "remote_changes_performed": false,
+    "physical_qualification": false
+  },
+  "current_onsite_followup": [
+    "Confirm camera seat and clamped base are rigid and unchanged since the supplied photos; report last remount if known, or explicitly unknown. Do not loosen/reseat to find it.",
+    "Add two close-ups from front and side with a ruler/tape adjacent to the camera/bracket in the measured plane, showing the visible flange-to-gripper mounting seam and screw positions. Include a readable scale and note ruler resolution; report inaccessible landmarks instead of moving the arm.",
+    "Add one scaled overhead view tying the base mounting plate, front/rear/side table edges, cable hatch rectangle and camera pole foot to the same visible references. Include tabletop-to-base mounting-plane height if not flush. Measurements or CAD may replace ruler photos; unscaled photos remain topology evidence only.",
+    "Place and secure matte high-contrast printed/textured paper on the table in the wrist camera's central view, away from jaws. The small glossy gum box alone is not an adequate scene. Do not move/enable the arm to aim it; automation rechecks view and depth before choosing ROI.",
+    "Before any separately approved motion, keep jaws empty, clear loose items/chair from the swept region, and manage cable loops without disconnecting peripherals or disturbing mounts. Stop if routing requires moving the arm. Confirm accessible emergency stop and onsite supervision."
+  ],
+  "diagnostic_region_verified_for_tracking": false,
+  "source_files": [
+    {
+      "file": "probe.json",
+      "sha256": "d915c188ce58fc29fa2ac6debbfc71ce3a7a156c2adb9353fea2363a4b63bfaf"
+    },
+    {
+      "file": "inputs.json",
+      "sha256": "85b63ace312d73698df25762fcc54426b5fde663c98cc818a0d394ebbb762f77"
+    },
+    {
+      "file": "image-observations.json",
+      "sha256": "ab8811da00d93d09335ca99aade7c5b89f477f63c98f5ef400f0549f3628951b"
+    },
+    {
+      "file": "image-manifest.json",
+      "sha256": "9274be3817533e0d1216f195639d9490c7c9acfec7feb8ee0a26b84b66649b9b"
+    },
+    {
+      "file": "\u5fae\u4fe1\u56fe\u7247_20261029201439_2_3.jpg",
+      "sha256": "406bf63f139f015207d09f14a2478a501a14eb76c7ceb06f0a11b1459e8ee9fa"
+    },
+    {
+      "file": "\u5fae\u4fe1\u56fe\u7247_20261029201443_3_3.jpg",
+      "sha256": "e336c69b1d0020998e3e4d38809cc668e6eef7201c8455daadf489fcc07055ba"
+    },
+    {
+      "file": "\u5fae\u4fe1\u56fe\u7247_20261029201446_4_3.jpg",
+      "sha256": "0817a59b06241f6d15ea3117c7a2680ad0045edb6ca574cf9c10c791f313e495"
+    },
+    {
+      "file": "\u5fae\u4fe1\u56fe\u7247_20261029201448_5_3.jpg",
+      "sha256": "0f4264c118eebd35e58fd009aa3c5c07e31d850ef24403d4c6b4e3e7bdcb0936"
+    }
+  ],
+  "artifact_sha256": {
+    "stage-a.overlay.draft.yaml": "5f7d5d28539b421fbcc741c934719857bd2825df72bc1e774d6e186a324b3880",
+    "collect.args.json": "ac38abc41d54fdecbbb38a69e5ede2f3b606d91caf6c5e853c636bb6fa9052c1",
+    "deferred-inputs.template.json": "91a8f5dde5db8a297490523c52904848b274cb4b7d08ef73cc8a7e3e9a2c2758",
+    "trial.args.draft.json": "eee77463bde90638552b9ba4bdd7f614e26461116c32c6e828e642db776e4b39"
+  }
+}

@@ -1628,6 +1628,11 @@ hub = [
 huggingface = [
     { name = "huggingface-hub" },
 ]
+leapcalib = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
 leapspace = [
     { name = "cua-sandbox", marker = "python_full_version >= '3.11' and python_full_version < '3.14'" },
     { name = "pydantic" },
@@ -1672,6 +1677,7 @@ requires-dist = [
     { name = "modelscope-hub", marker = "extra == 'hub'", specifier = ">=0.4.5" },
     { name = "msgpack", specifier = ">=1.0.8" },
     { name = "numpy", marker = "extra == 'benchmark'", specifier = ">=1.24" },
+    { name = "numpy", marker = "extra == 'leapcalib'", specifier = ">=1.24" },
     { name = "numpy", marker = "extra == 'robot'", specifier = ">=1.24" },
     { name = "numpy", marker = "extra == 'vision'", specifier = ">=1.24" },
     { name = "openai", specifier = ">=1.40" },
@@ -1701,7 +1707,7 @@ requires-dist = [
     { name = "trafilatura", marker = "extra == 'web'", specifier = ">=2.2" },
     { name = "watchdog", specifier = ">=3.0" },
 ]
-provides-extras = ["dev", "hub", "huggingface", "anthropic", "web", "leapspace", "vision", "robot", "benchmark"]
+provides-extras = ["dev", "hub", "huggingface", "anthropic", "web", "leapspace", "leapcalib", "vision", "robot", "benchmark"]
 
 [[package]]
 name = "lxml"

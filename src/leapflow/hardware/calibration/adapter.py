@@ -27,6 +27,7 @@ from typing import Any, Mapping, Sequence
 from leapcalib.contracts.failures import (
     FAILURE_BUDGET_EXCEEDED,
     FAILURE_CLOCK_DOMAIN_MISMATCH,
+    FAILURE_DEADLINE,
     FAILURE_EVIDENCE_CORRUPT,
     FAILURE_GEOMETRY_ASSET_MISSING,
     FAILURE_INSUFFICIENT_EVIDENCE,
@@ -34,6 +35,7 @@ from leapcalib.contracts.failures import (
     FAILURE_PROVENANCE_REFUSED,
     FAILURE_SCHEMA,
     FAILURE_UNSUPPORTED_PARAMETER,
+    FAILURE_WORKER_UNAVAILABLE,
     CalibrationFailure,
 )
 from leapcalib.contracts.identity import (
@@ -79,6 +81,8 @@ CALIBRATION_FAILURE_MAP: Mapping[str, str] = {
     FAILURE_EVIDENCE_CORRUPT: hw.FAILURE_CALIBRATION_MISSING,
     # A stage that was designed but not delivered.
     FAILURE_NOT_IMPLEMENTED: hw.FAILURE_SKILL_UNAVAILABLE,
+    FAILURE_WORKER_UNAVAILABLE: hw.FAILURE_SKILL_UNAVAILABLE,
+    FAILURE_DEADLINE: hw.FAILURE_TIMEOUT,
 }
 
 

@@ -115,6 +115,9 @@ async def serve_node(
     # registry/config dependency is visible exactly where it is taken.
     from dataclasses import replace
 
+    from duckdb import Error as CacheIndexError
+
+    from leapflow.cache.manager import CacheManager
     from leapflow.config import load_config
     from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
     from leapflow.hardware.skills.runtime import SkillRuntime, SkillRuntimeSettings
@@ -122,6 +125,18 @@ async def serve_node(
     config = load_config()
     settings = HardwareSettings.from_settings(config)
     registry = HardwareRegistry(replace(settings, persist_readings=False, stream_enabled=False))
+    try:
+        cache = await asyncio.to_thread(
+            CacheManager,
+            config.profile_layout.cache,
+            profile_id=config.profile_manifest.profile_id,
+        )
+        registry.bind_persistence(cache_manager=cache)
+    except (OSError, ValueError, CacheIndexError):
+        logger.warning(
+            "Node evidence cache unavailable; cache-dependent diagnostics will refuse",
+            exc_info=True,
+        )
     registry.load()
     contexts = registry.contexts()
     if not contexts:
@@ -130,7 +145,17 @@ async def serve_node(
             "Declare devices (`leap hw list` shows the active profile's view) and retry.\n"
         )
 
+    from leapflow.hardware.calibration.worker import CalibrationWorker
+
+    worker = None
+    try:
+        worker = CalibrationWorker.from_settings(config)
+        registry.bind_calibration_worker(worker)
+    except (ValueError, TypeError):
+        logger.warning("Calibration worker configuration refused; existing skills remain available", exc_info=True)
     verifier = _load_permit_verifier(permit_issuer_keys or [], node_id=node_id)
+    if verifier is not None:
+        registry.bind_approval_keys(verifier.trusted_public_keys, node_id=verifier.node_id)
     skill_runtime = SkillRuntime(registry, settings=SkillRuntimeSettings.from_settings(config))
     server = LhpNodeServer(
         registry,
@@ -175,6 +200,8 @@ async def serve_node(
     finally:
         await server.stop()
         await skill_runtime.close()
+        if worker is not None:
+            await worker.close()
         await registry.close_all()
     logger.info("LHP node %r stopped", node_id)
     return 0

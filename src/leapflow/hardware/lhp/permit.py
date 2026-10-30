@@ -35,6 +35,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from cryptography.exceptions import InvalidSignature
@@ -355,6 +356,15 @@ class PermitVerifier:
     @property
     def trusted_key_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._trusted))
+
+    @property
+    def node_id(self) -> str:
+        return self._node_id
+
+    @property
+    def trusted_public_keys(self) -> Mapping[str, Ed25519PublicKey]:
+        """Read-only copy for historical signature checks; never a trust mutation."""
+        return MappingProxyType(dict(self._trusted))
 
     def verify(
         self,

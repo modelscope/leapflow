@@ -1,0 +1,21 @@
+{
+  "ok": true,
+  "schema": "leapflow.private_source_ops_verification.v1",
+  "checks": [
+    "read-only inspection",
+    "missing approval refuses writes",
+    "hash-bound backup",
+    "active supervisor refuses apply/restore",
+    "staging drift refuses apply",
+    "existing file modes preserved",
+    "later source drift refuses restore",
+    "no automatic service action",
+    "restore original bytes",
+    "new files quarantined, never deleted"
+  ],
+  "simulated_files_only": true,
+  "real_supervisor_called": false,
+  "remote_changes_performed": false,
+  "physical_motion_performed": false,
+  "source_ops_sha256": "5ad0ad166fbc915a6b8adc19053482521b25c9a8d7de8da9dff3e5bde5782d6a"
+}

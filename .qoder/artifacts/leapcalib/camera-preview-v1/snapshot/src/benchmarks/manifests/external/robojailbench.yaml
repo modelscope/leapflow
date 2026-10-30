@@ -1,0 +1,45 @@
+id: robojailbench
+version: "1.0.0"
+source: "https://purseclab.github.io/benchmark-for-robotics-security/"
+paper: "https://arxiv.org/abs/2605.19328"
+repo: "https://github.com/purseclab/benchmark-for-robotics-security"
+license: "UNKNOWN"
+setup_guidance: "Use the official RoboJailBench attack-defense evaluation pipeline with RJB-Instructions and its augmented image datasets. Configure benchmark.commands.robojailbench and benchmark.data_roots.robojailbench; emit the official ASR, security_rate, utility_rate, and su_hm metrics as JSON."
+official:
+  implementation: "purseclab/benchmark-for-robotics-security"
+  evaluator: "src_new/analysis_attack_defense.py and official attack-defense pipeline"
+  protocol: "Intent-contrast attack-defense evaluation"
+  dataset: "RJB-Instructions plus the official augmented RoboVQA, DROID, NVIDIA PhysicalAI AV, RH20T, and Robo2VLM data"
+  result_contract: "Final JSON line with asr, security_rate, utility_rate, and su_hm."
+adapter: robojailbench
+tier: 3
+tags:
+  - safety
+  - adversarial
+  - jailbreak
+  - embodied
+  - prompt-injection
+required: false
+dependencies:
+  - config:benchmark.commands.robojailbench
+  - config:benchmark.data_roots.robojailbench
+timeouts:
+  availability: 10.0
+  trial: 600.0
+seeds:
+  - 42
+metrics:
+  - asr
+  - security_rate
+  - utility_rate
+  - su_hm
+gates: {}
+scenarios:
+  - scenario_id: robojailbench_official_suite
+    name: "RoboJailBench official attack-defense suite"
+    description: "Official intent-contrast evaluation over RJB-Instructions and augmented datasets."
+    tags: [adversarial, jailbreak, official]
+    timeout_seconds: 7200.0
+    required: true
+    parameters:
+      official_metrics: [asr, security_rate, utility_rate, su_hm]

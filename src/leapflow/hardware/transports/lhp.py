@@ -35,7 +35,7 @@ import binascii
 import logging
 import math
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from leapflow.hardware.context import HardwareContext, Quality
 from leapflow.hardware.lhp.authority import WRITE_MODE_PERMIT_REQUIRED
@@ -95,6 +95,7 @@ class LhpTransport:
         self._frame_channels: set[str] = set()
         self._remote_write_mode: str = ""  # from hello
         self._remote_node_id: str = ""  # from hello
+        self._calibration_ack: tuple[str, ...] = ()
 
     # ── Lifecycle ──
 
@@ -171,6 +172,7 @@ class LhpTransport:
                         exc_info=True,
                     )
         self._frame_channels.clear()
+        self._calibration_ack = ()
         self._capabilities = frozenset()
         self._client = None
         self._connected = False
@@ -330,7 +332,10 @@ class LhpTransport:
         if not self._connected or client is None:
             return TransportStatus(connected=False, detail="lhp transport is not open")
         try:
-            result = await client.request("probe", {"device_id": self._remote_device_id})
+            params: dict[str, Any] = {"device_id": self._remote_device_id}
+            if self._calibration_ack:
+                params["calibration_ack"] = list(self._calibration_ack)
+            result = await client.request("probe", params)
         except LhpRemoteError as exc:
             return TransportStatus(
                 connected=False, halt_supported=False, detail=f"{exc.code}: {exc}"
@@ -338,13 +343,37 @@ class LhpTransport:
         if not isinstance(result, Mapping):
             return TransportStatus(connected=False, detail="malformed probe result")
         hub = result.get("frame_hub")
+        metadata = {"frame_hub": dict(hub)} if isinstance(hub, Mapping) else {}
+        self._calibration_ack = ()
+        packet = result.get("calibration_lifecycle")
+        if packet is not None:
+            from leapflow.hardware.calibration.lifecycle import validate_packet
+            try:
+                packet = validate_packet(packet, self._remote_device_id)
+                # Owner identities are checked before applying fleet namespacing.
+                host_device = self._context.device_id if self._context else self._remote_device_id
+                metadata["calibration_lifecycle"] = {**packet, "events": [
+                    {**event, "device_id": host_device} for event in packet["events"]
+                ]}
+            except (ValueError, TypeError):
+                logger.warning("Malformed calibration lifecycle probe; records not acknowledged", exc_info=True)
+                metadata["calibration_lifecycle_error"] = "owner lifecycle identity validation failed"
+        if result.get("calibration_lifecycle_error"):
+            metadata["calibration_lifecycle_error"] = "owner lifecycle unavailable; evolution disabled"
         return TransportStatus(
             connected=bool(result.get("connected", False)),
             halt_supported=bool(result.get("halt_supported", False)),
             detail=str(result.get("detail") or ""),
             latency_ms=float(result.get("latency_ms") or 0.0),
-            metadata={"frame_hub": dict(hub)} if isinstance(hub, Mapping) else {},
+            metadata=metadata,
         )
+
+    def acknowledge_calibration(self, identities: Sequence[str]) -> None:
+        """Queue only bounded IDs accepted by the host's unified signal entry."""
+        from leapflow.hardware.calibration.lifecycle import MAX_EVENTS
+        if len(identities) > MAX_EVENTS or any(not isinstance(identity, str) or len(identity) != 64 for identity in identities):
+            raise ValueError("bounded lifecycle acknowledgment identities required")
+        self._calibration_ack = tuple(identities)
 
     async def halt(self) -> TransportStatus:
         """Emergency stop. Never raises and is never serialised by callers.

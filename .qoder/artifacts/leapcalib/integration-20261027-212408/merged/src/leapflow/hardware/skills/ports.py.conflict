@@ -1,0 +1,429 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""The facade protocols a node skill reaches the workcell through.
+
+``protocol`` holds the contract's value types (specs, plans, outcomes, the
+geometry a perception pass reports); this module holds the ports those values
+flow through. A skill imports both, ``geometry``, and the standard library --
+nothing else -- so swapping an arm, a camera, a grasp planner, or a model never
+touches a skill.
+
+Every port reports failure as a ``SkillError``. A port never chooses on the
+model's behalf: perception returns every candidate it saw with its score, a
+grasp planner returns every candidate with its score, and the skill (or S2
+through the skill's arguments) picks by id.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+
+from leapflow.hardware.skills.geometry import Plane, Pose, Transform, WorkspaceBox
+from leapflow.hardware.skills.protocol import (
+    ArmState,
+    CloudObservation,
+    GraspCandidate,
+    GripperResult,
+    HeldObject,
+    LocatedObject,
+    MotionResult,
+    PixelTarget,
+    PolicyReport,
+    SkillOutcome,
+    SkillPlan,
+    SkillSpec,
+    TargetObservation,
+)
+
+# Pose path modes a ``move_tcp`` may request. ``""`` leaves the arm's default.
+PATH_DEFAULT = ""
+PATH_LINEAR = "linear"
+PATH_POINT = "point"
+
+
+@runtime_checkable
+class WorkcellView(Protocol):
+    """The declared workcell a skill runs in, with every tuning it declares."""
+
+    @property
+    def workcell_id(self) -> str: ...
+
+    def role(self, name: str) -> str:
+        """Device id bound to a role (``arm``, ``gripper``, ``camera.wrist``...), or ``""``."""
+        ...
+
+    @property
+    def gripper_spec(self) -> Mapping[str, float]:
+        """``max_width_mm`` and ``min_hold_width_mm``, resolved at admission."""
+        ...
+
+    @property
+    def grasp_verify(self) -> Mapping[str, float]: ...
+
+    @property
+    def home(self) -> Mapping[str, float]: ...
+
+    @property
+    def tool_cone_deg(self) -> float: ...
+
+    @property
+    def freshness(self) -> Mapping[str, float]:
+        """How far the world may drift between plan and execute (mm, deg)."""
+        ...
+
+    @property
+    def calibration(self) -> Mapping[str, float]:
+        """Acceptance thresholds of the calibration skills."""
+        ...
+
+
+@runtime_checkable
+class FrameView(Protocol):
+    """Calibrated frames and the workspace, resolved from versioned calibrations."""
+
+    def transform(self, name: str) -> Transform | None:
+        """``T_parent_frame`` for a declared frame, or None when uncalibrated."""
+        ...
+
+    def parent(self, name: str) -> str:
+        """The frame *name* is expressed in: ``flange`` or ``base`` (``""`` if unknown)."""
+        ...
+
+    def procedure(self, name: str) -> str:
+        """The calibration procedure that measures a frame or ``workspace`` (``""`` if none)."""
+        ...
+
+    @property
+    def workspace(self) -> WorkspaceBox | None: ...
+
+    @property
+    def table(self) -> Plane | None:
+        """The support surface measured with the workspace, or None when not measured."""
+        ...
+
+    @property
+    def versions(self) -> Mapping[str, float]: ...
+
+    def parameters(self, name: str) -> Mapping[str, Any]:
+        """The parameters recorded with a resolved frame; empty when unresolved."""
+        ...
+
+
+@runtime_checkable
+class MotionFacade(Protocol):
+    """Governed discrete motion. Every call goes through the node write gate."""
+
+    async def state(self) -> ArmState: ...
+
+    def check_target(self, pose: Pose) -> None:
+        """Raise ``SkillError`` (NONE) when *pose* is outside the allowed region."""
+        ...
+
+    def check_kinematics(self, state: ArmState) -> None:
+        """Refuse when declared FK disagrees with the arm's reported flange."""
+        ...
+
+    def check_joints(
+        self, targets: Mapping[str, float], current: Mapping[str, float] | None
+    ) -> Pose:
+        """Check a joint endpoint and path with FK; return its predicted TCP."""
+        ...
+
+    def check_cartesian_path(
+        self, state: ArmState, targets: Sequence[Pose]
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Bounded IK waypoints whose actual joint-space paths pass workspace checks."""
+        ...
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        """The pose path modes this arm declares (``linear``, ``point``); may be empty."""
+        ...
+
+    def reached(self, pose: Pose, state: ArmState) -> bool:
+        """Whether *state*'s TCP is at *pose* within the arm's declared tolerance."""
+        ...
+
+    async def move_tcp(
+        self, pose: Pose, *, speed_pct: float | None = None, path: str = PATH_DEFAULT
+    ) -> MotionResult: ...
+
+    async def move_joints(
+        self, targets: Mapping[str, float], *, speed_pct: float | None = None
+    ) -> MotionResult: ...
+
+    async def gripper(self, width_mm: float, *, effort: float | None = None) -> GripperResult:
+        """Drive the gripper and wait until its width is stable (the declared settling)."""
+        ...
+
+    async def pause(self, seconds: float) -> None:
+        """Hold still for *seconds*; raises at once when the run is stopped or out of time."""
+        ...
+
+
+@runtime_checkable
+class ScenePort(Protocol):
+    """Node-local perception of the workcell: what lies on the table, and what is held.
+
+    Objects and grasps are handles: ``locate`` names every object it found
+    ``oN`` and ``remember_grasps`` names candidates ``gN``; later calls refer to
+    them only by those ids. A frame shared with S2 is ``fN``, and what S2 points
+    at in it becomes an object through ``lift``. Nothing here matches labels or
+    breaks ties.
+    """
+
+    async def locate(
+        self, queries: Sequence[str], *, min_score: float | None = None
+    ) -> tuple[LocatedObject, ...]:
+        """Every detection of *queries* in a fresh frame, each under a new id."""
+        ...
+
+    async def snapshot(self) -> Mapping[str, Any]:
+        """A fresh frame, remembered as ``frame`` and shared downscaled as ``image``."""
+        ...
+
+    async def lift(
+        self,
+        frame_id: str,
+        targets: Sequence[PixelTarget],
+        *,
+        coords: str,
+        capture_id: str | None = None,
+    ) -> tuple[tuple[LocatedObject, ...], tuple[Mapping[str, str], ...]]:
+        """The base-frame objects under *targets* in a remembered frame, each under a new
+        id, and the targets that lifted to nothing (``label``, ``reason``)."""
+        ...
+
+    def object(self, object_id: str) -> LocatedObject:
+        """A remembered object; raises ``target_not_found`` when unknown or aged out."""
+        ...
+
+    async def relocate(self, obj: LocatedObject) -> LocatedObject:
+        """Measure *obj* again only where its approved geometry projects.
+
+        This never grounds by label or selects another candidate; it raises when
+        the approved candidate can no longer be measured in a fresh frame.
+        """
+        ...
+
+    def remember_grasps(
+        self, obj: LocatedObject, candidates: Sequence[GraspCandidate]
+    ) -> tuple[GraspCandidate, ...]:
+        """Name *candidates* for *obj* ``gN`` (replacing earlier grasps of that object)."""
+        ...
+
+    def grasp(self, grasp_id: str) -> GraspCandidate:
+        """A remembered grasp; raises ``target_not_found`` when unknown or aged out."""
+        ...
+
+    @property
+    def held(self) -> HeldObject | None: ...
+
+    def hold(self, held: HeldObject) -> None: ...
+
+    def release(self) -> HeldObject | None: ...
+
+
+@runtime_checkable
+class VisionPort(Protocol):
+    """Node-local camera measurements a calibration may take.
+
+    Two of them: the declared target's pose, and the raw measured surface. Both
+    stay on the node. Not seeing the target is ``target_not_found`` (NONE); a
+    missing target declaration or vision library is ``skill_unavailable``.
+    """
+
+    async def observe_target(self) -> TargetObservation: ...
+
+    async def observe_cloud(
+        self, *, near_mm: float | None = None, far_mm: float | None = None
+    ) -> CloudObservation:
+        """A fresh frame's valid depth points, in the camera frame.
+
+        The depth window is applied before the cloud is thinned, so a caller that
+        names the region it cares about gets its whole point budget there.
+        """
+        ...
+
+<<<<<<< /Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/tmp3cad0jeg/board
+=======
+
+@runtime_checkable
+class MetricReadinessPort(Protocol):
+    """Target-free bounded capture; raw samples stay in the owning node's cache."""
+
+    async def metric_readiness(
+        self,
+        *,
+        frames: int,
+        points: int,
+        role: str,
+        stamp_uncertainty_s: float,
+        ttl_s: float,
+        quota_bytes: int,
+    ) -> Mapping[str, Any]: ...
+
+>>>>>>> /Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/tmp3cad0jeg/host
+
+@runtime_checkable
+class GraspPlanner(Protocol):
+    """Turns a located object into gripper poses; one per workcell, chosen by config."""
+
+    @property
+    def name(self) -> str: ...
+
+    async def candidates(
+        self, obj: LocatedObject, *, table: Plane, current: Pose
+    ) -> tuple[GraspCandidate, ...]:
+        """Grasps for *obj* with scores; empty when this gripper cannot take it."""
+        ...
+
+
+@runtime_checkable
+class PolicyPort(Protocol):
+    """Node-local streaming of a served policy (``model:<name>``) under the safety shield.
+
+    Every streamed action passes envelope, slew and workspace checks and the node
+    write gate. Unavailable or unbound policies raise ``skill_unavailable``.
+    """
+
+    @property
+    def startup_s(self) -> float:
+        """Run-deadline room a run needs before its first action (bind, observe, infer)."""
+        ...
+
+    async def preview(self, name: str, task: str) -> PolicyReport:
+        """One observation and inference, filtered but never commanded."""
+        ...
+
+    async def run(
+        self,
+        name: str,
+        task: str,
+        *,
+        approved: Mapping[str, Any],
+        duration_s: float,
+        speed_pct: float | None = None,
+    ) -> PolicyReport:
+        """Stream the policy for at most *duration_s*; failures raise ``SkillError``.
+
+        *approved* is the plan basis (``model``, ``adapter_digest``). The binding
+        that streams is the one checked against it: a different model or
+        embodiment is ``plan_stale`` before anything moves.
+        """
+        ...
+
+
+@runtime_checkable
+class GraspVerificationPort(Protocol):
+    """A run's continuous qualified observer; read-only and no transport ownership."""
+
+    def admit(self, data: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def qualification(self) -> Mapping[str, Any]: ...
+
+    async def inspect(self) -> Mapping[str, Any]: ...
+
+    async def verify(
+        self, stage: str, *, samples: int, grasp: Mapping[str, Any] | None = None
+    ) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class SkillContext(Protocol):
+    """Everything a skill may touch. Nothing else is reachable from a skill."""
+
+    @property
+    def workcell(self) -> WorkcellView: ...
+
+    @property
+    def frames(self) -> FrameView: ...
+
+    @property
+    def motion(self) -> MotionFacade: ...
+
+    @property
+    def scene(self) -> ScenePort:
+        """Perception; raises ``SkillError`` when the workcell has no camera or locator."""
+        ...
+
+    @property
+    def grasp_planner(self) -> GraspPlanner:
+        """The workcell's grasp planner; raises ``SkillError`` when it is not installed."""
+        ...
+
+    @property
+    def vision(self) -> VisionPort:
+        """Calibration-target measurement; raises ``SkillError`` when there is no camera."""
+        ...
+
+    def camera_vision(self, role: str = "camera") -> VisionPort:
+        """Target observation through the named camera role and its mount."""
+        ...
+
+    @property
+    def grasp_verification(self) -> GraspVerificationPort: ...
+
+    @property
+    def policies(self) -> PolicyPort: ...
+
+    @property
+    def limits(self) -> Mapping[str, float]: ...
+
+    @property
+    def cancelled(self) -> bool: ...
+
+    @property
+    def recording(self) -> bool:
+        """Whether runs here are recorded as episodes (a run's own recording, once started)."""
+        ...
+
+    async def read(self, role: str, channel_ids: Sequence[str]) -> Mapping[str, Any]: ...
+
+    def record_calibration(
+        self,
+        procedure_id: str,
+        *,
+        role: str = "",
+        parameters: Mapping[str, Any] | None = None,
+        matrix: Sequence[Sequence[float]] | None = None,
+        pose: Mapping[str, Any] | None = None,
+        notes: str = "",
+    ) -> float:
+        """Persist a calibration version; returns its ``recorded_at``."""
+        ...
+
+    def note(self, key: str, value: Any) -> None:
+        """Attach evidence to the run (timings, verdicts, measured residuals)."""
+        ...
+
+
+@runtime_checkable
+class NodeSkill(Protocol):
+    """A node-local skill. See ``protocol`` for the two-phase contract."""
+
+    @property
+    def spec(self) -> SkillSpec: ...
+
+    async def plan(
+        self, ctx: SkillContext, args: Mapping[str, Any]
+    ) -> SkillPlan | SkillOutcome: ...
+
+    async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome: ...
+
+
+__all__ = [
+    "PATH_DEFAULT",
+    "PATH_LINEAR",
+    "PATH_POINT",
+    "FrameView",
+    "GraspPlanner",
+    "GraspVerificationPort",
+    "MotionFacade",
+    "MetricReadinessPort",
+    "NodeSkill",
+    "PolicyPort",
+    "ScenePort",
+    "SkillContext",
+    "VisionPort",
+    "WorkcellView",
+]

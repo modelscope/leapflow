@@ -14,18 +14,15 @@ Nothing under ``leapcalib`` may import ``leapflow``. In particular it must not
 import ``leapflow.engine.calibration``, which calibrates LLM token budgets and
 shares nothing with this package but a word.
 
-**Scope of this release.** Only the offline readiness layer exists: typed
-observation/parameter/estimate schemas, SI rigid-body geometry with explicit
-raw-versus-corrected joint spaces, geometry-asset availability, error budgets,
-and integrity-checked evidence bundles with replay. There are no solvers, no
-acquisition from live hardware, and no activation path. ``estimation/`` and
-``runtime/`` are deliberately absent rather than empty: an extension point with
-no consumer is scaffolding, and scaffolding is how an unimplemented capability
-starts looking like a delivered one.
+**Scope of this release.** Typed SI observations, integrity-checked replay,
+robust metric correspondence/motion candidates, and measured local xyz/yaw
+response fitting with bounded shadow proposals. Native mesh ICP, independently
+anchored joint zeros, live acquisition ownership, and activation are not shipped.
+Factory intrinsics and nominal/raw kinematics remain explicit priors.
 
-Everything here is stdlib-only, so a hardware node can import the contracts
-without a numerical stack. NumPy and friends belong to the solvers, and the
-solvers do not exist yet.
+Contracts, inspection, and geometry are stdlib-only. The optional NumPy backend
+loads only during solves in ``estimation``; importing or discovering methods
+does not require a numerical stack. There is no ``runtime`` service package.
 """
 
 from __future__ import annotations

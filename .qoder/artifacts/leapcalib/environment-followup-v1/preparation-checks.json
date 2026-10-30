@@ -1,0 +1,31 @@
+{
+  "ok": true,
+  "physical_qualification": false,
+  "photos_promoted_to_measurements": false,
+  "stage_b_overlay_created": false,
+  "pose_batches_created": false,
+  "timing_gate_relaxed": false,
+  "remote_changes_performed": false,
+  "calibration_factor_sources": [],
+  "unresolved": [
+    "mount_confirmation",
+    "uncertainty_evidence",
+    "whole_link_geometry_evidence",
+    "rate_bound_evidence",
+    "wrist_prior_evidence",
+    "geometry",
+    "joint_rate_bounds_rad_s",
+    "endpoint_rate_bound_mm_s",
+    "rate_provenance_digest",
+    "reference_acquisition",
+    "reference_joints_deg",
+    "tool_transform",
+    "pairs",
+    "training",
+    "prior",
+    "prior_uncertainty"
+  ],
+  "readiness_blockers": [
+    "Proposed receipt + exposure uncertainty exceeds the trial stamp gate; obtain defensible bounds before collection, do not relax the gate"
+  ]
+}

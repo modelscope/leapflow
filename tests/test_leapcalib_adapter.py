@@ -196,6 +196,7 @@ def test_all_declared_failures_map_to_planning_time_hardware_failures() -> None:
             hw.FAILURE_CALIBRATION_STALE,
             hw.FAILURE_CALIBRATION_MISSING,
             hw.FAILURE_SKILL_UNAVAILABLE,
+            hw.FAILURE_TIMEOUT,
         }
         assert mapped != hw.FAILURE_INTERNAL_DEFECT
 

@@ -226,11 +226,17 @@ def _cell(
     workcell: Mapping[str, Any] | None = None,
     intrinsics: CameraIntrinsics = SIM_INTRINSICS,
     render: bool = False,
+    additional_cameras: Mapping[str, tuple[str, CameraIntrinsics, bool]] | None = None,
 ) -> tuple[SkillRuntime, SimBoardCamera]:
     arm = SimArmTransport()
     camera = SimBoardCamera(arm, mounting, intrinsics=intrinsics, render=render)
+    devices = {CAMERA_ID: camera}
+    for device_id, (mode, camera_intrinsics, camera_render) in (additional_cameras or {}).items():
+        devices[device_id] = SimBoardCamera(
+            arm, mode, intrinsics=camera_intrinsics, render=camera_render,
+        )
     registry = SkillNodeRegistry(
-        arm, store_path=tmp_path / "instrument.duckdb", devices={CAMERA_ID: camera}
+        arm, store_path=tmp_path / "instrument.duckdb", devices=devices
     )
     registry.last_command = lambda device_id, channel_id: None  # type: ignore[method-assign]
     registry.calibrate("tcp.offset", pose={"x": 0, "y": 0, "z": TOOL_LENGTH_MM})
@@ -441,12 +447,11 @@ async def test_wrist_role_calibrates_without_borrowing_the_overview_camera(
         "parent": "flange", "procedure": "handeye.eye_in_hand",
     }}
     intrinsics = CameraIntrinsics(640, 480, 900., 900., 320., 240.)
-    runtime, overview = _cell(tmp_path, workcell=data)
-    wrist = SimBoardCamera(overview.arm, EYE_IN_HAND, intrinsics=intrinsics, render=render)
+    runtime, overview = _cell(
+        tmp_path, workcell=data,
+        additional_cameras={wrist_id: (EYE_IN_HAND, intrinsics, render)},
+    )
     registry = _registry(runtime)
-    registry.devices[wrist_id] = wrist
-    # The fixture registry describes every provided sensor as a camera.
-    runtime.reload_workcells()
     result = await _run(runtime, "calib.handeye", {**FAST, "camera": "camera.wrist"})
     assert result.ok, result
     frames = _frames(runtime)

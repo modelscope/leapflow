@@ -1,16 +1,10 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""``leap-calib``: look at recorded evidence, replay it, and size an error budget.
+"""``leap-calib``: inspect/replay evidence, estimate candidates and propose shadows.
 
-Three verbs, all offline and all read-only. ``inspect`` and ``replay`` answer
-questions about a stored bundle; ``budget`` answers whether a task's margin
-survives the delay and lever-arm terms before anybody spends a day collecting
-data for it.
-
-What is deliberately absent is ``estimate`` and ``serve``. Neither a solver nor a
-worker service exists, and a subcommand that exits with "not implemented" is
-worse than no subcommand: it appears in ``--help`` as a capability, gets scripted
-against, and is discovered to be hollow by whoever depended on it. They arrive
-with the code that implements them.
+All verbs are offline and compute-only. Optional result files are explicitly
+requested private artifacts, never an integrated database or activated model.
+The estimate/shadow verbs use concrete discovered methods and bounded inputs;
+the private serve command is compute-only, with no acquisition or actuator authority.
 
 Exit codes are meant for scripts: ``0`` success, ``1`` a typed calibration
 failure (including a budget that does not close, which is the normal way for
@@ -25,10 +19,15 @@ import math
 import sys
 from typing import Any, Sequence
 
-from leapcalib.contracts.failures import CalibrationFailure
+from leapcalib.contracts.failures import CalibrationFailure, FAILURE_NOT_IMPLEMENTED, FAILURE_SCHEMA
+from leapcalib.contracts.methods import discover_methods
+from leapcalib.contracts.motion import MotionObservation
+from leapcalib.contracts.task import TaskDomain, TaskState, TaskTransition
+from leapcalib.contracts.observations import Stamp
 from leapcalib.contracts.observations import JointObservation, RgbdObservation
 from leapcalib.validation.budget import TaskTolerance, observation_delay_budget
 from leapcalib.validation.bundle import DEFAULT_MAX_BYTES, ReplaySource, read_bundle
+from leapcalib.validation.result import read_request, result_payload, write_result
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -84,18 +83,26 @@ def _replay(args: argparse.Namespace) -> int:
     source = ReplaySource(bundle, only_accepted=args.only_accepted)
     rgbd: list[RgbdObservation] = []
     joints: list[JointObservation] = []
+    motions: list[MotionObservation] = []
+    transitions: list[TaskTransition] = []
     for observation in source.observations():
         if isinstance(observation, RgbdObservation):
             rgbd.append(observation)
-        else:
+        elif isinstance(observation, JointObservation):
             joints.append(observation)
+        elif isinstance(observation, MotionObservation):
+            motions.append(observation)
+        elif isinstance(observation, TaskTransition):
+            transitions.append(observation)
 
     streams = sorted({f"{o.stream.device_id}:{o.stream.stream}" for o in rgbd})
     payload = {
         "bundle_id": bundle.bundle_id,
         "topology_digest": source.topology_digest,
         "only_accepted": args.only_accepted,
-        "replayed": len(rgbd) + len(joints),
+        "replayed": len(rgbd) + len(joints) + len(motions) + len(transitions),
+        "motions": len(motions),
+        "task_transitions": len(transitions),
         "rgbd": len(rgbd),
         "joints": len(joints),
         "streams": streams,
@@ -153,16 +160,81 @@ def _budget(args: argparse.Namespace) -> int:
     return EXIT_OK if verdict.fits else EXIT_FAILURE
 
 
+def _estimate(args: argparse.Namespace) -> int:
+    bundle = read_bundle(args.bundle, max_bytes=args.max_bytes)
+    request = read_request(args.request)
+    method_id = args.method if args.command == "estimate" else "task_response.v1"
+    method = discover_methods().get(method_id)
+    if method is None:
+        raise CalibrationFailure(
+            FAILURE_NOT_IMPLEMENTED,
+            f"method {method_id!r} is not installed; install the current distribution",
+        )
+    try:
+        fit = method.solve(bundle, request)
+        content: dict[str, Any] = {
+            "estimate": fit.to_dict(),
+            "candidate_digest": fit.digest,
+            "shadow_only": True,
+            "evidence_digest": bundle.digest,
+        }
+        if args.command == "shadow":
+            from leapcalib.estimation.response import propose_shadow
+
+            content["proposal"] = propose_shadow(
+                fit,
+                TaskState.from_mapping(request["current"]),
+                request["target_m_rad"],
+                TaskDomain.from_mapping(request["domain"]),
+                Stamp.from_mapping(request["now"]),
+                topology_digest=request["topology_digest"],
+            )
+    except (KeyError, TypeError, ValueError) as error:
+        raise CalibrationFailure(FAILURE_SCHEMA, f"invalid numerical request: {error}") from error
+    payload = result_payload(content)
+    if args.output:
+        write_result(args.output, payload, overwrite=args.overwrite)
+    lines = [
+        f"candidate   {fit.digest}",
+        f"method      {fit.method_id}",
+        f"rank        {fit.metadata['data_rank']}",
+        f"supported   {', '.join(fit.supported_blocks) or 'none'}",
+        f"partial     {', '.join(fit.partial_blocks) or 'none'}",
+        f"retained    {', '.join(fit.retained_blocks) or 'none'}",
+        "authority   candidate/shadow only; no activation or motion",
+    ]
+    lines.extend(f"limitation  {text}" for text in fit.limitations)
+    if "proposal" in content:
+        lines.append(f"proposal    {content['proposal'].get('reason', '')}")
+    _emit(payload, as_json=args.json, lines=lines)
+    if "proposal" in content and not content["proposal"]["accepted"]:
+        return EXIT_FAILURE
+    return EXIT_OK if fit.supported_blocks or fit.partial_blocks else EXIT_FAILURE
+
+
+def _serve(args: argparse.Namespace) -> int:
+    from leapcalib.runtime.protocol import WorkerBudgets
+    from leapcalib.runtime.server import main as serve_main
+
+    if len(args.budgets_json) > 4096:
+        raise ValueError("worker budget configuration exceeds byte bound")
+    budgets = WorkerBudgets(**json.loads(args.budgets_json))
+    return serve_main(args.socket, budgets)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="leap-calib",
         description=(
-            "Offline calibration evidence tooling. Inspects and replays recorded "
-            "observations and sizes task error budgets; it solves nothing and "
-            "touches no hardware."
+            "Offline calibration tooling: inspect/replay, bounded candidates, "
+            "task-local shadows and error budgets. No hardware or activation authority."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    worker = subparsers.add_parser("serve", help="serve compute-only jobs on an explicit private Unix socket")
+    worker.add_argument("--socket", required=True, help="absolute path under an owner-private 0700 directory")
+    worker.add_argument("--budgets-json", default="{}", help="bounded worker budgets; cannot exceed initial ceilings")
+    worker.set_defaults(handler=_serve)
 
     def add_bundle_args(sub: argparse.ArgumentParser) -> None:
         sub.add_argument("bundle", help="path to an evidence bundle JSON file")
@@ -188,6 +260,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="replay only the accepted split, leaving held-out samples untouched",
     )
     replay.set_defaults(handler=_replay)
+
+    for command in ("estimate", "shadow"):
+        solver = subparsers.add_parser(
+            command,
+            help="compute a candidate"
+            if command == "estimate"
+            else "fit measured response and propose a bounded shadow",
+        )
+        add_bundle_args(solver)
+        solver.add_argument(
+            "--request",
+            required=True,
+            help="bounded JSON request: prior/config or domain/current/target/now",
+        )
+        solver.add_argument("--output", help="optional private result artifact (never activation)")
+        solver.add_argument(
+            "--overwrite", action="store_true", help="explicitly replace the result file"
+        )
+        if command == "estimate":
+            solver.add_argument(
+                "--method", required=True, help="installed leapcalib.methods identifier"
+            )
+        solver.set_defaults(handler=_estimate)
 
     budget = subparsers.add_parser(
         "budget",

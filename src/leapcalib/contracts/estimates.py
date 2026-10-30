@@ -41,7 +41,18 @@ from leapcalib.contracts.parameters import (
 from leapcalib.contracts.units import canonical_number
 
 SCHEMA_VERSION = "leapcalib.estimate.v0"
-"""Schema identity of an estimate bundle. ``v0``: no solver has produced one yet."""
+"""Schema identity of a candidate estimate bundle; support never grants activation."""
+
+
+def _array(value: Any, *, maximum: int) -> list[Any] | tuple[Any, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) > maximum:
+        raise ValueError("bounded estimate array required before decoding")
+    return value
+
+
+def _text(value: Any, *, allow_empty: bool = False) -> None:
+    if not isinstance(value, str) or len(value) > 4096 or (not allow_empty and not value.strip()):
+        raise ValueError("bounded typed estimate identity/text required")
 
 
 @dataclass(frozen=True)
@@ -80,7 +91,7 @@ class ParameterEstimate:
     def _check_support(self) -> None:
         dimension = self.block.dimension
         indices = set(self.supported_components)
-        if any(not isinstance(i, int) or i < 0 or i >= dimension for i in indices):
+        if any(type(i) is not int or i < 0 or i >= dimension for i in indices):
             raise ValueError("supported components must index the block")
         if len(indices) != len(self.supported_components):
             raise ValueError("supported components must be unique")
@@ -145,18 +156,28 @@ class ParameterEstimate:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ParameterEstimate":
+        if not isinstance(data, Mapping) or set(data) - set(cls.__dataclass_fields__):
+            raise ValueError("unknown parameter estimate fields")
+        for name in ("values", "prior", "uncertainty", "prior_uncertainty"):
+            _array(data.get(name), maximum=1024)
+        for name in ("supported_components", "gauge_anchors", "limitations"):
+            _array(data.get(name, ()), maximum=1024)
+        _text(data.get("method_id", ""), allow_empty=True)
+        for name in ("gauge_anchors", "limitations"):
+            for value in data.get(name, ()):
+                _text(value)
         return cls(
             block=ParameterBlock.from_mapping(data["block"]),
-            values=tuple(float(v) for v in data["values"]),
-            prior=tuple(float(v) for v in data["prior"]),
-            support=str(data["support"]),
-            uncertainty=tuple(float(v) for v in data["uncertainty"]),
-            prior_uncertainty=tuple(float(v) for v in data["prior_uncertainty"]),
-            supported_components=tuple(int(i) for i in data.get("supported_components") or ()),
-            gauge_anchors=tuple(str(g) for g in data.get("gauge_anchors") or ()),
-            method_id=str(data.get("method_id") or ""),
-            accepted_count=int(data.get("accepted_count") or 0),
-            limitations=tuple(str(x) for x in data.get("limitations") or ()),
+            values=tuple(data["values"]),
+            prior=tuple(data["prior"]),
+            support=data["support"],
+            uncertainty=tuple(data["uncertainty"]),
+            prior_uncertainty=tuple(data["prior_uncertainty"]),
+            supported_components=tuple(data.get("supported_components", ())),
+            gauge_anchors=tuple(data.get("gauge_anchors", ())),
+            method_id=data.get("method_id", ""),
+            accepted_count=data.get("accepted_count", 0),
+            limitations=tuple(data.get("limitations", ())),
         )
 
 
@@ -206,13 +227,16 @@ class EstimateBundle:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.bundle_id.strip():
-            raise ValueError("an estimate bundle needs a nonempty id")
+        _text(self.bundle_id)
+        _text(self.method_id, allow_empty=True)
         if self.schema_version != SCHEMA_VERSION:
             raise ValueError(f"unsupported estimate schema {self.schema_version!r}")
         object.__setattr__(self, "estimates", tuple(self.estimates))
         for name in ("accepted_ids", "rejected_ids", "holdout_ids", "limitations"):
-            object.__setattr__(self, name, tuple(getattr(self, name)))
+            values = _array(getattr(self, name), maximum=4096)
+            for value in values:
+                _text(value)
+            object.__setattr__(self, name, tuple(values))
         groups = (set(self.accepted_ids), set(self.rejected_ids), set(self.holdout_ids))
         names = (self.accepted_ids, self.rejected_ids, self.holdout_ids)
         if any(len(group) != len(values) for group, values in zip(groups, names)):
@@ -251,17 +275,25 @@ class EstimateBundle:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "EstimateBundle":
+        if not isinstance(data, Mapping) or set(data) - set(cls.__dataclass_fields__):
+            raise ValueError("unknown estimate bundle fields")
+        estimates = _array(data.get("estimates"), maximum=128)
+        for name in ("accepted_ids", "rejected_ids", "holdout_ids", "limitations"):
+            _array(data.get(name, ()), maximum=4096)
+        metadata = data.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise ValueError("estimate metadata must be a mapping")
         return cls(
-            bundle_id=str(data["bundle_id"]),
+            bundle_id=data["bundle_id"],
             topology=TopologyIdentity.from_mapping(data["topology"]),
-            estimates=tuple(ParameterEstimate.from_mapping(e) for e in data["estimates"]),
-            accepted_ids=tuple(str(i) for i in data.get("accepted_ids") or ()),
-            rejected_ids=tuple(str(i) for i in data.get("rejected_ids") or ()),
-            holdout_ids=tuple(str(i) for i in data.get("holdout_ids") or ()),
-            method_id=str(data.get("method_id") or ""),
-            schema_version=str(data.get("schema_version") or SCHEMA_VERSION),
-            limitations=tuple(str(x) for x in data.get("limitations") or ()),
-            metadata=dict(data.get("metadata") or {}),
+            estimates=tuple(ParameterEstimate.from_mapping(e) for e in estimates),
+            accepted_ids=tuple(data.get("accepted_ids", ())),
+            rejected_ids=tuple(data.get("rejected_ids", ())),
+            holdout_ids=tuple(data.get("holdout_ids", ())),
+            method_id=data.get("method_id", ""),
+            schema_version=data.get("schema_version", SCHEMA_VERSION),
+            limitations=tuple(data.get("limitations", ())),
+            metadata=dict(metadata),
         )
 
     @property

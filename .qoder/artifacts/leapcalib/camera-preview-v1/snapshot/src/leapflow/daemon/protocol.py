@@ -1,0 +1,545 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""JSON-RPC 2.0 protocol types and LeapService interface for leapd.
+
+The protocol layer defines:
+
+1. **Message types** — JSON-RPC request, response, notification, and error
+2. **LeapService** — the abstract service interface that both in-process
+   and daemon modes implement
+3. **Method registry** — ``domain.action`` naming convention
+
+Wire format: newline-delimited JSON over Unix socket.
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import asdict, dataclass, field
+from enum import IntEnum
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Protocol, runtime_checkable
+
+
+class ErrorCode(IntEnum):
+    """Standard JSON-RPC 2.0 error codes plus application-specific ones."""
+    PARSE_ERROR = -32700
+    INVALID_REQUEST = -32600
+    METHOD_NOT_FOUND = -32601
+    INVALID_PARAMS = -32602
+    INTERNAL_ERROR = -32603
+
+    # Application-specific (reserved range: -32000 to -32099)
+    DATABASE_LOCKED = -32001
+    SESSION_NOT_FOUND = -32002
+    SKILL_NOT_FOUND = -32003
+    CANCELLED = -32004
+
+
+@dataclass(frozen=True)
+class RpcError:
+    """JSON-RPC error object."""
+    code: int
+    message: str
+    data: Optional[Any] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {"code": self.code, "message": self.message}
+        if self.data is not None:
+            d["data"] = self.data
+        return d
+
+
+@dataclass(frozen=True)
+class RpcRequest:
+    """JSON-RPC 2.0 request."""
+    method: str
+    params: Dict[str, Any] = field(default_factory=dict)
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    jsonrpc: str = "2.0"
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> RpcRequest:
+        return cls(
+            method=data["method"],
+            params=data.get("params", {}),
+            id=data.get("id", uuid.uuid4().hex[:12]),
+        )
+
+
+@dataclass(frozen=True)
+class RpcResponse:
+    """JSON-RPC 2.0 response (success or error)."""
+    id: str
+    result: Optional[Any] = None
+    error: Optional[RpcError] = None
+    jsonrpc: str = "2.0"
+
+    def to_json(self) -> str:
+        d: Dict[str, Any] = {"jsonrpc": self.jsonrpc, "id": self.id}
+        if self.error is not None:
+            d["error"] = self.error.to_dict()
+        else:
+            d["result"] = self.result
+        return json.dumps(d, ensure_ascii=False)
+
+    @classmethod
+    def success(cls, request_id: str, result: Any = None) -> RpcResponse:
+        return cls(id=request_id, result=result)
+
+    @classmethod
+    def fail(cls, request_id: str, code: int, message: str, data: Any = None) -> RpcResponse:
+        return cls(id=request_id, error=RpcError(code=code, message=message, data=data))
+
+
+@dataclass(frozen=True)
+class RpcNotification:
+    """JSON-RPC 2.0 notification (no id, no response expected)."""
+    method: str
+    params: Dict[str, Any] = field(default_factory=dict)
+    jsonrpc: str = "2.0"
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False)
+
+
+@dataclass(frozen=True)
+class StreamChunk:
+    """A single streaming chunk for daemon engine events."""
+    request_id: str
+    content: str
+    done: bool = False
+    event_type: Literal[
+        "chunk",
+        "final",
+        "tool_start",
+        "tool_complete",
+        "thinking",
+        "status",
+        "error",
+        "approval_request",
+        "approval_response",
+        "frame",
+    ] = "chunk"
+    metadata: Optional[Dict[str, Any]] = None
+
+    def to_notification(self) -> RpcNotification:
+        params: Dict[str, Any] = {
+            "id": self.request_id,
+            "content": self.content,
+            "done": self.done,
+            "event_type": self.event_type,
+        }
+        if self.metadata:
+            params["metadata"] = self.metadata
+        return RpcNotification(method="stream.chunk", params=params)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# LeapService — the contract between client and daemon
+# ══════════════════════════════════════════════════════════════════════
+
+@runtime_checkable
+class LeapService(Protocol):
+    """Service interface for leapd operations.
+
+    Both in-process mode and daemon mode implement this protocol.
+    Client code is agnostic to whether it talks to a local object
+    or a remote daemon over Unix socket.
+    """
+
+    async def signal_record(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Record a signal (observation, action, event)."""
+        ...
+
+    async def memory_search(
+        self, query: str, *, limit: int = 10, workspace_root: str = ""
+    ) -> List[Dict[str, Any]]:
+        """Search memory across all providers, scoped to the caller's workspace."""
+        ...
+
+    async def memory_insert(
+        self, content: str, kind: str = "fact", *, workspace_root: str = "", **kwargs: Any
+    ) -> str:
+        """Insert a memory entry tagged with the caller's workspace. Returns entry_id."""
+        ...
+
+    async def session_create(self, **kwargs: Any) -> Dict[str, Any]:
+        """Create a new conversation session."""
+        ...
+
+    async def session_resume(self, session_id: str) -> Dict[str, Any]:
+        """Resume an existing session."""
+        ...
+
+    async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+        """Chat with the engine (streaming). Yields StreamChunks."""
+        ...
+
+    async def engine_cancel(self, request_id: str = "") -> bool:
+        """Cancel the currently running engine task (optionally a specific request)."""
+        ...
+
+    async def skill_execute(self, skill_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a skill by name."""
+        ...
+
+    async def scheduler_arm(self, task_config: Dict[str, Any]) -> str:
+        """Arm a scheduled task. Returns task_id."""
+        ...
+
+    # ── Watch runtime (monitor subsystem) ──
+
+    async def watch_arm(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Arm a monitor watch. Returns its runtime view."""
+        ...
+
+    async def watch_list(self) -> List[Dict[str, Any]]:
+        """List all watches."""
+        ...
+
+    async def watch_get(self, watch_id: str) -> Dict[str, Any]:
+        """Return a single watch view."""
+        ...
+
+    async def watch_pause(self, watch_id: str) -> Dict[str, Any]:
+        """Suspend a watch until resumed."""
+        ...
+
+    async def watch_resume(self, watch_id: str) -> Dict[str, Any]:
+        """Re-arm a suspended watch."""
+        ...
+
+    async def watch_stop(self, watch_id: str) -> Dict[str, Any]:
+        """Terminally stop a watch (kept for history)."""
+        ...
+
+    async def watch_mute(self, watch_id: str, muted: bool = True) -> Dict[str, Any]:
+        """Toggle whether a watch's findings are pushed to view clients."""
+        ...
+
+    async def watch_refresh(self, watch_id: str) -> Dict[str, Any]:
+        """Run one observation cycle immediately (manual refresh)."""
+        ...
+
+    async def watch_findings(
+        self, watch_id: str = "", limit: int = 50, offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        """Return persisted findings, newest first."""
+        ...
+
+    async def session_history(self, limit: int = 200, session_id: str = "") -> Dict[str, Any]:
+        """Return a session's transcript and counts (empty id = current session)."""
+        ...
+
+    async def session_detail(
+        self,
+        session_id: str,
+        limit: int = 200,
+        offset: int = 0,
+        include_inactive: bool = True,
+        workspace_root: str = "",
+    ) -> Dict[str, Any]:
+        """Return a persisted historical session transcript by id."""
+        ...
+
+    async def session_analyze(self) -> Dict[str, Any]:
+        """Ensure a session-analysis watch and run one analysis cycle now."""
+        ...
+
+    async def evolution_run(
+        self,
+        *,
+        session_id: str,
+        reason: str = "manual",
+        wait: bool = False,
+        timeout_s: float = 180.0,
+    ) -> Dict[str, Any]:
+        """Finalize one explicitly named session and enqueue durable teacher work."""
+        ...
+
+    async def evolution_projection(
+        self,
+        *,
+        session_id: str,
+        rebuild: bool = False,
+    ) -> Dict[str, Any]:
+        """Return the event projection for one explicitly named session."""
+        ...
+
+    async def evolution_projection_aggregate(
+        self,
+        *,
+        rebuild: bool = False,
+    ) -> Dict[str, Any]:
+        """Return the explicitly cross-session profile projection."""
+        ...
+
+    async def status(self, session_id: str = "") -> Dict[str, Any]:
+        """Return daemon status (uptime, connections, db path, etc.).
+
+        ``session_id`` scopes the reply to the caller's session; without it no
+        session identity or per-session context figures are reported, since any
+        the daemon picked would belong to a different client.
+        """
+        ...
+
+    async def host_status(self) -> Dict[str, Any]:
+        """Return host backend status."""
+        ...
+
+    async def host_start(self) -> Dict[str, Any]:
+        """Start the host backend if available."""
+        ...
+
+    async def host_stop(self) -> Dict[str, Any]:
+        """Stop the host backend and keep the daemon runtime alive."""
+        ...
+
+    async def host_restart(self) -> Dict[str, Any]:
+        """Restart the host backend."""
+        ...
+
+    async def hardware_pause(self, device: str = "") -> Dict[str, Any]:
+        """Pause the daemon-owned sampling loop for one device.
+
+        Daemon-global like ``host_*``: hardware sampling is shared daemon state,
+        not session state, so this takes no ``session_id`` and returns none. It
+        does not occupy a turn-admission slot -- it is a direct control action,
+        not a turn -- which is what makes it safe to invoke from concurrent TUIs:
+        the effect is shared and visible to every connected client, which is the
+        point of a direct human intervention.
+        """
+        ...
+
+    async def hardware_resume(self, device: str = "") -> Dict[str, Any]:
+        """Resume the daemon-owned sampling loop for one device.
+
+        Daemon-global like ``host_*``: hardware sampling is shared daemon state,
+        not session state, so this takes no ``session_id`` and returns none. It
+        does not occupy a turn-admission slot and is safe to invoke from
+        concurrent TUIs; the resumed sampling is shared and visible to every
+        connected client.
+        """
+        ...
+
+    async def hardware_inventory(self) -> Dict[str, Any]:
+        """List admitted devices grouped by declared class.
+
+        Daemon-global and read-only: no transport is opened and nothing is probed,
+        which is what makes it safe to expose to a browser session through the board.
+        """
+        ...
+
+    async def hardware_device(self, device: str = "") -> Dict[str, Any]:
+        """Describe one device's channels, sampled values, controls and previews.
+
+        Read-only, and values come from the sampling ring rather than a fresh read:
+        opening a device page must not be the reason a bus is busy.
+        """
+        ...
+
+    async def hardware_rescan(self) -> Dict[str, Any]:
+        """Re-run discovery and converge on the new device set.
+
+        Daemon-global and shared: the new capability set applies to every connected
+        client at its next turn, exactly as a plugin install does.
+        """
+        ...
+
+    async def hardware_frame(
+        self,
+        device: str = "",
+        channel: str = "",
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        viewer_id: str = "",
+    ) -> Dict[str, Any]:
+        """Return one base64 frame from a previewable channel.
+
+        Gated by the approval chain on the declared privacy tier, and fail-closed: with
+        no gate installed, or a gate that raises, the frame is refused. The reply either
+        carries ``data_b64`` or a ``code`` and an ``error`` naming where consent is given.
+        ``fps``, ``max_width`` and ``quality`` are bounded by the runtime and declaration
+        ceilings, so a board profile can reduce work but cannot ask the device for an
+        unbounded capture stream.
+
+        Routed (see ``_APPROVAL_ROUTED_METHODS``): the prompt is delivered as an
+        interleaved ``stream.chunk`` notification on this request's own socket, so a
+        caller that passes ``on_stream_event`` can present it and answer via
+        ``approval.resolve`` while this call is still waiting.
+        """
+        ...
+
+    async def hardware_preview_stream(
+        self,
+        device: str = "",
+        channel: str = "",
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        viewer_id: str = "",
+    ) -> AsyncIterator[StreamChunk]:
+        """Yield latest-only preview frames over one daemon stream connection."""
+        ...
+
+    async def hardware_preview_release(
+        self, device: str = "", channel: str = "", viewer_id: str = ""
+    ) -> Dict[str, Any]:
+        """Release one preview owner immediately without opening hardware."""
+        ...
+
+    async def hardware_preview_status(self) -> Dict[str, Any]:
+        """Return in-memory active preview metrics without image bytes."""
+        ...
+
+    async def hardware_read(self, device: str = "", channel: str = "", viewer_id: str = "") -> Dict[str, Any]:
+        """Read one channel's current value through the approval chain.
+
+        A fresh transport read, unlike the sampled value on the device page -- which is why
+        it is an explicit call rather than part of a board refresh. Routed for the same
+        reason ``hardware_frame`` is: a privacy-gated channel needs somewhere to ask.
+        """
+        ...
+
+    async def hardware_write_request(
+        self, device: str = "", channel: str = "", value: Any = None, dry_run: bool = True
+    ) -> Dict[str, Any]:
+        """Preview (``dry_run=True``) or submit a channel write.
+
+        Delegates to the ordinary ``hw_configure``/``hw_actuate``/``hw_dispense`` handler,
+        chosen from the channel's *declared* effect class, so there is one write path with
+        one set of feasibility checks and one approval descriptor. Defaults to a dry run.
+        """
+        ...
+
+    async def tools_list(self) -> Dict[str, Any]:
+        """Return available tool groups for slash-command rendering."""
+        ...
+
+    async def usage_summary(self) -> Dict[str, Any]:
+        """Return token usage for the current daemon session."""
+        ...
+
+    async def app_command(self, args: str = "") -> Dict[str, Any]:
+        """Return an App Connector slash-command payload."""
+        ...
+
+    async def command_execute(self, name: str, args: str = "", session_id: str = "") -> Dict[str, Any]:
+        """Execute any engine-routed slash command and return structured result."""
+        ...
+
+    async def approval_status(self) -> Dict[str, Any]:
+        """Return pending approval requests."""
+        ...
+
+    async def approval_resolve(
+        self,
+        pending_id: str,
+        decision: str,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Resolve a pending approval request."""
+        ...
+
+    async def approval_cancel(self, pending_id: str, reason: str = "cancelled") -> Dict[str, Any]:
+        """Cancel a pending approval request."""
+        ...
+
+    async def shutdown(self) -> None:
+        """Graceful shutdown."""
+        ...
+
+    # ── Gateway ──────────────────────────────────────────────────────
+
+    async def gateway_connect(
+        self,
+        platform: str,
+        credentials: Dict[str, str],
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Connect a platform via the gateway."""
+        ...
+
+    async def gateway_disconnect(self, platform: str) -> Dict[str, Any]:
+        """Disconnect a platform."""
+        ...
+
+    async def gateway_status(self) -> List[Dict[str, Any]]:
+        """Return status of all gateway platforms."""
+        ...
+
+    async def gateway_send(
+        self,
+        platform: str,
+        chat_id: str,
+        text: str,
+        thread_id: str = "",
+    ) -> Dict[str, Any]:
+        """Send a message to a connected platform conversation."""
+        ...
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Method registry — maps JSON-RPC method names to LeapService methods
+# ══════════════════════════════════════════════════════════════════════
+
+METHOD_REGISTRY: Dict[str, str] = {
+    "signal.record": "signal_record",
+    "memory.search": "memory_search",
+    "memory.insert": "memory_insert",
+    "session.create": "session_create",
+    "session.resume": "session_resume",
+    "engine.chat": "engine_chat",
+    "engine.cancel": "engine_cancel",
+    "skill.execute": "skill_execute",
+    "scheduler.arm": "scheduler_arm",
+    "watch.arm": "watch_arm",
+    "watch.list": "watch_list",
+    "watch.get": "watch_get",
+    "watch.pause": "watch_pause",
+    "watch.resume": "watch_resume",
+    "watch.stop": "watch_stop",
+    "watch.mute": "watch_mute",
+    "watch.refresh": "watch_refresh",
+    "watch.findings": "watch_findings",
+    "session.history": "session_history",
+    "session.detail": "session_detail",
+    "session.analyze": "session_analyze",
+    "evolution.run": "evolution_run",
+    "evolution.projection": "evolution_projection",
+    "evolution.projection.aggregate": "evolution_projection_aggregate",
+    "daemon.status": "status",
+    "daemon.shutdown": "shutdown",
+    "host.status": "host_status",
+    "host.start": "host_start",
+    "host.stop": "host_stop",
+    "host.restart": "host_restart",
+    "hardware.pause": "hardware_pause",
+    "hardware.resume": "hardware_resume",
+    "hardware.inventory": "hardware_inventory",
+    "hardware.device": "hardware_device",
+    "hardware.rescan": "hardware_rescan",
+    "hardware.frame": "hardware_frame",
+    "hardware.preview.stream": "hardware_preview_stream",
+    "hardware.preview.release": "hardware_preview_release",
+    "hardware.preview.status": "hardware_preview_status",
+    "hardware.read": "hardware_read",
+    "hardware.write_request": "hardware_write_request",
+    "tools.list": "tools_list",
+    "usage.summary": "usage_summary",
+    "app.command": "app_command",
+    "command.execute": "command_execute",
+    "approval.status": "approval_status",
+    "approval.resolve": "approval_resolve",
+    "approval.cancel": "approval_cancel",
+    "gateway.connect": "gateway_connect",
+    "gateway.disconnect": "gateway_disconnect",
+    "gateway.status": "gateway_status",
+    "gateway.send": "gateway_send",
+    "events.subscribe": "subscribe_notifications",
+    "monitor.signal_metrics": "monitor_signal_metrics",
+    "subagent.state": "subagent_state",
+}

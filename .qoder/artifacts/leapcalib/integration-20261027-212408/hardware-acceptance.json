@@ -1,0 +1,156 @@
+{
+  "node_id": "yahboom",
+  "write_mode": "permit_required",
+  "cameras": [
+    {
+      "camera": "d435if",
+      "frame_count": 8,
+      "frame_sequences": [
+        6,
+        8,
+        10,
+        12,
+        14,
+        16,
+        18,
+        20
+      ],
+      "valid_ratio_range": [
+        0.9484126984126984,
+        0.9603174603174603
+      ],
+      "depth_scale_m": 0.0010000000474974513,
+      "intrinsics": {
+        "coeffs": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "fx": 607.3232421875,
+        "fy": 607.3110961914062,
+        "height": 480,
+        "model": "inverse_brown_conrady",
+        "ppx": 324.8339538574219,
+        "ppy": 248.20721435546875,
+        "width": 640
+      },
+      "depth_median_range_m": [
+        0.6720000319182873,
+        0.6730000319657847
+      ],
+      "receipt_age_range_s": [
+        0.03513757399923634,
+        0.04994769000040833
+      ],
+      "receipt_intervals_s": [
+        0.0671212659945013,
+        0.06685447499330621,
+        0.06639708600414451,
+        0.06653539500257466,
+        0.06690199600416236,
+        0.06671219899726566,
+        0.06656339499750175
+      ],
+      "compute_s": 0.06449075898854062,
+      "elapsed_s": 0.5209282380092191,
+      "process_cpu_s": 0.5945422720000018,
+      "resource_usage": {
+        "peak_rss_bytes": 280829952
+      },
+      "preview_overlap_samples": 12,
+      "evidence_digest": "b3128e98a11be2b2d53be437b051bd4b4bded27909b4f62138417f28fbda8476",
+      "result_digest": "01fe72b93028327f66d0fa4c41d844faa7aad873e713fe6cea4b53ec14e1494e",
+      "artifact_bytes": 179331,
+      "artifact_mode": "0600",
+      "indexed_sensitive": true,
+      "indexed_syncable": false,
+      "indexed_expires_at": 1793112230.4883544,
+      "motion_support": false,
+      "hardware_accuracy_certified": false,
+      "raw_exported": false
+    },
+    {
+      "camera": "d405",
+      "frame_count": 8,
+      "frame_sequences": [
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "valid_ratio_range": [
+        0.3412698412698413,
+        0.42063492063492064
+      ],
+      "depth_scale_m": 9.999999747378752e-05,
+      "intrinsics": {
+        "coeffs": [
+          -0.05158450827002525,
+          0.05574527382850647,
+          0.0005407693097367883,
+          -0.0006088152877055109,
+          -0.018499206751585007
+        ],
+        "fx": 393.31927490234375,
+        "fy": 392.90777587890625,
+        "height": 480,
+        "model": "inverse_brown_conrady",
+        "ppx": 313.4957580566406,
+        "ppy": 243.16151428222656,
+        "width": 640
+      },
+      "depth_median_range_m": [
+        0.4447999887634069,
+        0.48499998774786945
+      ],
+      "receipt_age_range_s": [
+        0.022664835996693,
+        0.043628503000945784
+      ],
+      "receipt_intervals_s": [
+        0.06678909699257929,
+        0.033318770001642406,
+        0.03341163700679317,
+        0.033990789990639314,
+        0.03259196600993164,
+        0.03295479199732654,
+        0.03440552100073546
+      ],
+      "compute_s": 0.05539162199420389,
+      "elapsed_s": 0.3264385529910214,
+      "process_cpu_s": 0.35037254399999895,
+      "resource_usage": {
+        "peak_rss_bytes": 304599040
+      },
+      "preview_overlap_samples": 8,
+      "evidence_digest": "5c4a1a55896f5c36d220695a47b6da831a3a0417549aa6d1087b2eab728e3670",
+      "result_digest": "41f94420c9f32bc947339319cf3850884d3b6d5d1c0b7a8e946e82e5fc6f5ff4",
+      "artifact_bytes": 163465,
+      "artifact_mode": "0600",
+      "indexed_sensitive": true,
+      "indexed_syncable": false,
+      "indexed_expires_at": 1793112239.5693142,
+      "motion_support": false,
+      "hardware_accuracy_certified": false,
+      "raw_exported": false
+    }
+  ],
+  "live_method_discovery": [
+    "metric_motion.v1",
+    "task_response.v1"
+  ],
+  "deployed_source_fingerprints_verified": true,
+  "active_runs": 0,
+  "active_control_sessions": 0,
+  "service": [
+    "MainPID=91004",
+    "ActiveState=active"
+  ],
+  "raw_camera_observations_exported": false
+}

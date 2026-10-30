@@ -11,13 +11,55 @@ from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.calibration_qualification import admit_package
 from leapflow.hardware.fleet import FleetNode, FleetTopology
 from leapflow.hardware.lhp.client import SocketLhpClient
-from leapflow.hardware.lhp.permit import PermitIssuer
+from leapflow.hardware.lhp.permit import PermitIssuer, request_digest
+from leapflow.security.actions import ActionDescriptor, ActionEffect, ActionKind
 from leapflow.hardware.skill_tools import SkillService
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest, SessionAwareGate
 from leapflow.security.orchestrator import ApprovalOrchestrator
 
 from .evidence import Evidence, Refusal
 from .session import Session, complete_cleanup
+
+
+async def reload_workcell(session: Session, *, workcell: str,
+                          approved: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Preview or reload through the existing owner and exact one-shot approval."""
+    if session.client is None:
+        raise Refusal("reload requires an authenticated owner connection")
+    preview = await session.client.request("skill.reload", {"workcell": workcell})
+    if "reload" not in preview:
+        session.success = False
+        return {"ok": False, **preview}
+    candidate = preview["reload"]
+    binding = candidate["request"]
+    digest = request_digest("skill.reload", binding)
+    if candidate.get("permit_digest") != digest:
+        raise Refusal("reload preview digest differs from its request")
+    if approved is None:
+        session.success = True
+        return {"ok": True, **preview}
+    if (approved.get("workcell") != workcell or approved.get("node_id") != session.settings.node_id
+            or approved.get("reload_request") != binding or approved.get("plan_digest") != digest):
+        raise Refusal("workcell or owner session changed; preview reload again")
+    consent = _Consent(approved, session.evidence)
+    governor = ApprovalOrchestrator(SessionAwareGate(consent))
+    action = ActionDescriptor(kind=ActionKind.RUNTIME_CONFIGURE.value,
+        effect=ActionEffect.CONFIGURE.value, summary="Reload an idle workcell declaration",
+        detail=json.dumps(binding, sort_keys=True), resource=f"{session.settings.node_id}/{workcell}",
+        metadata={"node_id": session.settings.node_id, "workcell": workcell,
+                  "skill_id": "skill.reload", "plan_digest": digest})
+    decision = await governor.evaluate(action)
+    if not decision.approved or consent.plan is not None:
+        raise Refusal("explicit one-shot reload consent was not admitted")
+    issuer = PermitIssuer.from_key_file(session.settings.issuer_key, auto_generate=False)
+    proof = issuer.issue(audience=session.settings.node_id, session_id="piper-qualification",
+                         workspace=str(session.settings.root), approval_id=action.action_id,
+                         digest=digest).to_dict()
+    session.evidence.record("workcell_reload_authorized", request=binding, action_digest=digest)
+    result = await session.client.request("skill.reload", {**binding, "permit": proof})
+    session.success = result.get("reload", {}).get("applied") is True
+    session.evidence.record("workcell_reload_result", result=result)
+    return {"ok": session.success, "executed": session.success, **result}
 
 
 def validate(path: Path, device_id: str) -> dict[str, Any]:

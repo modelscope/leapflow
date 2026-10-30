@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from leapflow.hardware.model_contract import ModelService
+from leapflow.hardware.skills.admission import RunAdmission
 from leapflow.hardware.skills.frames import FrameGraph
 from leapflow.hardware.skills.motion import GovernedMotion
 from leapflow.hardware.skills.perception import PerceptionSettings, WorkcellScene
@@ -22,7 +23,9 @@ from leapflow.hardware.skills.ports import GraspPlanner
 from leapflow.hardware.skills.protocol import (
     FAILURE_DEVICE_FAULT,
     FAILURE_SKILL_UNAVAILABLE,
+    FAILURE_WRITE_REFUSED,
     SkillError,
+    SkillPlan,
 )
 from leapflow.hardware.skills.policy_binding import PolicySettings
 from leapflow.hardware.skills.policy_stream import WorkcellPolicies
@@ -59,6 +62,10 @@ class RunContext:
         memory: SceneMemory,
         planner: Callable[[Any], GraspPlanner],
         recording: Callable[[], bool] = lambda: False,
+        admission: RunAdmission | None = None,
+        run_id: str = "",
+        node_session_id: str = "",
+        plan: SkillPlan | None = None,
     ) -> None:
         self._registry = registry
         self._spec = spec
@@ -69,11 +76,18 @@ class RunContext:
         self._memory = memory
         self._planner = planner
         self._recording = recording
+        self._admission = admission
+        self._run_id = run_id
+        self._node_session_id = node_session_id
+        self._plan = plan
+        self._acquisition_sources: list[Any] = []
+        self._effect_tasks: list[asyncio.Task[Any]] = []
         self._grasp_planner: GraspPlanner | None = None
         self._scene: WorkcellScene | None = None
         self._visions: dict[str, WorkcellVision] = {}
         self._policies: WorkcellPolicies | None = None
         self._grasp_verification: Any = None
+        self._calibration: Any = None
         self._committed = False
         self.evidence: dict[str, Any] = {}
 
@@ -100,6 +114,10 @@ class RunContext:
     @property
     def recording(self) -> bool:
         return self._recording()
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
 
     @property
     def committed(self) -> bool:
@@ -148,6 +166,13 @@ class RunContext:
         return self._grasp_verification
 
     @property
+    def calibration(self) -> Any:
+        if self._calibration is None:
+            from leapflow.hardware.calibration.collection import WorkcellCalibration
+            self._calibration = WorkcellCalibration(self, self._registry, node_session_id=self._node_session_id)
+        return self._calibration
+
+    @property
     def policies(self) -> WorkcellPolicies:
         if self._policies is None:
             try:
@@ -170,6 +195,127 @@ class RunContext:
             raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"this workcell binds no {role}")
         batch = await self._registry.read_batch(device_id, tuple(channel_ids))
         return {reading.channel_id: reading.value for reading in batch.readings}
+
+    def recorded_observations(
+        self, source: Any, *, profile: Any, ttl_s: float, quota_bytes: int,
+    ) -> Any:
+        """Owner-only acquisition binding; plan/read contexts cannot persist raw captures."""
+        from leapflow.hardware.calibration.evidence import AcquisitionBinding, RecordedObservationSource
+        from leapflow.hardware.calibration.generations import _json
+
+        if self._admission is None or self._plan is None or not self._run_id or not self._node_session_id:
+            raise SkillError(FAILURE_WRITE_REFUSED, "private acquisition requires an admitted exact skill run")
+        store = getattr(self._registry, "calibration_evidence", None)
+        if store is None:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, "private acquisition requires the instrument database and evidence cache")
+        binding = AcquisitionBinding(self._spec.workcell_id, self._run_id, self._node_session_id,
+                                     _json(self._plan.to_dict()), self._admission)
+
+        def committed(summary: dict[str, Any]) -> None:
+            self._committed = True
+            self.evidence.setdefault("acquisitions", []).append(summary)
+
+        recorded = RecordedObservationSource(source, store, profile=profile, binding=binding,
+                                             ttl_s=ttl_s, quota_bytes=quota_bytes, on_commit=committed)
+        self._acquisition_sources.append(recorded)
+        return recorded
+
+    async def record_reference(self, evidence_ids: Sequence[str], results: Sequence[Mapping[str, Any]], *, profile: Any) -> Mapping[str, Any]:
+        """Persist a task-local reference only under this exact admitted run."""
+        from leapflow.hardware.calibration.evidence import AcquisitionBinding, _settle_tasks
+        from leapflow.hardware.calibration.generations import _json
+        from leapflow.hardware.skills.protocol import SIDE_EFFECT_UNKNOWN
+
+        if self._admission is None or self._plan is None or not self._run_id or not self._node_session_id:
+            raise SkillError(FAILURE_WRITE_REFUSED, "reference persistence requires an admitted exact skill run")
+        store = self._registry.calibration_evidence
+        if store is None:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, "reference persistence requires the instrument evidence store")
+        binding = AcquisitionBinding(self._spec.workcell_id, self._run_id, self._node_session_id,
+                                     _json(self._plan.to_dict()), self._admission)
+
+        def committed(summary: dict[str, Any]) -> None:
+            self._committed = True
+            self.evidence.setdefault("references", []).append(summary)
+
+        task = store.start_reference(evidence_ids, results, profile=profile, binding=binding, on_commit=committed)
+        self._effect_tasks.append(task)
+        cancelled = False
+        try:
+            await _settle_tasks((task,))
+        except asyncio.CancelledError:
+            cancelled = True
+        try:
+            summary = task.result()
+        except Exception as exc:
+            raise SkillError(FAILURE_DEVICE_FAULT, "reference persistence failed; inspect committed digests before a new run",
+                             side_effect_state=SIDE_EFFECT_UNKNOWN) from exc
+        if cancelled:
+            raise asyncio.CancelledError
+        return summary
+
+    async def model_transaction(self, operation: Callable[[], Any], *, publish: Callable[[Any], None],
+                                preflight: Callable[[], Awaitable[None]] | None = None) -> Any:
+        """Settle an exact admitted non-motion effect while retaining all owner resources."""
+        from leapflow.hardware.calibration.evidence import AcquisitionBinding
+        from leapflow.hardware.calibration.generations import _json
+        from leapflow.hardware.skills.protocol import FAILURE_STOPPED, SIDE_EFFECT_UNKNOWN
+
+        if self._admission is None or self._plan is None or not self._run_id or not self._node_session_id:
+            raise SkillError(FAILURE_WRITE_REFUSED, "model transaction requires an admitted exact skill run")
+        if self.cancelled:
+            raise SkillError(FAILURE_STOPPED, "model transaction stopped before reservation")
+        sessions = getattr(self._registry, "node_sessions", None)
+        if sessions is None:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, "model transaction requires the existing node session owner")
+        binding = AcquisitionBinding(self._spec.workcell_id, self._run_id, self._node_session_id,
+                                     _json(self._plan.to_dict()), self._admission)
+        started = False
+
+        def dispatch() -> Any:
+            nonlocal started
+            started = True
+            return operation()
+
+        def settled(result: Any) -> None:
+            # Mark persistence before projection. If projection fails, the shared
+            # reservation coordinator latches uncertain consumers before release.
+            self._committed = True
+            self.note("model_transaction", {"plan_digest": self._plan.digest,
+                "action_digest": binding.admission.action_digest,
+                "generation": getattr(result, "generation", None)})
+            publish(result)
+
+        try:
+            return await sessions.run_reserved(self._spec.device_ids, owner_id=self._run_id,
+                run_id=self._run_id, operation=dispatch, on_settle=settled, preflight=preflight)
+        except SkillError as exc:
+            if not started:
+                raise
+            raise SkillError(FAILURE_DEVICE_FAULT, "model transaction settlement failed; owner reconciliation required",
+                             side_effect_state=SIDE_EFFECT_UNKNOWN) from exc
+        except ValueError as exc:
+            if not started:
+                raise SkillError(FAILURE_WRITE_REFUSED, f"model transaction refused: {exc}") from exc
+            raise SkillError(FAILURE_DEVICE_FAULT, "model transaction dispatched but settlement failed; owner reconciliation required",
+                             side_effect_state=SIDE_EFFECT_UNKNOWN) from exc
+        except Exception as exc:  # noqa: BLE001 - an uncertain DB effect must not escape unclassified
+            raise SkillError(FAILURE_DEVICE_FAULT, "model transaction failed; inspect committed generation before another request",
+                             side_effect_state=SIDE_EFFECT_UNKNOWN) from exc
+
+    async def settle_effects(self) -> None:
+        """Keep the existing run hold until every started private effect settles."""
+        for source in self._acquisition_sources:
+            try:
+                await source.settle()
+            except asyncio.CancelledError:
+                # Settlement already completed before this delayed cancellation.
+                self._cancel.set()
+        from leapflow.hardware.calibration.evidence import _settle_tasks
+        try:
+            await _settle_tasks(tuple(self._effect_tasks))
+        except asyncio.CancelledError:
+            self._cancel.set()
 
     def record_calibration(
         self,

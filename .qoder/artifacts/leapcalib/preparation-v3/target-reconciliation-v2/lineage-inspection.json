@@ -1,0 +1,152 @@
+{
+  "schema": "leapflow.private_source_lineage_inspection.v1",
+  "files": [
+    {
+      "path": "pyproject.toml",
+      "target_sha256": "8d42fdecfeefa2d50ce84e7943c2035e1f638e016220cd022f06b239f9fdc0bb",
+      "host_sha256": "2ebaeaea924cc6207f7d737984fd713c64db046902292f66eb7d51bcdfaea3b0",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json",
+      "host_hunks_equal_host_file": true
+    },
+    {
+      "path": "src/leapcalib/cli.py",
+      "target_sha256": "7ba15c48242b63a30726c797c949bb5d0f8143a040de85507049f94368cd303a",
+      "host_sha256": "77fc24f6dcdbc7c3f7c2e2c4d40254e93fa6e6e7a9b8249ce403dfdd64449c9a",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json"
+    },
+    {
+      "path": "src/leapcalib/contracts/estimates.py",
+      "target_sha256": "36563ee1769c5a273642ce6f04aa46b5477e460f5e3a69165f8f25192bffaab9",
+      "host_sha256": "b19b67149ed9df59ab2054f6f8aa17f7b4fc43d852de076d209f8262c4beb1c2",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json"
+    },
+    {
+      "path": "src/leapcalib/contracts/failures.py",
+      "target_sha256": "2386023a34c3957eb9e6d45f9d0052652d0e76479eb469ad942fadb5159c232a",
+      "host_sha256": "b4d4cab0c71046f77b04d6493008f42fa88378ee6ba72b7dd4eadb696c9316f2",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json"
+    },
+    {
+      "path": "src/leapcalib/contracts/identity.py",
+      "target_sha256": "6d655ccea84d0f9cda853e43801c9c465407cc0ad6e7b5deb2b4608d3ece05d4",
+      "host_sha256": "0b628992d6703c3549c3ae255ca5d3ee3af127de2e07be796c5e34379d2a01a9",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json"
+    },
+    {
+      "path": "src/leapcalib/contracts/observations.py",
+      "target_sha256": "5686d80a2e0796c313a8eb8f0b7277f15bda224e59cec8e153b2b2f94632698d",
+      "host_sha256": "90ca374c42cb4db670591975367339f31e9cb65448b3620122fe8d3e1dd44aa8",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json"
+    },
+    {
+      "path": "src/leapcalib/contracts/parameters.py",
+      "target_sha256": "c814d27fa6b14dbfadd5649103612acdb789bc4f3ea0a34db78173d67dcc64bf",
+      "host_sha256": "a4d96cf56b81454be2c12d54cfc9442a9a8a87b753f25e876d7e708b40f32fa1",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json"
+    },
+    {
+      "path": "src/leapcalib/validation/bundle.py",
+      "target_sha256": "04d803084f7b69ca040260c4f5162241c3304fbe1c6454c9e812b2a34ba81195",
+      "host_sha256": "d888818ba25af441201bcd1814a0e971e4d78db6ad2dca1ed961265325f223c0",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/adapter.py",
+      "target_sha256": "3af55e6c5f5da77113c2d2078667f9eebea129f41cc3be3a605b8086d3f197a2",
+      "host_sha256": "1972aca21065316ef14e4255f352520f1cebc742f655298ba9020eb295684b7e",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json"
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/measurements.py",
+      "target_sha256": "3b0bbbe46e9212a66cf41b954ee2eeab9a1e008600251d0e8ea7b60d9853a331",
+      "host_sha256": "d3dd744d7a2b0bc8090afbb64d0fca92b59837f0337152186df092c76e5d2e36",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json"
+    },
+    {
+      "path": "src/leapflow/hardware/health_monitor.py",
+      "target_sha256": "2accec6e9b52aedc21f100656ca4f253ec41efec3a91d0dfaa8b7f81b8220528",
+      "host_sha256": "f504a5fc7f8bf6f8413c4b9288edb2f4dfe2ae023347604af6cc089d21143c7e",
+      "finding": "requires_semantic_inspection",
+      "host_hunks_equal_host_file": true
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/server.py",
+      "target_sha256": "fa23cc16f558eeb416648e1002c42f5ef2dc6b1cc2124485e62a045db0f8aa5e",
+      "host_sha256": "4a0a32123ed62c823b2e22f66f5379552a41cf44fc3fb26059c553852f6c13c7",
+      "finding": "requires_semantic_inspection",
+      "host_hunks_equal_host_file": true
+    },
+    {
+      "path": "src/leapflow/hardware/registry.py",
+      "target_sha256": "a07dcc567925a636ad88c07c45fe935d44528a6239ffdf0410a983e6622dcd25",
+      "host_sha256": "8c6c1b4fba4547228e487a2b22a709e0c13dd8074ec191e7e7ed0d62d061c161",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json",
+      "host_hunks_equal_host_file": true
+    },
+    {
+      "path": "src/leapflow/hardware/skills/ports.py",
+      "target_sha256": "c36d27e3541d29e9821ac7cb6459058555571a10a359a70d1e3fec104764bc0d",
+      "host_sha256": "ceeab0feb3ebd51d7ca34ef709acb59a08af140fb80b78eac14359b767dce2a8",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json",
+      "host_hunks_equal_host_file": true
+    },
+    {
+      "path": "src/leapflow/hardware/skills/protocol.py",
+      "target_sha256": "2131bd4385ea1fbdb3806d2cf03f2449614bc8f1e554a4aaee7c3d5810c2e176",
+      "host_sha256": "61f28568a038d5b3ca46263fa47ff2473dc2a08a01fa8121144f47f45d88b838",
+      "finding": "requires_semantic_inspection",
+      "host_hunks_equal_host_file": true
+    },
+    {
+      "path": "src/leapflow/hardware/skills/runtime.py",
+      "target_sha256": "adc8e909865bda41df44161895fd832be6e6ac2682ed787760ae74c13e08a80f",
+      "host_sha256": "848e5409c98ebe5794ede4a0f2394cf8be7ee323d5e663394994af60eef0873d",
+      "finding": "requires_semantic_inspection",
+      "host_hunks_equal_host_file": true
+    },
+    {
+      "path": "src/leapflow/hardware/skills/vision.py",
+      "target_sha256": "ffa4b5986ddb5fe84adf0f3fd57a989aa48b5e7195aff48a0b66e05e1a8f9dbb",
+      "host_sha256": "a905c8f75394e13bd42aaa25fb9aba9cf9f4306683266ec29af73c79d1e6b0f0",
+      "finding": "target_is_exact_previously_reconciled_task_source",
+      "previous_manifest": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408/deployment-manifest.json",
+      "host_hunks_equal_host_file": true
+    },
+    {
+      "path": "src/leapflow/hardware/skills/workcell.py",
+      "target_sha256": "1dfecd030486ae04e20e0e214058335b7fe91f40acae1888bf9b6b3460f38ca7",
+      "host_sha256": "3f5e219af3fc589142eb0f0e7e7f17322bd9bc4fffd5a14644b3e48e32299d9d",
+      "finding": "requires_semantic_inspection",
+      "host_hunks_equal_host_file": true
+    },
+    {
+      "path": "src/leapflow/hardware/transports/lhp.py",
+      "target_sha256": "4f727fe064adb8b4a0266a6353732ddece0d1b0bff468825ed61cff64c44816c",
+      "host_sha256": "2924df0a145e3a57acaacc3ff043cfdc6ca6ac1148b24aa987c913d284edc84b",
+      "finding": "requires_semantic_inspection",
+      "host_hunks_equal_host_file": true
+    }
+  ],
+  "requires_semantic_inspection": [
+    "src/leapflow/hardware/health_monitor.py",
+    "src/leapflow/hardware/lhp/server.py",
+    "src/leapflow/hardware/skills/protocol.py",
+    "src/leapflow/hardware/skills/runtime.py",
+    "src/leapflow/hardware/skills/workcell.py",
+    "src/leapflow/hardware/transports/lhp.py"
+  ],
+  "remote_changes_performed": false,
+  "deployment_approved": false
+}

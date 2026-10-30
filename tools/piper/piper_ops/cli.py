@@ -106,6 +106,8 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--workcell", required=True)
     item.add_argument("--skill", required=True)
     item.add_argument("--args-file", type=Path, required=True)
+    item = command(cal, "reload", writing=True)
+    item.add_argument("--workcell", required=True)
     return root
 
 
@@ -195,6 +197,16 @@ async def hardware(args: argparse.Namespace, settings: Settings, evidence: Evide
         if args.group == "calibration":
             if args.operation == "inspect":
                 return await calibration.run(session)
+            if args.operation == "reload":
+                result = await calibration.reload_workcell(session, workcell=args.workcell, approved=plan)
+                if executing or result.get("ok") is not True:
+                    return result
+                reload = result["reload"]
+                return preview_result({"version": 1, "operation": "reload", "settings": asdict(settings),
+                    "declaration_digest": unverified_digest(session.context), "node_id": settings.node_id,
+                    "workcell": args.workcell, "skill_id": "skill.reload",
+                    "plan_digest": reload["permit_digest"], "reload_request": reload["request"],
+                    "candidate": reload["candidate"], "impact": "idle declaration replacement; no motion or restart"})
             arguments = json.loads(args.args_file.read_text())
             result = await calibration.run(session, workcell=args.workcell, skill=args.skill,
                                            args=arguments, approved=plan)

@@ -1,0 +1,301 @@
+{
+  "backup": "/home/jetson/leap_work/leapcalib-integration-20261027-212408",
+  "artifact": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/integration-20261027-212408",
+  "original_dirty_count": 87,
+  "original_head": "b3883a1d21b00ee21f136dcffe52556b194fb62e",
+  "files": [
+    {
+      "path": "pyproject.toml",
+      "original_sha256": "537da3272631b3eb165b178d07516c7b16cc3346c584ef510d135aca58912286",
+      "merged_sha256": "8d42fdecfeefa2d50ce84e7943c2035e1f638e016220cd022f06b239f9fdc0bb",
+      "host_sha256": "8d42fdecfeefa2d50ce84e7943c2035e1f638e016220cd022f06b239f9fdc0bb",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/__init__.py",
+      "original_sha256": null,
+      "merged_sha256": "f220f3124bdbc9834244ac612ad7b244c31eeeb0d0366a75c37e106c6889099e",
+      "host_sha256": "f220f3124bdbc9834244ac612ad7b244c31eeeb0d0366a75c37e106c6889099e",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/cli.py",
+      "original_sha256": null,
+      "merged_sha256": "7ba15c48242b63a30726c797c949bb5d0f8143a040de85507049f94368cd303a",
+      "host_sha256": "7ba15c48242b63a30726c797c949bb5d0f8143a040de85507049f94368cd303a",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/contracts/__init__.py",
+      "original_sha256": null,
+      "merged_sha256": "0df543dade45ed2aca70c7971e6e125d5569a2bebb7f09aa0203bed814e700c9",
+      "host_sha256": "0df543dade45ed2aca70c7971e6e125d5569a2bebb7f09aa0203bed814e700c9",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/contracts/estimates.py",
+      "original_sha256": null,
+      "merged_sha256": "36563ee1769c5a273642ce6f04aa46b5477e460f5e3a69165f8f25192bffaab9",
+      "host_sha256": "36563ee1769c5a273642ce6f04aa46b5477e460f5e3a69165f8f25192bffaab9",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/contracts/failures.py",
+      "original_sha256": null,
+      "merged_sha256": "2386023a34c3957eb9e6d45f9d0052652d0e76479eb469ad942fadb5159c232a",
+      "host_sha256": "2386023a34c3957eb9e6d45f9d0052652d0e76479eb469ad942fadb5159c232a",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/contracts/identity.py",
+      "original_sha256": null,
+      "merged_sha256": "6d655ccea84d0f9cda853e43801c9c465407cc0ad6e7b5deb2b4608d3ece05d4",
+      "host_sha256": "6d655ccea84d0f9cda853e43801c9c465407cc0ad6e7b5deb2b4608d3ece05d4",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/contracts/methods.py",
+      "original_sha256": null,
+      "merged_sha256": "5cf426a177083ce871487a6439b430fb5ed2dc31175149b7d0ccfeb39e4df1ed",
+      "host_sha256": "5cf426a177083ce871487a6439b430fb5ed2dc31175149b7d0ccfeb39e4df1ed",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/contracts/motion.py",
+      "original_sha256": null,
+      "merged_sha256": "2dd0712de85d89bbb5dcfe7d7435e576859d3676599442dde2d50241d7a39dab",
+      "host_sha256": "2dd0712de85d89bbb5dcfe7d7435e576859d3676599442dde2d50241d7a39dab",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/contracts/observations.py",
+      "original_sha256": null,
+      "merged_sha256": "5686d80a2e0796c313a8eb8f0b7277f15bda224e59cec8e153b2b2f94632698d",
+      "host_sha256": "5686d80a2e0796c313a8eb8f0b7277f15bda224e59cec8e153b2b2f94632698d",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/contracts/parameters.py",
+      "original_sha256": null,
+      "merged_sha256": "c814d27fa6b14dbfadd5649103612acdb789bc4f3ea0a34db78173d67dcc64bf",
+      "host_sha256": "c814d27fa6b14dbfadd5649103612acdb789bc4f3ea0a34db78173d67dcc64bf",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/contracts/task.py",
+      "original_sha256": null,
+      "merged_sha256": "3077d568346725793285af3fc68e88d4ca4c537569dd8e5d74fe66e33bfef61a",
+      "host_sha256": "3077d568346725793285af3fc68e88d4ca4c537569dd8e5d74fe66e33bfef61a",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/contracts/units.py",
+      "original_sha256": null,
+      "merged_sha256": "74cb515a09406747036ca5d73c02d49a2a200712349b3dfa0993c1539f76145e",
+      "host_sha256": "74cb515a09406747036ca5d73c02d49a2a200712349b3dfa0993c1539f76145e",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/estimation/__init__.py",
+      "original_sha256": null,
+      "merged_sha256": "b9985556f3b8d43fe46b5781045b09d4bf03ed10ffa6c81387832b4d596ce790",
+      "host_sha256": "b9985556f3b8d43fe46b5781045b09d4bf03ed10ffa6c81387832b4d596ce790",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/estimation/handeye.py",
+      "original_sha256": null,
+      "merged_sha256": "1a2a7a1b006ee341dbc5ed4afc3b5793bae3c327b14a530cd48d7f6e314e3be8",
+      "host_sha256": "1a2a7a1b006ee341dbc5ed4afc3b5793bae3c327b14a530cd48d7f6e314e3be8",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/estimation/numeric.py",
+      "original_sha256": null,
+      "merged_sha256": "a82176d4d5f71df1978514f89b3ba20f5e714afdf239e95a5d519dae2970208f",
+      "host_sha256": "a82176d4d5f71df1978514f89b3ba20f5e714afdf239e95a5d519dae2970208f",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/estimation/registration.py",
+      "original_sha256": null,
+      "merged_sha256": "a1d5f81ae4b16d0b3842bdb1aa9039bd91c920b857569e11dc7d4d29c793f912",
+      "host_sha256": "a1d5f81ae4b16d0b3842bdb1aa9039bd91c920b857569e11dc7d4d29c793f912",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/estimation/response.py",
+      "original_sha256": null,
+      "merged_sha256": "f4f1462dcfce28b36b1001e56cff940eef56b56cb1a3ea2314835e9d0e3b624d",
+      "host_sha256": "f4f1462dcfce28b36b1001e56cff940eef56b56cb1a3ea2314835e9d0e3b624d",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/geometry/__init__.py",
+      "original_sha256": null,
+      "merged_sha256": "3cbaee6f28ca2624d4347733dfb6675a5d919c33017e68d588b606d2138a3588",
+      "host_sha256": "3cbaee6f28ca2624d4347733dfb6675a5d919c33017e68d588b606d2138a3588",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/geometry/conventions.py",
+      "original_sha256": null,
+      "merged_sha256": "23376d1855b0ef36f469dceab1a7f5992dabfb944a269ed82387b4134b1c0beb",
+      "host_sha256": "23376d1855b0ef36f469dceab1a7f5992dabfb944a269ed82387b4134b1c0beb",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/geometry/se3.py",
+      "original_sha256": null,
+      "merged_sha256": "ecf5faa38e8073b4a986c2d779ff7b0830925f9976348318d2c67bc789deea76",
+      "host_sha256": "ecf5faa38e8073b4a986c2d779ff7b0830925f9976348318d2c67bc789deea76",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/validation/__init__.py",
+      "original_sha256": null,
+      "merged_sha256": "1db2247e32c4253fdfe25a16cb3d8d647ee92699d66f01a7b89f8ff18a2ec83e",
+      "host_sha256": "1db2247e32c4253fdfe25a16cb3d8d647ee92699d66f01a7b89f8ff18a2ec83e",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/validation/assets.py",
+      "original_sha256": null,
+      "merged_sha256": "2b80ce8f2c96b99c21f4f78c4d75d1f4c8192ddef179b294bfc030af94e4de27",
+      "host_sha256": "2b80ce8f2c96b99c21f4f78c4d75d1f4c8192ddef179b294bfc030af94e4de27",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/validation/budget.py",
+      "original_sha256": null,
+      "merged_sha256": "1c6f66817c92bed2bce9a2238abbd944be4455b372fcd8199d5e0cce798abce7",
+      "host_sha256": "1c6f66817c92bed2bce9a2238abbd944be4455b372fcd8199d5e0cce798abce7",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/validation/bundle.py",
+      "original_sha256": null,
+      "merged_sha256": "04d803084f7b69ca040260c4f5162241c3304fbe1c6454c9e812b2a34ba81195",
+      "host_sha256": "04d803084f7b69ca040260c4f5162241c3304fbe1c6454c9e812b2a34ba81195",
+      "changed": true
+    },
+    {
+      "path": "src/leapcalib/validation/result.py",
+      "original_sha256": null,
+      "merged_sha256": "0aed3b51cb7024aabc144a8b9722cca25c43d2e0071ad9eedb24672ae174a76a",
+      "host_sha256": "0aed3b51cb7024aabc144a8b9722cca25c43d2e0071ad9eedb24672ae174a76a",
+      "changed": true
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/__init__.py",
+      "original_sha256": null,
+      "merged_sha256": "4041233178af8080487032e7679fed0c5ae595e203e2201a24b8f8a3cb60015d",
+      "host_sha256": "4041233178af8080487032e7679fed0c5ae595e203e2201a24b8f8a3cb60015d",
+      "changed": true
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/adapter.py",
+      "original_sha256": null,
+      "merged_sha256": "3af55e6c5f5da77113c2d2078667f9eebea129f41cc3be3a605b8086d3f197a2",
+      "host_sha256": "3af55e6c5f5da77113c2d2078667f9eebea129f41cc3be3a605b8086d3f197a2",
+      "changed": true
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/measurements.py",
+      "original_sha256": null,
+      "merged_sha256": "3b0bbbe46e9212a66cf41b954ee2eeab9a1e008600251d0e8ea7b60d9853a331",
+      "host_sha256": "3b0bbbe46e9212a66cf41b954ee2eeab9a1e008600251d0e8ea7b60d9853a331",
+      "changed": true
+    },
+    {
+      "path": "src/leapflow/hardware/calibration/readiness.py",
+      "original_sha256": null,
+      "merged_sha256": "79975676f66dcb51e9301f82ff6e080a17edb0c24069f0a518aca5c1b92b9a9f",
+      "host_sha256": "79975676f66dcb51e9301f82ff6e080a17edb0c24069f0a518aca5c1b92b9a9f",
+      "changed": true
+    },
+    {
+      "path": "src/leapflow/hardware/lhp/runtime.py",
+      "original_sha256": "01284f52eb6b3dc8090907e8802f60a363d2249a00b50c9c579b60eb7ef39999",
+      "merged_sha256": "7d44321901e2ad8b79f51e3c67a0769985ec179aeec22e0a532a9454702c30c6",
+      "host_sha256": "7d44321901e2ad8b79f51e3c67a0769985ec179aeec22e0a532a9454702c30c6",
+      "changed": true
+    },
+    {
+      "path": "src/leapflow/hardware/registry.py",
+      "original_sha256": "f42365e52b71735343108c9572709a2aa93453bf35b0019dfa6bb9dbd7e9288e",
+      "merged_sha256": "a07dcc567925a636ad88c07c45fe935d44528a6239ffdf0410a983e6622dcd25",
+      "host_sha256": "a07dcc567925a636ad88c07c45fe935d44528a6239ffdf0410a983e6622dcd25",
+      "changed": true
+    },
+    {
+      "path": "src/leapflow/hardware/skills/builtin/metric_readiness.py",
+      "original_sha256": null,
+      "merged_sha256": "7f9df5176b53d474fb1b9642b1b79d14788fbda77a29ca36040cc10516fd9fac",
+      "host_sha256": "7f9df5176b53d474fb1b9642b1b79d14788fbda77a29ca36040cc10516fd9fac",
+      "changed": true
+    },
+    {
+      "path": "src/leapflow/hardware/skills/ports.py",
+      "original_sha256": "2c18f0673284d4b2e34dfef2f210887d7f15edf4787ed53766d7613a15a7e653",
+      "merged_sha256": "c36d27e3541d29e9821ac7cb6459058555571a10a359a70d1e3fec104764bc0d",
+      "host_sha256": "c36d27e3541d29e9821ac7cb6459058555571a10a359a70d1e3fec104764bc0d",
+      "changed": true
+    },
+    {
+      "path": "src/leapflow/hardware/skills/vision.py",
+      "original_sha256": "281939db6598eef2ac535257685f4bd09dcf70c02bef5f70c3f00eb52b58f141",
+      "merged_sha256": "ffa4b5986ddb5fe84adf0f3fd57a989aa48b5e7195aff48a0b66e05e1a8f9dbb",
+      "host_sha256": "ffa4b5986ddb5fe84adf0f3fd57a989aa48b5e7195aff48a0b66e05e1a8f9dbb",
+      "changed": true
+    },
+    {
+      "path": "tests/test_leapcalib_contracts.py",
+      "original_sha256": null,
+      "merged_sha256": "438405e32b59edfab7ebbd036e953ba83019f63e6bf99e08b1ab07d61a1153ff",
+      "host_sha256": "438405e32b59edfab7ebbd036e953ba83019f63e6bf99e08b1ab07d61a1153ff",
+      "changed": true
+    },
+    {
+      "path": "tests/test_leapcalib_estimation.py",
+      "original_sha256": null,
+      "merged_sha256": "8a26a2bcff404f53fc95721b9fba86662d47c9af6941d3dc396e9c5ad61dc832",
+      "host_sha256": "8a26a2bcff404f53fc95721b9fba86662d47c9af6941d3dc396e9c5ad61dc832",
+      "changed": true
+    },
+    {
+      "path": "tests/test_leapcalib_readiness.py",
+      "original_sha256": null,
+      "merged_sha256": "45ea6f792e6eef5e2a15367fdf0e51805542991572b6817bc3314692c726b66d",
+      "host_sha256": "45ea6f792e6eef5e2a15367fdf0e51805542991572b6817bc3314692c726b66d",
+      "changed": true
+    },
+    {
+      "path": "tests/test_leapcalib_validation.py",
+      "original_sha256": null,
+      "merged_sha256": "c44b93ec6a0d541aab030a6ad249c551bc24d4063b68b99e925469b9529ba0b8",
+      "host_sha256": "c44b93ec6a0d541aab030a6ad249c551bc24d4063b68b99e925469b9529ba0b8",
+      "changed": true
+    },
+    {
+      "path": "tools/calib_regression.py",
+      "original_sha256": null,
+      "merged_sha256": "d4a93dc28b1bb56d1af66260168ab169493a6f222e7f700c68b73f4fc417eda9",
+      "host_sha256": "d4a93dc28b1bb56d1af66260168ab169493a6f222e7f700c68b73f4fc417eda9",
+      "changed": true
+    },
+    {
+      "path": "uv.lock",
+      "original_sha256": "8789f2cc019ffea7599bb0c65e29cbdb221de2cb25fe8b55f7fa15fdcb449a09",
+      "merged_sha256": "d51f36079ab769236f92ffed4022244287a54220462c3e9112c06bc609868370",
+      "host_sha256": "d51f36079ab769236f92ffed4022244287a54220462c3e9112c06bc609868370",
+      "changed": true
+    }
+  ],
+  "resolved_conflicts": [
+    "pyproject.toml",
+    "src/leapflow/hardware/skills/ports.py",
+    "src/leapflow/hardware/skills/vision.py",
+    "uv.lock"
+  ]
+}

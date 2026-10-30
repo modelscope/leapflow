@@ -1,0 +1,1292 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""Continuous sampling: raw readings in, derived events out.
+
+The layering here is the whole point, and it is a boundary decision rather than an
+optimisation. ``SignalBuffer`` holds 50 interaction signals and every signal drives
+causal fusion; a single 10 Hz channel would flush that buffer in five seconds and
+run fusion at sampling rate, destroying both subsystems at once.
+
+So raw readings stay inside this module, in a bounded per-channel ring. What crosses
+into the interaction signal pipeline is *events* -- a threshold crossed, a rate
+exceeded, samples lost -- which occur at the rate at which something worth noticing
+actually happens.
+
+Every detection rule is derived from the channel's own ``Envelope``. Nothing new is
+declared: the limits a human already wrote down for approval are the same limits
+that make an observation interesting.
+
+Two clocks are in play and they are not interchangeable. Intervals, slew rates and
+staleness read ``Reading.monotonic_at``, because wall-clock jumps would fabricate
+rates no device produced. Anything that leaves this module -- an event's timestamp,
+a persisted window -- carries ``Reading.observed_at``, because every consumer
+outside it (findings, audit, the board's time axis) is wall-clock.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Callable, Deque, Iterable, Iterator, Protocol, runtime_checkable
+
+from leapflow.hardware.context import (
+    Channel,
+    DegradationPolicy,
+    HardwareContext,
+    Quality,
+    as_numeric,
+)
+from leapflow.hardware.degradation import DegradationCoordinator
+from leapflow.hardware.transport import Reading
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_RING_CAPACITY = 4096
+
+MIN_EVENT_INTERVAL_S = 1.0
+"""Floor on how often one channel may re-report the same event kind.
+
+Edge-triggered kinds rarely reach it. Level-triggered ones -- a slew that stays
+above ``max_rate`` for a whole ramp -- would otherwise emit once per sample and
+reproduce, on the consumer side, the exact flood the raw/event split prevents on
+the producer side. The first occurrence of a kind is never suppressed, and
+suppressions are counted rather than discarded silently.
+"""
+
+EventSink = Callable[["HardwareEvent"], None]
+"""Receives derived events. Must be thread-safe and non-blocking."""
+
+
+class HardwareEventClass:
+    """Behavioural classification for hardware events (D-X4 three-way split).
+
+    Every event kind maps to exactly one class. The classification determines the
+    dispatch path:
+
+    ``REFLEX``
+        Safety-critical, handled without LLM involvement.  Alert-policy actions
+        (hw_estop, degradation) execute immediately via the reflex path.
+    ``DELIBERATIVE``
+        May require an LLM decision.  If hardware-triggered reentry is enabled,
+        these events can open an isolated subagent round (writes still gated by
+        normal approval).
+    ``RECORD``
+        Informational only.  Stored in the reading store, visible on the board
+        and in the watch pipeline, but not routed to any decision path.
+    """
+
+    REFLEX = "reflex"
+    DELIBERATIVE = "deliberative"
+    RECORD = "record"
+
+
+# Canonical mapping: event kind → behavioural class.
+# The mapping is intentionally conservative: when in doubt an event is REFLEX
+# (fail-closed). Adding a new EventKind without extending this mapping makes it
+# REFLEX by default, which is the only safe choice for an unknown condition.
+_EVENT_CLASS_MAP: dict[str, str] = {
+    # ── Reflex (safety-critical, no LLM) ──
+    "threshold_exceeded": HardwareEventClass.REFLEX,
+    "rate_exceeded": HardwareEventClass.REFLEX,
+    "unreachable": HardwareEventClass.REFLEX,
+    # ── Deliberative (may trigger reentry round) ──
+    "quality_degraded": HardwareEventClass.DELIBERATIVE,
+    "stale": HardwareEventClass.DELIBERATIVE,
+    # ── Record (informational, store only) ──
+    "settled": HardwareEventClass.RECORD,
+    "sample_loss": HardwareEventClass.RECORD,
+    "calibration_started": HardwareEventClass.RECORD,
+    "calibration_completed": HardwareEventClass.RECORD,
+    "calibration_failed": HardwareEventClass.RECORD,
+    "calibration_expired": HardwareEventClass.RECORD,
+    "calibration_candidate": HardwareEventClass.RECORD,
+    "calibration_rejected": HardwareEventClass.RECORD,
+    "calibration_no_op": HardwareEventClass.RECORD,
+    "calibration_activated": HardwareEventClass.RECORD,
+    "calibration_rolled_back": HardwareEventClass.RECORD,
+    "calibration_invalidated": HardwareEventClass.RECORD,
+    "calibration_drift": HardwareEventClass.DELIBERATIVE,
+}
+
+
+def classify_hardware_event(kind: str) -> str:
+    """Return the behavioural class for the given event kind.
+
+    Unknown kinds default to REFLEX (fail-closed): an unrecognised condition is
+    assumed safety-critical until explicitly classified.
+    """
+    return _EVENT_CLASS_MAP.get(kind, HardwareEventClass.REFLEX)
+
+
+@runtime_checkable
+class HardwareDeliberativeObserver(Protocol):
+    """Receives deliberative hardware events for potential reentry triggering.
+
+    Registered on the hardware registry and called from ``publish_event`` when
+    a classified event has ``event_class == DELIBERATIVE``.  The observer decides
+    whether the event warrants an agent reentry round; the write path inside that
+    round still runs through normal approval gates.
+
+    Implementations must be non-blocking: long work should be scheduled rather
+    than awaited.
+    """
+
+    def on_deliberative_event(self, event: "HardwareEvent") -> None:
+        """Accept a deliberative hardware event for evaluation."""
+        ...
+
+
+class EventKind:
+    """Observed conditions worth telling somebody about.
+
+    Some are traceable to a declared envelope field -- a threshold, a rate limit, a
+    settling time. Others are not: sample loss is read from gaps in the transport's
+    own sequence, degraded quality from what the device reports about its reading,
+    and unreachability from the connection itself. What they share is that each names
+    one specific observable condition rather than a judgement about it.
+    """
+
+    THRESHOLD_EXCEEDED = "threshold_exceeded"
+    RATE_EXCEEDED = "rate_exceeded"
+    STALE = "stale"
+    SAMPLE_LOSS = "sample_loss"
+    QUALITY_DEGRADED = "quality_degraded"
+    SETTLED = "settled"
+    UNREACHABLE = "unreachable"
+    """A command was refused because the device could not be reached.
+
+    Raised from the command path rather than the sampling loop, and it is the one
+    condition a board cannot infer from anything else: a bench whose commands are all
+    being refused looks exactly like a bench nobody is using.
+    """
+
+    # ── Calibration lifecycle (IC-6) ──
+    CALIBRATION_STARTED = "calibration_started"
+    """A calibration procedure has been initiated on a channel."""
+    CALIBRATION_COMPLETED = "calibration_completed"
+    """A calibration procedure completed successfully."""
+    CALIBRATION_FAILED = "calibration_failed"
+    """A calibration procedure failed before producing a valid correction."""
+    CALIBRATION_EXPIRED = "calibration_expired"
+    """The last successful calibration has exceeded its validity period."""
+    CALIBRATION_CANDIDATE = "calibration_candidate"
+    CALIBRATION_REJECTED = "calibration_rejected"
+    CALIBRATION_NO_OP = "calibration_no_op"
+    CALIBRATION_ACTIVATED = "calibration_activated"
+    CALIBRATION_ROLLED_BACK = "calibration_rolled_back"
+    CALIBRATION_INVALIDATED = "calibration_invalidated"
+    CALIBRATION_DRIFT = "calibration_drift"
+
+
+@dataclass(frozen=True)
+class HardwareEvent:
+    """One notable change in a device's observed state."""
+
+    kind: str
+    device_id: str
+    channel_id: str
+    quantity: str
+    detail: str
+    value: Any = None
+    unit: str = ""
+    observed_at: float = 0.0
+    """Wall-clock. This crosses module boundaries, so it must be the clock every
+    consumer outside ``leapflow.hardware`` already uses."""
+    event_class: str = ""
+    """Behavioural classification (reflex / deliberative / record).
+
+    Populated by ``classify_hardware_event`` at creation time. An empty string
+    means the classification has not been applied yet; consumers that depend on
+    it should fall back to ``classify_hardware_event(self.kind)``.
+    """
+
+    @property
+    def event_type(self) -> str:
+        """Return the EventBus type. ``hw`` is the family every consumer groups on.
+
+        Dotted so ``dashboard.service._event_family`` -- which splits on the first
+        separator -- yields ``hw`` without any enumeration being added anywhere.
+        """
+        return f"hw.{self.kind}"
+
+    @property
+    def source(self) -> str:
+        """Return the EventBus source: the channel that produced the observation."""
+        return f"{self.device_id}.{self.channel_id}"
+
+    def to_detail(self) -> str:
+        """Return a compact one-line description for the signal pipeline."""
+        where = f"{self.device_id}.{self.channel_id}"
+        rendered = (
+            ""
+            if self.value is None
+            else f" value={self.value}{f' {self.unit}' if self.unit else ''}"
+        )
+        return f"[{self.kind}] {where}{rendered}: {self.detail}"
+
+    @property
+    def resolved_event_class(self) -> str:
+        """Return the event class, computing it from kind if not set."""
+        return self.event_class or classify_hardware_event(self.kind)
+
+    def to_payload(self) -> dict[str, Any]:
+        """Return the EventBus payload, using that layer's key names.
+
+        ``ts`` and ``_mono_ts`` are the platform's contract, not this module's
+        preference: the pre-normalized pass-through reads ``ts`` for the event's
+        instant and ``EventReorderBuffer`` reads ``_mono_ts`` for arrival-order
+        correction. Supplying ``observed_at`` under its domain name instead would
+        leave both unset -- the event would be stamped with the moment it was
+        *normalized* rather than observed, and would sort against other sources by
+        nothing at all.
+
+        ``source`` is explicit for the same reason: without it the pass-through
+        substitutes the event type, and every view then shows that as the origin
+        instead of the channel that produced the observation.
+        """
+        return {
+            "kind": self.kind,
+            "event_class": self.resolved_event_class,
+            "source": self.source,
+            "device_id": self.device_id,
+            "channel_id": self.channel_id,
+            "quantity": self.quantity,
+            "detail": self.detail,
+            "value": self.value,
+            "unit": self.unit,
+            "ts": self.observed_at,
+            "_mono_ts": time.monotonic(),
+        }
+
+
+class ReadingRing:
+    """Bounded per-channel history of raw readings.
+
+    Bounded because an unbounded one is a memory leak with a schedule: eight channels
+    at 10 Hz for an overnight run is millions of samples. Losing the oldest readings is
+    acceptable; what is not acceptable is losing them *silently*, which is why
+    ``gaps()`` exists -- a break in the transport's sequence numbering is the only
+    evidence that something was dropped between the device and here.
+    """
+
+    def __init__(self, capacity: int = DEFAULT_RING_CAPACITY) -> None:
+        self._readings: Deque[Reading] = deque(maxlen=max(2, int(capacity)))
+        self._dropped_sequences = 0
+        self._expected_sequence: int | None = None
+
+    def record(self, reading: Reading) -> int:
+        """Append *reading*, returning how many samples appear to have been lost."""
+        lost = 0
+        if self._expected_sequence is not None and reading.sequence > self._expected_sequence:
+            lost = reading.sequence - self._expected_sequence
+            self._dropped_sequences += lost
+        self._expected_sequence = reading.sequence + 1
+        self._readings.append(reading)
+        return lost
+
+    @property
+    def latest(self) -> Reading | None:
+        return self._readings[-1] if self._readings else None
+
+    @property
+    def dropped(self) -> int:
+        """Total samples missing from the sequence over this ring's lifetime."""
+        return self._dropped_sequences
+
+    def __len__(self) -> int:
+        return len(self._readings)
+
+    def __iter__(self) -> Iterator[Reading]:
+        return iter(self._readings)
+
+    def window(self, count: int) -> tuple[Reading, ...]:
+        """Return the most recent *count* readings, oldest first."""
+        if count <= 0:
+            return ()
+        items = list(self._readings)
+        return tuple(items[-count:])
+
+    def summary(self) -> dict[str, Any]:
+        """Return a compact summary suitable for disclosure to a model.
+
+        Deliberately small. A model must never be handed the raw series -- that is
+        what makes an overnight run affordable -- so this is the shape that reaches
+        it: where the value is now, where it has been, and whether anything was lost.
+        """
+        latest = self.latest
+        if latest is None:
+            return {"samples": 0}
+        numeric = [n for r in self._readings if (n := as_numeric(r.value)) is not None]
+        payload: dict[str, Any] = {
+            "samples": len(self._readings),
+            "latest": latest.value,
+            "unit": latest.unit,
+            "quality": latest.quality,
+            "dropped": self._dropped_sequences,
+        }
+        if numeric:
+            payload.update(
+                {
+                    "min": min(numeric),
+                    "max": max(numeric),
+                    "mean": sum(numeric) / len(numeric),
+                    "trend": _trend(numeric),
+                }
+            )
+        return payload
+
+
+class HardwareEventDetector:
+    """Turns a stream of readings into events, using only declared envelope data.
+
+    Stateful per channel: staleness and rate need to remember what came before. Kept
+    separate from the ring so the detection rules can be tested against a synthetic
+    series without a transport in the picture.
+    """
+
+    def __init__(self, context: HardwareContext, channel: Channel) -> None:
+        self._context = context
+        self._channel = channel
+        self._last_numeric: float | None = None
+        self._last_monotonic: float | None = None
+        self._degraded_streak = 0
+        self._breached = False
+        self._stale = False
+
+    def observe(self, reading: Reading, *, lost: int = 0) -> tuple[HardwareEvent, ...]:
+        """Return the events this reading produces."""
+        events: list[HardwareEvent] = []
+        channel = self._channel
+        envelope = channel.envelope
+
+        if lost > 0:
+            events.append(
+                self._event(
+                    EventKind.SAMPLE_LOSS,
+                    reading,
+                    f"{lost} sample(s) missing from the transport sequence",
+                )
+            )
+
+        if reading.quality != Quality.OK.value:
+            self._degraded_streak += 1
+            # Three in a row rather than one: a lone suspect sample is noise, a run of
+            # them is a fault. Reporting every one would reproduce the sampling-rate
+            # flood this layer exists to prevent.
+            if self._degraded_streak == 3:
+                events.append(
+                    self._event(
+                        EventKind.QUALITY_DEGRADED,
+                        reading,
+                        f"quality has been {reading.quality!r} for 3 consecutive samples",
+                    )
+                )
+        else:
+            self._degraded_streak = 0
+
+        numeric = as_numeric(reading.value)
+        if numeric is not None and envelope.declared:
+            events.extend(self._numeric_events(reading, numeric))
+
+        self._last_numeric = numeric if numeric is not None else self._last_numeric
+        self._last_monotonic = reading.monotonic_at
+        self._stale = False
+        return tuple(events)
+
+    def check_stale(self, *, now: float | None = None) -> tuple[HardwareEvent, ...]:
+        """Return a staleness event when sampling has stopped.
+
+        Silence is itself an observation: a channel declared at 10 Hz that has said
+        nothing for a second has failed, and the absence of readings is the only way
+        that failure shows up.
+
+        ``now`` is monotonic, matching ``_last_monotonic``. Comparing a wall-clock
+        instant against a monotonic one yields a difference of the two epochs --
+        a number so large or so negative that the deadline is either always or
+        never met, and in both cases the check reports nothing useful.
+        """
+        channel = self._channel
+        if channel.sample_rate_hz <= 0 or self._last_monotonic is None or self._stale:
+            return ()
+        deadline = 2.0 / channel.sample_rate_hz
+        elapsed = (now if now is not None else time.monotonic()) - self._last_monotonic
+        if elapsed <= deadline:
+            return ()
+        self._stale = True
+        return (
+            HardwareEvent(
+                kind=EventKind.STALE,
+                device_id=self._context.device_id,
+                channel_id=channel.channel_id,
+                quantity=channel.quantity,
+                detail=(f"no sample for {elapsed:.2f}s on a {channel.sample_rate_hz:g} Hz channel"),
+                unit=channel.unit,
+                observed_at=time.time(),
+            ),
+        )
+
+    def _numeric_events(self, reading: Reading, numeric: float) -> list[HardwareEvent]:
+        events: list[HardwareEvent] = []
+        envelope = self._channel.envelope
+
+        # Asymmetric on purpose. Leaving the range is judged against the declared
+        # limit, because that is the limit a human wrote down. Returning must clear
+        # an inward margin, so a value resting on the boundary does not alternate
+        # breach and recovery at the sampling rate -- which would bury the one
+        # crossing that mattered under thousands of identical events.
+        if not self._breached:
+            if not envelope.contains(numeric):
+                self._breached = True
+                events.append(
+                    self._event(
+                        EventKind.THRESHOLD_EXCEEDED,
+                        reading,
+                        f"left the declared range ({_bounds(envelope)})",
+                    )
+                )
+        elif envelope.contains(numeric, margin=envelope.settle_margin):
+            # Re-entering is worth one event too, so a watcher can see recovery
+            # instead of inferring it from silence.
+            self._breached = False
+            events.append(self._event(EventKind.SETTLED, reading, "returned to the declared range"))
+
+        if (
+            envelope.max_rate is not None
+            and self._last_numeric is not None
+            and self._last_monotonic is not None
+        ):
+            elapsed = reading.monotonic_at - self._last_monotonic
+            if elapsed > 0 and envelope.rate_exceeded(
+                delta=numeric - self._last_numeric, elapsed_s=elapsed
+            ):
+                observed = abs(numeric - self._last_numeric) / elapsed
+                events.append(
+                    self._event(
+                        EventKind.RATE_EXCEEDED,
+                        reading,
+                        f"changing at {observed:g}/s, above the declared {envelope.max_rate:g}/s",
+                    )
+                )
+        return events
+
+    def _event(self, kind: str, reading: Reading, detail: str) -> HardwareEvent:
+        return HardwareEvent(
+            kind=kind,
+            device_id=self._context.device_id,
+            channel_id=self._channel.channel_id,
+            quantity=self._channel.quantity,
+            detail=detail,
+            value=reading.value,
+            unit=reading.unit or self._channel.unit,
+            observed_at=reading.observed_at,
+        )
+
+
+class HardwareStreamSource:
+    """Samples one channel on a schedule, emitting derived events.
+
+    Satisfies ``ActiveSignalSource`` structurally -- ``source_id`` / ``channel_id`` /
+    ``start(emit)`` / ``stop()`` -- but the sink receives a ``HardwareEvent``, not an
+    ``InteractionSignal``. Moving this under ``ActiveSourceManager`` therefore needs an
+    adapter for that one type, not just a registration: the manager's queue is typed for
+    interaction signals. Stated here because "can be handed over unchanged" was true of
+    the protocol and false of the payload, and that gap is the kind a reader would only
+    discover after wiring it.
+    """
+
+    def __init__(
+        self,
+        registry: Any,
+        context: HardwareContext,
+        channel: Channel,
+        *,
+        ring_capacity: int = DEFAULT_RING_CAPACITY,
+        event_sink: EventSink | None = None,
+        reading_store: Any = None,
+        alert_policy: Any = None,
+        degradation_policy: DegradationPolicy | None = None,
+    ) -> None:
+        self._registry = registry
+        self._context = context
+        self._channel = channel
+        self.ring = ReadingRing(ring_capacity)
+        self._detector = HardwareEventDetector(context, channel)
+        self._event_sink = event_sink
+        self._store = reading_store
+        self._alert_policy = alert_policy
+        self._degradation_policy = degradation_policy
+        self._degradation_coordinator = DegradationCoordinator(registry, context)
+        self._task: asyncio.Task[None] | None = None
+        self._stopping = asyncio.Event()
+        self._last_emitted: dict[str, float] = {}
+        self._paced_out = 0
+        self._samples = 0
+        self._skipped_slots = 0
+        self._started_monotonic: float | None = None
+        self._comm_loss_start: float | None = None
+        self._degradation_triggered: bool = False
+        self._sensor_loss_streak: int = 0
+        self._sensor_loss_triggered: bool = False
+        self._last_degradation_outcome: Any = None
+
+    @property
+    def source_id(self) -> str:
+        return f"hw:{self._context.device_id}:{self._channel.channel_id}"
+
+    @property
+    def channel_id(self) -> str:
+        """Signal channel used for config-level gating of the whole device."""
+        return f"hw.{self._context.device_id}"
+
+    async def start(self, emit: Any) -> None:
+        """Begin sampling. Returns promptly; the loop runs as an internal task.
+
+        Returning immediately is a protocol requirement, not a style choice: the
+        manager starts every source in sequence, so a source that sampled inline would
+        stall the ones after it.
+        """
+        if self._task is not None:
+            return
+        self._stopping.clear()
+        self._task = asyncio.create_task(self._run(emit), name=self.source_id)
+
+    async def stop(self) -> None:
+        """Stop sampling. Idempotent, and must not raise."""
+        self._stopping.set()
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+            logger.warning("Hardware stream %s stop raised: %s", self.source_id, exc)
+
+    async def _run(self, emit: Any) -> None:
+        interval = 1.0 / self._channel.sample_rate_hz if self._channel.sample_rate_hz > 0 else 1.0
+        consecutive_failures = 0
+        self._started_monotonic = time.monotonic()
+        # Deadline-based rather than sleep-based. A fixed sleep after each read adds
+        # the read's own duration to every period, so a channel declared at 10 Hz
+        # runs slower than 10 Hz -- silently, because the window record counts the
+        # samples it actually got and nothing compares that against the declaration.
+        next_at = self._started_monotonic
+        while not self._stopping.is_set():
+            try:
+                async with self._registry.device_io(self._context.device_id):
+                    transport = await self._registry.transport(self._context.device_id)
+                    reading = await transport.read(self._channel.channel_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one device must not stop the rest
+                consecutive_failures += 1
+                # Logged once per streak rather than per sample: a disconnected device
+                # would otherwise produce log lines at the sampling rate, burying the
+                # first and most useful one.
+                if consecutive_failures == 1:
+                    logger.warning(
+                        "Hardware stream %s read failed: %s", self.source_id, exc, exc_info=True
+                    )
+                    # Mark the start of a communication loss window.
+                    self._comm_loss_start = time.monotonic()
+                # DegradationPolicy: comm_loss enforcement.
+                await self._maybe_trigger_comm_loss()
+                self._dispatch(self._detector.check_stale(), emit)
+                await self._sleep(min(interval * (2**consecutive_failures), 30.0))
+                # Backoff deliberately abandons the old cadence; resuming the prior
+                # deadline would burst to "catch up" on a device that just recovered.
+                next_at = time.monotonic()
+                continue
+
+            # Recovery: clear comm-loss state only after a healthy read.
+            if consecutive_failures > 0 or self._comm_loss_start is not None:
+                self._comm_loss_start = None
+                self._degradation_triggered = False
+                self._registry.clear_degradation(
+                    self._context.device_id, recovery="healthy_stream_read"
+                )
+            consecutive_failures = 0
+            self._samples += 1
+            lost = self.ring.record(reading)
+            await self._persist(reading, lost=lost)
+            # Sensor quality tracking for degradation policy.
+            await self._track_sensor_quality(reading)
+            self._dispatch(self._detector.observe(reading, lost=lost), emit)
+
+            next_at += interval
+            delay = next_at - time.monotonic()
+            if delay < 0:
+                # Behind schedule. Skip the missed slots instead of firing them back
+                # to back: a burst would exceed the declared rate the envelope was
+                # written against, and the count makes the shortfall observable
+                # rather than leaving it to be inferred from a thin series.
+                missed = int(-delay // interval) + 1
+                self._skipped_slots += missed
+                next_at += missed * interval
+                delay = max(0.0, next_at - time.monotonic())
+            await self._sleep(delay)
+
+    async def _maybe_trigger_comm_loss(self) -> None:
+        """Evaluate DegradationPolicy.comm_loss_policy during a failure streak.
+
+        Triggers at most once per contiguous loss streak; the flag is cleared on
+        the next successful read.  No-op when no policy is declared or when the
+        loss window has not yet exceeded ``max_comm_loss_s``.
+        """
+        policy = self._degradation_policy
+        if policy is None or self._degradation_triggered:
+            return
+        if self._comm_loss_start is None:
+            return
+        elapsed = time.monotonic() - self._comm_loss_start
+        if elapsed <= policy.max_comm_loss_s:
+            return
+        self._degradation_triggered = True
+        await self._execute_degradation(policy.comm_loss_policy, reason="comm_loss")
+
+    async def _track_sensor_quality(self, reading: Reading) -> None:
+        """Evaluate DegradationPolicy.sensor_loss_policy on quality streaks.
+
+        Non-OK readings (STALE/SATURATED/SUSPECT) accumulate a streak; a run of
+        three triggers the declared ``sensor_loss_policy`` once.  An OK reading
+        resets both the streak and the triggered flag so a future loss can fire.
+        """
+        policy = self._degradation_policy
+        if reading.quality == Quality.OK.value:
+            self._sensor_loss_streak = 0
+            if self._sensor_loss_triggered:
+                self._registry.clear_degradation(
+                    self._context.device_id, recovery="healthy_sensor_read"
+                )
+            self._sensor_loss_triggered = False
+            return
+        self._sensor_loss_streak += 1
+        if policy is None or self._sensor_loss_triggered:
+            return
+        # Three consecutive degraded samples mirrors the detector's own threshold
+        # for QUALITY_DEGRADED: a lone suspect sample is noise, a run of them is
+        # a fault worth acting on.
+        if self._sensor_loss_streak < 3:
+            return
+        self._sensor_loss_triggered = True
+        await self._execute_degradation(policy.sensor_loss_policy, reason="sensor_loss")
+
+    async def _execute_degradation(self, action: str, *, reason: str) -> None:
+        """Delegate every transition to the shared fail-closed coordinator."""
+        outcome = await self._degradation_coordinator.execute(
+            action,
+            reason=reason,
+            failed_channel_id=self._channel.channel_id,
+            sensor_switcher=self._switch_sensor,
+        )
+        self._last_degradation_outcome = outcome
+        if outcome.completed and outcome.action == "switch_sensor":
+            self._degradation_triggered = False
+            self._sensor_loss_triggered = False
+
+    async def _switch_sensor(self, target_channel_id: str) -> bool:
+        """Verify and atomically switch this source to a declared fallback."""
+        target = self._context.channel(target_channel_id)
+        if target is None or not target.is_readable:
+            return False
+        try:
+            async with self._registry.device_io(self._context.device_id):
+                transport = await self._registry.transport(self._context.device_id)
+                reading = await transport.read(target_channel_id)
+        except Exception:  # noqa: BLE001 - coordinator records the fail-closed outcome
+            return False
+        if reading.quality != Quality.OK.value:
+            return False
+        self._channel = target
+        self._detector = HardwareEventDetector(self._context, target)
+        return True
+
+    @property
+    def degradation_triggered(self) -> bool:
+        """Return True while a declared degradation action is in effect.
+
+        Callers that gate commands (e.g. ``hold_position``) can read this to
+        decide whether to issue new writes without blocking the sampling loop.
+        """
+        return self._degradation_triggered or self._sensor_loss_triggered
+
+    @property
+    def last_degradation_outcome(self) -> Any | None:
+        """Return the most recent governed degradation transition."""
+        return self._last_degradation_outcome
+
+    async def _persist(self, reading: Reading, *, lost: int) -> None:
+        """Buffer one sample and, when a window closes, write it off the sampling path.
+
+        Buffering stays on the loop because it only mutates dictionaries. The write
+        does not: appending a file and opening DuckDB inside the sampling loop stalls
+        it for the duration of that I/O, which on a 10 Hz channel is a whole period
+        or more. Draining first and writing in a worker keeps buffer mutation
+        single-threaded while the blocking part happens elsewhere.
+        """
+        store = self._store
+        if store is None:
+            return
+        try:
+            store.record(reading, dropped=lost)
+            if not store.due_for_flush():
+                return
+            batches = store.drain()
+            if batches:
+                await asyncio.to_thread(store.write_batches, batches)
+        except Exception as exc:  # noqa: BLE001 - persistence must not stop sampling
+            logger.warning(
+                "Hardware reading persistence failed for %s: %s",
+                self.source_id,
+                exc,
+                exc_info=True,
+            )
+
+    async def _sleep(self, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(self._stopping.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return
+
+    def _dispatch(self, events: Iterable[HardwareEvent], emit: Any) -> None:
+        """Hand events to the sink, signal pipeline, and alert policy, paced per kind.
+
+        ``emit`` receives the ``HardwareEvent`` itself rather than a pre-flattened
+        signal, because the consumer decides the representation: the event family,
+        the value and the unit are all needed downstream, and collapsing them to a
+        detail string here would force every consumer to parse it back out.
+
+        Alert policy evaluation runs after the emit so the event is recorded (and
+        visible on the board) before a response is attempted.  The policy itself
+        dispatches asynchronous tasks so it never blocks the sampling loop.
+        """
+        for event in events:
+            if not self._admit(event):
+                continue
+            if self._event_sink is not None:
+                try:
+                    self._event_sink(event)
+                except Exception as exc:  # noqa: BLE001 - a sink must not stop sampling
+                    logger.warning("Hardware event sink raised: %s", exc, exc_info=True)
+            if emit is not None:
+                try:
+                    emit(event)
+                except Exception as exc:  # noqa: BLE001 - as above
+                    logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
+            # Alert policy evaluation: after emit so the event is visible first.
+            if self._alert_policy is not None:
+                try:
+                    self._alert_policy.evaluate(event)
+                    # Reset consecutive counters on recovery so a new breach cycle
+                    # starts fresh rather than carrying stale counts.
+                    if event.kind == EventKind.SETTLED:
+                        self._alert_policy.reset_channel(event.device_id, event.channel_id)
+                except Exception as exc:  # noqa: BLE001 - policy must not stop sampling
+                    logger.warning("Hardware alert policy raised: %s", exc, exc_info=True)
+
+    def _admit(self, event: HardwareEvent) -> bool:
+        """Return whether this event clears the per-kind-per-channel rate floor.
+
+        Keyed by ``kind:device_id.channel_id`` so that:
+
+        - A paced ``rate_exceeded`` on one channel can never hide a first-time
+          ``threshold_exceeded`` on a *different* channel -- suppressing an
+          observation from another channel would trade one flood for one blind
+          spot.
+        - The same kind on the *same* channel is still suppressed for the
+          ``MIN_EVENT_INTERVAL_S`` floor, preventing level-triggered floods.
+        """
+        now = time.monotonic()
+        key = f"{event.kind}:{event.device_id}.{event.channel_id}"
+        previous = self._last_emitted.get(key)
+        if previous is not None and now - previous < MIN_EVENT_INTERVAL_S:
+            self._paced_out += 1
+            return False
+        self._last_emitted[key] = now
+        return True
+
+    @property
+    def health(self) -> dict[str, Any]:
+        """Return sampling health for disclosure and for the board.
+
+        ``observed_hz`` against ``declared_hz`` is the only way a cadence shortfall
+        becomes visible: the stored series looks entirely normal when a channel runs
+        at two thirds of its declared rate.
+        """
+        declared = float(self._channel.sample_rate_hz or 0.0)
+        started = self._started_monotonic
+        elapsed = (time.monotonic() - started) if started is not None else 0.0
+        observed = (self._samples / elapsed) if elapsed > 0 else 0.0
+        return {
+            "source_id": self.source_id,
+            "device_id": self._context.device_id,
+            "channel_id": self._channel.channel_id,
+            "declared_hz": declared,
+            "observed_hz": observed,
+            "rate_ratio": (observed / declared) if declared > 0 else 0.0,
+            "samples": self._samples,
+            "skipped_slots": self._skipped_slots,
+            "dropped": self.ring.dropped,
+            "events_paced_out": self._paced_out,
+        }
+
+
+class BatchStreamCoordinator:
+    """Coordinates batch sampling for all streaming channels of one device.
+
+    When the transport satisfies ``BatchTransport``, one coordinator replaces
+    N individual ``HardwareStreamSource`` tasks with a single sampling loop
+    that calls ``read_batch`` once per period.  The readings are then
+    distributed to the per-channel rings and detectors, preserving the
+    per-channel event model while eliminating per-read lock contention.
+
+    Falls back to individual sources when the transport does not support
+    batch -- the coordinator is an optimisation, not a requirement.
+    """
+
+    def __init__(
+        self,
+        registry: Any,
+        context: HardwareContext,
+        channels: tuple[Channel, ...],
+        *,
+        ring_capacity: int = DEFAULT_RING_CAPACITY,
+        event_sink: EventSink | None = None,
+        reading_store: Any = None,
+        alert_policy: Any = None,
+        degradation_policy: DegradationPolicy | None = None,
+    ) -> None:
+        self._registry = registry
+        self._context = context
+        self._channels = channels
+        self._channel_ids = tuple(ch.channel_id for ch in channels)
+        self._rings: dict[str, ReadingRing] = {
+            ch.channel_id: ReadingRing(ring_capacity) for ch in channels
+        }
+        self._detectors: dict[str, HardwareEventDetector] = {
+            ch.channel_id: HardwareEventDetector(context, ch) for ch in channels
+        }
+        self._event_sink = event_sink
+        self._store = reading_store
+        self._alert_policy = alert_policy
+        self._degradation_policy = degradation_policy
+        self._degradation_coordinator = DegradationCoordinator(registry, context)
+        self._task: asyncio.Task[None] | None = None
+        self._stopping = asyncio.Event()
+        self._last_emitted: dict[str, float] = {}
+        self._paced_out = 0
+        self._samples = 0
+        self._skipped_slots = 0
+        self._started_monotonic: float | None = None
+        self._comm_loss_start: float | None = None
+        self._degradation_triggered: bool = False
+        self._sensor_loss_streak: int = 0
+        self._sensor_loss_triggered: bool = False
+        self._last_degradation_outcome: Any = None
+
+    @property
+    def source_id(self) -> str:
+        return f"hw.batch:{self._context.device_id}"
+
+    async def start(self, emit: Any) -> None:
+        """Begin batch sampling. Returns promptly; the loop runs as an internal task."""
+        if self._task is not None:
+            return
+        self._stopping.clear()
+        self._task = asyncio.create_task(self._run(emit), name=self.source_id)
+
+    async def stop(self) -> None:
+        """Stop batch sampling. Idempotent."""
+        self._stopping.set()
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+            logger.warning("Batch stream %s stop raised: %s", self.source_id, exc)
+
+    async def _run(self, emit: Any) -> None:
+        """Core batch sampling loop.
+
+        Uses deadline-based scheduling identical to HardwareStreamSource._run(),
+        but calls read_batch() once to get all channels simultaneously.
+        The batch readings are then split and fed to per-channel rings,
+        detectors, persistence and event dispatch.
+
+        The sampling rate is the maximum declared rate across all channels.
+        """
+        max_rate = max(
+            (ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0
+        )
+        interval = 1.0 / max_rate if max_rate > 0 else 1.0
+        consecutive_failures = 0
+        self._started_monotonic = time.monotonic()
+        next_at = self._started_monotonic
+        while not self._stopping.is_set():
+            try:
+                batch = await self._registry.read_batch(self._context.device_id, self._channel_ids)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one device must not stop the rest
+                consecutive_failures += 1
+                if consecutive_failures == 1:
+                    logger.warning(
+                        "Batch stream %s read failed: %s", self.source_id, exc, exc_info=True
+                    )
+                    self._comm_loss_start = time.monotonic()
+                # DegradationPolicy: comm_loss enforcement.
+                await self._maybe_trigger_comm_loss()
+                # Check staleness on all channels during failures.
+                for detector in self._detectors.values():
+                    self._dispatch(detector.check_stale(), emit)
+                await self._sleep(min(interval * (2**consecutive_failures), 30.0))
+                next_at = time.monotonic()
+                continue
+
+            # Recovery: clear comm-loss state.
+            if consecutive_failures > 0 or self._comm_loss_start is not None:
+                self._comm_loss_start = None
+                self._degradation_triggered = False
+                self._registry.clear_degradation(
+                    self._context.device_id, recovery="healthy_batch_read"
+                )
+            consecutive_failures = 0
+            self._samples += 1
+
+            # Distribute batch readings to per-channel rings and detectors.
+            for reading in batch.readings:
+                ch_id = reading.channel_id
+                ring = self._rings.get(ch_id)
+                if ring is None:
+                    continue
+                lost = ring.record(reading)
+                await self._persist(reading, lost=lost)
+                # Sensor quality tracking for degradation policy.
+                await self._track_sensor_quality(reading)
+                detector = self._detectors.get(ch_id)
+                if detector is not None:
+                    self._dispatch(detector.observe(reading, lost=lost), emit)
+
+            next_at += interval
+            delay = next_at - time.monotonic()
+            if delay < 0:
+                missed = int(-delay // interval) + 1
+                self._skipped_slots += missed
+                next_at += missed * interval
+                delay = max(0.0, next_at - time.monotonic())
+            await self._sleep(delay)
+
+    async def _maybe_trigger_comm_loss(self) -> None:
+        """Evaluate DegradationPolicy.comm_loss_policy during a failure streak."""
+        policy = self._degradation_policy
+        if policy is None or self._degradation_triggered:
+            return
+        if self._comm_loss_start is None:
+            return
+        elapsed = time.monotonic() - self._comm_loss_start
+        if elapsed <= policy.max_comm_loss_s:
+            return
+        self._degradation_triggered = True
+        await self._execute_degradation(policy.comm_loss_policy, reason="comm_loss")
+
+    async def _track_sensor_quality(self, reading: Reading) -> None:
+        """Evaluate DegradationPolicy.sensor_loss_policy on quality streaks."""
+        policy = self._degradation_policy
+        if reading.quality == Quality.OK.value:
+            self._sensor_loss_streak = 0
+            if self._sensor_loss_triggered:
+                self._registry.clear_degradation(
+                    self._context.device_id, recovery="healthy_batch_sensor_read"
+                )
+            self._sensor_loss_triggered = False
+            return
+        self._sensor_loss_streak += 1
+        if policy is None or self._sensor_loss_triggered:
+            return
+        if self._sensor_loss_streak < 3:
+            return
+        self._sensor_loss_triggered = True
+        await self._execute_degradation(policy.sensor_loss_policy, reason="sensor_loss")
+
+    async def _execute_degradation(self, action: str, *, reason: str) -> None:
+        """Delegate batch-source transitions to the shared coordinator."""
+        failed_channel_id = self._channel_ids[0] if self._channel_ids else ""
+        outcome = await self._degradation_coordinator.execute(
+            action,
+            reason=reason,
+            failed_channel_id=failed_channel_id,
+            sensor_switcher=self._switch_sensor,
+        )
+        self._last_degradation_outcome = outcome
+        if outcome.completed and outcome.action == "switch_sensor":
+            self._degradation_triggered = False
+            self._sensor_loss_triggered = False
+
+    async def _switch_sensor(self, target_channel_id: str) -> bool:
+        """Replace one failed batch input only after healthy fallback readback."""
+        target = self._context.channel(target_channel_id)
+        if target is None or not target.is_readable:
+            return False
+        try:
+            async with self._registry.device_io(self._context.device_id):
+                transport = await self._registry.transport(self._context.device_id)
+                reading = await transport.read(target_channel_id)
+        except Exception:  # noqa: BLE001 - coordinator performs the fail-closed fallback
+            return False
+        if reading.quality != Quality.OK.value:
+            return False
+        failed = next(
+            (channel_id for channel_id in self._channel_ids if channel_id != target_channel_id),
+            "",
+        )
+        updated = tuple(
+            target if channel.channel_id == failed else channel for channel in self._channels
+        )
+        self._channels = updated
+        self._channel_ids = tuple(dict.fromkeys(channel.channel_id for channel in updated))
+        self._rings.setdefault(target_channel_id, ReadingRing(DEFAULT_RING_CAPACITY))
+        self._detectors[target_channel_id] = HardwareEventDetector(self._context, target)
+        return True
+
+    @property
+    def degradation_triggered(self) -> bool:
+        """Return True while a declared degradation action is in effect."""
+        return self._degradation_triggered or self._sensor_loss_triggered
+
+    @property
+    def last_degradation_outcome(self) -> Any | None:
+        """Return the most recent governed degradation transition."""
+        return self._last_degradation_outcome
+
+    async def _persist(self, reading: Reading, *, lost: int) -> None:
+        """Buffer one sample for persistence, mirroring HardwareStreamSource._persist."""
+        store = self._store
+        if store is None:
+            return
+        try:
+            store.record(reading, dropped=lost)
+            if not store.due_for_flush():
+                return
+            batches = store.drain()
+            if batches:
+                await asyncio.to_thread(store.write_batches, batches)
+        except Exception as exc:  # noqa: BLE001 - persistence must not stop sampling
+            logger.warning(
+                "Hardware reading persistence failed for %s: %s",
+                self.source_id,
+                exc,
+                exc_info=True,
+            )
+
+    async def _sleep(self, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(self._stopping.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return
+
+    def _dispatch(self, events: Iterable[HardwareEvent], emit: Any) -> None:
+        """Hand events to the sink, signal pipeline, and alert policy, paced per kind."""
+        for event in events:
+            if not self._admit(event):
+                continue
+            if self._event_sink is not None:
+                try:
+                    self._event_sink(event)
+                except Exception as exc:  # noqa: BLE001 - a sink must not stop sampling
+                    logger.warning("Hardware event sink raised: %s", exc, exc_info=True)
+            if emit is not None:
+                try:
+                    emit(event)
+                except Exception as exc:  # noqa: BLE001 - as above
+                    logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
+            if self._alert_policy is not None:
+                try:
+                    self._alert_policy.evaluate(event)
+                    if event.kind == EventKind.SETTLED:
+                        self._alert_policy.reset_channel(event.device_id, event.channel_id)
+                except Exception as exc:  # noqa: BLE001 - policy must not stop sampling
+                    logger.warning("Hardware alert policy raised: %s", exc, exc_info=True)
+
+    def _admit(self, event: HardwareEvent) -> bool:
+        """Return whether this event clears the per-kind-per-channel rate floor."""
+        now = time.monotonic()
+        key = f"{event.kind}:{event.device_id}.{event.channel_id}"
+        previous = self._last_emitted.get(key)
+        if previous is not None and now - previous < MIN_EVENT_INTERVAL_S:
+            self._paced_out += 1
+            return False
+        self._last_emitted[key] = now
+        return True
+
+    def ring(self, channel_id: str) -> ReadingRing | None:
+        """Return the per-channel ring, or None for an unknown channel."""
+        return self._rings.get(channel_id)
+
+    @property
+    def health(self) -> dict[str, Any]:
+        """Return batch sampling health metrics."""
+        max_rate = max(
+            (ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0
+        )
+        started = self._started_monotonic
+        elapsed = (time.monotonic() - started) if started is not None else 0.0
+        observed = (self._samples / elapsed) if elapsed > 0 else 0.0
+        total_dropped = sum(r.dropped for r in self._rings.values())
+        return {
+            "source_id": self.source_id,
+            "device_id": self._context.device_id,
+            "channels": len(self._channels),
+            "declared_hz": float(max_rate),
+            "observed_hz": observed,
+            "rate_ratio": (observed / max_rate) if max_rate > 0 else 0.0,
+            "samples": self._samples,
+            "skipped_slots": self._skipped_slots,
+            "dropped": total_dropped,
+            "events_paced_out": self._paced_out,
+        }
+
+
+def build_batch_coordinators(
+    registry: Any,
+    *,
+    ring_capacity: int = DEFAULT_RING_CAPACITY,
+    event_sink: EventSink | None = None,
+    reading_store: Any = None,
+    alert_policy: Any = None,
+) -> tuple[BatchStreamCoordinator, ...]:
+    """Return one coordinator per device whose transport supports BatchTransport.
+
+    Devices whose transport does not satisfy ``BatchTransport`` are skipped;
+    their channels are handled by individual ``HardwareStreamSource`` instances
+    from ``build_stream_sources``.
+    """
+    from leapflow.hardware.transport import BatchTransport
+
+    coordinators: list[BatchStreamCoordinator] = []
+    for context in registry.contexts():
+        channels = tuple(
+            ch for ch in context.streaming_channels if ch.is_readable and not ch.is_media
+        )
+        if not channels:
+            continue
+        # Check whether the transport declaration supports batch.
+        # We inspect the transport kind; the actual isinstance check against the
+        # live transport is deferred to read_batch at runtime, but the coordinator
+        # is only created for devices whose transport advertises BatchTransport.
+        transport_kind = context.transport.kind
+        try:
+            from leapflow.hardware.transports import build_transport
+
+            proto = build_transport(transport_kind, context.transport.config)
+            if not isinstance(proto, BatchTransport):
+                continue
+        except Exception:  # noqa: BLE001 - skip devices we cannot probe
+            continue
+        coordinators.append(
+            BatchStreamCoordinator(
+                registry,
+                context,
+                channels,
+                ring_capacity=ring_capacity,
+                event_sink=event_sink,
+                reading_store=reading_store,
+                alert_policy=alert_policy,
+                degradation_policy=context.degradation,
+            )
+        )
+    return tuple(coordinators)
+
+
+def build_stream_sources(
+    registry: Any,
+    *,
+    ring_capacity: int = DEFAULT_RING_CAPACITY,
+    event_sink: EventSink | None = None,
+    reading_store: Any = None,
+    alert_policy: Any = None,
+    batch_device_ids: frozenset[str] = frozenset(),
+) -> tuple[HardwareStreamSource, ...]:
+    """Return one source per streaming channel across all admitted devices.
+
+    ``sample_rate_hz > 0`` is the only thing consulted. No device type is enumerated
+    anywhere, which is what lets a declaration add a sensor without touching code.
+
+    Media channels are excluded even when they declare a rate. Admission already
+    clears the rate on them; this is the second half of that guard, kept here
+    because this is the loop that would otherwise push a few hundred kilobytes per
+    sample into the raw NDJSON segment and try to average frames into a downsample
+    window. Previews are pulled on demand by whoever is watching, never sampled.
+
+    Channels belonging to devices in *batch_device_ids* are skipped: they are
+    handled by a ``BatchStreamCoordinator`` instead, and building individual
+    sources for them would double-sample the device.
+    """
+    sources: list[HardwareStreamSource] = []
+    for context in registry.contexts():
+        if context.device_id in batch_device_ids:
+            continue
+        for channel in context.streaming_channels:
+            if not channel.is_readable or channel.is_media:
+                continue
+            sources.append(
+                HardwareStreamSource(
+                    registry,
+                    context,
+                    channel,
+                    ring_capacity=ring_capacity,
+                    event_sink=event_sink,
+                    reading_store=reading_store,
+                    alert_policy=alert_policy,
+                    degradation_policy=context.degradation,
+                )
+            )
+    return tuple(sources)
+
+
+def _trend(values: list[float]) -> str:
+    """Classify a series as rising, falling, or flat by comparing its halves."""
+    if len(values) < 4:
+        return "flat"
+    midpoint = len(values) // 2
+    first = sum(values[:midpoint]) / midpoint
+    second = sum(values[midpoint:]) / (len(values) - midpoint)
+    spread = max(values) - min(values)
+    if spread == 0:
+        return "flat"
+    delta = (second - first) / spread
+    if delta > 0.1:
+        return "rising"
+    if delta < -0.1:
+        return "falling"
+    return "flat"
+
+
+def _bounds(envelope: Any) -> str:
+    low = "-inf" if envelope.min_value is None else f"{envelope.min_value:g}"
+    high = "+inf" if envelope.max_value is None else f"{envelope.max_value:g}"
+    return f"{low}..{high}"
+
+
+__all__ = [
+    "BatchStreamCoordinator",
+    "DEFAULT_RING_CAPACITY",
+    "MIN_EVENT_INTERVAL_S",
+    "EventKind",
+    "HardwareDeliberativeObserver",
+    "HardwareEvent",
+    "HardwareEventDetector",
+    "HardwareStreamSource",
+    "ReadingRing",
+    "build_batch_coordinators",
+    "build_stream_sources",
+]

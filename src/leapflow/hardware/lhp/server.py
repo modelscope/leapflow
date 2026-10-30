@@ -81,6 +81,7 @@ from leapflow.hardware.lhp.protocol import (
     ERR_UNKNOWN_DEVICE,
     ERR_UNSUPPORTED_CAPABILITY,
     FAILURE_DEVICE_BUSY,
+    FAILURE_SAFETY_DENIED,
     LHP_DEFAULT_PORT,
     LHP_SUPPORTED_VERSIONS,
     MAX_FRAME_BYTES,
@@ -99,6 +100,7 @@ from leapflow.hardware.lhp.protocol import (
 from leapflow.hardware.node_gate import (
     NodeWriteGate,
     ReadingIdentityError,
+    control_safety_refusal,
     merged_batch_state,
     refusal,
     verify_reading_identity,
@@ -160,7 +162,11 @@ class LhpNodeServer:
         self._sessions = NodeSessions(
             registry,
             device_busy=skill_runtime.holds_device if skill_runtime is not None else None,
+            transaction_run_owner=skill_runtime.transaction_run_owner if skill_runtime is not None else None,
         )
+        bind_sessions = getattr(registry, "bind_node_sessions", None)
+        if callable(bind_sessions):
+            bind_sessions(self._sessions)
         self._server: asyncio.AbstractServer | None = None
         self._unix_path = ""
         self._writers: set[asyncio.StreamWriter] = set()
@@ -170,6 +176,8 @@ class LhpNodeServer:
         # connection releases everything it held -- a host that vanished cannot keep a
         # camera on.
         self._frame_holds: dict[str, set[tuple[str, str]]] = {}
+        from leapflow.hardware.calibration.lifecycle import OwnerLifecycle
+        self._calibration_lifecycle = OwnerLifecycle(registry)
         self._handlers: dict[str, Any] = {
             "hello": self._handle_hello,
             "list": self._handle_list,
@@ -515,7 +523,7 @@ class LhpNodeServer:
             raise LhpProtocolError("write needs a 'value' (null is a value; omission is not)")
         value = params.get("value")
         self._resolve_channel(device_id, channel_id)
-        gate_refusal = self._busy_refusal(device_id) or self._authority.check("write", params)
+        gate_refusal = self._write_feasibility_refusal(device_id) or self._authority.check("write", params)
         if gate_refusal is not None:
             return gate_refusal.to_dict()
         outcome = await self._gate.write(device_id, channel_id, value)
@@ -533,7 +541,7 @@ class LhpNodeServer:
                     f"unknown channel {channel_id!r} on device {device_id!r}",
                     code=ERR_UNKNOWN_CHANNEL,
                 )
-        gate_refusal = self._busy_refusal(device_id) or self._authority.check("write_batch", params)
+        gate_refusal = self._write_feasibility_refusal(device_id) or self._authority.check("write_batch", params)
         if gate_refusal is not None:
             outcomes = tuple(gate_refusal for _ in commands)
             return self._batch_payload(ok=False, outcomes=outcomes)
@@ -553,6 +561,16 @@ class LhpNodeServer:
         hub = (status.metadata or {}).get("frame_hub")
         if isinstance(hub, Mapping) and hub:
             payload["frame_hub"] = dict(hub)  # pump health for the host's monitor; JSON-safe
+        if hasattr(self._registry, "calibration_generations"):
+            try:
+                payload["calibration_lifecycle"] = await self._calibration_lifecycle.probe(
+                    device_id, _CONNECTION_ID.get(), params.get("calibration_ack", ()),
+                )
+            except ValueError as exc:
+                raise LhpProtocolError(str(exc), code=ERR_BAD_REQUEST) from exc
+            except Exception:  # noqa: BLE001 - telemetry storage cannot fail a health probe
+                logger.warning("Calibration lifecycle probe unavailable", exc_info=True)
+                payload["calibration_lifecycle_error"] = "durable lifecycle telemetry unavailable; evolution disabled"
         return payload
 
     async def _handle_halt(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -601,10 +619,23 @@ class LhpNodeServer:
     # ── Control session handlers ──
 
     async def _handle_control_open(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        gate_refusal = self._authority.check("control.open", params)
-        if gate_refusal is not None:
-            return gate_refusal.to_dict()
-        return await self._sessions.open(params, connection_id=_CONNECTION_ID.get())
+        device_id = str(params.get("device_id") or "")
+        if busy := self._write_feasibility_refusal(device_id):
+            return busy.to_dict()
+        if reason := control_safety_refusal(self._registry, device_id):
+            return refusal(reason, FAILURE_SAFETY_DENIED).to_dict()
+        # Missing authority and observe-only refusals consume no nonce. All other
+        # authority is checked after the awaited owner feasibility checks.
+        if self._authority.mode == WRITE_MODE_OBSERVE_ONLY or (
+            self._authority.mode == WRITE_MODE_PERMIT_REQUIRED and params.get("permit") is None
+        ):
+            gate_refusal = self._authority.check("control.open", params)
+            if gate_refusal is not None:
+                return gate_refusal.to_dict()
+        return await self._sessions.open(
+            params, connection_id=_CONNECTION_ID.get(),
+            authorize=lambda: self._authority.check("control.open", params),
+        )
 
     async def _handle_control_renew(self, params: Mapping[str, Any]) -> dict[str, Any]:
         return await self._sessions.renew(params, connection_id=_CONNECTION_ID.get())
@@ -642,17 +673,21 @@ class LhpNodeServer:
             )
         return context, channel
 
-    def _busy_refusal(self, device_id: str) -> WriteOutcome | None:
-        """Refuse a wire write while a session or a skill run holds *device_id*.
+    def _write_feasibility_refusal(self, device_id: str) -> WriteOutcome | None:
+        """Refuse busy or unreconciled consumers before consuming a wire permit.
 
-        Checked before the permit so a refusal for a held device does not burn it.
+        Restart stop-use, like a resource hold, is feasibility rather than authority.
         """
-        if not self._sessions.busy_device((device_id,)):
-            return None
-        return refusal(
-            f"device {device_id!r} is held by a running session; stop it or wait for it to end",
-            FAILURE_DEVICE_BUSY,
-        )
+        if self._sessions.busy_device((device_id,)):
+            return refusal(
+                f"device {device_id!r} is held by a running session; stop it or wait for it to end",
+                FAILURE_DEVICE_BUSY,
+            )
+        from leapflow.hardware.node_gate import recovery_safety_refusal
+
+        if reason := recovery_safety_refusal(self._registry, device_id):
+            return refusal(reason, FAILURE_SAFETY_DENIED)
+        return None
 
     @staticmethod
     def _batch_payload(*, ok: bool, outcomes: tuple[WriteOutcome, ...]) -> dict[str, Any]:
@@ -785,6 +820,7 @@ class LhpNodeServer:
         finally:
             # Sessions owned by a dropped connection fail safe.
             try:
+                self._calibration_lifecycle.disconnect(state.connection_id)
                 await self._sessions.on_disconnect(state.connection_id)
             except Exception as exc:  # noqa: BLE001 - a fail-safe fault must not leak the writer
                 logger.error("LHP disconnect fail-safe failed: %s", exc, exc_info=True)

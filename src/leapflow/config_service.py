@@ -287,6 +287,16 @@ _FIELD_DESCRIPTIONS = {
         "known to produce no sensitive data. Applied when the store is built, so a "
         "change needs a daemon restart."
     ),
+    "hardware.calibration_worker_enabled": (
+        "Enable the lazy node-owned compute-only calibration subprocess. Defaults off; "
+        "does not grant acquisition, motion, or model activation. Requires node restart."
+    ),
+    "hardware.calibration_worker_budgets": (
+        "JSON worker budgets: request_bytes (16777216), response_bytes (2097152), queued_jobs (2), "
+        "max_keyframes (128), max_tracks (2048), roi_width (640), roi_height (480), startup_s (10), "
+        "update_s (2), solve_s (30), rss_bytes (536870912). Values may tighten, never expand "
+        "these ceilings. Socket location is profile-layout-owned. Requires node restart."
+    ),
     "hardware.skills_enabled": (
         "Comma-separated patterns (fnmatch) of node skills a hardware node offers; empty "
         "offers every discovered skill. Read when the node starts, so a change needs a "

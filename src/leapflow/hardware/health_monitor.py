@@ -129,6 +129,8 @@ class HardwareHealthMonitor:
         # Per-device health tracking.
         self._records: dict[str, DeviceHealthRecord] = {}
         self._frames = FrameHealthTracker()
+        from leapflow.hardware.calibration.lifecycle import LifecycleReceiver
+        self._calibration_lifecycle = LifecycleReceiver(registry)
         self._poll_task: asyncio.Task[None] | None = None
         self._stopped = asyncio.Event()
         self._started = False
@@ -554,6 +556,14 @@ class HardwareHealthMonitor:
 
         record.last_probe_time = time.monotonic()
         self._observe_frames(device_id, probe_result)
+        if probe_result is not None:
+            try:
+                accepted = self._calibration_lifecycle.observe(device_id, probe_result)
+                acknowledge = getattr(transport, "acknowledge_calibration", None)
+                if callable(acknowledge):
+                    acknowledge(accepted)
+            except (ValueError, TypeError):
+                logger.warning("Calibration lifecycle delivery refused; records remain pending", exc_info=True)
 
     def _observe_frames(self, device_id: str, status: Any) -> None:
         """Publish the frame-pump transitions a camera's probe reveals as signals."""

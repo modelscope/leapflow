@@ -25,7 +25,21 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Mapping, Protocol, Sequence, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Iterator,
+    Mapping,
+    Protocol,
+    Sequence,
+    Union,
+    runtime_checkable,
+)
+
+if TYPE_CHECKING:
+    from leapcalib.contracts.motion import MotionObservation
+    from leapcalib.contracts.task import TaskTransition
+    from leapcalib.contracts.raw_task import RawTaskTransition
 
 from leapcalib.contracts.failures import (
     FAILURE_CLOCK_DOMAIN_MISMATCH,
@@ -139,10 +153,10 @@ class Stamp:
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "Stamp":
         return cls(
-            seconds=float(data["seconds"]),
-            domain=str(data.get("domain") or CLOCK_NODE_MONOTONIC),
-            semantics=str(data.get("semantics") or STAMP_RECEIPT),
-            uncertainty_s=float(data.get("uncertainty_s") or 0.0),
+            seconds=data["seconds"],
+            domain=data.get("domain", CLOCK_NODE_MONOTONIC),
+            semantics=data.get("semantics", STAMP_RECEIPT),
+            uncertainty_s=data.get("uncertainty_s", 0.0),
         )
 
 
@@ -186,11 +200,11 @@ class PixelDepthSample:
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "PixelDepthSample":
         return cls(
-            u_px=float(data["u_px"]),
-            v_px=float(data["v_px"]),
-            depth_m=float(data["depth_m"]),
+            u_px=data["u_px"],
+            v_px=data["v_px"],
+            depth_m=data["depth_m"],
             link_id=str(data.get("link_id") or ""),
-            weight=float(data.get("weight", 1.0)),
+            weight=data.get("weight", 1.0),
         )
 
 
@@ -322,9 +336,9 @@ class JointObservation:
             observation_id=str(data["observation_id"]),
             model=ModelIdentity(**dict(data["model"])),
             stamp=Stamp.from_mapping(data["stamp"]),
-            q_raw_rad=tuple(float(q) for q in data["q_raw_rad"]),
+            q_raw_rad=tuple(data["q_raw_rad"]),
             still=data.get("still", False),
-            max_speed_rad_s=float(data.get("max_speed_rad_s") or 0.0),
+            max_speed_rad_s=data.get("max_speed_rad_s", 0.0),
             metadata=dict(data.get("metadata") or {}),
         )
 
@@ -333,8 +347,8 @@ class JointObservation:
         return digest_of(self.to_dict())
 
 
-Observation = RgbdObservation | JointObservation
-"""Either observation kind; both carry an id, a stamp and an identity."""
+Observation = Union[RgbdObservation, JointObservation, "MotionObservation", "TaskTransition", "RawTaskTransition"]
+"""Raw observations and derived measured motion/task factors with source identities."""
 
 
 def pair_spread_s(camera: RgbdObservation, joints: JointObservation) -> float:
@@ -359,6 +373,18 @@ def observation_from_mapping(data: Mapping[str, Any]) -> Observation:
         return RgbdObservation.from_mapping(data)
     if kind == "joints":
         return JointObservation.from_mapping(data)
+    if kind == "motion":
+        from leapcalib.contracts.motion import MotionObservation
+
+        return MotionObservation.from_mapping(data)
+    if kind == "task_transition":
+        from leapcalib.contracts.task import TaskTransition
+
+        return TaskTransition.from_mapping(data)
+    if kind == "raw_task_transition":
+        from leapcalib.contracts.raw_task import RawTaskTransition
+
+        return RawTaskTransition.from_mapping(data)
     raise ValueError(f"unknown observation kind {kind!r}")
 
 

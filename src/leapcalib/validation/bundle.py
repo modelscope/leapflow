@@ -37,8 +37,13 @@ from leapcalib.contracts.failures import (
     CalibrationFailure,
 )
 from leapcalib.contracts.identity import TopologyIdentity, digest_of
+from leapcalib.contracts.motion import MotionObservation
+from leapcalib.contracts.task import TaskTransition
+from leapcalib.contracts.raw_task import RawTaskTransition
 from leapcalib.contracts.units import canonical_number
 from leapcalib.contracts.observations import (
+    RgbdObservation,
+    JointObservation,
     Observation,
     observation_from_mapping,
     settled_fraction,
@@ -46,8 +51,11 @@ from leapcalib.contracts.observations import (
     worst_stamp_uncertainty_s,
 )
 
-SCHEMA_VERSION = "leapcalib.evidence.v0"
-"""Schema identity of an evidence bundle; readers refuse a version they do not know."""
+SCHEMA_VERSION = "leapcalib.evidence.v1"
+LEGACY_SCHEMA_VERSION = "leapcalib.evidence.v0"
+RAW_SCHEMA_VERSION = "leapcalib.evidence.v2"
+READABLE_VERSIONS = frozenset({SCHEMA_VERSION, LEGACY_SCHEMA_VERSION, RAW_SCHEMA_VERSION})
+"""v1 adds measured motion/task factors; v0 raw recordings remain readable."""
 
 DEFAULT_MAX_BYTES = 16 * 1024 * 1024
 """Read bound. Bundles hold sampled points and regions, not full image streams."""
@@ -111,7 +119,7 @@ class EvidenceBundle:
     def __post_init__(self) -> None:
         if not self.bundle_id.strip():
             raise ValueError("an evidence bundle needs a nonempty id")
-        if self.schema_version != SCHEMA_VERSION:
+        if self.schema_version not in READABLE_VERSIONS:
             raise CalibrationFailure(
                 FAILURE_SCHEMA, f"unsupported evidence schema {self.schema_version!r}"
             )
@@ -134,6 +142,85 @@ class EvidenceBundle:
         unknown = (groups[0] | groups[1] | groups[2]) - known
         if unknown:
             raise ValueError(f"split references absent observations {sorted(unknown)}")
+        if self.schema_version != RAW_SCHEMA_VERSION and any(isinstance(o, RawTaskTransition) for o in self.observations):
+            raise ValueError("raw-joint factors require evidence v2")
+        if self.schema_version == LEGACY_SCHEMA_VERSION:
+            if any(isinstance(o, (MotionObservation, TaskTransition)) for o in self.observations):
+                raise ValueError("v0 cannot carry v1 motion/task factors")
+        else:
+            self._validate_references()
+        self._validate_source_split()
+
+    def _validate_references(self) -> None:
+        streams = {s.digest for s in self.topology.streams}
+        by_id = {o.observation_id: o for o in self.observations}
+        states: dict[str, Any] = {}
+        for observation in self.observations:
+            if isinstance(observation, RawTaskTransition):
+                self._validate_raw_sources(observation, by_id, states)
+            if isinstance(observation, TaskTransition):
+                for state in (observation.first, observation.second):
+                    if state.state_id in by_id:
+                        raise ValueError("task source identity collides with an observation")
+                    if state.state_id in states and states[state.state_id] != state:
+                        raise ValueError(
+                            "task source identity refers to inconsistent measured states"
+                        )
+                    states[state.state_id] = state
+            if hasattr(observation, "stream") and observation.stream.digest not in streams:
+                raise ValueError("observation stream differs from bundle topology")
+            if hasattr(observation, "model") and observation.model != self.topology.model:
+                raise ValueError("observation model differs from bundle topology")
+            if not isinstance(observation, MotionObservation):
+                continue
+            for source_id, stamp in zip(
+                observation.source_ids, (observation.first_stamp, observation.stamp)
+            ):
+                source = by_id.get(source_id)
+                if not isinstance(source, RgbdObservation):
+                    raise ValueError("motion factor requires recorded RGB-D source observations")
+                if (
+                    source.stream != observation.stream
+                    or source.stamp != stamp
+                    or source.provenance != observation.provenance
+                ):
+                    raise ValueError("motion source profile, stamp or provenance differs")
+
+    def _validate_raw_sources(
+        self, observation: RawTaskTransition, by_id: Mapping[str, Observation], states: dict[str, Any]
+    ) -> None:
+        for state in (observation.first, observation.second):
+            state_id = state.task.state_id
+            if state_id in by_id or (state_id in states and states[state_id] != state):
+                raise ValueError("raw task source identity collides or refers to inconsistent states")
+            states[state_id] = state
+            for identity in state.frame_ids:
+                frame = by_id.get(identity)
+                if not isinstance(frame, RgbdObservation) or frame.stream != observation.stream or frame.provenance != observation.provenance:
+                    raise ValueError("raw response requires recorded matching metric frames")
+                if not frame.stamp.comparable_with(state.task.stamp):
+                    raise ValueError("raw source frame clock differs")
+            for identity in state.feedback_ids:
+                feedback = by_id.get(identity)
+                if not isinstance(feedback, JointObservation) or feedback.model != observation.model:
+                    raise ValueError("raw response requires recorded matching feedback")
+                if not feedback.stamp.comparable_with(state.feedback_stamp):
+                    raise ValueError("raw feedback clock differs")
+            if not any(by_id[i].stamp == state.task.stamp for i in state.frame_ids):
+                raise ValueError("task capture stamp does not match recorded frame")
+            if not any(by_id[i].stamp == state.feedback_stamp and by_id[i].q_raw_rad == state.joints_rad for i in state.feedback_ids):
+                raise ValueError("measured raw endpoint does not match recorded feedback")
+
+    def _validate_source_split(self) -> None:
+        by_id = {o.observation_id: o for o in self.observations}
+        training: set[str] = set()
+        holdouts: set[str] = set()
+        for ids, expanded in ((self.accepted_ids, training), (self.holdout_ids, holdouts)):
+            for identity in ids:
+                expanded.add(identity)
+                expanded.update(getattr(by_id[identity], "source_ids", ()))
+        if training & holdouts:
+            raise ValueError("training and holdout factors share source observations")
 
     @property
     def content(self) -> dict[str, Any]:
@@ -206,7 +293,7 @@ class EvidenceBundle:
             raise CalibrationFailure(FAILURE_SCHEMA, "evidence payload has no content object")
         content = payload["content"]
         version = str(content.get("schema_version") or "")
-        if version != SCHEMA_VERSION:
+        if version not in READABLE_VERSIONS:
             raise CalibrationFailure(FAILURE_SCHEMA, f"unsupported evidence schema {version!r}")
         stored = payload.get("digest")
         if not isinstance(stored, str) or not stored:

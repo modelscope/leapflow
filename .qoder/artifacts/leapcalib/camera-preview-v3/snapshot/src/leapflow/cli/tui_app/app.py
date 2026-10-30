@@ -1,0 +1,1285 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""Application-based TUI controller — the hybrid architecture core.
+
+Combines prompt_toolkit's Application (persistent layout, fixed input,
+modal-ready widget system) with Rich rendering (Markdown, panels, syntax
+highlighting) for the scrollback output region.
+
+Architecture
+~~~~~~~~~~~~
+All logic runs on a single asyncio event loop — no threads::
+
+    Application ← handle_enter (key binding)
+         ↑              ↓
+         │     pending_input (asyncio.Queue)
+    invalidate()        ↓
+         ←── _process_loop (asyncio.Task)
+                        ↓
+                on_input(text) ← business logic in interactive.py
+                        ↓
+           Console.print → patch_stdout → output above layout
+"""
+
+from __future__ import annotations
+
+import asyncio
+import shutil
+import time
+from collections import deque
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Optional,
+    Sequence,
+    Union,
+)
+
+from prompt_toolkit import Application
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.formatted_text.utils import fragment_list_len, fragment_list_width
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout.containers import ConditionalContainer, Float, FloatContainer
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.layout.processors import Processor, Transformation
+from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.styles import Style as PTStyle
+from prompt_toolkit.utils import get_cwidth
+from prompt_toolkit.widgets import TextArea
+
+from leapflow.cli.tui_app.approval_modal import ApprovalModal
+from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus, command_key
+from leapflow.cli.tui_app.input import build_completer
+from leapflow.cli.tui_app.paste import (
+    PASTE_FRAGMENT_WINDOW_S,
+    PasteHeuristics,
+    PasteStore,
+)
+from leapflow.cli.tui_app.status import StatusBar
+from leapflow.cli.tui_app.theme import Theme
+from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+
+if TYPE_CHECKING:
+    from leapflow.cli.tui_app.console import LeapConsole
+
+_HISTORY_FILENAME = "history"
+_REFRESH_INTERVAL_S = 0.5
+_PASTE_COMPACTOR_ATTR = "_leapflow_paste_compactor_installed"
+_PLACEHOLDER_CURSOR_SPACER = "  "
+
+InputHandler = Callable[[str], Union[Awaitable[None], None]]
+ControlHandler = Callable[[str], bool]
+
+
+def _format_inline_duration(seconds: float) -> str:
+    """Format short elapsed text for inline TUI guidance."""
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    return f"{minutes}m{seconds - minutes * 60:.0f}s"
+
+
+def _compute_input_cap(rows: int) -> int:
+    """Max visible input rows: grow with content up to ~45% of the terminal,
+    leaving room for the status chrome and some transcript; never below 4."""
+    return max(4, min(int(rows * 0.45), rows - 6))
+
+
+def _wrapped_display_rows(line: str, width: int) -> int:
+    """Return display rows needed for one logical line at a given cell width."""
+    width = max(1, int(width))
+    if not line:
+        return 1
+    rows = 1
+    used = 0
+    for char in line:
+        char_width = max(0, get_cwidth(char))
+        if char_width == 0:
+            continue
+        if used and used + char_width > width:
+            rows += 1
+            used = 0
+        if char_width > width:
+            rows += 1 if used else 0
+            used = 0
+            continue
+        used += char_width
+    return rows
+
+
+def _estimate_input_rows(text: str, columns: int, *, prompt_width: int = 0) -> int:
+    """Estimate wrapped display rows for the input buffer.
+
+    The first logical line loses cells to the rendered prompt prefix. Later
+    logical lines use the full input width. Width is display-cell based, so CJK
+    wide characters count as two cells.
+    """
+    columns = max(1, int(columns))
+    if not text:
+        return 1
+    total = 0
+    for index, line in enumerate(str(text).split("\n")):
+        line_width = columns if index else max(1, columns - max(0, prompt_width))
+        total += _wrapped_display_rows(line, line_width)
+    return max(1, total)
+
+
+class _DynamicPlaceholderProcessor(Processor):
+    """Render the input prompt and contextual placeholder text."""
+
+    def __init__(
+        self,
+        provider: Callable[[], str],
+        prompt_provider: Callable[[], list[tuple[str, str]]],
+    ) -> None:
+        self._provider = provider
+        self._prompt_provider = prompt_provider
+
+    def apply_transformation(self, transformation_input: Any) -> Transformation:
+        document = getattr(transformation_input, "document", None)
+        is_first_line = getattr(transformation_input, "lineno", 0) == 0
+        has_text = bool(getattr(document, "text", "")) if document is not None else False
+        if not is_first_line:
+            return Transformation(transformation_input.fragments)
+        prompt_fragments = self._prompt_provider()
+        if has_text:
+            prefix = prompt_fragments
+            fragments = [*prefix, *transformation_input.fragments]
+            shift_position = fragment_list_len(prefix)
+            return Transformation(
+                fragments,
+                source_to_display=lambda index: index + shift_position,
+                display_to_source=lambda index: index - shift_position,
+            )
+        placeholder = self._provider()
+        placeholder_fragments = [
+            ("class:placeholder", _PLACEHOLDER_CURSOR_SPACER),
+            ("class:placeholder", placeholder),
+        ] if placeholder else []
+        fragments = [*prompt_fragments, *placeholder_fragments, *transformation_input.fragments]
+        shift_position = fragment_list_len(prompt_fragments)
+        return Transformation(
+            fragments,
+            source_to_display=lambda index: index + shift_position,
+            display_to_source=lambda _index: 0,
+        )
+
+
+class _CommandQueue:
+    """Small observable async queue for TUI command scheduling."""
+
+    def __init__(self) -> None:
+        self._items: deque[TuiCommand] = deque()
+        self._ready = asyncio.Event()
+
+    def put_nowait(self, command: TuiCommand) -> None:
+        self._items.append(command)
+        self._ready.set()
+
+    async def get(self) -> TuiCommand:
+        while not self._items:
+            self._ready.clear()
+            await self._ready.wait()
+        command = self._items.popleft()
+        if not self._items:
+            self._ready.clear()
+        return command
+
+    def get_nowait(self) -> TuiCommand:
+        if not self._items:
+            raise asyncio.QueueEmpty
+        command = self._items.popleft()
+        if not self._items:
+            self._ready.clear()
+        return command
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+    def contains_key(self, key: str) -> bool:
+        return any(command.command_key == key for command in self._items)
+
+    def snapshot(self) -> list[TuiCommand]:
+        return list(self._items)
+
+
+class LeapApp:
+    """Hybrid TUI: prompt_toolkit Application + Rich output.
+
+    Owns the Application, HSplit layout (spinner → status bar → input),
+    and the async worker task that drains input and dispatches to the
+    caller-supplied ``on_input`` callback.
+
+    All output flows through ``rich.Console`` via ``patch_stdout``,
+    appearing above the fixed layout at the terminal bottom.
+    """
+
+    def __init__(
+        self,
+        *,
+        console: "LeapConsole",
+        theme: Theme,
+        status: StatusBar,
+        commands: Sequence[tuple[str, str]] = (),
+        config_fields: Sequence[object] = (),
+        board_templates: Sequence[str] = (),
+        history_path: Optional[Path] = None,
+        on_input: Optional[InputHandler] = None,
+        on_control: Optional[ControlHandler] = None,
+    ) -> None:
+        self._console = console
+        self._theme = theme
+        self._status = status
+        self._on_input = on_input
+        self._on_control = on_control
+
+        self._should_exit = False
+        self._agent_running = False
+        self._prompt_mode = "idle"
+        self._spinner_text = ""
+        self._tool_start_time: float = 0.0
+        self._next_command_id = 1
+        self._queue_paused = False
+        self._active_dispatch_task: Optional[asyncio.Task[Any]] = None
+        self._active_terminal_status: Optional[TuiCommandStatus] = None
+        self._active_terminal_reason = ""
+        self._last_control_c_at = 0.0
+        self._paste_heuristics = PasteHeuristics()
+        self._paste_store = PasteStore(self._paste_heuristics)
+        self._paste_blocks = self._paste_store.blocks
+        self._paste_fragment_text = ""
+        self._paste_fragment_start_cursor = 0
+        self._paste_fragment_last_at = 0.0
+        self._active_fragment_marker: Optional[str] = None
+        self._active_command: Optional[TuiCommand] = None
+        self._pending_input = _CommandQueue()
+        self._side_tasks: set[asyncio.Task[Any]] = set()
+        self._approval_modal: Optional[ApprovalModal] = None
+
+        if history_path is None:
+            raise ValueError("LeapApp requires an explicit layout-derived history_path")
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        self._history_path = history_path
+
+        self._input_area = self._build_input_area(commands, config_fields, board_templates)
+        self._app = self._build_application()
+
+    # ── Public state properties ──────────────────────────────────────
+
+    @property
+    def agent_running(self) -> bool:
+        return self._agent_running
+
+    @agent_running.setter
+    def agent_running(self, value: bool) -> None:
+        self._agent_running = value
+        self._invalidate()
+
+    @property
+    def prompt_mode(self) -> str:
+        return self._prompt_mode
+
+    @prompt_mode.setter
+    def prompt_mode(self, value: str) -> None:
+        self._prompt_mode = value
+        self._invalidate()
+
+    @property
+    def spinner_text(self) -> str:
+        return self._spinner_text
+
+    @spinner_text.setter
+    def spinner_text(self, value: str) -> None:
+        self._spinner_text = value
+        self._tool_start_time = time.monotonic() if value else 0.0
+        self._invalidate()
+
+    async def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
+        """Show a native TUI approval modal and return the selected decision.
+
+        Waits for the user without a deadline. The modal stays up until it is
+        answered, the turn is cancelled, or the client goes away — stepping away
+        from the keyboard must not silently deny the action.
+        """
+        if self._approval_modal is not None:
+            return ApprovalDecision.DENY
+
+        modal = ApprovalModal.create(request)
+        self._approval_modal = modal
+        self._input_area.buffer.reset()
+        self._clear_paste_state()
+        self._invalidate()
+        try:
+            return await asyncio.shield(modal.future)
+        finally:
+            if self._approval_modal is modal:
+                self._approval_modal = None
+            self._invalidate()
+
+    def submit_text(self, text: str) -> TuiCommand:
+        """Submit user text into the serial TUI command queue."""
+        normalized = self._resolve_paste_blocks(text).strip()
+        if not normalized:
+            raise ValueError("Cannot submit an empty TUI command")
+        if self._dispatch_control_text(normalized):
+            return TuiCommand.create(command_id=0, text=normalized).mark_done()
+        # Side commands (e.g. /btw) bypass the serial queue when a task is active
+        if self._active_command is not None and self._is_side_command(normalized):
+            return self._dispatch_side_command(normalized)
+        key = command_key(normalized)
+        command = TuiCommand.create(command_id=self._next_command_id, text=normalized)
+        self._next_command_id += 1
+        if self._is_duplicate_command_key(key):
+            skipped = command.mark_skipped("duplicate queued/running command skipped")
+            self._console.command_footer(skipped)
+            self._sync_task_counts()
+            self._invalidate()
+            return skipped
+        self._pending_input.put_nowait(command)
+        self._sync_task_counts()
+        if self._active_command is not None or self._pending_input.qsize() > 1 or self._queue_paused:
+            self._console.command_card(command)
+        self._invalidate()
+        return command
+
+    @property
+    def queue_paused(self) -> bool:
+        """Return whether queued commands are currently held."""
+        return self._queue_paused
+
+    @property
+    def active_command(self) -> Optional[TuiCommand]:
+        """Return the currently running command, if any."""
+        return self._active_command
+
+    def complete_active_command_in_response(self) -> Optional[TuiCommand]:
+        """Mark the active command done when its status is rendered with the response label."""
+        if self._active_command is None:
+            return None
+        completed = self._active_command.mark_done()
+        self._active_command = completed
+        self._active_terminal_status = TuiCommandStatus.DONE
+        self._active_terminal_reason = ""
+        self._sync_task_counts()
+        self._invalidate()
+        return completed
+
+    def block_active_command_in_response(self, reason: str) -> Optional[TuiCommand]:
+        """Mark the active command blocked when recovery guidance is rendered inline."""
+        if self._active_command is None:
+            return None
+        blocked = self._active_command.mark_blocked(reason)
+        self._active_command = blocked
+        self._active_terminal_status = TuiCommandStatus.BLOCKED
+        self._active_terminal_reason = reason
+        self._sync_task_counts()
+        self._invalidate()
+        return blocked
+
+    def queued_commands(self) -> list[TuiCommand]:
+        """Return a snapshot of pending commands in queue order."""
+        return self._pending_input.snapshot()
+
+    def pause_queue(self) -> bool:
+        """Pause starting future queued commands; current work continues."""
+        if self._queue_paused:
+            return False
+        self._queue_paused = True
+        self._sync_task_counts()
+        self._invalidate()
+        return True
+
+    def resume_queue(self) -> bool:
+        """Resume starting queued commands."""
+        if not self._queue_paused:
+            return False
+        self._queue_paused = False
+        self._sync_task_counts()
+        self._invalidate()
+        return True
+
+    def clear_queued_commands(self, reason: str = "cleared by user") -> list[TuiCommand]:
+        """Drop every pending command and render them as skipped."""
+        dropped: list[TuiCommand] = []
+        while True:
+            try:
+                command = self._pending_input.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            skipped = command.mark_skipped(reason)
+            dropped.append(skipped)
+            self._console.command_footer(skipped)
+        self._sync_task_counts()
+        self._invalidate()
+        return dropped
+
+    def drop_queued_command(self, command_id: int, reason: str = "dropped by user") -> Optional[TuiCommand]:
+        """Drop one queued command by id while preserving queue order."""
+        kept: list[TuiCommand] = []
+        dropped: Optional[TuiCommand] = None
+        while True:
+            try:
+                command = self._pending_input.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if command.id == command_id and dropped is None:
+                dropped = command.mark_skipped(reason)
+                self._console.command_footer(dropped)
+            else:
+                kept.append(command)
+        for command in kept:
+            self._pending_input.put_nowait(command)
+        self._sync_task_counts()
+        self._invalidate()
+        return dropped
+
+    def request_cancel_active(self, reason: str = "cancelled by user") -> Optional[TuiCommand]:
+        """Mark current work as cancelled and cancel its dispatch task."""
+        return self._request_finish_active(TuiCommandStatus.CANCELLED, reason)
+
+    def request_skip_active(self, reason: str = "skipped by user") -> Optional[TuiCommand]:
+        """Mark current work as skipped and cancel its dispatch task."""
+        return self._request_finish_active(TuiCommandStatus.SKIPPED, reason)
+
+    def _request_finish_active(self, status: TuiCommandStatus, reason: str) -> Optional[TuiCommand]:
+        if self._active_command is None:
+            return None
+        self._active_terminal_status = status
+        self._active_terminal_reason = reason
+        terminal = self._terminal_command(self._active_command, status, reason)
+        self._active_command = terminal
+        self._console.command_footer(terminal)
+        task = self._active_dispatch_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._spinner_text = ""
+        self._tool_start_time = 0.0
+        self._sync_task_counts()
+        self._invalidate()
+        return terminal
+
+    def _terminal_command(
+        self,
+        command: TuiCommand,
+        status: TuiCommandStatus,
+        reason: str,
+    ) -> TuiCommand:
+        if status == TuiCommandStatus.CANCELLED:
+            return command.mark_cancelled(reason)
+        if status == TuiCommandStatus.SKIPPED:
+            return command.mark_skipped(reason)
+        if status == TuiCommandStatus.BLOCKED:
+            return command.mark_blocked(reason)
+        return command.mark_failed(reason)
+
+    def _is_duplicate_command_key(self, key: str) -> bool:
+        active = self._active_command
+        return bool((active is not None and active.command_key == key) or self._pending_input.contains_key(key))
+
+    # ── Side-command concurrent bypass ────────────────────────────
+
+    # Commands that are safe to run concurrently with the main task.
+    # Extensible: add command names here as new concurrent-safe commands appear.
+    _SIDE_COMMAND_NAMES: frozenset[str] = frozenset({"btw"})
+
+    def _is_side_command(self, text: str) -> bool:
+        """Return True when *text* is a concurrent-safe side command.
+
+        Uses the command registry to resolve the input, then checks against
+        the known set of side commands that can run without blocking the
+        serial queue.
+        """
+        from leapflow.cli.commands.registry import resolve_command
+
+        bare = text.lstrip("/").strip()
+        if not bare:
+            return False
+        cmd = resolve_command(bare)
+        return cmd is not None and cmd.name in self._SIDE_COMMAND_NAMES
+
+    def _dispatch_side_command(self, text: str) -> TuiCommand:
+        """Create a concurrent asyncio.Task for a side command.
+
+        The task runs independently of the serial ``_process_loop``:
+        it does not touch ``_active_command`` or queue state.  The task
+        reference is held in ``_side_tasks`` to prevent GC.
+        """
+        command = TuiCommand.create(command_id=self._next_command_id, text=text)
+        self._next_command_id += 1
+        on_input = self._on_input
+
+        async def _run_side() -> None:
+            try:
+                if on_input is not None:
+                    result = on_input(text)
+                    if asyncio.iscoroutine(result):
+                        await result
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self._console.error(f"Side question failed: {exc}")
+
+        task = asyncio.create_task(_run_side(), name=f"side-{command.id}")
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
+        self._invalidate()
+        return command.mark_done()
+
+    def _dispatch_control_text(self, text: str) -> bool:
+        handler = self._on_control
+        if handler is None:
+            return False
+        try:
+            handled = handler(text)
+        except Exception as exc:
+            self._console.error(f"Task control failed: {exc}")
+            return True
+        if handled:
+            self._invalidate()
+        return handled
+
+    def _should_compact_paste(self, text: str) -> bool:
+        """Return True when rendering pasted text directly would hurt TUI responsiveness."""
+        return self._paste_heuristics.should_compact_block(text)
+
+    def _paste_marker(self, text: str) -> str:
+        """Create a safe visible marker while keeping full text in the side channel."""
+        return self._paste_store.create_marker(text)
+
+    def _resolve_paste_blocks(self, text: str) -> str:
+        """Replace compact paste markers with the original full pasted content."""
+        return self._paste_store.resolve(text)
+
+    def _clear_paste_state(self) -> None:
+        """Clear both side-channel paste blocks and in-flight fragment state."""
+        self._paste_store.clear()
+        self._reset_paste_fragment_window()
+
+    def _reset_paste_fragment_window(self) -> None:
+        """Forget pending fragmented paste detection state."""
+        self._paste_fragment_text = ""
+        self._paste_fragment_start_cursor = 0
+        self._paste_fragment_last_at = 0.0
+        self._active_fragment_marker = None
+
+    def _fragment_continues(self, now: float) -> bool:
+        """Return True when an insert arrives inside the paste-fragment window."""
+        if self._paste_fragment_last_at <= 0:
+            return False
+        return now - self._paste_fragment_last_at <= PASTE_FRAGMENT_WINDOW_S
+
+    def _replace_fragment_with_marker(self, buffer: Any, marker: str) -> bool:
+        """Replace already-rendered fragmented paste text with a safe marker."""
+        start = self._paste_fragment_start_cursor
+        fragment = self._paste_fragment_text
+        end = start + len(fragment)
+        try:
+            current = buffer.text
+            if current[start:end] != fragment:
+                return False
+            buffer.text = f"{current[:start]}{marker}{current[end:]}"
+            buffer.cursor_position = start + len(marker)
+            return True
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def _insert_paste_text(self, buffer: Any, text: str) -> None:
+        """Insert pasted text, compacting large blocks to keep terminal rendering smooth."""
+        if not text:
+            return
+        if self._should_compact_paste(text):
+            buffer.insert_text(self._paste_marker(text))
+            self._reset_paste_fragment_window()
+            self._invalidate()
+            return
+        buffer.insert_text(text)
+
+    def _install_paste_compactor(self, buffer: Any) -> None:
+        """Compact bulk and fragmented Buffer inserts before they hurt rendering."""
+        if getattr(buffer, _PASTE_COMPACTOR_ATTR, False):
+            return
+        original_insert_text = buffer.insert_text
+        ref = self
+
+        def insert_text(text: str, *args: Any, **kwargs: Any) -> None:
+            if not isinstance(text, str) or not text:
+                original_insert_text(text, *args, **kwargs)
+                return
+
+            now = time.monotonic()
+            if ref._active_fragment_marker and ref._fragment_continues(now):
+                ref._paste_store.append_to_marker(ref._active_fragment_marker, text)
+                ref._paste_fragment_last_at = now
+                ref._invalidate()
+                return
+            if not ref._fragment_continues(now):
+                ref._reset_paste_fragment_window()
+
+            if ref._should_compact_paste(text):
+                original_insert_text(ref._paste_marker(text), *args, **kwargs)
+                ref._paste_fragment_last_at = now
+                ref._invalidate()
+                return
+
+            if not ref._paste_fragment_text:
+                ref._paste_fragment_start_cursor = int(getattr(buffer, "cursor_position", 0))
+            original_insert_text(text, *args, **kwargs)
+            ref._paste_fragment_text += text
+            ref._paste_fragment_last_at = now
+
+            if ref._paste_heuristics.should_compact_fragment_window(ref._paste_fragment_text):
+                marker = ref._paste_marker(ref._paste_fragment_text)
+                if ref._replace_fragment_with_marker(buffer, marker):
+                    ref._paste_fragment_text = ""
+                    ref._active_fragment_marker = marker
+                    ref._paste_fragment_last_at = now
+                    ref._invalidate()
+
+        buffer.insert_text = insert_text
+        setattr(buffer, _PASTE_COMPACTOR_ATTR, True)
+
+    def _accept_auto_suggestion(self, buffer: Any) -> bool:
+        """Accept the visible auto-suggestion when one is available."""
+        suggestion = getattr(buffer, "suggestion", None)
+        suggestion_text = getattr(suggestion, "text", "") if suggestion else ""
+        if not suggestion_text:
+            return False
+        buffer.insert_text(suggestion_text)
+        return True
+
+    def _completion_is_open(self, buffer: Any) -> bool:
+        """Return True when prompt_toolkit is showing completion candidates."""
+        return getattr(buffer, "complete_state", None) is not None
+
+    def _close_completion(self, buffer: Any) -> bool:
+        """Close the active completion menu when present."""
+        if not self._completion_is_open(buffer):
+            return False
+        buffer.cancel_completion()
+        self._invalidate()
+        return True
+
+    def _cursor_at_first_input_line(self, buffer: Any) -> bool:
+        """Return True when Up should leave line navigation and enter history."""
+        try:
+            return buffer.document.cursor_position_row <= 0
+        except (AttributeError, TypeError):
+            return True
+
+    def _cursor_at_last_input_line(self, buffer: Any) -> bool:
+        """Return True when Down should leave line navigation and enter history."""
+        try:
+            document = buffer.document
+            return document.cursor_position_row >= document.line_count - 1
+        except (AttributeError, TypeError):
+            return True
+
+    def _move_history_backward(self, buffer: Any) -> bool:
+        """Move to an older history entry while preserving the current draft."""
+        before_index = getattr(buffer, "working_index", None)
+        try:
+            buffer.history_backward()
+        except AttributeError:
+            return False
+        moved = getattr(buffer, "working_index", None) != before_index
+        if moved:
+            self._invalidate()
+        return moved
+
+    def _move_history_forward(self, buffer: Any) -> bool:
+        """Move to a newer history entry, restoring the draft at the newest slot."""
+        before_index = getattr(buffer, "working_index", None)
+        try:
+            buffer.history_forward()
+        except AttributeError:
+            return False
+        moved = getattr(buffer, "working_index", None) != before_index
+        if moved:
+            self._invalidate()
+        return moved
+
+    def _completion_previous_or_cursor_up(self, buffer: Any) -> None:
+        """Navigate completion candidates, then history, then multiline cursor movement."""
+        if self._completion_is_open(buffer):
+            buffer.complete_previous()
+            return
+        if self._cursor_at_first_input_line(buffer) and self._move_history_backward(buffer):
+            return
+        buffer.cursor_up()
+
+    def _completion_next_or_cursor_down(self, buffer: Any) -> None:
+        """Navigate completion candidates, then history, then multiline cursor movement."""
+        if self._completion_is_open(buffer):
+            buffer.complete_next()
+            return
+        if self._cursor_at_last_input_line(buffer) and self._move_history_forward(buffer):
+            return
+        buffer.cursor_down()
+
+    def _accept_or_start_completion(self, buffer: Any) -> None:
+        """Accept the selected completion or open completion candidates."""
+        complete_state = getattr(buffer, "complete_state", None)
+        current_completion = getattr(complete_state, "current_completion", None)
+        if complete_state is not None and current_completion is None:
+            buffer.complete_next()
+            complete_state = getattr(buffer, "complete_state", None)
+            current_completion = getattr(complete_state, "current_completion", None)
+        if current_completion is not None:
+            buffer.apply_completion(current_completion)
+            return
+        if self._accept_auto_suggestion(buffer):
+            return
+        buffer.start_completion(select_first=True)
+
+    def _move_right_or_accept_suggestion(self, buffer: Any) -> None:
+        """Keep normal Right-arrow movement while accepting visible suggestions at EOL."""
+        if getattr(buffer, "cursor_position", 0) >= len(getattr(buffer, "text", "")):
+            if self._accept_auto_suggestion(buffer):
+                return
+        buffer.cursor_right()
+
+    # ── Lifecycle ────────────────────────────────────────────────────
+
+    async def run(self) -> int:
+        """Start the TUI — blocks until user exits. Returns exit code."""
+        worker = asyncio.create_task(self._process_loop())
+        try:
+            with patch_stdout(raw=True):
+                await self._app.run_async()
+        except (EOFError, KeyboardInterrupt):
+            pass
+        finally:
+            self._should_exit = True
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+        return 0
+
+    def exit(self) -> None:
+        """Request graceful TUI shutdown."""
+        self._should_exit = True
+        if self._app.is_running:
+            self._app.exit()
+
+    def clear_screen(self) -> None:
+        """Clear the terminal and reset the renderer's position state.
+
+        Must go through prompt_toolkit's renderer rather than a shell ``clear``:
+        the Application owns the TTY (``full_screen=False`` + ``patch_stdout``)
+        and caches where it last drew. Clearing behind its back leaves that
+        cache stale, so the next redraw lands at the wrong offset. Renderer
+        ``clear()`` erases the screen *and* re-requests the absolute cursor
+        position, keeping the layout consistent afterwards.
+        """
+        if not self._app.is_running:
+            return
+        self._app.renderer.clear()
+
+    # ── Async worker ─────────────────────────────────────────────────
+
+    async def _process_loop(self) -> None:
+        """Drain pending_input and dispatch to on_input handler."""
+        while not self._should_exit:
+            if self._queue_paused:
+                await asyncio.sleep(0.1)
+                continue
+            try:
+                command = await asyncio.wait_for(
+                    self._pending_input.get(), timeout=0.1
+                )
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                return
+
+            if not command.text.strip():
+                self._sync_task_counts()
+                continue
+
+            self._active_command = command.mark_running()
+            self._active_terminal_status = None
+            self._active_terminal_reason = ""
+            self._agent_running = True
+            self._sync_task_counts()
+            self._console.command_card(self._active_command)
+            try:
+                if self._on_input is not None:
+                    result = self._on_input(command.text)
+                    if asyncio.iscoroutine(result):
+                        self._active_dispatch_task = asyncio.create_task(result)
+                        await self._active_dispatch_task
+                if self._active_command is not None and self._active_terminal_status is None:
+                    finished = self._active_command.mark_done()
+                    self._console.command_footer(finished)
+            except asyncio.CancelledError:
+                if self._active_command is not None and self._active_terminal_status is not None:
+                    terminal = self._terminal_command(
+                        self._active_command,
+                        self._active_terminal_status,
+                        self._active_terminal_reason or self._active_terminal_status.value,
+                    )
+                    if terminal.status != self._active_command.status:
+                        self._console.command_footer(terminal)
+                elif self._active_command is not None:
+                    cancelled = self._active_command.mark_cancelled("cancelled by user")
+                    self._console.command_footer(cancelled)
+            except Exception as exc:
+                if self._active_command is not None:
+                    failed = self._active_command.mark_failed(f"{type(exc).__name__}: {exc}")
+                    self._console.command_footer(failed)
+                self._console.error(f"{exc}")
+                self._spinner_text = ""
+                self._tool_start_time = 0.0
+            finally:
+                self._active_command = None
+                self._active_dispatch_task = None
+                self._active_terminal_status = None
+                self._active_terminal_reason = ""
+                self._spinner_text = ""
+                self._tool_start_time = 0.0
+                self._agent_running = False
+                self._sync_task_counts()
+                self._invalidate()
+
+    # ── Layout construction ──────────────────────────────────────────
+
+    def _current_input_text(self) -> str:
+        input_area = getattr(self, "_input_area", None)
+        buffer = getattr(input_area, "buffer", None)
+        return str(getattr(buffer, "text", "") or "")
+
+    def _input_visual_rows(self, columns: int) -> int:
+        prompt_width = fragment_list_width(self._prompt_fragments())
+        return _estimate_input_rows(
+            self._current_input_text(),
+            columns,
+            prompt_width=prompt_width,
+        )
+
+    def _effective_input_cap(self, lines: int) -> int:
+        """Max visible input rows for the current run-state.
+
+        While a task streams output, hold a small, stable cap: a dynamic or large
+        reserved region reshapes the scroll region under ``patch_stdout`` on
+        every redraw and can crash the terminal (macOS Terminal in particular).
+        Adaptive, content-sized sizing resumes once the task finishes (idle),
+        when the input area is the sole owner of the TTY.
+        """
+        if self._agent_running:
+            return 4
+        return _compute_input_cap(lines)
+
+    def _input_hidden_rows(self) -> int:
+        terminal = shutil.get_terminal_size((80, 24))
+        cap = self._effective_input_cap(terminal.lines)
+        return max(0, self._input_visual_rows(terminal.columns) - cap)
+
+    def _input_overflow_hint(self) -> list[tuple[str, str]]:
+        hidden_rows = self._input_hidden_rows()
+        if hidden_rows <= 0:
+            return []
+        suffix = "row" if hidden_rows == 1 else "rows"
+        # The external editor is disabled while a task streams (single TTY owner),
+        # so don't advertise it then.
+        action = "full view resumes when idle" if self._agent_running else "Ctrl+X Ctrl+E edit full draft"
+        return [(
+            "class:hint",
+            f"↑ {hidden_rows} more input {suffix} hidden · {action}",
+        )]
+
+    def _input_height(self) -> Dimension:
+        """Content-sized input height, capped to the terminal size when idle.
+
+        While a task streams output the height is pinned to a small, stable
+        region (min=1, max=4, preferred=1) so the reserved bottom area does not
+        thrash the scroll region under ``patch_stdout`` mid-stream — a cause of
+        terminal crashes. When idle the height tracks wrapped content up to an
+        adaptive cap; a one-line draft still renders as a single row.
+        """
+        terminal = shutil.get_terminal_size((80, 24))
+        cap = self._effective_input_cap(terminal.lines)
+        if self._agent_running:
+            return Dimension(min=1, max=cap, preferred=1)
+        preferred = min(cap, max(1, self._input_visual_rows(terminal.columns)))
+        return Dimension(min=1, max=cap, preferred=preferred)
+
+    def _build_input_area(
+        self,
+        commands: Sequence[tuple[str, str]],
+        config_fields: Sequence[object],
+        board_templates: Sequence[str] = (),
+    ) -> TextArea:
+        completer = build_completer(
+            commands, config_fields=config_fields, board_templates=board_templates
+        )
+        ref = self
+
+        area = TextArea(
+            height=self._input_height,
+            prompt="",
+            style="class:input-area",
+            multiline=True,
+            wrap_lines=True,
+            dont_extend_height=True,
+            history=FileHistory(str(self._history_path)),
+            completer=completer,
+            complete_while_typing=True,
+            auto_suggest=AutoSuggestFromHistory(),
+            input_processors=[_DynamicPlaceholderProcessor(
+                ref._placeholder_text,
+                ref._prompt_fragments,
+            )],
+        )
+        area.buffer.tempfile_suffix = ".md"
+        self._install_paste_compactor(area.buffer)
+        return area
+
+    def _build_application(self) -> Application[Any]:
+        no_approval = Condition(lambda: self._approval_modal is None)
+        has_approval = Condition(lambda: self._approval_modal is not None)
+
+        spinner = Window(
+            content=FormattedTextControl(self._spinner_fragments),
+            height=self._spinner_height,
+            wrap_lines=True,
+        )
+        status_gap = Window(
+            content=FormattedTextControl(lambda: []),
+            height=1,
+            style="class:status-gap",
+        )
+        status_bar = Window(
+            content=FormattedTextControl(self._status),
+            height=1,
+            wrap_lines=False,
+            style="class:status-bar",
+        )
+        approval_panel = ConditionalContainer(
+            Window(
+                content=FormattedTextControl(self._approval_fragments),
+                height=self._approval_height,
+                wrap_lines=False,
+                dont_extend_height=True,
+                style="class:approval.modal",
+            ),
+            filter=has_approval,
+        )
+        input_overflows = Condition(lambda: self._input_hidden_rows() > 0)
+
+        input_hint = Window(
+            content=FormattedTextControl(self._input_overflow_hint),
+            height=1,
+            style="class:hint",
+        )
+        root = HSplit([
+            ConditionalContainer(spinner, filter=no_approval),
+            approval_panel,
+            ConditionalContainer(status_gap, filter=no_approval),
+            status_bar,
+            ConditionalContainer(input_hint, filter=no_approval & input_overflows),
+            ConditionalContainer(self._input_area, filter=no_approval),
+        ])
+        layout = Layout(
+            FloatContainer(
+                content=root,
+                floats=[
+                    Float(
+                        xcursor=True,
+                        ycursor=True,
+                        content=CompletionsMenu(
+                            max_height=12,
+                            scroll_offset=1,
+                            display_arrows=True,
+                        ),
+                    ),
+                ],
+            )
+        )
+
+        cursor_kwargs: dict[str, Any] = {}
+        try:
+            from prompt_toolkit.cursor_shapes import (
+                CursorShape,
+                SimpleCursorShapeConfig,
+            )
+            cursor_kwargs["cursor"] = SimpleCursorShapeConfig(CursorShape.BLOCK)
+        except ImportError:
+            pass
+
+        return Application(
+            layout=layout,
+            key_bindings=self._build_keybindings(),
+            style=self._build_style(),
+            full_screen=False,
+            mouse_support=False,
+            refresh_interval=_REFRESH_INTERVAL_S,
+            erase_when_done=True,
+            **cursor_kwargs,
+        )
+
+    def _build_keybindings(self) -> KeyBindings:
+        kb = KeyBindings()
+        ref = self
+        approval_filter = Condition(lambda: ref._approval_modal is not None)
+
+        def choose_approval_text(text: str) -> None:
+            modal = ref._approval_modal
+            if modal is None:
+                return
+            if modal.choose_text(text):
+                ref._invalidate()
+
+        for key in ("1", "2", "3", "4", "5", "6", "7", "8", "9", "y", "o", "s", "a", "n", "d", "v"):
+            @kb.add(key, filter=approval_filter)
+            def _(event, key=key):
+                choose_approval_text(key)
+
+        @kb.add(Keys.Enter)
+        def _(event):
+            if ref._approval_modal is not None:
+                ref._approval_modal.choose_selected()
+                ref._invalidate()
+                return
+            buffer = event.app.current_buffer
+            complete_state = getattr(buffer, "complete_state", None)
+            current_completion = getattr(complete_state, "current_completion", None)
+            if complete_state is not None and current_completion is None:
+                buffer.complete_next()
+                complete_state = getattr(buffer, "complete_state", None)
+                current_completion = getattr(complete_state, "current_completion", None)
+            if current_completion is not None:
+                before = buffer.text
+                buffer.apply_completion(current_completion)
+                if buffer.text != before:
+                    return
+            text = buffer.text.strip()
+            if not text:
+                return
+            has_compacted_paste = ref._paste_store.has_blocks
+            ref.submit_text(text)
+            buffer.reset(append_to_history=not has_compacted_paste)
+            ref._reset_paste_fragment_window()
+
+        @kb.add(Keys.Escape)
+        def _(event):
+            if ref._approval_modal is not None:
+                ref._approval_modal.deny()
+                ref._invalidate()
+                return
+            if ref._close_completion(event.current_buffer):
+                return
+            event.current_buffer.reset()
+            ref._clear_paste_state()
+
+        @kb.add(Keys.Escape, Keys.Enter)
+        def _(event):
+            event.current_buffer.insert_text("\n")
+
+        @kb.add(Keys.Tab)
+        def _(event):
+            ref._accept_or_start_completion(event.current_buffer)
+
+        @kb.add(Keys.Up)
+        def _(event):
+            if ref._approval_modal is not None:
+                ref._approval_modal.move(-1)
+                ref._invalidate()
+                return
+            ref._completion_previous_or_cursor_up(event.current_buffer)
+
+        @kb.add(Keys.Down)
+        def _(event):
+            if ref._approval_modal is not None:
+                ref._approval_modal.move(1)
+                ref._invalidate()
+                return
+            ref._completion_next_or_cursor_down(event.current_buffer)
+
+        @kb.add(Keys.Right)
+        def _(event):
+            ref._move_right_or_accept_suggestion(event.current_buffer)
+
+        @kb.add(Keys.ControlX, Keys.ControlE)
+        def _(event):
+            # Compose long input in $EDITOR only when idle. Spawning an external
+            # editor (alternate screen + raw mode) while a task streams output
+            # through patch_stdout makes two owners contend for the TTY and can
+            # crash the terminal; the editor becomes available again the moment
+            # the task finishes. (buffer round-trips via tempfile_suffix.)
+            if ref._approval_modal is not None or ref._agent_running:
+                return
+            event.current_buffer.open_in_editor(validate_and_handle=False)
+
+        @kb.add(Keys.BracketedPaste)
+        def _(event):
+            ref._insert_paste_text(event.current_buffer, event.data)
+
+        @kb.add(Keys.ControlD)
+        def _(event):
+            ref._should_exit = True
+            event.app.exit()
+
+        @kb.add(Keys.ControlC)
+        def _(event):
+            if ref._approval_modal is not None:
+                ref._approval_modal.deny()
+                ref._invalidate()
+                return
+            if event.current_buffer.text:
+                event.current_buffer.reset()
+                ref._clear_paste_state()
+                return
+            if ref._agent_running:
+                now = time.monotonic()
+                if now - ref._last_control_c_at <= 2.0 and ref._dispatch_control_text("/cancel"):
+                    ref._last_control_c_at = 0.0
+                    return
+                ref._last_control_c_at = now
+                ref._console.system(
+                    "Task is running. Type /cancel to stop, /skip to continue the queue, "
+                    "or press Ctrl+C again to cancel."
+                )
+                return
+            ref._should_exit = True
+            event.app.exit()
+
+        return kb
+
+    def _build_style(self) -> PTStyle:
+        t = self._theme
+        input_style = f"bg:{t.input_bg} {t.input_text} bold"
+        disabled_style = f"bg:{t.input_bg} {t.input_disabled_text}"
+        return PTStyle.from_dict({
+            "input-area": input_style,
+            "input-area.disabled": disabled_style,
+            "prompt": t.prompt_char,
+            "prompt.working": t.accent_dim,
+            "prompt.recording": t.recording,
+            "prompt.paused": t.prompt_paused,
+            "prompt.executing": t.executing,
+            "status-gap": "",
+            "status-bar": f"bg:{t.toolbar_bg} {t.statusbar_fg}",
+            "status-bar.strong": f"bg:{t.toolbar_bg} bold {t.statusbar_accent}",
+            "status-bar.dim": f"bg:{t.toolbar_bg} {t.statusbar_dim}",
+            "status-bar.good": f"bg:{t.toolbar_bg} {t.statusbar_good}",
+            "status-bar.warn": f"bg:{t.toolbar_bg} {t.warning}",
+            "status-bar.bad": f"bg:{t.toolbar_bg} {t.error}",
+            "hint": t.text_dim,
+            "auto-suggest": t.auto_suggest,
+            "placeholder": f"{t.input_placeholder} nobold",
+            "selection": f"bg:{t.input_selection_bg} {t.input_selection_fg}",
+            "completion-menu": f"bg:{t.toolbar_bg} {t.input_text}",
+            "completion-menu.completion": f"bg:{t.toolbar_bg} {t.input_text}",
+            "completion-menu.completion.current": f"bg:{t.input_selection_bg} bold {t.input_selection_fg}",
+            "completion-menu.meta.completion": f"bg:{t.toolbar_bg} {t.text_muted}",
+            "completion-menu.meta.completion.current": f"bg:{t.input_selection_bg} {t.input_selection_fg}",
+            "approval.modal": f"bg:{t.input_bg} {t.text}",
+            "approval.border": t.warning,
+            "approval.title": f"bold {t.warning}",
+            "approval.summary": f"bold {t.text}",
+            "approval.label": t.text_dim,
+            "approval.detail": t.warning,
+            "approval.dim": t.text_muted,
+            "approval.option": t.text,
+            "approval.selected": f"bg:{t.input_selection_bg} bold {t.input_selection_fg}",
+        })
+
+    # ── Fragment providers ───────────────────────────────────────────
+
+    def _prompt_fragments(self) -> list[tuple[str, str]]:
+        if self._queue_paused:
+            return [
+                ("class:prompt.paused", "⏸ "),
+                ("class:prompt", "❯ "),
+            ]
+        if self._agent_running:
+            return [("class:prompt.working", "⚕ ")]
+        _mode_prompts = {
+            "learning": [
+                ("class:prompt.recording", "● rec "),
+                ("class:prompt", "❯ "),
+            ],
+            "paused": [
+                ("class:prompt.paused", "⏸ "),
+                ("class:prompt", "❯ "),
+            ],
+            "executing": [("class:prompt.executing", "▶ ")],
+        }
+        return _mode_prompts.get(self._prompt_mode, [("class:prompt", "❯ ")])
+
+    def _placeholder_text(self) -> str:
+        """Return contextual input guidance for an empty buffer."""
+        if self._prompt_mode == "learning":
+            return "/teach stop · /teach status · /teach pause · /teach skip · /annotate <text>"
+        if self._queue_paused:
+            return "Queue paused · /resume continue · /drop <id> remove · /queue view"
+        if self._active_command is not None:
+            command = self._active_command
+            elapsed = _format_inline_duration(command.elapsed_s)
+            return (
+                f"Running {command.label} {elapsed} · type to queue next · "
+                "/cancel stop · /skip next · /queue view"
+            )
+        if self._pending_input.qsize() > 0:
+            return f"{self._pending_input.qsize()} queued · /pause hold · /queue view · /drop <id> remove"
+        return "Ask LeapFlow… /help commands · /status runtime · /queue tasks"
+
+    def _approval_max_lines(self) -> int:
+        """Terminal-aware max height for the inline approval panel."""
+        terminal_lines = shutil.get_terminal_size((80, 24)).lines
+        return max(8, terminal_lines - 2)
+
+    def _approval_fragments(self) -> list[tuple[str, str]]:
+        modal = self._approval_modal
+        if modal is None:
+            return []
+        return modal.fragments(max_lines=self._approval_max_lines())
+
+    def _approval_height(self) -> int:
+        modal = self._approval_modal
+        if modal is None:
+            return 0
+        return modal.line_count(max_lines=self._approval_max_lines())
+
+    def _spinner_fragments(self) -> list[tuple[str, str]]:
+        if not self._spinner_text:
+            return []
+        elapsed = ""
+        if self._tool_start_time > 0:
+            dt = time.monotonic() - self._tool_start_time
+            if dt >= 60:
+                m, s = int(dt // 60), int(dt % 60)
+                elapsed = f"  ({m:02d}m{s:02d}s)"
+            else:
+                elapsed = f"  ({dt:.1f}s)"
+        text = f"  {self._spinner_text}{elapsed}"
+        if self._active_command is not None and self._active_command.elapsed_s >= 30:
+            text += " · /cancel stop · /skip next · /queue view"
+        return [("class:hint", text)]
+
+    def _spinner_height(self) -> int:
+        return 1 if self._spinner_text else 0
+
+    # ── Internal ─────────────────────────────────────────────────────
+
+    def _sync_task_counts(self) -> None:
+        self._status.update_task_counts(
+            running=1 if self._active_command is not None else 0,
+            queued=self._pending_input.qsize(),
+        )
+
+    def _invalidate(self) -> None:
+        if self._app.is_running:
+            self._app.invalidate()

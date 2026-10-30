@@ -128,7 +128,9 @@ class MotionFacade(Protocol):
         """Check a joint endpoint and path with FK; return its predicted TCP."""
         ...
 
-    def check_cartesian_path(self, state: ArmState, targets: Sequence[Pose]) -> tuple[Mapping[str, Any], ...]:
+    def check_cartesian_path(
+        self, state: ArmState, targets: Sequence[Pose]
+    ) -> tuple[Mapping[str, Any], ...]:
         """Bounded IK waypoints whose actual joint-space paths pass workspace checks."""
         ...
 
@@ -180,7 +182,11 @@ class ScenePort(Protocol):
         ...
 
     async def lift(
-        self, frame_id: str, targets: Sequence[PixelTarget], *, coords: str,
+        self,
+        frame_id: str,
+        targets: Sequence[PixelTarget],
+        *,
+        coords: str,
         capture_id: str | None = None,
     ) -> tuple[tuple[LocatedObject, ...], tuple[Mapping[str, str], ...]]:
         """The base-frame objects under *targets* in a remembered frame, each under a new
@@ -237,6 +243,22 @@ class VisionPort(Protocol):
         names the region it cares about gets its whole point budget there.
         """
         ...
+
+
+@runtime_checkable
+class MetricReadinessPort(Protocol):
+    """Target-free bounded capture; raw samples stay in the owning node's cache."""
+
+    async def metric_readiness(
+        self,
+        *,
+        frames: int,
+        points: int,
+        role: str,
+        stamp_uncertainty_s: float,
+        ttl_s: float,
+        quota_bytes: int,
+    ) -> Mapping[str, Any]: ...
 
 
 @runtime_checkable
@@ -298,8 +320,56 @@ class GraspVerificationPort(Protocol):
 
     async def inspect(self) -> Mapping[str, Any]: ...
 
-    async def verify(self, stage: str, *, samples: int,
-                     grasp: Mapping[str, Any] | None = None) -> Mapping[str, Any]: ...
+    async def verify(
+        self, stage: str, *, samples: int, grasp: Mapping[str, Any] | None = None
+    ) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class CalibrationPort(Protocol):
+    """Private admitted acquisition and redacted diagnostics through the hardware owner."""
+
+    async def collection_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def collect(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+    async def inspect(self, *, evidence_digest: str = "") -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class CalibrationReferencePort(Protocol):
+    """Stationary task-local registration, separately optional from collection."""
+
+    async def reference_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def align_reference(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class CalibrationTrialPort(Protocol):
+    """Indexed camera-only candidate assessment; no activation or actuator access."""
+
+    async def trial_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def assess_motion(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class CalibrationPosePort(Protocol):
+    """Bounded nominal-only acquisition through the ordinary governed motion facade."""
+
+    async def poses_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def collect_poses(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class CalibrationRollbackPort(Protocol):
+    """Optional governed between-run rollback; persistence is effectful, never motion."""
+
+    async def rollback_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def rollback(self, plan: SkillPlan) -> Mapping[str, Any]: ...
 
 
 @runtime_checkable
@@ -336,6 +406,9 @@ class SkillContext(Protocol):
 
     @property
     def grasp_verification(self) -> GraspVerificationPort: ...
+
+    @property
+    def calibration(self) -> CalibrationPort: ...
 
     @property
     def policies(self) -> PolicyPort: ...
@@ -389,10 +462,14 @@ __all__ = [
     "PATH_DEFAULT",
     "PATH_LINEAR",
     "PATH_POINT",
+    "CalibrationPort",
+    "CalibrationReferencePort",
+    "CalibrationRollbackPort",
     "FrameView",
     "GraspPlanner",
     "GraspVerificationPort",
     "MotionFacade",
+    "MetricReadinessPort",
     "NodeSkill",
     "PolicyPort",
     "ScenePort",

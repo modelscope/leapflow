@@ -1,0 +1,2086 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""Interactive subcommand — persistent REPL with hybrid Application TUI.
+
+Uses ``LeapApp`` (prompt_toolkit Application + Rich) for a Hermes-style
+fixed-input experience: status bar and input are pinned at the terminal
+bottom while Rich-formatted output scrolls above.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional
+
+from leapflow.cli.commands.run import _print_execution_result
+from leapflow.cli.helpers import require_initialized
+from leapflow.engine import StreamEvent
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from leapflow.cli.context import Context
+    from leapflow.copilot.types import PredictionCandidate
+    from leapflow.daemon.client import DaemonClient
+
+_CLI_INTERACTION_EVENT = "cli.interaction"
+_CLI_EVENT_SOURCE = "interactive_repl"
+
+_last_hint: Optional["PredictionCandidate"] = None
+
+_WATCH_EXIT_ACTIVE_STATES = frozenset({"armed", "watching", "due", "confirming", "executing"})
+
+
+def _board_lens_names() -> tuple[str, ...]:
+    """Return the installed board lenses, for ``/board `` completion.
+
+    Read from the template library rather than enumerated, because a lens is a YAML
+    file an operator can add: a hardcoded list would silently stop offering theirs.
+    Failure is empty, not fatal -- losing a completion must never stop the TUI starting.
+    """
+    try:
+        from leapflow.dashboard.templates import TemplateLibrary
+
+        return tuple(sorted(TemplateLibrary().names()))
+    except Exception:
+        logger.debug("slash completion: board lenses unavailable", exc_info=True)
+        return ()
+
+
+def _is_app_command(canonical: str) -> bool:
+    """Return true only for `/app` or `/app ...`, not `/apple`."""
+    return canonical == "app" or canonical.startswith("app ")
+
+
+async def _prompt_stop_daemon_on_exit(
+    client: "DaemonClient",
+    settings: Any,
+    console: Any,
+) -> None:
+    """Ask whether to stop leapd after a daemon-backed TUI exits."""
+    try:
+        daemon_status = await client.status()
+    except Exception:
+        daemon_status = {}
+    pid = daemon_status.get("pid") or "unknown"
+    console.system(
+        "leapd runs in the background; stop/restart it after reinstalling LeapFlow "
+        "to load new code."
+    )
+    await _stop_board_watches_on_exit(client, console)
+    connected_clients = daemon_status.get("connected_clients")
+    other_clients = 0
+    try:
+        other_clients = max(0, int(connected_clients or 0))
+    except (TypeError, ValueError):
+        other_clients = 0
+    if other_clients > 0:
+        console.system(
+            f"Detected {other_clients} other Leap client(s); keeping leapd running by default."
+        )
+        stop = await _ask_yes_no_default_no(f"Stop leapd anyway (pid={pid})? [y/N]: ")
+    else:
+        stop = await _ask_yes_no_default_yes(f"Stop leapd now (pid={pid})? [Y/n]: ")
+    if not stop:
+        console.system("leapd kept running. Use `leap daemon restart` when needed.")
+        return
+
+    from leapflow.daemon.lifecycle import stop_daemon
+
+    runtime_dir = settings.runtime_dir
+    console.system(f"Stopping leapd (pid={pid}); requesting graceful shutdown...")
+    graceful_requested = False
+    try:
+        await asyncio.wait_for(client.shutdown(), timeout=3.0)
+        graceful_requested = True
+    except Exception:
+        graceful_requested = False
+    # The user confirmed the stop, so escalate all the way to SIGKILL if needed.
+    # Patience over surprise: use generous windows and narrate every step so the
+    # wait is transparent rather than a silent stall.
+    result = await asyncio.to_thread(
+        stop_daemon,
+        runtime_dir,
+        timeout_s=8.0,
+        force=True,
+        grace_timeout_s=3.0 if graceful_requested else 0.0,
+        force_timeout_s=6.0,
+        on_progress=console.system,
+    )
+    if result.stopped:
+        suffix = " (forced with SIGKILL)" if result.forced else ""
+        console.system(f"leapd stopped{suffix}.")
+    else:
+        console.warning(
+            f"leapd could not be stopped even after SIGKILL (pid={result.pid}). "
+            "It may be blocked on the OS (e.g. disk I/O); run "
+            f"`kill -9 {result.pid}` if it stays unhealthy."
+        )
+
+
+async def _stop_board_watches_on_exit(client: "DaemonClient", console: Any) -> None:
+    """Stop every active board watch before exiting so none linger in leapd.
+
+    LeapBoard watches are tied to the interactive session, so leaving the TUI
+    tears them down; a brief line tells the user what was stopped.
+    """
+    try:
+        watches = await asyncio.wait_for(client.watch_list(), timeout=1.5)
+    except Exception:
+        return
+    active = [w for w in watches if isinstance(w, dict) and _is_active_watch(w)]
+    watch_ids = [wid for wid in (str(w.get("watch_id", "")) for w in active) if wid]
+    if not watch_ids:
+        return
+    # Stop concurrently so exit is bounded by a single timeout, not the sum of
+    # one per watch; keep per-watch diagnostics for any that fail.
+    results = await asyncio.gather(
+        *(asyncio.wait_for(client.watch_stop(wid), timeout=1.0) for wid in watch_ids),
+        return_exceptions=True,
+    )
+    stopped = 0
+    for wid, result in zip(watch_ids, results):
+        if isinstance(result, Exception):
+            logger.debug("interactive: failed to stop board watch %s", wid, exc_info=result)
+        else:
+            stopped += 1
+    if stopped:
+        console.system(f"Stopped {stopped} board watch(es) on exit.")
+
+
+def _is_active_watch(watch: dict[str, Any]) -> bool:
+    return str(watch.get("state", "")) in _WATCH_EXIT_ACTIVE_STATES
+
+
+async def _open_dashboard_view(settings: Any, console: Any, payload: dict[str, Any]) -> None:
+    """Open the web dashboard on the user's machine (client-side).
+
+    Shared by both the in-process and daemon-backed REPLs so a single owner
+    handles server discovery, URL assembly, and the browser-open UX.
+    """
+    from leapflow.dashboard import launcher
+
+    template = str(payload.get("template") or "")
+    url = payload.get("url")
+    if not url:
+        try:
+            state = await asyncio.to_thread(launcher.ensure_server, settings)
+        except Exception as exc:
+            console.warning(f"Could not start the dashboard server: {exc}")
+            return
+        url = launcher.build_view_url(
+            state["bind"], state["port"], state["token"], template=template,
+            # Forwarded so a drill-down (``/board device`` / ``/board preview``) lands on
+            # that device's page rather than the fleet: the daemon resolved which device
+            # was meant, and dropping it here would silently discard that answer.
+            device=str(payload.get("device") or ""),
+            channel=str(payload.get("channel") or ""),
+        )
+    if launcher.open_in_browser(url):
+        console.system(f"Opened dashboard in your browser: {url}")
+    else:
+        console.system(f"Dashboard ready (open manually): {url}")
+    # Any follow-up the daemon wants the operator to read -- what a preview grant now
+    # covers, or that a consent prompt is about to appear here. Emitted after the URL so
+    # the actionable line is the last thing on screen.
+    for note in payload.get("notes") or ():
+        console.system(str(note))
+    if payload.get("watch_id"):
+        console.system(
+            "Observing the current session; analysis streams to the board as it completes."
+        )
+
+
+async def _ask_yes_no_default_yes(prompt: str) -> bool:
+    """Return True by default, including non-interactive or interrupted prompts."""
+    if not sys.stdin.isatty():
+        return True
+    try:
+        answer = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: input(prompt).strip().lower(),
+        )
+    except (EOFError, KeyboardInterrupt):
+        return True
+    return answer not in {"n", "no"}
+
+
+async def _ask_yes_no_default_no(prompt: str) -> bool:
+    """Return False by default, including non-interactive or interrupted prompts."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: input(prompt).strip().lower(),
+        )
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in {"y", "yes"}
+
+
+def _host_started(status: dict[str, Any]) -> bool:
+    return bool(status.get("started")) and str(status.get("backend") or "") != "mock"
+
+
+def _print_host_status(console: Any, host: dict[str, Any]) -> None:
+    backend = str(host.get("backend") or "unknown")
+    if _host_started(host):
+        console.success("Host is on — CuaDriver OS control is connected.")
+    else:
+        console.system("Host is off — CuaDriver is not running for this session.")
+    console.system(
+        "Host/CuaDriver lets LeapFlow see and control the desktop: screenshots, UI automation, "
+        "app/clipboard actions."
+    )
+    console.system(
+        "Stopping it releases the background CuaDriver process; chat, memory, approvals, "
+        "skills, and non-OS tools keep working."
+    )
+    tools = host.get("tools_count")
+    extra = f" tools={tools}" if tools is not None else ""
+    console.system(f"backend={backend} started={host.get('started')}{extra}")
+    if host.get("last_error"):
+        console.warning(f"host error: {host['last_error']}")
+
+
+def _announce_self_evolution(console: Any, settings: Any) -> None:
+    """State the self-evolution mode on the first screen, in both directions.
+
+    Placed beside the approval-bypass notice because it is the same kind of fact: a mode
+    that changes what the agent may decide to do, which a user must know *before* acting
+    rather than discover afterwards. Announced in both states on purpose -- printing only
+    when enabled would make the quiet default indistinguishable from a build without the
+    feature, and a user who cannot tell which they have cannot reason about either.
+
+    The world model itself is not mentioned as a mode because it is not one: it reviews
+    sessions and records what it learned about the environment, which changes what the
+    agent knows and nothing else.
+    """
+    if getattr(settings, "evolution_enabled", False):
+        console.print(
+            "\u26a0 Self-evolution on \u2014 the agent may propose new capabilities "
+            "for itself; each still needs your approval",
+            style="bold yellow",
+        )
+    else:
+        console.system(
+            "Self-evolution off \u2014 the agent adapts by learning, not by writing "
+            "new capabilities. Enable with: leap config set evolution.enabled true"
+        )
+
+
+def _print_auth_setup_hint(console: Any, settings: Any) -> bool:
+    """Render a compact first-run auth hint when no primary LLM key is configured."""
+    if getattr(settings, "has_llm_credentials", False):
+        return False
+    warnings = tuple(getattr(settings, "config_warnings", ()) or ())
+    missing_ref = next((item.split("Missing secret ref: ", 1)[1] for item in warnings if "Missing secret ref: " in item), "")
+    console.warning("LLM API key is not configured.")
+    if missing_ref:
+        console.system(f"Set it with `leap config secret set {missing_ref}` or run `leap config llm key`.")
+    else:
+        console.system("Run `leap config llm key` to store the API key, or `leap config llm set --api-key <key>` for scripts.")
+    return True
+
+
+def _host_action(args: str) -> str:
+    """Resolve a /host action through the registry's shared declaration."""
+    from leapflow.cli.commands.registry import resolve_command, resolve_command_action
+
+    command = resolve_command("host")
+    action = resolve_command_action(command, args) if command is not None else None
+    return action.name if action is not None else ""
+
+
+def _host_action_usage() -> str:
+    """Return the canonical /host usage text from the command registry."""
+    from leapflow.cli.commands.registry import command_action_usage, resolve_command
+
+    command = resolve_command("host")
+    return command_action_usage(command) if command is not None else "Usage: /host"
+
+
+def _format_queue_elapsed(seconds: float) -> str:
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    return f"{minutes}m{seconds - minutes * 60:.0f}s"
+
+
+class _DaemonRuntimeBridge:
+    """Reconnectable bridge for daemon-backed TUI runtime calls."""
+
+    def __init__(
+        self,
+        client: "DaemonClient",
+        settings: Any,
+        console: Any,
+        *,
+        session_id_getter: Any,
+        session_id_setter: Any,
+        metadata_applier: Any,
+        lease: Any | None = None,
+        mock_host: bool = False,
+        client_factory: Any | None = None,
+    ) -> None:
+        self.client = client
+        self._settings = settings
+        self._console = console
+        self._session_id_getter = session_id_getter
+        self._session_id_setter = session_id_setter
+        self._metadata_applier = metadata_applier
+        self._lease = lease
+        self._mock_host = mock_host
+        self._client_factory = client_factory
+
+    async def call(self, operation: Any, *, description: str) -> Any:
+        """Run one RPC operation and recover the daemon once on connection failure."""
+        from leapflow.daemon.client import DaemonUnavailableError
+
+        try:
+            return await operation(self.client)
+        except DaemonUnavailableError as exc:
+            await self.recover(f"{description} failed: {exc}")
+            return await operation(self.client)
+
+    async def recover(self, reason: str) -> None:
+        """Reconnect or restart leapd, then restore runtime metadata and session."""
+        from leapflow.daemon.client import recover_daemon_client
+
+        self._console.warning(f"Lost connection to leapd; attempting recovery. {reason}")
+
+        def _status(message: str) -> None:
+            self._console.system(message)
+
+        factory = self._client_factory or recover_daemon_client
+        self.client = await factory(
+            self._settings,
+            mock_host=self._mock_host,
+            status_callback=_status,
+        )
+        status = await self.client.status(str(self._session_id_getter() or ""))
+        self._metadata_applier(status)
+        session_id = str(self._session_id_getter() or "")
+        if session_id:
+            result = await self.client.session_resume(session_id)
+            if result.get("found"):
+                restored = str(result.get("session_id") or session_id)
+                self._session_id_setter(restored)
+                self._console.success(f"Reconnected to leapd and resumed session {restored}")
+            else:
+                self._console.warning(
+                    f"Reconnected to leapd, but session '{session_id}' was not found."
+                )
+        else:
+            self._console.success("Reconnected to leapd.")
+        if self._lease is not None:
+            await self._lease.touch(state="idle", session_id=str(self._session_id_getter() or ""))
+
+
+async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) -> int:
+    """Persistent REPL session with hybrid TUI (Application + Rich)."""
+    require_initialized(ctx)
+
+    from leapflow.cli.tui_app import (
+        LeapApp,
+        LeapConsole,
+        SessionExitStats,
+        StreamRenderer,
+        build_exit_summary_lines,
+        detect_theme,
+        summarize_messages,
+    )
+    from leapflow.cli.tui_app.status import StatusBar
+    from leapflow.cli.banner import display_rich_banner
+    from leapflow.cli.commands.registry import completion_entries
+    from leapflow.config_service import ConfigService
+    from leapflow.cli.commands.router import CommandRouter, render_command_result
+    from leapflow.cli.commands.slash_handlers import (
+        command_execute,
+        handle_status,
+        handle_tool,
+        handle_usage,
+        handle_model,
+        handle_config,
+        handle_gateway,
+        handle_app,
+        handle_plugin,
+        _is_plugin_command,
+        render_command_payload,
+        render_plugin_generate_start,
+    )
+    from leapflow.utils.terminal_io import TerminalIOProvider
+    from leapflow.engine.session.session import SessionMode
+    from leapflow.plugins import get_registry
+    _tool_registry = get_registry()
+
+    theme = detect_theme()
+    console = LeapConsole(theme)
+    status = StatusBar(theme)
+    io = TerminalIOProvider()
+    exit_stats = SessionExitStats()
+    command_router = CommandRouter("in_process")
+    active_resume_id = ""
+    storage_volatile = bool(getattr(ctx, "storage_volatile", False))
+
+    # ── Session callbacks ────────────────────────────────────────────
+
+    def _on_progress(stage: str, current: int, total: int) -> None:
+        console.system(f"[{stage}] {current}/{total}")
+
+    def _on_complete(result) -> None:
+        if result and result.new_skills:
+            console.success(
+                f"Learning complete — {len(result.new_skills)} new skill(s)"
+            )
+            for name in result.new_skills:
+                console.system(f"  → {name}")
+
+    def _on_step(idx: int, total: int, step_desc: str) -> None:
+        console.system(f"[{idx + 1}/{total}] {step_desc}")
+
+    ctx.session.set_on_learn_progress(_on_progress)
+    if hasattr(ctx.session, "set_on_learn_complete"):
+        ctx.session.set_on_learn_complete(_on_complete)
+    ctx.session.set_on_execute_step(_on_step)
+
+    # ── Helpers ──────────────────────────────────────────────────────
+
+    def _mode_name() -> str:
+        if ctx.session and ctx.session.mode == SessionMode.LEARNING:
+            if ctx.imitation and ctx.imitation.recorder.state.name == "PAUSED":
+                return "paused"
+            return "learning"
+        elif ctx.session and ctx.session.mode == SessionMode.EXECUTING:
+            return "executing"
+        return "idle"
+
+    def _skill_count() -> int:
+        index_count = (
+            len(ctx.skill_index.get_entries())
+            if hasattr(ctx, "skill_index") and ctx.skill_index
+            else 0
+        )
+        registry_count = len(ctx.registry.list_all()) if ctx.registry else 0
+        return index_count + registry_count
+
+    def _platform_online() -> bool:
+        return hasattr(ctx.rpc, "connected") and ctx.rpc.connected
+
+    def _update_status() -> None:
+        ctx_used = 0
+        ctx_max = ctx.settings.llm_context_length
+        ctx_state = "baseline"
+        engine = ctx.engine
+        if engine is not None:
+            ctx_used = getattr(engine, "context_token_count", 0)
+            snapshot = getattr(engine, "context_budget_snapshot", {})
+            if callable(snapshot):
+                snapshot = snapshot()
+            if isinstance(snapshot, dict):
+                ctx_state = str(snapshot.get("context_posture") or "baseline")
+        mode = _mode_name()
+        status.update(
+            mode=mode,
+            skill_count=_skill_count(),
+            platform_online=_platform_online(),
+            model_name=ctx.settings.llm_model,
+            session_turns=getattr(engine, "turn_count", 0) if engine else 0,
+            context_used=ctx_used,
+            context_max=ctx_max,
+            context_state=ctx_state,
+        )
+        app.prompt_mode = mode
+
+    # ── Banner ───────────────────────────────────────────────────────
+
+    all_skills = ctx.registry.list_all() if ctx.registry else []
+    mcp_count = (
+        len(getattr(ctx, "platform_tools", []))
+        if hasattr(ctx, "platform_tools")
+        else 0
+    )
+    ctx_len = ctx.settings.llm_context_length
+
+    def _gateway_connected_names() -> list[str]:
+        gw = getattr(ctx, "gateway_server", None)
+        if gw is None:
+            return []
+        return [
+            (gw.manifests[s.platform_id].display_name
+             if s.platform_id in gw.manifests
+             else s.platform_id)
+            for s in gw.platform_status()
+            if s.connected
+        ]
+
+    def _render_banner() -> None:
+        display_rich_banner(
+            model=ctx.settings.llm_model,
+            cwd=os.getcwd(),
+            session_id=getattr(ctx.session, "session_id", ""),
+            platform_online=_platform_online(),
+            tool_defs=_tool_registry.tool_definitions,
+            skills=all_skills,
+            context_length=ctx_len,
+            mcp_tools=mcp_count,
+            gateway_connected=_gateway_connected_names(),
+            theme=theme,
+        )
+        if storage_volatile:
+            console.warning(
+                "Primary database is locked by another LeapFlow instance; "
+                "this window is using volatile storage."
+            )
+            console.system("New memory, session history, and learned skills will not persist here.")
+
+    def _active_chat_session_id() -> str:
+        engine = getattr(ctx, "engine", None)
+        current = getattr(engine, "_current_session_id", "") if engine else ""
+        return str(current or active_resume_id or "")
+
+    def _stored_message_counts(session_id: str) -> tuple[int, int, int] | None:
+        if not session_id:
+            return None
+        store = getattr(ctx, "_conversation_store", None)
+        if store is None:
+            engine = getattr(ctx, "engine", None)
+            store = getattr(engine, "_conversation_store", None) if engine else None
+        if store is None:
+            return None
+        try:
+            messages = store.get_messages(session_id, limit=10_000)
+        except Exception:
+            logger.debug("session summary message lookup failed", exc_info=True)
+            return None
+        return summarize_messages(messages)
+
+    def _print_exit_summary() -> None:
+        session_id = _active_chat_session_id()
+        counts = _stored_message_counts(session_id)
+        if counts is None:
+            message_count = exit_stats.message_count
+            user_messages = exit_stats.user_messages
+            tool_calls = exit_stats.tool_calls
+        else:
+            message_count, user_messages, stored_tool_calls = counts
+            tool_calls = max(stored_tool_calls, exit_stats.tool_calls)
+        if not session_id and message_count == 0:
+            return
+        console.newline()
+        for line in build_exit_summary_lines(
+            session_id=session_id,
+            duration_s=exit_stats.duration_s,
+            message_count=message_count,
+            user_messages=user_messages,
+            tool_calls=tool_calls,
+            resumable=not storage_volatile,
+        ):
+            console.print(line)
+
+    # ── Stream response ──────────────────────────────────────────────
+
+    async def _stream_response(prompt_text: str) -> None:
+        exit_stats.record_user_message()
+        status.mark_turn_start()
+        app.agent_running = True
+        app.spinner_text = "Thinking…"
+
+        renderer = StreamRenderer(console)
+        renderer.start()
+        turn_completed = False
+        try:
+            async for event in ctx.engine.run_stream(prompt_text, enable_thinking=ctx.settings.show_thinking):
+                if isinstance(event, StreamEvent):
+                    if event.type == "chunk":
+                        renderer.feed(event.content)
+                    elif event.type == "thinking":
+                        renderer.feed_thinking(event.content)
+                        # Phase 2: route thinking to spinner for in-place display
+                        _preview = (event.content or "").strip().replace("\n", " ")[:80]
+                        if _preview:
+                            app.spinner_text = f"💭 {_preview}"
+                    elif event.type == "tool_start":
+                        app.spinner_text = renderer.tool_started(
+                            event.content,
+                            metadata=event.metadata or {},
+                        )
+                    elif event.type == "tool_complete":
+                        renderer.tool_finished(event.content, metadata=event.metadata or {})
+                        app.spinner_text = "Thinking…"
+                    elif event.type == "final":
+                        if not renderer.text:
+                            renderer.feed(event.content)
+                else:
+                    renderer.feed(str(event))
+            turn_completed = True
+        finally:
+            if turn_completed and renderer.permission_blocked:
+                command = app.block_active_command_in_response(renderer.permission_block_reason)
+            elif turn_completed:
+                command = app.complete_active_command_in_response()
+            else:
+                command = None
+            renderer.finish(command=command)
+            if renderer.has_output:
+                exit_stats.record_assistant_message()
+            exit_stats.record_tool_calls(renderer.tool_count)
+            app.spinner_text = ""
+            app.agent_running = False
+            status.mark_turn_end()
+            _update_status()
+
+    # ── Input handler (business logic) ───────────────────────────────
+
+    async def handle_input(text: str) -> None:
+        """Dispatch one user input — slash commands or natural language."""
+        global _last_hint
+
+        try:
+            if ctx.reload_runtime_config_if_changed():
+                console.success(
+                    "Configuration reloaded for this session."
+                )
+        except Exception as exc:
+            logger.warning("Runtime config reload failed: %s", exc)
+            console.warning(f"Configuration reload failed: {exc}")
+
+        _learning = ctx.session and ctx.session.mode == SessionMode.LEARNING
+        if _learning:
+            ctx.imitation.end_control_input()
+
+        _update_status()
+
+        # Copilot feedback on previous hint
+        if ctx.copilot_idle is not None:
+            ctx.copilot_idle.on_event_timestamp(time.time())
+
+        if ctx.copilot_feedback is not None and _last_hint is not None:
+            if _is_hint_accepted(text, _last_hint):
+                signal = ctx.copilot_feedback.on_accept()
+            elif ctx.copilot_encoder is not None:
+                signal = ctx.copilot_feedback.on_next_action(
+                    text, ctx.copilot_encoder.current_state
+                )
+            else:
+                signal = None
+            if signal and ctx.copilot_evolution:
+                await ctx.copilot_evolution.process_feedback(signal)
+            _last_hint = None
+
+        if _learning:
+            ctx.imitation.mark_control_input()
+
+        console.rule()
+
+        # ── Slash command dispatch ──
+        invocation = command_router.parse(text)
+        if invocation is not None:
+            unsupported = command_router.unsupported_result(invocation)
+            if unsupported is not None:
+                render_command_result(console, unsupported)
+                return
+            cmd_text = invocation.text
+            cmd_def = invocation.command
+            canonical = cmd_def.name
+            cmd_args = invocation.args
+
+            if canonical == "exit":
+                if ctx.session and ctx.session.mode == SessionMode.LEARNING:
+                    try:
+                        await ctx.session.exit_learning()
+                        console.system("Learning stopped.")
+                    except Exception:
+                        pass
+                elif _learning:
+                    ctx.imitation.end_control_input()
+                app.exit()
+                return
+
+            if canonical == "help":
+                _show_help(console, runtime="in_process")
+                return
+
+            if canonical == "status":
+                handle_status(ctx, console, cmd_args)
+                return
+
+            if canonical == "host":
+                action = _host_action(cmd_args)
+                if action == "status":
+                    result = await ctx.host_backend_status()
+                elif action == "start":
+                    console.system("Starting CuaDriver OS control for this session…")
+                    result = await ctx.host_backend_start()
+                elif action == "stop":
+                    console.system("Stopping CuaDriver OS control; chat and memory stay available…")
+                    result = await ctx.host_backend_stop()
+                elif action == "restart":
+                    console.system("Restarting CuaDriver OS control…")
+                    result = await ctx.host_backend_restart()
+                else:
+                    console.warning(_host_action_usage())
+                    console.system("Use Tab after `/host ` to choose an action.")
+                    return
+                succeeded = bool(result.get("ok", True))
+                render_command_payload(
+                    console,
+                    {
+                        "ok": succeeded,
+                        "view": "host",
+                        "action": action,
+                        "result": result,
+                        "message": (
+                            ""
+                            if succeeded
+                            else str(result.get("last_error") or "Host control failed.")
+                        ),
+                    },
+                )
+                _update_status()
+                return
+
+            if canonical == "clear":
+                app.clear_screen()
+                _render_banner()
+                return
+
+            if canonical == "tool":
+                handle_tool(ctx, console, cmd_args)
+                return
+
+            if canonical == "gateway":
+                handle_gateway(ctx, console, cmd_args)
+                return
+
+            if _is_app_command(canonical):
+                app_args = cmd_text[len("app"):].strip()
+                await handle_app(ctx, console, app_args)
+                _update_status()
+                return
+
+            if _is_plugin_command(canonical):
+                plugin_args = cmd_text[len("plugin"):].strip()
+                if plugin_args.startswith("generate"):
+                    render_plugin_generate_start(console, plugin_args)
+                await handle_plugin(ctx, console, plugin_args)
+                return
+
+            if canonical == "usage":
+                handle_usage(ctx, console, cmd_args)
+                return
+
+            if canonical == "model":
+                handle_model(ctx, console, cmd_args)
+                _update_status()
+                return
+
+            if canonical == "config":
+                handle_config(ctx, console, cmd_args)
+                _update_status()
+                return
+
+            if canonical.startswith("teach") or canonical == "annotate":
+                if await _handle_teach(ctx, console, cmd_text, _learning):
+                    await _after_dispatch(text)
+                    return
+
+            if canonical.startswith("skill"):
+                if _handle_skill(ctx, console, cmd_text):
+                    return
+
+            if canonical.startswith("hub"):
+                from leapflow.cli.commands.hub import cmd_hub
+
+                hub_args = (
+                    cmd_text.split()[1:] if len(cmd_text.split()) > 1 else []
+                )
+                await cmd_hub(ctx, hub_args)
+                return
+
+            if canonical == "btw":
+                from leapflow.cli.commands.btw_handler import handle_btw
+                await handle_btw(ctx, console, cmd_args)
+                return
+
+            if canonical == "run":
+                trigger_or_name = cmd_args
+                if trigger_or_name.startswith("--skill "):
+                    skill_name = trigger_or_name[len("--skill "):]
+                    result = await ctx.session.execute_skill(skill_name, io=io)
+                else:
+                    matched = ctx.session.find_skill(trigger_or_name)
+                    if matched:
+                        result = await ctx.session.execute_skill(
+                            matched, io=io
+                        )
+                    else:
+                        await _stream_response(trigger_or_name)
+                        await _after_dispatch(text)
+                        return
+                _print_execution_result(result)
+                return
+
+            # Registered engine command with no in-process fast path (e.g.
+            # /board): route through the shared command_execute contract so a
+            # recognized slash command never leaks into the LLM chat stream.
+            # Client-local commands are handled above or via task-control.
+            if not cmd_def.client_local:
+                try:
+                    payload = await command_execute(ctx, canonical, cmd_args)
+                except Exception as exc:
+                    console.warning(f"/{canonical} failed: {exc}")
+                    return
+                if str(payload.get("view")) == "dashboard":
+                    if payload.get("mode") == "open":
+                        await _open_dashboard_view(ctx.settings, console, payload)
+                    else:
+                        render_command_payload(console, payload)
+                    return
+                else:
+                    render_command_payload(console, payload)
+                return
+
+        if _learning:
+            ctx.imitation.end_control_input()
+
+        # ── Natural language input ──
+        if ctx.session and ctx.session.mode == SessionMode.LEARNING:
+            ctx.session.annotate(text)
+            console.system("(Noted as annotation during learning)")
+            await _after_dispatch(text)
+            return
+
+        matched = ctx.session.find_skill(text) if ctx.session else None
+        if matched:
+            result = await ctx.session.execute_skill(matched, io=io)
+            _print_execution_result(result)
+        else:
+            await _stream_response(text)
+
+        await _after_dispatch(text)
+
+    async def _after_dispatch(text: str) -> None:
+        """Post-dispatch: inject copilot event and display ghost hint."""
+        global _last_hint
+
+        await _inject_copilot_event(ctx, text, _mode_name)
+
+        _learning = ctx.session and ctx.session.mode == SessionMode.LEARNING
+        if (
+            not _learning
+            and ctx.copilot_pipeline is not None
+            and ctx.copilot_config is not None
+        ):
+            best = ctx.copilot_pipeline.get_best(
+                min_confidence=ctx.copilot_config.min_confidence_display
+            )
+            if best is not None:
+                _render_ghost_hint(console, best)
+                _last_hint = best
+                if (
+                    ctx.copilot_feedback is not None
+                    and ctx.copilot_encoder is not None
+                ):
+                    ctx.copilot_feedback.track_shown(
+                        best, ctx.copilot_encoder.current_state
+                    )
+            else:
+                _last_hint = None
+        else:
+            _last_hint = None
+
+    def _render_queue_state() -> None:
+        active = app.active_command
+        queued = app.queued_commands()
+        if active is None and not queued:
+            console.system("Queue is empty.")
+            return
+        if active is not None:
+            console.system(f"{active.label} {active.status.value} {_format_queue_elapsed(active.elapsed_s)}  {active.summary()}")
+        for command in queued:
+            console.system(f"{command.label} {command.status.value}  {command.summary()}")
+        if app.queue_paused:
+            console.system("Queue is paused — use /resume to continue.")
+
+    def _handle_task_control(text: str) -> bool:
+        invocation = command_router.parse(text)
+        if invocation is None:
+            return False
+        canonical = invocation.command.name
+        args = invocation.args.strip()
+        if canonical not in {"cancel", "skip", "pause", "resume", "queue", "drop"}:
+            return False
+        if canonical == "cancel":
+            cancelled = app.request_cancel_active("cancelled by user")
+            if cancelled is None:
+                console.system("No running task to cancel.")
+            else:
+                engine = getattr(ctx, "engine", None)
+                if engine is not None and hasattr(engine, "cancel"):
+                    engine.cancel()
+                console.warning(f"Cancelled {cancelled.label}. Continuing queued work.")
+            return True
+        if canonical == "skip":
+            skipped = app.request_skip_active("skipped by user")
+            if skipped is None:
+                console.system("No running task to skip.")
+            else:
+                engine = getattr(ctx, "engine", None)
+                if engine is not None and hasattr(engine, "cancel"):
+                    engine.cancel()
+                console.warning(f"Skipped {skipped.label}. Continuing queued work.")
+            return True
+        if canonical == "pause":
+            changed = app.pause_queue()
+            console.system("Queue paused. Current running task continues; new queued tasks will wait." if changed else "Queue is already paused.")
+            return True
+        if canonical == "resume":
+            changed = app.resume_queue()
+            console.system("Queue resumed." if changed else "Queue is not paused.")
+            return True
+        if canonical == "queue":
+            if args.lower() == "clear":
+                dropped = app.clear_queued_commands("cleared by user")
+                console.system(f"Cleared {len(dropped)} queued task(s).")
+            else:
+                _render_queue_state()
+            return True
+        if canonical == "drop":
+            try:
+                command_id = int(args)
+            except ValueError:
+                console.warning("Usage: /drop <queued_task_id>")
+                return True
+            dropped = app.drop_queued_command(command_id, "dropped by user")
+            if dropped is None:
+                console.warning(f"No queued task #{command_id}.")
+            else:
+                console.system(f"Dropped {dropped.label}.")
+            return True
+        return False
+
+    # ── Create and run the Application ───────────────────────────────
+
+    app = LeapApp(
+        console=console,
+        theme=theme,
+        status=status,
+        commands=completion_entries(),
+        config_fields=tuple(ConfigService(ctx.settings).list_fields()),
+        board_templates=_board_lens_names(),
+        history_path=ctx.settings.profile_layout.tui_history_path,
+        on_input=handle_input,
+        on_control=_handle_task_control,
+    )
+    ctx.set_approval_handler(app.request_approval)
+
+    # Auto-connect previously configured gateway platforms
+    gw = getattr(ctx, "gateway_server", None)
+    if gw is not None:
+        try:
+            gw_count = await gw.start()
+            if gw_count > 0:
+                console.system(f"  Gateway: {gw_count} platform(s) reconnected")
+        except Exception:
+            logger.debug("Gateway auto-connect failed", exc_info=True)
+
+    if resume_id and ctx.engine is not None:
+        if ctx.engine.load_session(resume_id):
+            active_resume_id = resume_id
+            console.success(f"Resumed session {resume_id}")
+        else:
+            console.warning(f"Session '{resume_id}' not found; starting a new session.")
+
+    _render_banner()
+    if ctx.settings.approval_bypass:
+        console.print("\u26a0 Approval bypass active \u2014 all non-hardline actions auto-approved", style="bold yellow")
+    _announce_self_evolution(console, ctx.settings)
+    _print_auth_setup_hint(console, ctx.settings)
+    _update_status()
+    exit_code = 0
+    try:
+        exit_code = await app.run()
+    finally:
+        ctx.set_approval_handler(None)
+        _print_exit_summary()
+    return exit_code
+
+
+async def cmd_interactive_daemon(
+    client: "DaemonClient",
+    settings: Any,
+    *,
+    resume_id: Optional[str] = None,
+    mock_host: bool = False,
+) -> int:
+    """Persistent REPL backed by leapd thin-client RPC."""
+    from leapflow.cli.banner import display_rich_banner
+    from leapflow.cli.commands.registry import completion_entries
+    from leapflow.config_service import ConfigService
+    from leapflow.cli.commands.router import CommandRouter
+    from leapflow.cli.commands.slash_handlers import (
+        _is_plugin_command,
+        render_app_payload,
+        render_command_payload,
+        render_plugin_generate_start,
+    )
+    from leapflow.cli.tui_app import (
+        LeapApp,
+        LeapConsole,
+        SessionExitStats,
+        StreamRenderer,
+        build_exit_summary_lines,
+        detect_theme,
+    )
+    from leapflow.cli.tui_app.status import StatusBar
+    from leapflow.daemon.lease import ClientLease
+    from leapflow.plugins import get_registry
+    _tool_registry = get_registry()
+
+    theme = detect_theme()
+    console = LeapConsole(theme)
+    status = StatusBar(theme)
+    exit_stats = SessionExitStats()
+    command_router = CommandRouter("daemon")
+    # A fresh TUI (no --resume) gets its own distinct session id so that two
+    # concurrent TUI clients route to isolated per-session engines on the daemon
+    # (bounded by daemon.max_concurrent_turns) instead of converging on one
+    # shared session and serializing. --resume keeps the requested id.
+    active_session_id = str(resume_id or "") or uuid.uuid4().hex[:16]
+    turn_count = 0
+    runtime_model_name = str(getattr(settings, "llm_model", ""))
+    runtime_context_length = int(getattr(settings, "llm_context_length", 0) or 0)
+    runtime_context_used = 0
+    runtime_context_state = "baseline"
+    runtime_daemon_pid = ""
+    runtime_host_online = False
+    runtime_turn_active = 0
+    runtime_turn_max = 0
+    runtime_turn_waiting = 0
+    client_lease = ClientLease(
+        settings.runtime_dir,
+        kind="tui",
+        session_id=active_session_id,
+    )
+
+    def _apply_daemon_runtime_metadata(metadata: dict[str, Any]) -> None:
+        nonlocal active_session_id, runtime_model_name, runtime_context_length
+        nonlocal runtime_context_used, runtime_context_state, runtime_daemon_pid, runtime_host_online
+        nonlocal runtime_turn_active, runtime_turn_max, runtime_turn_waiting
+        if metadata.get("pid"):
+            runtime_daemon_pid = str(metadata["pid"])
+        # A session id is this client's own identity, so it is only ever accepted
+        # from the daemon when we have none yet (first assignment, or right after
+        # an explicit resume). A daemon serving several TUIs can report whichever
+        # session it resolved; adopting that made a second TUI send another
+        # workspace's session id and get rejected on every turn.
+        reported_session = str(metadata.get("session_id") or "")
+        if reported_session and reported_session != active_session_id:
+            if active_session_id:
+                logger.debug(
+                    "ignoring daemon-reported session %s; this client owns %s",
+                    reported_session, active_session_id,
+                )
+            else:
+                active_session_id = reported_session
+        if metadata.get("model"):
+            runtime_model_name = str(metadata["model"])
+        if metadata.get("llm_model"):
+            runtime_model_name = str(metadata["llm_model"])
+        if metadata.get("llm_context_length") is not None:
+            try:
+                runtime_context_length = max(1, int(metadata["llm_context_length"]))
+            except (TypeError, ValueError):
+                pass
+        if metadata.get("context_used") is not None:
+            try:
+                runtime_context_used = max(0, int(metadata["context_used"]))
+            except (TypeError, ValueError):
+                pass
+        if metadata.get("context_posture"):
+            runtime_context_state = str(metadata["context_posture"])
+        elif isinstance(metadata.get("context_budget_snapshot"), dict):
+            snapshot = metadata["context_budget_snapshot"]
+            if snapshot.get("working_memory_trimmed"):
+                # A smaller prompt can be legitimate, but this label makes the
+                # retention boundary explicit instead of implying compression.
+                runtime_context_state = "memory-trimmed"
+            else:
+                runtime_context_state = str(snapshot.get("context_posture") or runtime_context_state)
+        host = metadata.get("host_backend")
+        if isinstance(host, dict):
+            runtime_host_online = _host_started(host)
+        admission = metadata.get("turn_admission")
+        if isinstance(admission, dict):
+            try:
+                runtime_turn_active = max(0, int(admission.get("active", 0) or 0))
+                runtime_turn_max = max(0, int(admission.get("max_concurrent", 0) or 0))
+                runtime_turn_waiting = max(0, int(admission.get("waiting", 0) or 0))
+            except (TypeError, ValueError):
+                pass
+
+    def _set_active_session_id(session_id: str) -> None:
+        nonlocal active_session_id
+        active_session_id = session_id
+
+    bridge = _DaemonRuntimeBridge(
+        client,
+        settings,
+        console,
+        session_id_getter=lambda: active_session_id,
+        session_id_setter=_set_active_session_id,
+        metadata_applier=_apply_daemon_runtime_metadata,
+        lease=client_lease,
+        mock_host=mock_host,
+    )
+
+    def _update_status() -> None:
+        effective_mode = daemon_session_mode if daemon_session_mode in ("learning", "paused") else "daemon"
+        status.update(
+            mode=effective_mode,
+            skill_count=0,
+            platform_online=runtime_host_online,
+            model_name=runtime_model_name,
+            session_turns=turn_count,
+            context_used=runtime_context_used,
+            context_max=runtime_context_length,
+            context_state=runtime_context_state,
+            daemon_turn_active=runtime_turn_active,
+            daemon_turn_max=runtime_turn_max,
+            daemon_turn_waiting=runtime_turn_waiting,
+        )
+        app.prompt_mode = effective_mode
+
+    def _render_banner() -> None:
+        display_rich_banner(
+            model=runtime_model_name,
+            cwd=os.getcwd(),
+            session_id=active_session_id,
+            platform_online=runtime_host_online,
+            tool_defs=_tool_registry.tool_definitions,
+            skills=[],
+            context_length=runtime_context_length,
+            mcp_tools=0,
+            gateway_connected=[],
+            theme=theme,
+        )
+        daemon_suffix = f" pid={runtime_daemon_pid}" if runtime_daemon_pid else ""
+        console.system(f"Daemon mode{daemon_suffix}: shared runtime across terminals.")
+        console.system("After reinstalling LeapFlow, use `leap daemon restart` to load new code.")
+
+    async def _print_daemon_status() -> None:
+        try:
+            daemon_status = await bridge.call(
+                lambda current_client: current_client.status(active_session_id),
+                description="daemon status",
+            )
+        except Exception as exc:
+            console.warning(f"Daemon status unavailable: {exc}")
+            return
+        _apply_daemon_runtime_metadata(daemon_status)
+        _update_status()
+        console.system(
+            "leapd "
+            f"pid={daemon_status.get('pid')} "
+            f"profile={daemon_status.get('profile')} "
+            f"clients={daemon_status.get('active_clients')} "
+            f"connected={daemon_status.get('connected_clients', 0)} "
+            f"volatile={daemon_status.get('volatile')}"
+        )
+        # Surface this TUI's own workspace so a user running several TUIs against
+        # one shared daemon can confirm at a glance which project this session is
+        # bound to (tools and memory are scoped to exactly this root).
+        console.system(f"Workspace: {Path.cwd().resolve()}")
+        admission = daemon_status.get("turn_admission")
+        if isinstance(admission, dict):
+            active = int(admission.get("active", 0) or 0)
+            cap = int(admission.get("max_concurrent", 0) or 0)
+            waiting = int(admission.get("waiting", 0) or 0)
+            available = int(admission.get("available", 0) or 0)
+            console.system(
+                f"Daemon turns: active={active}/{cap} "
+                f"available={available} waiting={waiting}"
+            )
+            active_ids = [str(item) for item in admission.get("active_request_ids") or []]
+            if active_ids:
+                console.system(f"Active turn request ids: {', '.join(active_ids)}")
+        db_path = daemon_status.get("db_path")
+        if db_path:
+            console.system(f"DB: {db_path}")
+        profile_config_dir = daemon_status.get("profile_config_dir")
+        if profile_config_dir:
+            console.system(f"Profile config: {profile_config_dir}")
+        user_config_path = daemon_status.get("user_config_path")
+        if user_config_path:
+            console.system(f"User config: {user_config_path}")
+        workspace_config_path = daemon_status.get("workspace_config_path")
+        if workspace_config_path:
+            console.system(f"Workspace config: {workspace_config_path}")
+        runtime_version = daemon_status.get("runtime_version")
+        if runtime_version:
+            console.system(f"Runtime version: {runtime_version}")
+        runtime_source = daemon_status.get("runtime_source")
+        if runtime_source:
+            console.system(f"Runtime source: {runtime_source}")
+        runtime_executable = daemon_status.get("runtime_executable")
+        if runtime_executable:
+            console.system(f"Python: {runtime_executable}")
+        context_length = daemon_status.get("llm_context_length")
+        if context_length:
+            console.system(f"Context budget: {int(context_length):,} tokens")
+        context_used = daemon_status.get("context_used")
+        if context_used is not None:
+            console.system(f"Context used: {int(context_used):,} tokens")
+        host = daemon_status.get("host_backend")
+        if isinstance(host, dict):
+            _print_host_status(console, host)
+
+    async def _handle_daemon_approval(event: StreamEvent) -> None:
+        from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+
+        metadata = event.metadata or {}
+        payload = metadata.get("approval")
+        if not isinstance(payload, dict):
+            return
+        pending_id = str(payload.get("pending_id") or "")
+        if not pending_id:
+            return
+        app.spinner_text = "Waiting for approval…"
+        request = ApprovalRequest.from_dict(payload)
+        decision = await app.request_approval(request)
+        value = decision.value if isinstance(decision, ApprovalDecision) else str(decision)
+        await bridge.call(
+            lambda current_client: current_client.approval_resolve(pending_id, value),
+            description="approval resolve",
+        )
+        app.spinner_text = "Thinking…"
+
+    async def _stream_response(
+        prompt_text: str,
+        *,
+        allow_retry: bool = True,
+        record_user: bool = True,
+    ) -> None:
+        nonlocal turn_count
+        from leapflow.daemon.client import DaemonUnavailableError
+
+        if record_user:
+            exit_stats.record_user_message()
+        status.mark_turn_start()
+        app.agent_running = True
+        app.spinner_text = "Thinking…"
+        await client_lease.touch(state="streaming", session_id=active_session_id)
+
+        renderer = StreamRenderer(console)
+        renderer.start()
+        retry_error: DaemonUnavailableError | None = None
+        saw_real_event = False
+        turn_completed = False
+        try:
+            async for event in bridge.client.engine_chat(
+                prompt_text,
+                session_id=active_session_id,
+                workspace_root=str(Path.cwd().resolve()),
+                enable_thinking=settings.show_thinking,
+            ):
+                metadata = event.metadata or {}
+                is_heartbeat = event.type == "status" and metadata.get("heartbeat")
+                if not is_heartbeat:
+                    saw_real_event = True
+                _apply_daemon_runtime_metadata(metadata)
+                if event.type == "chunk":
+                    renderer.feed(event.content)
+                elif event.type == "thinking":
+                    renderer.feed_thinking(event.content)
+                    # Phase 2: route thinking to spinner for in-place display
+                    _preview = (event.content or "").strip().replace("\n", " ")[:80]
+                    if _preview:
+                        app.spinner_text = f"💭 {_preview}"
+                elif event.type == "tool_start":
+                    app.spinner_text = renderer.tool_started(
+                        event.content,
+                        metadata=metadata,
+                    )
+                elif event.type == "tool_complete":
+                    renderer.tool_finished(event.content, metadata=metadata)
+                    app.spinner_text = "Thinking…"
+                elif event.type == "final":
+                    if not renderer.text:
+                        renderer.feed(event.content)
+                elif event.type == "error":
+                    renderer.feed(event.content)
+                elif event.type == "approval_request":
+                    await client_lease.touch(state="approval", session_id=active_session_id)
+                    await _handle_daemon_approval(event)
+                    await client_lease.touch(state="streaming", session_id=active_session_id)
+                elif event.type == "status":
+                    if not metadata.get("heartbeat"):
+                        console.system(event.content)
+            turn_completed = True
+        except DaemonUnavailableError as exc:
+            if allow_retry and not saw_real_event:
+                retry_error = exc
+            else:
+                console.warning(
+                    "Lost connection to leapd after the turn started; "
+                    "the command was not replayed to avoid duplicate side effects."
+                )
+                raise
+        finally:
+            if turn_completed and renderer.permission_blocked:
+                command = app.block_active_command_in_response(renderer.permission_block_reason)
+            elif turn_completed:
+                command = app.complete_active_command_in_response()
+            else:
+                command = None
+            renderer.finish(command=command)
+            if renderer.has_output:
+                exit_stats.record_assistant_message()
+            exit_stats.record_tool_calls(renderer.tool_count)
+            if turn_completed:
+                turn_count += 1
+            app.spinner_text = ""
+            app.agent_running = False
+            status.mark_turn_end()
+            await client_lease.touch(state="idle", session_id=active_session_id)
+            _update_status()
+
+        if retry_error is not None:
+            await bridge.recover(f"chat stream failed before output: {retry_error}")
+            console.system("Retrying the interrupted request once after reconnecting to leapd.")
+            await _stream_response(prompt_text, allow_retry=False, record_user=False)
+
+    # Session mode tracking for teaching — daemon-side state mirrored here
+    daemon_session_mode = "idle"
+
+    async def _open_dashboard(payload: dict) -> None:
+        """Open the web dashboard on the user's machine (client-side)."""
+        await _open_dashboard_view(settings, console, payload)
+
+    async def handle_input(text: str) -> None:
+        nonlocal daemon_session_mode
+
+        invocation = command_router.parse(text)
+        if invocation is not None:
+            canonical = invocation.command.name
+            cmd_args = invocation.args
+
+            # Client-local commands: handled directly by the TUI
+            if invocation.command.client_local:
+                if canonical == "exit":
+                    if daemon_session_mode == "learning":
+                        try:
+                            await bridge.call(
+                                lambda c: c.command_execute("teach stop", ""),
+                                description="/teach stop",
+                            )
+                        except Exception:
+                            pass
+                    app.exit()
+                    return
+                if canonical == "help":
+                    _show_help(console, runtime="daemon")
+                    return
+                if canonical == "clear":
+                    app.clear_screen()
+                    _render_banner()
+                    return
+                # Task control commands are handled by the existing _handle_task_control
+                _handle_task_control(text)
+                return
+
+            # Engine-routed commands: dispatch through daemon RPC
+            plugin_args_for_progress = ""
+            if _is_plugin_command(canonical):
+                plugin_args_for_progress = canonical[len("plugin"):].strip()
+                if plugin_args_for_progress:
+                    plugin_args_for_progress = plugin_args_for_progress + (" " + cmd_args if cmd_args else "")
+                else:
+                    plugin_args_for_progress = cmd_args
+                if plugin_args_for_progress.startswith("generate"):
+                    render_plugin_generate_start(console, plugin_args_for_progress)
+            try:
+                payload = await bridge.call(
+                    lambda current_client: current_client.command_execute(
+                        canonical,
+                        cmd_args,
+                        session_id=active_session_id,
+                        on_stream_event=_handle_daemon_approval,
+                    ),
+                    description=f"/{canonical}",
+                )
+            except Exception as exc:
+                console.warning(f"/{canonical} failed: {exc}")
+                return
+
+            # Track session mode changes (teach start/stop/discard)
+            new_mode = payload.get("session_mode")
+            if isinstance(new_mode, str):
+                daemon_session_mode = new_mode
+                if new_mode == "learning":
+                    app.prompt_mode = "learning"
+                elif new_mode == "paused":
+                    app.prompt_mode = "paused"
+                else:
+                    app.prompt_mode = "daemon"
+
+            # Special case: streaming commands (like /run) need chat stream
+            if payload.get("stream") and payload.get("prompt"):
+                console.system("Running through daemon chat stream; approvals and host state stay visible.")
+                await _stream_response(str(payload["prompt"]))
+                return
+
+            # Special case: /host with runtime metadata
+            if payload.get("view") == "host" and payload.get("result"):
+                _apply_daemon_runtime_metadata({"host_backend": payload["result"]})
+                _update_status()
+
+            # A config mutation changes runtime state the status bar shows. The TUI
+            # is a separate process, so its cached model/context values only move
+            # when the daemon reports them back; without this the bar keeps showing
+            # the model captured at startup even though the change already applies.
+            if str(payload.get("view")) == "config" and payload.get("changed_keys"):
+                runtime_update: dict[str, Any] = {}
+                if payload.get("model"):
+                    runtime_update["llm_model"] = payload["model"]
+                if payload.get("llm_context_length") is not None:
+                    runtime_update["llm_context_length"] = payload["llm_context_length"]
+                if runtime_update:
+                    _apply_daemon_runtime_metadata(runtime_update)
+                    _update_status()
+
+            if str(payload.get("view")) == "dashboard":
+                if payload.get("mode") == "open":
+                    await _open_dashboard(payload)
+                else:
+                    render_command_payload(console, payload)
+                return
+
+            # Render: app-specific views use app renderer, others use generic
+            view = str(payload.get("view") or "")
+            if view in ("list", "guide", "connect", "disconnect", "remove", "events", "actions") and "result" in payload:
+                render_app_payload(console, payload)
+            else:
+                render_command_payload(console, payload)
+            return
+
+        # Learning mode: route through engine (chat-demonstration recording)
+        # and also annotate for distillation context.
+        if daemon_session_mode == "learning":
+            try:
+                await bridge.call(
+                    lambda current_client: current_client.command_execute("annotate", text),
+                    description="annotate",
+                )
+            except Exception:
+                pass
+            console.rule()
+            await _stream_response(text)
+            return
+
+        console.rule()
+        await _stream_response(text)
+
+    def _print_exit_summary() -> None:
+        if not active_session_id and exit_stats.message_count == 0:
+            return
+        console.newline()
+        for line in build_exit_summary_lines(
+            session_id=active_session_id,
+            duration_s=exit_stats.duration_s,
+            message_count=exit_stats.message_count,
+            user_messages=exit_stats.user_messages,
+            tool_calls=exit_stats.tool_calls,
+            resumable=True,
+        ):
+            console.print(line)
+
+    def _render_queue_state() -> None:
+        active = app.active_command
+        queued = app.queued_commands()
+        if active is None and not queued:
+            console.system("Queue is empty.")
+            return
+        if active is not None:
+            console.system(f"{active.label} {active.status.value} {_format_queue_elapsed(active.elapsed_s)}  {active.summary()}")
+        for command in queued:
+            console.system(f"{command.label} {command.status.value}  {command.summary()}")
+        if app.queue_paused:
+            console.system("Queue is paused — use /resume to continue.")
+
+    def _request_daemon_cancel() -> None:
+        async def cancel_remote() -> None:
+            try:
+                await bridge.call(
+                    lambda current_client: current_client.engine_cancel(),
+                    description="engine cancel",
+                )
+            except Exception as exc:
+                console.warning(f"Daemon cancel failed: {exc}")
+        asyncio.create_task(cancel_remote())
+
+    def _handle_task_control(text: str) -> bool:
+        invocation = command_router.parse(text)
+        if invocation is None:
+            return False
+        canonical = invocation.command.name
+        args = invocation.args.strip()
+        if canonical not in {"cancel", "skip", "pause", "resume", "queue", "drop"}:
+            return False
+        if canonical == "cancel":
+            cancelled = app.request_cancel_active("cancelled by user")
+            if cancelled is None:
+                console.system("No running task to cancel.")
+            else:
+                _request_daemon_cancel()
+                console.warning(f"Cancelled {cancelled.label}. Continuing queued work.")
+            return True
+        if canonical == "skip":
+            skipped = app.request_skip_active("skipped by user")
+            if skipped is None:
+                console.system("No running task to skip.")
+            else:
+                _request_daemon_cancel()
+                console.warning(f"Skipped {skipped.label}. Continuing queued work.")
+            return True
+        if canonical == "pause":
+            changed = app.pause_queue()
+            console.system("Queue paused. Current running task continues; new queued tasks will wait." if changed else "Queue is already paused.")
+            return True
+        if canonical == "resume":
+            changed = app.resume_queue()
+            console.system("Queue resumed." if changed else "Queue is not paused.")
+            return True
+        if canonical == "queue":
+            if args.lower() == "clear":
+                dropped = app.clear_queued_commands("cleared by user")
+                console.system(f"Cleared {len(dropped)} queued task(s).")
+            else:
+                _render_queue_state()
+            return True
+        if canonical == "drop":
+            try:
+                command_id = int(args)
+            except ValueError:
+                console.warning("Usage: /drop <queued_task_id>")
+                return True
+            dropped = app.drop_queued_command(command_id, "dropped by user")
+            if dropped is None:
+                console.warning(f"No queued task #{command_id}.")
+            else:
+                console.system(f"Dropped {dropped.label}.")
+            return True
+        return False
+
+    app = LeapApp(
+        console=console,
+        theme=theme,
+        status=status,
+        commands=completion_entries(),
+        config_fields=tuple(ConfigService(settings).list_fields()),
+        board_templates=_board_lens_names(),
+        history_path=settings.profile_layout.tui_history_path,
+        on_input=handle_input,
+        on_control=_handle_task_control,
+    )
+
+    if resume_id:
+        result = await bridge.call(
+            lambda current_client: current_client.session_resume(resume_id),
+            description="session resume",
+        )
+        if result.get("found"):
+            active_session_id = str(result.get("session_id") or resume_id)
+            console.success(f"Resumed session {active_session_id}")
+        else:
+            console.warning(f"Session '{resume_id}' not found; starting a new session.")
+            active_session_id = ""
+
+    try:
+        _apply_daemon_runtime_metadata(await bridge.call(
+            lambda current_client: current_client.status(active_session_id),
+            description="daemon status",
+        ))
+    except Exception as exc:
+        console.warning(f"Daemon status unavailable: {exc}")
+
+    _render_banner()
+    if settings.approval_bypass:
+        console.print("\u26a0 Approval bypass active \u2014 all non-hardline actions auto-approved", style="bold yellow")
+    _announce_self_evolution(console, settings)
+    _print_auth_setup_hint(console, settings)
+    _update_status()
+
+    # Background notification subscription for push events (distillation progress, etc.)
+    _notification_task: asyncio.Task[None] | None = None
+
+    async def _notification_listener() -> None:
+        """Subscribe to daemon notifications and render them in TUI."""
+        nonlocal daemon_session_mode
+        from leapflow.daemon.client import DaemonUnavailableError
+
+        async def _refresh_watch_count() -> None:
+            try:
+                watches = await bridge.client.watch_list()
+            except Exception:
+                return
+            active = sum(1 for w in watches if w.get("state") in ("armed", "watching"))
+            status.update_monitor_counts(watches=active)
+            app.invalidate()
+
+        while True:
+            try:
+                # Reset stale state on each (re)connection attempt
+                status.distill_phase = ""
+                status.distill_progress = 0.0
+                await _refresh_watch_count()
+                async for event in bridge.client.subscribe_notifications():
+                    event_type = event.get("event_type", "")
+                    payload = event.get("payload") or {}
+                    if event_type == "teach.progress":
+                        status.distill_phase = str(payload.get("phase", ""))
+                        status.distill_progress = float(payload.get("progress", 0.0))
+                        app.invalidate()
+                    elif event_type == "teach.stopped":
+                        daemon_session_mode = "idle"
+                        app.prompt_mode = "daemon"
+                        reason = payload.get("reason", "")
+                        if reason == "idle_timeout":
+                            console.warning("Recording stopped automatically (idle timeout).")
+                        else:
+                            console.system("Recording stopped.")
+                        _update_status()
+                    elif event_type == "teach.complete":
+                        status.distill_phase = ""
+                        status.distill_progress = 0.0
+                        new_skills = payload.get("new_skills") or []
+                        candidate_count = payload.get("candidate_count", 0)
+                        if new_skills:
+                            console.success(
+                                f"Distillation complete — {len(new_skills)} new skill(s)"
+                            )
+                            for name in new_skills:
+                                console.system(f"  → {name}")
+                        elif candidate_count > 0:
+                            console.system(
+                                f"Distillation complete — {candidate_count} candidate(s), none activated"
+                            )
+                        else:
+                            console.system("Distillation complete — no skills produced (insufficient signal)")
+                        app.invalidate()
+                    elif event_type == "monitor.finding":
+                        console.monitor_card(payload)
+                        if str(payload.get("severity")) == "alert":
+                            status.update_monitor_counts(alerts=status.alert_count + 1)
+                        app.invalidate()
+                    elif event_type == "watch.state":
+                        await _refresh_watch_count()
+                    elif event_type == "signal.stream":
+                        # Track signal flow activity for health visibility
+                        status.increment_signal_stream()
+                    elif event_type == "monitor.error":
+                        logger.debug("monitor error notification: %s", payload)
+            except (DaemonUnavailableError, OSError, asyncio.IncompleteReadError):
+                await asyncio.sleep(3.0)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.debug("notification_listener: unexpected error", exc_info=True)
+                await asyncio.sleep(5.0)
+
+    exit_code = 0
+    try:
+        await client_lease.start()
+        _notification_task = asyncio.create_task(_notification_listener())
+        exit_code = await app.run()
+    finally:
+        if _notification_task is not None:
+            _notification_task.cancel()
+            try:
+                await _notification_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await client_lease.stop()
+        _print_exit_summary()
+        await _prompt_stop_daemon_on_exit(bridge.client, settings, console)
+    return exit_code
+
+
+# ── Command handlers ─────────────────────────────────────────────────
+
+
+async def _handle_teach(
+    ctx: "Context", console, line: str, learning: bool
+) -> bool:
+    """Handle teach/learn commands. Returns True if handled."""
+    from leapflow.engine.session.session import SessionMode
+
+    if (
+        line.startswith("teach start")
+        or line.startswith("教学开始")
+        or line == "teach"
+    ):
+        if ctx.session and ctx.session.mode == SessionMode.LEARNING:
+            console.warning("Already in teaching mode. Say '/teach stop' to end.")
+            return True
+
+        # Parse --mode for physical demonstration modes.
+        raw_args = ""
+        if line.startswith("teach start "):
+            raw_args = line[len("teach start "):]
+        elif line.startswith("教学开始 "):
+            raw_args = line[len("教学开始 "):]
+
+        from leapflow.cli.commands.slash_handlers import _parse_teach_start_args
+
+        parsed = _parse_teach_start_args(raw_args)
+        mode = parsed.get("mode", "gui")
+
+        if mode in ("teleop", "kinesthetic"):
+            from leapflow.cli.commands.slash_handlers import (
+                _start_physical_teach,
+            )
+
+            result = await _start_physical_teach(ctx, mode, parsed)
+            if result.get("ok"):
+                console.success(result["message"])
+            else:
+                console.error(result.get("message", "Failed to start physical teach."))
+            return True
+
+        # Default GUI path — unchanged.
+        goal = parsed.get("goal", "")
+        try:
+            session = await ctx.session.enter_learning(goal=goal)
+            console.success(f"Teaching started — session {session.session_id}")
+            if goal:
+                console.system(f"Goal: {goal}")
+            console.system(
+                "Commands: /teach stop │ /teach discard │ /teach pause │ "
+                "/teach resume │ /teach skip [n] │ /annotate <text>"
+            )
+        except Exception as e:
+            console.error(str(e))
+        return True
+
+    if line == "teach stop":
+        # Check for an active physical session first.
+        from leapflow.cli.commands.slash_handlers import _stop_physical_teach
+
+        physical_result = await _stop_physical_teach(ctx)
+        if physical_result is not None:
+            console.success(physical_result["message"])
+            return True
+
+        if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
+            if learning:
+                ctx.imitation.end_control_input()
+            console.warning("Not in teaching mode.")
+            return True
+        try:
+            console.system("Stopping recording…")
+            result = await ctx.session.exit_learning()
+            console.success(
+                f"Recording stopped — {result.step_count} steps, "
+                f"{result.duration:.1f}s"
+            )
+
+            report = getattr(result, "learnability_report", None)
+            if report:
+                from leapflow.learning.learnability import LearnabilityDecision
+
+                if report.decision == LearnabilityDecision.SKIP:
+                    console.warning(
+                        f"Not worth learning — {report.reason} "
+                        f"(score: {report.score:.2f})"
+                    )
+                    return True
+                elif report.decision == LearnabilityDecision.ASK:
+                    console.system(
+                        f"Uncertain (score: {report.score:.2f}) — {report.reason}"
+                    )
+                    answer = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: input("  Learn this? [y/N]: ").strip().lower()
+                    )
+                    if answer not in ("y", "yes"):
+                        ctx.session.reject_learning()
+                        console.system("Skipped.")
+                        return True
+                    ctx.session.confirm_learning()
+
+            if result.step_count > 0 and ctx.settings.has_llm_credentials:
+                console.system("Analyzing and distilling…")
+                final = await ctx.session.await_learning()
+                if final and final.candidates:
+                    candidates = list(final.candidates)
+                    activated = (
+                        set(final.activated_skill_names)
+                        if final.activated_skill_names
+                        else set()
+                    )
+                    console.success(f"Distilled {len(candidates)} candidate(s)")
+                    if activated:
+                        for name in activated:
+                            console.system(f"  → {name}")
+                else:
+                    console.system("No skills distilled (insufficient signal).")
+            elif result.step_count > 0:
+                console.warning("LLM not configured — run 'leap relearn' later")
+
+            if result.new_skills:
+                console.success(f"New skills: {', '.join(result.new_skills)}")
+            if result.suggestions > 0:
+                console.system(f"Suggestions pending: {result.suggestions}")
+        except Exception as e:
+            console.error(str(e))
+        return True
+
+    if line in ("teach quit", "teach discard"):
+        if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
+            console.warning("Not in teaching mode.")
+            return True
+        try:
+            await ctx.session.discard_learning()
+            console.system("Teaching discarded. No skill generated.")
+        except Exception as e:
+            console.error(str(e))
+        return True
+
+    if line == "teach save":
+        if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
+            console.warning("Not in teaching mode.")
+            return True
+        try:
+            learning_session = ctx.session.current_session
+            await ctx.session.abandon_learning()
+            console.success("Session saved for later resume.")
+            if learning_session:
+                console.system(
+                    f"  Resume with: /teach resume {learning_session.session_id}"
+                )
+        except Exception as e:
+            console.error(str(e))
+        return True
+
+    if line == "teach pause":
+        if ctx.session:
+            ctx.session.pause_learning()
+            console.system("Recording paused.")
+        return True
+
+    if line == "teach resume":
+        from leapflow.engine.session.session import SessionMode as SM
+
+        if ctx.session and ctx.session.mode == SM.LEARNING:
+            ctx.session.resume_learning()
+            console.system("Recording resumed.")
+        else:
+            console.warning("Not in teaching mode. Use '/teach resume <id>'.")
+        return True
+
+    if line.startswith("teach resume "):
+        resume_id = line[len("teach resume "):].strip()
+        if not resume_id:
+            console.warning("Usage: /teach resume <session_id>")
+            return True
+        if ctx.session and ctx.session.mode == SessionMode.LEARNING:
+            console.warning("Already in teaching mode. Stop first.")
+            return True
+        try:
+            session = await ctx.session.resume_session(resume_id)
+            traj = ctx.imitation.get_trajectory(session.trajectory_id)
+            step_count = traj.step_count if traj else 0
+            console.success(
+                f"Resumed session {session.session_id} "
+                f"({step_count} existing steps)"
+            )
+            if session.goal:
+                console.system(f"Goal: {session.goal}")
+        except Exception as e:
+            console.error(f"Resume failed: {e}")
+        return True
+
+    if line.startswith("annotate ") or line.startswith("标注 "):
+        text = line.split(" ", 1)[1] if " " in line else ""
+        if ctx.session and text:
+            ctx.session.annotate(text)
+            console.system("Annotation added.")
+        return True
+
+    if line.startswith("teach skip"):
+        parts = line.split()
+        n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        if ctx.session:
+            count = ctx.session.mark_skip(n)
+            console.system(f"Marked {count} step(s) as noise.")
+        else:
+            console.warning("Not in learning mode.")
+        return True
+
+    return False
+
+
+def _handle_skill(ctx: "Context", console, line: str) -> bool:
+    """Handle skill commands. Returns True if handled."""
+    if line in ("skill", "skill list"):
+        skills = ctx.registry.list_all() if ctx.registry else []
+        if not skills:
+            console.system("No skills registered.")
+        else:
+            from rich.table import Table
+
+            table = Table(
+                show_header=True, header_style="bold", border_style="dim"
+            )
+            table.add_column("Name", style="cyan", max_width=30)
+            table.add_column("Version", justify="center")
+            table.add_column("Confidence", justify="center")
+            table.add_column("Description", max_width=40)
+            for s in skills:
+                m = s.metadata
+                table.add_row(
+                    s.name,
+                    f"v{m.version}",
+                    f"{m.confidence:.0%}",
+                    s.description[:40],
+                )
+            console.print(table)
+        return True
+
+    if line.startswith("skill show "):
+        name = line[len("skill show "):]
+        skill = ctx.registry.get(name) if ctx.registry else None
+        if skill is None:
+            console.warning(f"Skill '{name}' not found.")
+        else:
+            from rich.panel import Panel
+            from rich.text import Text
+
+            m = skill.metadata
+            info = Text()
+            info.append(f"Name:        {skill.name}\n")
+            info.append(f"Description: {skill.description}\n")
+            info.append(f"Version:     v{m.version}\n")
+            info.append(f"Confidence:  {m.confidence:.0%}\n")
+            if skill.triggers:
+                info.append(f"Triggers:    {', '.join(skill.triggers)}")
+            console.print(
+                Panel(info, title=skill.name, border_style="cyan")
+            )
+        return True
+
+    if line.startswith("skill disable "):
+        name = line[len("skill disable "):]
+        found = False
+        if ctx.skill_lib and ctx.skill_lib.deactivate_parameterized(name):
+            found = True
+        if ctx.registry and ctx.registry.unregister(name):
+            found = True
+        if found:
+            console.success(f"Skill '{name}' disabled.")
+        else:
+            console.warning(f"Skill '{name}' not found.")
+        return True
+
+    if line.startswith("skill delete "):
+        name = line[len("skill delete "):]
+        found = False
+        if ctx.skill_lib:
+            stored = ctx.skill_lib.load_skill_by_title(name)
+            if stored:
+                stored.status = "deleted"
+                ctx.skill_lib.update_skill(stored)
+                found = True
+        if ctx.registry and ctx.registry.unregister(name):
+            found = True
+        if found:
+            console.success(f"Skill '{name}' deleted.")
+        else:
+            console.warning(f"Skill '{name}' not found.")
+        return True
+
+    return False
+
+
+def _show_help(console, runtime: str = "in_process") -> None:
+    """Display categorized help using the command registry."""
+    from leapflow.cli.commands.registry import commands_by_category
+
+    categories = commands_by_category(runtime=runtime)  # type: ignore[arg-type]
+
+    console.print()
+    for category, cmds in categories.items():
+        console.print(f"  [bold]── {category} ──[/]")
+        for cmd in cmds:
+            name = f"/{cmd.name}"
+            if cmd.args_hint:
+                name = f"{name} {cmd.args_hint}"
+            aliases = ""
+            if cmd.aliases:
+                visible = [
+                    a
+                    for a in cmd.aliases
+                    if not a.startswith("教") and a != "?" and a not in ("teach",)
+                ]
+                if visible:
+                    aliases = f" [dim]({', '.join(visible)})[/]"
+            effect = ""
+            if cmd.requires_host:
+                effect = " [dim]host[/]"
+            elif cmd.requires_llm:
+                effect = " [dim]llm[/]"
+            console.print(
+                f"    [cyan]{name:<28}[/] {cmd.description}{aliases}{effect}"
+            )
+        console.print()
+
+    console.system(
+        "Type your message to chat · Alt+Enter for multiline · Tab for completion"
+    )
+
+
+# ── Copilot helpers ──────────────────────────────────────────────────
+
+
+def _render_ghost_hint(console, candidate: "PredictionCandidate") -> None:
+    """Render a ghost hint in the console."""
+    confidence_pct = int(candidate.confidence * 100)
+    console.system(
+        f"💡 {candidate.action_description} ({confidence_pct}% — Tab to accept)"
+    )
+
+
+def _is_hint_accepted(user_input: str, hint: "PredictionCandidate") -> bool:
+    desc = hint.action_description.lower().strip()
+    inp = user_input.lower().strip()
+    return inp == desc or (
+        desc and inp.startswith(desc.split()[0]) and len(inp) > 2
+    )
+
+
+async def _inject_copilot_event(
+    ctx: "Context", line: str, mode_fn
+) -> None:
+    """Synthesize a CLI interaction event for the Copilot pipeline."""
+    if ctx.copilot_pipeline is None or ctx.copilot_encoder is None:
+        return
+    from leapflow.domain.events import PRIORITY_NORMAL, SystemEvent
+
+    synth_event = SystemEvent(
+        event_type=_CLI_INTERACTION_EVENT,
+        source=_CLI_EVENT_SOURCE,
+        payload={"input": line, "mode": mode_fn()},
+        timestamp=time.time(),
+        priority=PRIORITY_NORMAL,
+    )
+    await ctx.event_bus.handle_event(synth_event.event_type, synth_event.payload)
+    await ctx.copilot_pipeline.on_action_observed(ctx.copilot_encoder.snapshot())
