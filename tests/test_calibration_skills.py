@@ -316,6 +316,25 @@ async def test_a_workspace_beyond_the_bootstrap_box_cannot_be_verified(tmp_path:
     )
 
 
+async def test_workspace_verification_ignores_the_measured_box_it_is_about_to_replace(
+    tmp_path: Path,
+) -> None:
+    """The skill that measures the workspace plans in the bootstrap box, always.
+
+    A wide measured box would let every corner through, so a plan accepted here
+    would prove the skill had trusted the geometry it is about to overwrite.
+    """
+    registry = _registry(tmp_path)
+    registry.calibrate("tcp.offset", pose={"x": 0, "y": 0, "z": TOOL_LENGTH_MM})
+    registry.calibrate("workspace.safe_box", parameters={**SAFE_BOX, "x_min": 100.0})
+    runtime = _runtime(tmp_path, registry)
+    wide = {**BOX_ARGS, "x": [120, 390], "z_min": 130}
+    refused = await _refusal(runtime, "calib.workspace", wide)
+    assert refused.failure_code == FAILURE_OUT_OF_WORKSPACE
+    assert "bootstrap_box" in refused.message
+    assert registry.sim.batches == []
+
+
 async def test_the_floor_follows_the_highest_corner_of_a_tilted_table(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     registry.calibrate("tcp.offset", pose={"x": 0, "y": 0, "z": TOOL_LENGTH_MM})

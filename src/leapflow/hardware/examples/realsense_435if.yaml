@@ -27,6 +27,15 @@ transport:
     expected_product: "D435"
     minimum_usb: "3.0"
     align_depth_to_color: true
+    frame_timeout_ms: 5000
+    # Qualification requires current independent certificates, not these placeholders.
+    mount_digest: ""
+    calibration_digest: ""
+    # Optional measurement: {roi, background_roi, limits, mount_digest,
+    # calibration_digest, uncertainty_mm}. No default ROI or accuracy is assumed.
+    # Optional geometry_measurement adds object/jaws BGR selectors, cuboid_seeds,
+    # surface_sigma_mm, contour_sigma_px, jaw_radius_px, jaw_min_samples,
+    # jaw_dispersion_mm and scene_id. Outputs remain proposals, never held_verified.
     color: {width: 1280, height: 720, fps: 30}
     depth: {width: 848, height: 480, fps: 30}
     infrared: {width: 848, height: 480, fps: 30}
@@ -74,3 +83,17 @@ channels:
     effect: "read"
     privacy: "environment"
     description: "Bounded calibration, profile, and latest-frame metadata; never frame bytes."
+  - channel_id: "camera.rgbd.quality"
+    direction: "read"
+    quantity: "depth_quality"
+    representation: "state"
+    effect: "read"
+    privacy: "environment"
+    description: "Configured node-local lossless RGB-D qualification; unavailable until measurement is declared."
+  - channel_id: "camera.rgbd.geometry"
+    direction: "read"
+    quantity: "geometry_proposal"
+    representation: "state"
+    effect: "read"
+    privacy: "environment"
+    description: "Configured RGB contours, cuboid alternatives and inner-pad measurements; not a grasp certificate."

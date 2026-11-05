@@ -35,7 +35,7 @@ import binascii
 import logging
 import math
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from leapflow.hardware.context import HardwareContext, Quality
 from leapflow.hardware.lhp.authority import WRITE_MODE_PERMIT_REQUIRED
@@ -46,11 +46,14 @@ from leapflow.hardware.lhp.client import (
 )
 from leapflow.hardware.lhp.permit import PERMIT_PARAM, request_digest
 from leapflow.hardware.lhp.protocol import (
+    CAP_FRAME_FRESHNESS_V1,
     CAP_PERMIT_V1,
     ERR_UNSUPPORTED_CAPABILITY,
     FAILURE_PERMIT_REQUIRED,
+    MAX_FRAME_AGE_MS,
     MAX_FRAME_DATA_BYTES,
     MAX_FRAME_RATE_HZ,
+    MAX_FRAME_SEQUENCE,
     MAX_FRAME_WIDTH,
     SAFE_FRAME_MEDIA_TYPES,
     WRITE_EFFECT_UNKNOWN_CODES,
@@ -92,6 +95,7 @@ class LhpTransport:
         self._frame_channels: set[str] = set()
         self._remote_write_mode: str = ""  # from hello
         self._remote_node_id: str = ""  # from hello
+        self._calibration_ack: tuple[str, ...] = ()
 
     # ── Lifecycle ──
 
@@ -168,6 +172,7 @@ class LhpTransport:
                         exc_info=True,
                     )
         self._frame_channels.clear()
+        self._calibration_ack = ()
         self._capabilities = frozenset()
         self._client = None
         self._connected = False
@@ -195,9 +200,22 @@ class LhpTransport:
         return self._localize_reading(result, channel_id)
 
     async def read_frame(
-        self, channel_id: str, *, max_width: int = 0, quality: int = 0, fps: float = 0.0
+        self,
+        channel_id: str,
+        *,
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        min_sequence: int = 0,
+        after_monotonic: float | None = None,
     ) -> FrameReading:
-        """Fetch one bounded frame while preserving host-side identity and timebase."""
+        """Fetch one bounded frame while preserving host-side identity and timebase.
+
+        Freshness bounds cross the wire as the node's own sequence and an *age*:
+        ``after_monotonic`` is this host's clock, meaningless on the node, so it is
+        sent as "no older than now minus the bound" and the node re-anchors it to its
+        own clock -- stricter by the link latency, never looser.
+        """
         client = self._require_client()
         required = {"read_frame", "release_frame"}
         if not required.issubset(self._capabilities):
@@ -217,22 +235,49 @@ class LhpTransport:
             raise TransportError(
                 "frame rate is outside protocol bounds", failure_code="bad_request"
             )
+        params: dict[str, Any] = {
+            "device_id": self._remote_device_id,
+            "channel_id": channel_id,
+            "max_width": int(max_width),
+            "quality": int(quality),
+            "fps": float(fps),
+        }
+        params.update(self._freshness_params(min_sequence, after_monotonic))
         try:
-            result = await client.request(
-                "read_frame",
-                {
-                    "device_id": self._remote_device_id,
-                    "channel_id": channel_id,
-                    "max_width": int(max_width),
-                    "quality": int(quality),
-                    "fps": float(fps),
-                },
-            )
+            result = await client.request("read_frame", params)
         except LhpRemoteError as exc:
             raise TransportError(str(exc) or exc.code, failure_code=exc.code) from exc
         frame = self._frame_from_payload(result, channel_id)
         self._frame_channels.add(channel_id)
         return frame
+
+    def _freshness_params(
+        self, min_sequence: int, after_monotonic: float | None
+    ) -> dict[str, Any]:
+        """Translate host freshness bounds to wire parameters, or refuse them."""
+        if not min_sequence and after_monotonic is None:
+            return {}
+        if CAP_FRAME_FRESHNESS_V1 not in self._capabilities:
+            raise TransportError(
+                "LHP node cannot honour frame freshness bounds; upgrade the node",
+                failure_code=ERR_UNSUPPORTED_CAPABILITY,
+            )
+        if isinstance(min_sequence, bool) or not 0 <= int(min_sequence) <= MAX_FRAME_SEQUENCE:
+            raise TransportError(
+                "frame sequence bound is outside protocol bounds", failure_code="bad_request"
+            )
+        params: dict[str, Any] = {}
+        if min_sequence:
+            params["min_sequence"] = int(min_sequence)
+        if after_monotonic is not None:
+            age_ms = (time.monotonic() - float(after_monotonic)) * 1000.0
+            if not math.isfinite(age_ms):
+                raise TransportError(
+                    "frame freshness bound is not a finite instant", failure_code="bad_request"
+                )
+            # A future bound means "after now"; an ancient one is clamped, which is stricter.
+            params["max_age_ms"] = min(max(0.0, age_ms), MAX_FRAME_AGE_MS)
+        return params
 
     async def write(self, channel_id: str, value: Any) -> WriteOutcome:
         client = self._require_client()
@@ -287,43 +332,93 @@ class LhpTransport:
         if not self._connected or client is None:
             return TransportStatus(connected=False, detail="lhp transport is not open")
         try:
-            result = await client.request("probe", {"device_id": self._remote_device_id})
+            params: dict[str, Any] = {"device_id": self._remote_device_id}
+            if self._calibration_ack:
+                params["calibration_ack"] = list(self._calibration_ack)
+            result = await client.request("probe", params)
         except LhpRemoteError as exc:
             return TransportStatus(
                 connected=False, halt_supported=False, detail=f"{exc.code}: {exc}"
             )
         if not isinstance(result, Mapping):
             return TransportStatus(connected=False, detail="malformed probe result")
+        hub = result.get("frame_hub")
+        metadata = {"frame_hub": dict(hub)} if isinstance(hub, Mapping) else {}
+        self._calibration_ack = ()
+        packet = result.get("calibration_lifecycle")
+        if packet is not None:
+            from leapflow.hardware.calibration.lifecycle import validate_packet
+            try:
+                packet = validate_packet(packet, self._remote_device_id)
+                # Owner identities are checked before applying fleet namespacing.
+                host_device = self._context.device_id if self._context else self._remote_device_id
+                metadata["calibration_lifecycle"] = {**packet, "events": [
+                    {**event, "device_id": host_device} for event in packet["events"]
+                ]}
+            except (ValueError, TypeError):
+                logger.warning("Malformed calibration lifecycle probe; records not acknowledged", exc_info=True)
+                metadata["calibration_lifecycle_error"] = "owner lifecycle identity validation failed"
+        if result.get("calibration_lifecycle_error"):
+            metadata["calibration_lifecycle_error"] = "owner lifecycle unavailable; evolution disabled"
         return TransportStatus(
             connected=bool(result.get("connected", False)),
             halt_supported=bool(result.get("halt_supported", False)),
             detail=str(result.get("detail") or ""),
             latency_ms=float(result.get("latency_ms") or 0.0),
+            metadata=metadata,
         )
 
+    def acknowledge_calibration(self, identities: Sequence[str]) -> None:
+        """Queue only bounded IDs accepted by the host's unified signal entry."""
+        from leapflow.hardware.calibration.lifecycle import MAX_EVENTS
+        if len(identities) > MAX_EVENTS or any(not isinstance(identity, str) or len(identity) != 64 for identity in identities):
+            raise ValueError("bounded lifecycle acknowledgment identities required")
+        self._calibration_ack = tuple(identities)
+
     async def halt(self) -> TransportStatus:
-        """Emergency stop. Never raises and is never serialised by callers."""
+        """Emergency stop. Never raises and is never serialised by callers.
+
+        Every branch that could not put the stop on the wire answers
+        ``halt_delivered=False`` while still reporting the device's *declared*
+        halt capability: a remote arm whose link is gone may still be travelling,
+        and the fleet has to be able to tell that apart from a camera that
+        released its own capture.
+        """
         client = self._client
         if not self._connected or client is None:
             return TransportStatus(
-                connected=False, halt_supported=False, detail="lhp transport is not open"
+                connected=False,
+                halt_supported=self._declared_halt_support(),
+                halt_delivered=False,
+                detail="lhp transport is not open; the stop was not sent",
             )
         try:
             result = await client.request("halt", {"device_id": self._remote_device_id})
         except LhpRemoteError as exc:
             logger.error("LHP halt for %r failed: %s", self._remote_device_id, exc, exc_info=True)
             return TransportStatus(
-                connected=False, halt_supported=False, detail=f"{exc.code}: {exc}"
+                connected=False,
+                halt_supported=self._declared_halt_support(),
+                halt_delivered=False,
+                detail=f"{exc.code}: {exc}",
             )
         if not isinstance(result, Mapping):
             return TransportStatus(
-                connected=False, halt_supported=False, detail="malformed halt result"
+                connected=False,
+                halt_supported=self._declared_halt_support(),
+                halt_delivered=False,
+                detail="malformed halt result",
             )
         return TransportStatus(
             connected=bool(result.get("connected", False)),
             halt_supported=bool(result.get("halt_supported", False)),
+            halt_delivered=bool(result.get("halt_delivered", True)),
             detail=str(result.get("detail") or ""),
         )
+
+    def _declared_halt_support(self) -> bool:
+        """The device's declared stop capability, independent of the link state."""
+        return bool(getattr(self._context, "halt_supported", False))
 
     # ── Batch side-protocol ──
 

@@ -4,7 +4,7 @@
 A training machine copies a node's episode directory and turns it into a
 dataset; this module is everything that conversion needs short of the dataset
 writer itself, so no converter re-implements the format, the labels or the
-adapter (``temp/devices/deployment/convert_to_lerobot.py`` only writes LeRobot):
+adapter; dataset-specific exporters only own the writer:
 
 * ``read_episodes`` selects episodes by their *effective* verdict -- the newest
   ``labels.jsonl`` label (S2's verification) when one exists, else the run's

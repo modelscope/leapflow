@@ -3,9 +3,10 @@
 
 Pure Python on purpose: the node runtime must import on a board without numpy,
 and every quantity a skill reasons about is a 3-vector or a 3x3 rotation. The
-calibration fits (``fit_plane``, ``solve_pivot``, ``solve_hand_eye``) are small
-least-squares problems solved through the normal equations; the one rotation
-fit they need is Horn's quaternion method on a 4x4 Jacobi eigensolver.
+calibration fits (``fit_plane``, ``solve_pivot``, ``solve_hand_eye``,
+``solve_tool_hand_eye``) are small least-squares problems solved through the
+normal equations; the one rotation fit they need is Horn's quaternion method
+on a 4x4 Jacobi eigensolver.
 
 Conventions -- one place, so a vendor that disagrees changes exactly one function:
 
@@ -670,16 +671,427 @@ def _hand_eye_fit(
     )
 
 
+# ── Tool-point hand-eye ──────────────────────────────────────────────────────
+
+MIN_TOOL_HAND_EYE_SAMPLES = 6
+_TOOL_FIT_SAMPLES = 5  # one sample may be held out of the fit for a leave-one-out check
+_HUBER_K = 1.345  # 95% efficiency when the residuals are really Gaussian
+_HUBER_FLOOR_MM = 0.5  # below the camera's noise floor a residual says nothing
+_TOOL_ALTERNATING_STEPS = 8  # closed-form sweeps before the refinement takes over
+_TOOL_REFINE_STEPS = 60
+_TOOL_HAND_EYE_TOLERANCE_MM = 1e-4
+# Where the observed point may sit in the flange frame, as alternating-fit seeds.
+# The tool axis is the flange's +Z, so the seeds walk that line through the range
+# a gripper can reach; the fit keeps whichever start explains the samples best.
+_TOOL_SEEDS: tuple[Vec3, ...] = ((0.0, 0.0, 60.0), (0.0, 0.0, 120.0), (0.0, 0.0, -60.0))
+
+
+@dataclass(frozen=True)
+class ToolHandEyeFit:
+    """The solution of ``p_cam_i = R_X (R_i t + p_i) + t_X``, and how well it holds.
+
+    ``mount`` is ``T_camera_base`` (mm) and ``tool`` the observed point in the
+    flange frame. ``residual`` is per-sample distance in mm and ``held_out`` the
+    same distance predicted by a fit that never saw that sample -- the number
+    that says whether the mount is measured or merely fitted. The sigmas are the
+    parameter standard errors the normal equations imply at the fitted noise
+    level, so a thin pose set shows up as a large sigma even when the residuals
+    are small.
+    """
+
+    mount: Transform
+    tool: Vec3
+    samples: int
+    residual_rms_mm: float
+    residual_max_mm: float
+    held_out_rms_mm: float
+    held_out_max_mm: float
+    condition_number: float
+    translation_sigma_mm: float
+    rotation_sigma_deg: float
+    tool_sigma_mm: float
+    iterations: int
+    outliers: int = 0
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "samples": self.samples,
+            "residual_rms_mm": round(self.residual_rms_mm, 3),
+            "residual_max_mm": round(self.residual_max_mm, 3),
+            "held_out_rms_mm": round(self.held_out_rms_mm, 3),
+            "held_out_max_mm": round(self.held_out_max_mm, 3),
+            "condition_number": round(self.condition_number, 3),
+            "translation_sigma_mm": round(self.translation_sigma_mm, 3),
+            "rotation_sigma_deg": round(self.rotation_sigma_deg, 4),
+            "tool_sigma_mm": round(self.tool_sigma_mm, 3),
+            "iterations": self.iterations,
+            "outliers": self.outliers,
+        }
+
+
+def solve_tool_hand_eye(flanges: Sequence[Pose], points: Sequence[Vec3]) -> ToolHandEyeFit:
+    """Camera mount and tool point from one flange-fixed point seen at every pose.
+
+    A fixed camera sees a point rigidly attached to the flange (the closed
+    gripper's tip) at poses ``(R_i, p_i)``. The point sits at ``R_i t + p_i`` in
+    the base frame and at ``p_cam_i`` on the depth image, so
+
+        ``p_cam_i = R_X (R_i t + p_i) + t_X``
+
+    with nine unknowns: the camera mount ``X = (R_X, t_X)`` in the base frame and
+    the tool point ``t`` in the flange frame. No calibration target, and no
+    separate TCP measurement, is needed.
+
+    Solved in two stages: alternating closed forms (weighted Kabsch for ``X``,
+    linear least squares for ``t``) bring the estimate into the basin, then a
+    damped Gauss-Newton refinement on all nine parameters converges quadratically.
+    Huber weights bound the influence of a dropped or mis-segmented observation.
+    Poses that turn about a single axis leave ``t`` and the mount's heading
+    entangled, so they raise ``ValueError``.
+    """
+    if len(flanges) != len(points):
+        raise ValueError("tool hand-eye needs one camera point per arm pose")
+    if len(flanges) < MIN_TOOL_HAND_EYE_SAMPLES:
+        raise ValueError(
+            f"tool hand-eye needs at least {MIN_TOOL_HAND_EYE_SAMPLES} poses "
+            f"(got {len(flanges)})"
+        )
+    _check_rotation_spread(flanges)
+    mount, tool, _, iterations = _best_fit(flanges, points)
+    residuals = _tool_residuals(flanges, points, mount, tool)
+    held_out = _held_out_errors(flanges, points)
+    sigmas = _parameter_sigmas(flanges, points, mount, tool, residuals)
+    return ToolHandEyeFit(
+        mount=mount,
+        tool=tool,
+        samples=len(flanges),
+        residual_rms_mm=_rms(residuals),
+        residual_max_mm=max(residuals),
+        held_out_rms_mm=_rms(held_out),
+        held_out_max_mm=max(held_out),
+        condition_number=sigmas[3],
+        translation_sigma_mm=sigmas[0],
+        rotation_sigma_deg=sigmas[1],
+        tool_sigma_mm=sigmas[2],
+        iterations=iterations,
+        outliers=sum(1 for weight in _huber_weights(residuals) if weight < 1.0),
+    )
+
+
+def _mean_tool_point(flanges: Sequence[Pose], points: Sequence[Vec3]) -> Vec3:
+    """A first guess at ``t``: the average of the camera points carried into the flange."""
+    guesses = [mat_vec(transpose(pose.rotation), point) for pose, point in zip(flanges, points)]
+    return (sum(v[0] for v in guesses) / len(guesses),
+            sum(v[1] for v in guesses) / len(guesses),
+            sum(v[2] for v in guesses) / len(guesses))
+
+
+def _check_rotation_spread(flanges: Sequence[Pose]) -> None:
+    """Refuse poses that turn about a single axis: ``t`` is unobservable along it."""
+    axes: list[Vec3] = []
+    for i in range(len(flanges)):
+        for j in range(i):
+            relative = mat_mul(transpose(flanges[j].rotation), flanges[i].rotation)
+            axis = rotation_vector(relative)
+            if norm(axis) >= _MIN_MOTION_RAD:
+                axes.append(axis)
+    if not _spans_two_axes(axes):
+        raise ValueError(
+            "the arm poses turn about a single axis; tilt about at least two different axes"
+        )
+
+
+def _fit(
+    flanges: Sequence[Pose], points: Sequence[Vec3], seed: Vec3
+) -> tuple[Transform, Vec3, float, int]:
+    """``(mount, tool, robust cost, refinement steps)`` from one alternating seed."""
+    mount, tool = _initial(flanges, points, seed)
+    return _refine(flanges, points, mount, tool)
+
+
+def _initial(
+    flanges: Sequence[Pose], points: Sequence[Vec3], seed: Vec3
+) -> tuple[Transform, Vec3]:
+    """Alternate ``X`` (Kabsch) and ``t`` (linear) a few times to reach the basin."""
+    tool, weights = seed, [1.0] * len(flanges)
+    mount = Transform()
+    for _ in range(_TOOL_ALTERNATING_STEPS):
+        mount = _fit_mount(flanges, points, tool, weights)
+        weights = _huber_weights(_tool_residuals(flanges, points, mount, tool))
+        tool = _fit_tool(flanges, points, mount, weights)
+    return _fit_mount(flanges, points, tool, weights), tool
+
+
+def _refine(
+    flanges: Sequence[Pose], points: Sequence[Vec3], mount: Transform, tool: Vec3
+) -> tuple[Transform, Vec3, float, int]:
+    """Damped Gauss-Newton over all nine parameters.
+
+    Alternating two exact sub-solves converges only linearly -- the tool point
+    sits on a 150 mm lever, so the two blocks trade the same error back and
+    forth. The joint step uses the same closed-form Jacobian the uncertainty
+    report needs, and reaches the solution quadratically.
+    """
+    cost = float("inf")
+    damping = 1e-3
+    steps = 0
+    for steps in range(1, _TOOL_REFINE_STEPS + 1):
+        residuals = _tool_residuals(flanges, points, mount, tool)
+        current = _robust_cost(residuals)
+        normal, gradient = _normal_equations(flanges, points, mount, tool, residuals)
+        while damping < 1e9:
+            damped = [
+                [normal[i][j] + (damping * normal[i][i] if i == j else 0.0) for j in range(9)]
+                for i in range(9)
+            ]
+            delta = solve_linear(damped, [-value for value in gradient])
+            candidate = _stepped(mount, tool, delta)
+            trial = _robust_cost(_tool_residuals(flanges, points, *candidate))
+            if trial < current:
+                mount, tool, cost = candidate[0], candidate[1], trial
+                damping = max(damping / 3.0, 1e-9)
+                break
+            damping *= 4.0
+        else:
+            break  # no descent direction left: the fit is as good as these samples allow
+        if norm(delta[:3]) < _TOOL_HAND_EYE_TOLERANCE_MM:
+            if norm(delta[3:6]) < _TOOL_HAND_EYE_TOLERANCE_MM and norm(delta[6:]) < 1e-6:
+                break
+    return mount, tool, cost, steps
+
+
+def _stepped(mount: Transform, tool: Vec3, delta: Sequence[float]) -> tuple[Transform, Vec3]:
+    """Apply one parameter step: the tool point, the mount translation, its rotation."""
+    moved_tool = (tool[0] + delta[0], tool[1] + delta[1], tool[2] + delta[2])
+    moved_translation = (
+        mount.translation[0] + delta[3],
+        mount.translation[1] + delta[4],
+        mount.translation[2] + delta[5],
+    )
+    rotation = mat_mul(mount.rotation, _exp_so3(delta[6:]))
+    return Transform(rotation, moved_translation), moved_tool
+
+
+def _exp_so3(vector: Sequence[float]) -> Mat3:
+    """Rodrigues: a rotation vector (radians) to a rotation matrix."""
+    angle = norm(vector)
+    if angle < 1e-12:
+        return IDENTITY
+    axis = (vector[0] / angle, vector[1] / angle, vector[2] / angle)
+    c, s = math.cos(angle), math.sin(angle)
+    x, y, z = axis
+    k = 1.0 - c
+    return (
+        (c + x * x * k, x * y * k - z * s, x * z * k + y * s),
+        (y * x * k + z * s, c + y * y * k, y * z * k - x * s),
+        (z * x * k - y * s, z * y * k + x * s, c + z * z * k),
+    )
+
+
+def _normal_equations(
+    flanges: Sequence[Pose],
+    points: Sequence[Vec3],
+    mount: Transform,
+    tool: Vec3,
+    residuals: Sequence[float],
+) -> tuple[list[list[float]], list[float]]:
+    """``(J^T W J, J^T W r)`` for the nine parameters, with Huber weights."""
+    weights = _huber_weights(residuals)
+    normal = [[0.0] * 9 for _ in range(9)]
+    gradient = [0.0] * 9
+    for pose, point, weight in zip(flanges, points, weights):
+        base = add(mat_vec(pose.rotation, tool), pose.position)
+        residual = sub(mount.apply(base), point)
+        rows = _jacobian_rows(mount, pose, base)
+        for k in range(3):
+            row = rows[k]
+            for i in range(9):
+                gradient[i] += weight * row[i] * residual[k]
+                for j in range(9):
+                    normal[i][j] += weight * row[i] * row[j]
+    return normal, gradient
+
+
+def _jacobian_rows(mount: Transform, pose: Pose, base: Vec3) -> list[list[float]]:
+    """``d p_cam / d(t, t_X, w)`` for one sample: the tool point, the mount, its turn."""
+    tool_block = mat_mul(mount.rotation, pose.rotation)
+    skew = _skew_rotated(mount.rotation, base)
+    rows = []
+    for k in range(3):
+        row = [tool_block[k][0], tool_block[k][1], tool_block[k][2], 0.0, 0.0, 0.0,
+               -skew[k][0], -skew[k][1], -skew[k][2]]
+        row[3 + k] = 1.0
+        rows.append(row)
+    return rows
+
+
+def _huber_weights(residuals: Sequence[float]) -> list[float]:
+    """Weights that cap one bad sample's pull at the robust noise scale."""
+    ordered = sorted(residuals)
+    scale = max(ordered[len(ordered) // 2] / 0.6745, _HUBER_FLOOR_MM)
+    limit = _HUBER_K * scale
+    return [1.0 if r <= limit else limit / r for r in residuals]
+
+
+def _robust_cost(residuals: Sequence[float]) -> float:
+    """The Huber loss the solver minimises, so one outlier cannot buy a better score.
+
+    Seeding and step acceptance compare this, not the plain sum of squares: with
+    a plain cost a 50 mm bad sample is worth trading 6 mm of every other sample
+    for, which is how a mis-segmented frame drags a calibration off.
+    """
+    ordered = sorted(residuals)
+    scale = max(ordered[len(ordered) // 2] / 0.6745, _HUBER_FLOOR_MM)
+    limit = _HUBER_K * scale
+    return sum(r * r if r <= limit else limit * (2.0 * r - limit) for r in residuals)
+
+
+def _fit_mount(
+    flanges: Sequence[Pose], points: Sequence[Vec3], tool: Vec3, weights: Sequence[float]
+) -> Transform:
+    """The ``T_camera_base`` that best maps ``R_i t + p_i`` onto ``p_cam_i``."""
+    base = [add(mat_vec(pose.rotation, tool), pose.position) for pose in flanges]
+    total = sum(weights)
+    if total <= 0.0:
+        raise ValueError("every sample was down-weighted; the observations disagree")
+    centre_base = tuple(sum(w * b[k] for w, b in zip(weights, base)) / total for k in range(3))
+    centre_cam = tuple(sum(w * p[k] for w, p in zip(weights, points)) / total for k in range(3))
+    total_matrix = [[0.0] * 3 for _ in range(3)]
+    for weight, b, p in zip(weights, base, points):
+        part = _outer(sub(p, centre_cam), sub(b, centre_base))
+        for i in range(3):
+            for j in range(3):
+                total_matrix[i][j] += weight * part[i][j]
+    rotation = nearest_rotation(total_matrix)
+    shifted = sub(centre_cam, mat_vec(rotation, centre_base))
+    return Transform(rotation, shifted)
+
+
+def _fit_tool(
+    flanges: Sequence[Pose], points: Sequence[Vec3], mount: Transform, weights: Sequence[float]
+) -> Vec3:
+    """The ``t`` that best explains the samples for a given mount (linear)."""
+    rows: list[tuple[float, ...]] = []
+    values: list[float] = []
+    for pose, point, weight in zip(flanges, points, weights):
+        root = math.sqrt(weight)
+        matrix = mat_mul(mount.rotation, pose.rotation)
+        rhs = sub(sub(point, mount.translation), mat_vec(mount.rotation, pose.position))
+        for k in range(3):
+            rows.append(tuple(root * matrix[k][j] for j in range(3)))
+            values.append(root * rhs[k])
+    solved = least_squares(rows, values)
+    return (solved[0], solved[1], solved[2])
+
+
+def _tool_residuals(
+    flanges: Sequence[Pose], points: Sequence[Vec3], mount: Transform, tool: Vec3
+) -> list[float]:
+    return [
+        norm(sub(mount.apply(add(mat_vec(pose.rotation, tool), pose.position)), point))
+        for pose, point in zip(flanges, points)
+    ]
+
+
+def _held_out_errors(flanges: Sequence[Pose], points: Sequence[Vec3]) -> list[float]:
+    """Per sample: the distance a fit that never saw it predicts for it."""
+    errors: list[float] = []
+    for index in range(len(flanges)):
+        rest = [i for i in range(len(flanges)) if i != index]
+        if len(rest) < _TOOL_FIT_SAMPLES:
+            raise ValueError(
+                f"a leave-one-out check needs more than {_TOOL_FIT_SAMPLES} poses"
+            )
+        best = _best_fit([flanges[i] for i in rest], [points[i] for i in rest])
+        predicted = best[0].apply(
+            add(mat_vec(flanges[index].rotation, best[1]), flanges[index].position)
+        )
+        errors.append(norm(sub(predicted, points[index])))
+    return errors
+
+
+def _best_fit(
+    flanges: Sequence[Pose], points: Sequence[Vec3]
+) -> tuple[Transform, Vec3, float, int]:
+    """The best of the alternating seeds for this sample set."""
+    best: tuple[float, Transform, Vec3, int] | None = None
+    for seed in (_mean_tool_point(flanges, points), *_TOOL_SEEDS):
+        mount, tool, rms, iterations = _fit(flanges, points, seed)
+        if best is None or rms < best[0]:
+            best = (rms, mount, tool, iterations)
+    assert best is not None
+    return best[1], best[2], best[0], best[3]
+
+
+def _parameter_sigmas(
+    flanges: Sequence[Pose],
+    points: Sequence[Vec3],
+    mount: Transform,
+    tool: Vec3,
+    residuals: Sequence[float],
+) -> tuple[float, float, float, float]:
+    """``(position sigma mm, rotation sigma deg, tool sigma mm, condition number)``.
+
+    The Jacobian of ``p_cam_i`` with respect to the tool point, the mount's
+    translation and the mount's rotation vector is exact in closed form, so the
+    normal equations give the parameter standard errors at the fitted noise
+    level. A pose set that barely excites a direction makes them large, which is
+    the honest way to report "measured, but not well".
+    """
+    rows: list[list[float]] = []
+    for pose in flanges:
+        base = add(mat_vec(pose.rotation, tool), pose.position)
+        rows.extend(_jacobian_rows(mount, pose, base))
+    normal = [[sum(row[i] * row[j] for row in rows) for j in range(9)] for i in range(9)]
+    length = [math.sqrt(max(normal[i][i], 1e-30)) for i in range(9)]
+    equilibrated = [[normal[i][j] / (length[i] * length[j]) for j in range(9)] for i in range(9)]
+    scaled_values, _ = _symmetric_eigen(equilibrated)
+    smallest, largest = min(scaled_values), max(scaled_values)
+    condition = math.sqrt(largest / smallest) if smallest > 0.0 else math.inf
+    degrees = 3 * len(flanges) - 9
+    variance = (sum(r * r for r in residuals) / degrees) if degrees > 0 else 0.0
+    inverse = _invert(normal)
+    position = math.sqrt(sum(inverse[3 + k][3 + k] for k in range(3)) * variance)
+    tool_error = math.sqrt(sum(inverse[k][k] for k in range(3)) * variance)
+    angles = [[inverse[6 + i][6 + j] for j in range(3)] for i in range(3)]
+    angle_values, _ = _symmetric_eigen(angles)
+    rotation = math.degrees(math.sqrt(max(max(angle_values), 0.0) * variance))
+    return position, rotation, tool_error, condition
+
+
+def _skew_rotated(rotation: Mat3, base: Vec3) -> Mat3:
+    """``R [base]x``: the derivative of ``R exp([w]x) base`` with respect to ``-w``."""
+    b1, b2, b3 = base
+    skew = ((0.0, -b3, b2), (b3, 0.0, -b1), (-b2, b1, 0.0))
+    return mat_mul(rotation, skew)  # type: ignore[arg-type]
+
+
+def _invert(matrix: Sequence[Sequence[float]]) -> list[list[float]]:
+    """The inverse of a small square matrix, column by column."""
+    size = len(matrix)
+    columns = [
+        solve_linear(matrix, [1.0 if i == k else 0.0 for i in range(size)])
+        for k in range(size)
+    ]
+    return [[columns[j][i] for j in range(size)] for i in range(size)]
+
+
+def _rms(values: Sequence[float]) -> float:
+    return math.sqrt(sum(v * v for v in values) / len(values)) if values else 0.0
+
+
 __all__ = [
     "DOWN",
     "IDENTITY",
     "MIN_HAND_EYE_SAMPLES",
+    "MIN_TOOL_HAND_EYE_SAMPLES",
     "POSE_AXES",
     "Footprint",
     "HandEyeFit",
     "Mat3",
     "Plane",
     "Pose",
+    "ToolHandEyeFit",
     "Transform",
     "Vec3",
     "WorkspaceBox",
@@ -702,6 +1114,7 @@ __all__ = [
     "solve_hand_eye",
     "solve_linear",
     "solve_pivot",
+    "solve_tool_hand_eye",
     "sub",
     "tool_cone_deg",
     "transpose",

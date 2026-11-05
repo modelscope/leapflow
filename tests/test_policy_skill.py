@@ -362,6 +362,20 @@ async def test_run_streams_joint_targets_checked_through_forward_kinematics(
     assert not commanded(arm, "ee.z")  # never mixes motion spaces in one stream
 
 
+async def test_a_cartesian_stream_must_aim_inside_the_tool_cone(tmp_path: Path) -> None:
+    """The cone is a rule about the attitude a command asks for.
+
+    A joint row may hold the tilt it inherited -- that is how a run starts on an
+    arm a halt left pointing sideways.  A cartesian row instead says where the
+    tool must point, so the same posture is refused here: the workcell allows 30
+    deg and this one is 81.7.
+    """
+    arm = SimArmTransport(travel_reads=1, joints=JOINT_START, forward=piper_chain().forward)
+    outcome = await refuse_run(policy_cell(tmp_path, _ee_policy(), arm=arm))
+    assert outcome.failure_code == FAILURE_SHIELD_VIOLATION
+    assert "tool would tilt" in outcome.message and "30.0" in outcome.message
+
+
 async def test_joint_policies_refuse_a_dh_table_the_arm_disagrees_with(tmp_path: Path) -> None:
     # Joints read zero while the firmware reports START_FLANGE: the table is wrong.
     outcome = await refuse_run(policy_cell(tmp_path, _joint_policy()))

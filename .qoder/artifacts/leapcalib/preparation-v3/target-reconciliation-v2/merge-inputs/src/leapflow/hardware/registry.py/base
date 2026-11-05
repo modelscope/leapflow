@@ -1,0 +1,1802 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""Hardware registry: providers in, admitted contexts and transports out.
+
+Structurally the same shape as ``ToolPluginRegistry`` -- discover, validate,
+assemble -- because the problem is the same and the philosophy has already been
+settled: one declaration is the single source of truth, and everything else is
+derived from it deterministically.
+
+Admission is fail-closed and returns a structured report rather than raising. One
+malformed declaration must not make every other device in the profile disappear,
+and a device that fails a *write* precondition is demoted to read-only rather than
+removed, because reads stay valuable for diagnosis exactly when something is wrong.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections import deque
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Deque, Iterable, Mapping, Sequence
+
+from leapflow.hardware.context import (
+    SUPPORTED_HC_VERSIONS,
+    Channel,
+    HardwareContext,
+    as_numeric,
+)
+from leapflow.hardware.providers import (
+    HardwareContextProvider,
+    ProviderError,
+    build_provider,
+)
+from leapflow.hardware.transport import HardwareTransport, TransportError, TransportStatus
+from leapflow.hardware.transports import available_transports, build_transport
+
+if TYPE_CHECKING:
+    from leapflow.hardware.stream import HardwareDeliberativeObserver
+
+logger = logging.getLogger(__name__)
+
+_DEVICE_ID_ALLOWED = set("abcdefghijklmnopqrstuvwxyz0123456789_")
+
+
+class UnverifiedContextPolicy:
+    """How to treat a context no human has confirmed."""
+
+    DENY_WRITE = "deny_write"
+    PROMPT = "prompt"
+    ALLOW = "allow"
+
+
+@dataclass(frozen=True)
+class HardwareSettings:
+    """Runtime policy for the hardware subsystem.
+
+    Passive local discovery starts by default: host metrics and media enumeration give the
+    board an honest inventory without opening a camera, a microphone, a radio or a network
+    connection. Observation remains gated per declared privacy tier, and explicitly
+    disabling this setting remains a hard disable.
+    """
+
+    enabled: bool = True
+    providers: tuple[tuple[str, Mapping[str, Any]], ...] = ()
+    max_devices: int = 16
+    unverified_context_policy: str = UnverifiedContextPolicy.DENY_WRITE
+    require_describe_before_write: bool = True
+    envelope_grant: bool = True
+    trust_skip_enabled: bool = False
+    stream_enabled: bool = True
+    stream_ring_capacity: int = 4096
+    persist_readings: bool = True
+    downsample_interval_s: float = 60.0
+    raw_retention_days: float = 7.0
+    history_retention_days: float = 90.0
+    raw_segment_mb: float = 32.0
+    reading_store_sensitive: bool = True
+    readings_dir: str = ""
+    instrument_db_path: str = ""
+    workspace_id: str = ""
+    rediscover_interval_s: float = 0.0
+    # How long a post-write verdict may follow a value that is still travelling
+    # toward its command. A slow servo legitimately needs seconds to arrive, and
+    # judging it by the declared settling time alone reports a correct move as
+    # contradicted; a value still moving when this budget ends is reported as
+    # pending instead of failed.
+    write_verification_follow_s: float = 10.0
+    preview_idle_timeout_s: float = 5.0
+    # Detail uses 1280px / 30fps / JPEG 85; Balanced stays 960px / 8fps / JPEG 75.
+    preview_max_fps: float = 30.0
+    preview_max_width: int = 1280
+    preview_quality: int = 85
+    # Typed root Settings input for LHP edge nodes; parsed by fleet_config at
+    # plugin startup so the registry remains free of topology concerns.
+    fleet_nodes: str = ""
+    # JSON array (or already parsed sequence in tests) of reflex alert rules.
+    hardware_alert_policies: Any = ""
+    # Profile-owned append-only audit destination for HardwareTools.
+    audit_log_path: str = ""
+    # Profile-owned record of which declarations an operator has reviewed, and
+    # the digest of what they reviewed.  Exposed here because the fleet needs to
+    # consult it for remote devices too: an edge node cannot vouch for itself.
+    verified_path: str = ""
+    # Profile-owned Ed25519 key the host signs LHP execution permits with;
+    # empty disables permit minting (nodes in ``permit_required`` then refuse).
+    permit_issuer_key_path: str = ""
+    # Host consent to show workcell camera frames to the model (perceive.snapshot);
+    # the workcell must declare share_frames too.
+    share_frames: bool = False
+
+    @property
+    def denies_unverified_writes(self) -> bool:
+        return self.unverified_context_policy == UnverifiedContextPolicy.DENY_WRITE
+
+    @classmethod
+    def from_settings(cls, settings: Any) -> "HardwareSettings":
+        """Derive runtime policy from the loaded ``Settings``.
+
+        The declarations directory defaults to the active profile's, resolved through
+        the layout rather than assembled here: a managed path must be declared by a
+        layout object, never joined together at the point of use.
+        """
+        profile_layout = getattr(settings, "profile_layout", None)
+        configured = str(getattr(settings, "hardware_devices_dir", "") or "").strip()
+        if configured:
+            devices_dir = Path(configured).expanduser()
+            verified_path = devices_dir.parent / "verified.json"
+        elif profile_layout is not None:
+            devices_dir = profile_layout.hardware.devices_dir
+            verified_path = profile_layout.hardware.verified_path
+        else:
+            # Tests and small in-process callers may deliberately provide no profile
+            # layout. They still own the explicit enable/disable decision; returning the
+            # class default here would silently re-enable a subsystem a caller set False.
+            return cls(
+                enabled=bool(getattr(settings, "hardware_enabled", True)),
+                hardware_alert_policies=getattr(settings, "hardware_alert_policies", ""),
+            )
+        return cls(
+            enabled=bool(getattr(settings, "hardware_enabled", True)),
+            providers=_provider_rows(
+                settings, devices_dir=devices_dir, verified_path=verified_path
+            ),
+            verified_path=str(verified_path),
+            max_devices=int(getattr(settings, "hardware_max_devices", 16) or 16),
+            unverified_context_policy=str(
+                getattr(settings, "hardware_unverified_policy", UnverifiedContextPolicy.DENY_WRITE)
+                or UnverifiedContextPolicy.DENY_WRITE
+            ),
+            require_describe_before_write=bool(
+                getattr(settings, "hardware_require_describe", True)
+            ),
+            envelope_grant=bool(getattr(settings, "hardware_envelope_grant", True)),
+            trust_skip_enabled=bool(getattr(settings, "hardware_trust_skip_enabled", False)),
+            stream_enabled=bool(getattr(settings, "hardware_stream_enabled", True)),
+            stream_ring_capacity=int(
+                getattr(settings, "hardware_stream_ring_capacity", 4096) or 4096
+            ),
+            persist_readings=bool(getattr(settings, "hardware_persist_readings", True)),
+            downsample_interval_s=float(
+                getattr(settings, "hardware_downsample_interval_s", 60.0) or 60.0
+            ),
+            raw_retention_days=float(getattr(settings, "hardware_raw_retention_days", 7.0) or 7.0),
+            history_retention_days=float(
+                getattr(settings, "hardware_history_retention_days", 90.0) or 90.0
+            ),
+            raw_segment_mb=float(getattr(settings, "hardware_raw_segment_mb", 32.0) or 32.0),
+            reading_store_sensitive=bool(
+                getattr(settings, "hardware_reading_store_sensitive", True)
+            ),
+            fleet_nodes=str(getattr(settings, "hardware_fleet_nodes", "") or ""),
+            hardware_alert_policies=getattr(settings, "hardware_alert_policies", ""),
+            audit_log_path=(
+                str(profile_layout.hardware.audit_log_path) if profile_layout is not None else ""
+            ),
+            permit_issuer_key_path=(
+                str(profile_layout.hardware.permit_issuer_key_path)
+                if profile_layout is not None
+                else ""
+            ),
+            instrument_db_path=(
+                str(profile_layout.instrument_db_path) if profile_layout is not None else ""
+            ),
+            rediscover_interval_s=float(
+                getattr(settings, "hardware_rediscover_interval_s", 0.0) or 0.0
+            ),
+            write_verification_follow_s=float(
+                getattr(settings, "hardware_write_verification_follow_s", 10.0) or 10.0
+            ),
+            preview_idle_timeout_s=float(
+                getattr(settings, "hardware_preview_idle_timeout_s", 5.0) or 5.0
+            ),
+            preview_max_fps=float(getattr(settings, "hardware_preview_max_fps", 30.0) or 30.0),
+            preview_max_width=int(getattr(settings, "hardware_preview_max_width", 1280) or 1280),
+            preview_quality=int(getattr(settings, "hardware_preview_quality", 85) or 85),
+            share_frames=bool(getattr(settings, "hardware_share_frames", False)),
+        )
+
+
+DEFAULT_PROVIDER_KINDS = ("yaml", "host", "media")
+"""Discovery sources enabled when hardware is on and nothing else is configured.
+
+``yaml`` supplies declarations a person wrote and is accountable for. ``host`` costs
+nothing to enumerate, needs no permission, and answers the question every operator
+asks first -- what is this machine doing. ``media`` lists cameras and microphones
+without opening any of them, which is why it can be on by default: enumeration needs
+no consent, and the reads that *do* disclose something are refused until a grant
+exists. Discovering a camera and disclosing what it sees are different acts.
+
+Scanners that transmit (Bluetooth) or leave the host (mDNS) are deliberately absent:
+discovery should never be the reason a radio starts up or a packet leaves the machine.
+"""
+
+
+def _provider_rows(
+    settings: Any, *, devices_dir: Path, verified_path: Path
+) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    """Build the ``(kind, config)`` rows for every configured provider.
+
+    Config-driven rather than a fixed row, so adding a discovery source is a
+    configuration change and an out-of-tree provider needs no core edit. Each kind
+    receives only the config it understands; an unknown kind is passed through with
+    an empty mapping and reported by ``build_provider`` as an admission note rather
+    than crashing the load.
+    """
+    raw = getattr(settings, "hardware_providers", "") or ""
+    if isinstance(raw, str):
+        kinds = [item.strip() for item in raw.split(",") if item.strip()]
+    else:
+        kinds = [str(item).strip() for item in raw if str(item).strip()]
+    if not kinds:
+        kinds = list(DEFAULT_PROVIDER_KINDS)
+
+    configs: dict[str, Mapping[str, Any]] = {
+        "yaml": {"devices_dir": str(devices_dir), "verified_path": str(verified_path)},
+        "host": {
+            "sample_interval_s": float(getattr(settings, "hardware_host_interval_s", 0.0) or 0.0),
+            "include": str(getattr(settings, "hardware_host_include", "") or ""),
+            "exclude": str(getattr(settings, "hardware_host_exclude", "") or ""),
+        },
+        "media": {
+            "include_screens": bool(getattr(settings, "hardware_media_screens", False)),
+            "include_microphones": bool(getattr(settings, "hardware_media_microphones", True)),
+            "max_fps": float(getattr(settings, "hardware_preview_max_fps", 0.0) or 0.0),
+        },
+    }
+    # Deduplicated while preserving order: two rows of one kind would discover every
+    # device twice and have the second copy rejected as a duplicate device_id, which
+    # reads as a declaration error rather than a configuration one.
+    seen: set[str] = set()
+    rows: list[tuple[str, Mapping[str, Any]]] = []
+    for kind in kinds:
+        if kind in seen:
+            continue
+        seen.add(kind)
+        rows.append((kind, configs.get(kind, {})))
+    return tuple(rows)
+
+
+def build_registry(settings: Any) -> HardwareRegistry | None:
+    """Return a loaded registry, or None when hardware is disabled.
+
+    Returning None rather than an empty registry is the whole default-off contract:
+    callers use it to decide whether to compose a hardware risk classifier at all, so
+    a disabled profile keeps the unmodified ``DefaultRiskClassifier`` and behaves
+    byte-for-byte as it did before this subsystem existed.
+
+    Never raises: a malformed declaration directory must not prevent the process from
+    starting. Failures are reported through the returned registry's load report.
+    """
+    policy = HardwareSettings.from_settings(settings)
+    if not policy.enabled:
+        return None
+    registry = HardwareRegistry(policy)
+    try:
+        report = registry.load()
+    except (OSError, ValueError) as exc:
+        logger.error("Hardware registry failed to load: %s", exc, exc_info=True)
+        return registry
+    for note in report.notes:
+        logger.warning(
+            "Hardware admission %s device=%s rule=%s: %s",
+            note.outcome,
+            note.device_id or "-",
+            note.rule,
+            note.detail,
+        )
+    return registry
+
+
+@dataclass(frozen=True)
+class AdmissionNote:
+    """One admission decision, reported rather than logged and forgotten."""
+
+    device_id: str
+    rule: str
+    outcome: str  # "rejected" | "demoted" | "warning"
+    detail: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "device_id": self.device_id,
+            "rule": self.rule,
+            "outcome": self.outcome,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class LoadReport:
+    """Outcome of a registry load pass."""
+
+    admitted: tuple[str, ...] = ()
+    rejected: tuple[str, ...] = ()
+    notes: tuple[AdmissionNote, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "admitted": list(self.admitted),
+            "rejected": list(self.rejected),
+            "notes": [note.to_dict() for note in self.notes],
+        }
+
+
+class HardwareRegistry:
+    """Owns admitted hardware contexts and their lazily opened transports."""
+
+    def __init__(
+        self,
+        settings: HardwareSettings | None = None,
+        *,
+        providers: Sequence[HardwareContextProvider] = (),
+    ) -> None:
+        self._settings = settings or HardwareSettings()
+        self._explicit_providers = tuple(providers)
+        self._contexts: dict[str, HardwareContext] = {}
+        # Declarations owned by external sources (fabric nodes), keyed by source id
+        # in registration order. Kept apart from ``_contexts`` because ``load()``
+        # rebuilds the admitted set from scratch and must re-merge these.
+        self._external_contexts: dict[str, tuple[HardwareContext, ...]] = {}
+        self._transports: dict[str, HardwareTransport] = {}
+        self._open_locks: dict[str, asyncio.Lock] = {}
+        self._io_locks: dict[str, asyncio.Lock] = {}
+        # Links whose halt was interrupted before their state could be settled;
+        # closed on the device's next open (see ``halt``).
+        self._orphans: dict[str, HardwareTransport] = {}
+        self._report = LoadReport()
+        self._described: set[tuple[str, str]] = set()
+        self._last_command: dict[tuple[str, str], tuple[float, float]] = {}
+        self._degradation_latches: dict[str, Any] = {}
+        self._stream_sources: tuple[Any, ...] | None = None
+        self._alert_orchestrator: Any = None
+        self._alert_policy: Any = None
+        self._reading_store: Any = None
+        self._calibration_store: Any = None
+        self._preview_broker: Any = None
+        # One holder for instrument.duckdb, shared by the reading and calibration stores.
+        # A single process must not open two independent read-write connections to the
+        # same DuckDB file, so the registry owns the holder and injects it into both.
+        self._instrument_conn: Any = None
+        self._outcome_recorder: Any = None
+        self._pending_write_expectations: dict[tuple[str, str], list[Any]] = {}
+        self._cache_manager: Any = None
+        self._session_id: str = ""
+        # Bounded on purpose: an unbounded event log on a long-running bench is a leak
+        # with a schedule, and hw_status only ever shows a recent tail.
+        self._recent_events: Deque[Any] = deque(maxlen=200)
+        self._event_emitter: Any = None
+        self._deliberative_observer: HardwareDeliberativeObserver | None = None
+        self._control_buses: dict[str, Any] = {}
+        self._evidence_store: Any = None
+
+    # ── Loading ──
+
+    @property
+    def settings(self) -> HardwareSettings:
+        return self._settings
+
+    def set_alert_orchestrator(self, orchestrator: Any) -> None:
+        """Bind the live approval route used by non-estop alert actions."""
+        self._alert_orchestrator = orchestrator
+        if self._alert_policy is not None:
+            self._alert_policy.set_orchestrator(orchestrator)
+
+    @property
+    def alert_policy(self) -> Any:
+        """Return the lazily built alert policy, if rules are configured."""
+        return self._alert_policy
+
+    @property
+    def evidence_store(self) -> Any:
+        """Lazily constructed evidence store backed by the shared instrument DB.
+
+        Uses the same ``_instrument_holder()`` as the reading and calibration
+        stores so all three tiers share one DuckDB connection.  Returns None
+        when no instrument database is configured.
+        """
+        if self._evidence_store is None and self._settings.instrument_db_path:
+            try:
+                from leapflow.hardware.evidence import EvidenceStore
+
+                self._evidence_store = EvidenceStore(
+                    db_path=Path(self._settings.instrument_db_path),
+                    connection_holder=self._instrument_holder(),
+                )
+            except Exception:  # noqa: BLE001 - evidence is diagnostic, not gating
+                logger.debug("Failed to initialize EvidenceStore", exc_info=True)
+        return self._evidence_store
+
+    @evidence_store.setter
+    def evidence_store(self, store: Any) -> None:
+        self._evidence_store = store
+
+    @property
+    def report(self) -> LoadReport:
+        return self._report
+
+    def load(self) -> LoadReport:
+        """Run every configured provider, apply admission rules, and store results.
+
+        Idempotent: calling it again re-runs discovery and replaces the admitted
+        set, which is what makes a declaration edit visible without a restart.
+        """
+        self._contexts.clear()
+        self._degradation_latches.clear()
+        # Discarded so the next request rebuilds them against the new declarations; a
+        # cached source would keep sampling a channel that no longer exists.
+        self._stream_sources = None
+        if not self._settings.enabled:
+            self._report = LoadReport()
+            return self._report
+
+        discovered: list[HardwareContext] = []
+        notes: list[AdmissionNote] = []
+        for provider in self._resolve_providers(notes):
+            try:
+                discovered.extend(provider.discover())
+            except (ProviderError, OSError, ValueError) as exc:
+                logger.warning(
+                    "Hardware provider %r discovery failed: %s",
+                    getattr(provider, "kind", "?"),
+                    exc,
+                    exc_info=True,
+                )
+                notes.append(
+                    AdmissionNote(
+                        device_id="",
+                        rule="provider",
+                        outcome="warning",
+                        detail=f"provider {getattr(provider, 'kind', '?')!r} failed: {exc}",
+                    )
+                )
+
+        admitted: list[str] = []
+        rejected: list[str] = []
+        self._merge_candidates(discovered, notes=notes, admitted=admitted, rejected=rejected)
+        # External sources (fabric nodes) merge after local providers, in registration
+        # order -- the order *is* the precedence rule: a locally declared id always
+        # wins, and the source's duplicate is recorded as rejected rather than
+        # replacing it (frozen LHP spec §8).
+        for source_contexts in tuple(self._external_contexts.values()):
+            self._merge_candidates(
+                source_contexts, notes=notes, admitted=admitted, rejected=rejected
+            )
+
+        self._report = LoadReport(
+            admitted=tuple(admitted), rejected=tuple(rejected), notes=tuple(notes)
+        )
+        logger.info(
+            "Hardware registry loaded: %d admitted, %d rejected", len(admitted), len(rejected)
+        )
+        return self._report
+
+    def _merge_candidates(
+        self,
+        candidates: Iterable[HardwareContext],
+        *,
+        notes: list[AdmissionNote],
+        admitted: list[str],
+        rejected: list[str],
+    ) -> None:
+        """Admit each candidate in order, updating *notes*/*admitted*/*rejected*.
+
+        Shared by the local-provider pass and the external-source pass so both
+        obey exactly one admission implementation: V1-V7 via ``_admit``, the
+        duplicate rule inside ``_admit`` (first writer wins), and the V8 cap.
+        """
+        for context in candidates:
+            verdict = self._admit(context, notes)
+            if verdict is None:
+                rejected.append(context.device_id or "<unnamed>")
+                continue
+            if len(admitted) >= self._settings.max_devices:
+                notes.append(
+                    AdmissionNote(
+                        device_id=verdict.device_id,
+                        rule="V8",
+                        outcome="rejected",
+                        detail=f"exceeds max_devices={self._settings.max_devices}",
+                    )
+                )
+                rejected.append(verdict.device_id)
+                continue
+            self._contexts[verdict.device_id] = verdict
+            admitted.append(verdict.device_id)
+
+    def _resolve_providers(self, notes: list[AdmissionNote]) -> tuple[HardwareContextProvider, ...]:
+        if self._explicit_providers:
+            return self._explicit_providers
+        resolved: list[HardwareContextProvider] = []
+        for kind, config in self._settings.providers:
+            try:
+                resolved.append(build_provider(kind, config))
+            except ProviderError as exc:
+                notes.append(
+                    AdmissionNote(
+                        device_id="",
+                        rule="provider",
+                        outcome="warning",
+                        detail=f"provider {kind!r} unavailable: {exc}",
+                    )
+                )
+        return tuple(resolved)
+
+    # ── External sources (fabric nodes) ──
+
+    def register_external_contexts(
+        self, source_id: str, contexts: Iterable[HardwareContext]
+    ) -> tuple[str, ...]:
+        """Record the declarations owned by an external source (a fabric node).
+
+        Recording is bookkeeping -- the declarations become live on the next
+        ``load()``/``reconcile()``, which re-merges every registered source after
+        the local providers. Re-registering the same source replaces its snapshot.
+        Returns the device ids recorded for this source.
+        """
+        text = str(source_id or "").strip()
+        if not text:
+            raise ValueError("external source_id must be non-empty")
+        snapshot = tuple(contexts)
+        self._external_contexts[text] = snapshot
+        return tuple(context.device_id for context in snapshot if context.device_id)
+
+    def unregister_external_source(self, source_id: str) -> tuple[str, ...]:
+        """Drop *source_id*'s declarations and return the ids that were recorded.
+
+        Bookkeeping only -- the admitted set keeps the devices until the next
+        ``load()``/``reconcile()`` removes them, which is where transports are
+        closed and no longer-running devices detach cleanly.
+        """
+        snapshot = self._external_contexts.pop(str(source_id or "").strip(), ())
+        return tuple(context.device_id for context in snapshot if context.device_id)
+
+    def external_source_ids(self) -> tuple[str, ...]:
+        """Return the registered external source ids, in registration order."""
+        return tuple(self._external_contexts)
+
+    async def reconcile(self) -> LoadReport:
+        """Re-run discovery and converge on the new device set without disrupting the old.
+
+        The hot-plug path, and deliberately *not* ``load()``. ``load()`` clears the
+        admitted contexts and discards ``_stream_sources`` while the sampling tasks
+        those objects own are still running: the tasks keep reading, keep writing to
+        the store, and are no longer the objects ``stop_streams()`` can stop. One
+        rediscovery would leak a task per streaming channel, every time.
+
+        So the difference is computed and the old sources are captured before the
+        reload. Devices that vanished have their transports closed; a device whose
+        declaration is byte-identical keeps running untouched; only new or altered
+        devices cause a restart. Comparing whole contexts is what catches an edited
+        envelope -- the event detector holds the old bounds, so it must be rebuilt.
+
+        Never raises: rediscovery runs on a schedule and from an RPC, and a scanner
+        that fails must leave the previous fleet running.
+        """
+        if not self._settings.enabled:
+            return self._report
+
+        previous = dict(self._contexts)
+        # Captured before load() drops the attribute: without this reference the only
+        # thing still holding the running tasks would be the event loop.
+        retired = self._stream_sources or ()
+        was_streaming = self._stream_sources is not None
+
+        report = self.load()
+
+        current = dict(self._contexts)
+        removed = sorted(set(previous) - set(current))
+        added = sorted(set(current) - set(previous))
+        altered = sorted(
+            device_id
+            for device_id in set(previous) & set(current)
+            if previous[device_id] != current[device_id]
+        )
+
+        if not (removed or added or altered):
+            # Nothing changed, so the discarded source tuple has to be put back or the
+            # next call to stream_sources() would build a second set of loops beside
+            # the ones already running.
+            self._stream_sources = retired or self._stream_sources
+            return report
+
+        for device_id in (*removed, *altered):
+            # An altered device's transport was configured from a declaration that no
+            # longer exists, so it is dropped and rebuilt on next use.
+            await self.drop_transport(device_id)
+
+        if was_streaming:
+            await self._stop_sources(retired)
+            await self.start_streams()
+
+        logger.info(
+            "Hardware reconcile: +%d -%d ~%d device(s)", len(added), len(removed), len(altered)
+        )
+        return report
+
+    @staticmethod
+    async def _stop_sources(sources: Sequence[Any]) -> None:
+        """Stop the given sampling loops, isolating failures. Never raises."""
+        for source in sources:
+            try:
+                await source.stop()
+            except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+                logger.warning(
+                    "Hardware stream %s stop failed during reconcile: %s",
+                    getattr(source, "source_id", "?"),
+                    exc,
+                    exc_info=True,
+                )
+
+    # ── Admission rules ──
+
+    def _admit(
+        self, context: HardwareContext, notes: list[AdmissionNote]
+    ) -> HardwareContext | None:
+        """Apply V1-V7 to *context*, returning the admitted form or None.
+
+        Rules that concern the ability to command a device demote it to read-only;
+        rules that concern whether the declaration can be understood at all reject
+        it. The distinction matters: an unusable declaration is a user error to
+        report, while an untrusted device is still worth observing.
+        """
+        device_id = context.device_id
+
+        # V2 -- identity must be usable as a stable key and safe in a path.
+        if not device_id or any(ch not in _DEVICE_ID_ALLOWED for ch in device_id):
+            notes.append(
+                AdmissionNote(
+                    device_id=device_id or "<unnamed>",
+                    rule="V2",
+                    outcome="rejected",
+                    detail="device_id must be non-empty and match [a-z0-9_]+",
+                )
+            )
+            return None
+        if device_id in self._contexts:
+            notes.append(
+                AdmissionNote(
+                    device_id=device_id,
+                    rule="V2",
+                    outcome="rejected",
+                    detail="duplicate device_id",
+                )
+            )
+            return None
+
+        # V1 -- an unknown protocol version is refused, never migrated silently.
+        if context.hc_version not in SUPPORTED_HC_VERSIONS:
+            notes.append(
+                AdmissionNote(
+                    device_id=device_id,
+                    rule="V1",
+                    outcome="rejected",
+                    detail=(
+                        f"unsupported hc_version {context.hc_version!r}; "
+                        f"supported: {', '.join(sorted(SUPPORTED_HC_VERSIONS))}"
+                    ),
+                )
+            )
+            return None
+
+        # V4 -- a transport we cannot build makes the device unusable entirely.
+        if context.transport.kind not in available_transports():
+            notes.append(
+                AdmissionNote(
+                    device_id=device_id,
+                    rule="V4",
+                    outcome="rejected",
+                    detail=(
+                        f"unknown transport kind {context.transport.kind!r}; "
+                        f"available: {', '.join(available_transports())}"
+                    ),
+                )
+            )
+            return None
+
+        if not context.channels:
+            notes.append(
+                AdmissionNote(
+                    device_id=device_id,
+                    rule="V2",
+                    outcome="rejected",
+                    detail="declaration has no channels",
+                )
+            )
+            return None
+
+        channels = list(context.channels)
+        seen: set[str] = set()
+        for index, channel in enumerate(channels):
+            if not channel.channel_id or channel.channel_id in seen:
+                notes.append(
+                    AdmissionNote(
+                        device_id=device_id,
+                        rule="V2",
+                        outcome="rejected",
+                        detail=f"channel #{index} has a missing or duplicate channel_id",
+                    )
+                )
+                return None
+            seen.add(channel.channel_id)
+
+        # V5 -- a device that cannot be stopped may not be commanded at all.
+        if context.halt_supported is False and any(c.is_writable for c in channels):
+            notes.append(
+                AdmissionNote(
+                    device_id=device_id,
+                    rule="V5",
+                    outcome="demoted",
+                    detail="halt_supported is false; all writable channels demoted to read-only",
+                )
+            )
+            channels = [c.without_write() for c in channels]
+
+        # V7 -- an unconfirmed context cannot authorize a physical change.
+        if (
+            self._settings.denies_unverified_writes
+            and not context.provenance.is_verified
+            and any(c.is_writable for c in channels)
+        ):
+            notes.append(
+                AdmissionNote(
+                    device_id=device_id,
+                    rule="V7",
+                    outcome="demoted",
+                    detail=(
+                        "context is not verified by a human; writable channels demoted "
+                        "to read-only (policy unverified_context_policy=deny_write)"
+                    ),
+                )
+            )
+            channels = [c.without_write() for c in channels]
+
+        # V3 -- an undeclared envelope is not an unbounded one.
+        for index, channel in enumerate(channels):
+            if channel.is_writable and not channel.envelope.declared:
+                notes.append(
+                    AdmissionNote(
+                        device_id=device_id,
+                        rule="V3",
+                        outcome="demoted",
+                        detail=(
+                            f"channel {channel.channel_id!r} is writable without a declared "
+                            "envelope; demoted to read-only"
+                        ),
+                    )
+                )
+                channels[index] = channel.without_write()
+
+        # V9 -- a frame channel is an observation, never a command.
+        #
+        # Its declared rate is deliberately left alone: on a media channel the rate is
+        # a capture ceiling rather than a sampling cadence, and ``Channel.is_streaming``
+        # already excludes media, so no sampling loop is built for it. Zeroing it here
+        # would destroy the ceiling the preview path needs.
+        for index, channel in enumerate(channels):
+            if channel.is_media and channel.is_writable:
+                notes.append(
+                    AdmissionNote(
+                        device_id=device_id,
+                        rule="V9",
+                        outcome="demoted",
+                        detail=(
+                            f"channel {channel.channel_id!r} carries frames and cannot be "
+                            "written; demoted to read-only"
+                        ),
+                    )
+                )
+                channels[index] = channel.without_write()
+
+        # V10 -- a read that discloses the environment must say so before it happens.
+        for channel in channels:
+            if channel.is_privacy_gated:
+                notes.append(
+                    AdmissionNote(
+                        device_id=device_id,
+                        rule="V10",
+                        outcome="warning",
+                        detail=(
+                            f"channel {channel.channel_id!r} declares privacy "
+                            f"{channel.privacy!r}; reads require consent before the first "
+                            "observation. Start its preview on LeapBoard and answer the "
+                            "in-panel prompt, or run `/board preview <device>` in the TUI. "
+                            "A session grant then covers the continuous preview."
+                        ),
+                    )
+                )
+
+        # V6 -- an interlock we cannot evaluate must block, not be ignored.
+        readable = {c.channel_id for c in channels if c.is_readable}
+        broken = {
+            lock.interlock_id
+            for lock in context.interlocks
+            if lock.channel_id not in readable or not lock.interlock_id
+        }
+        for lock_id in sorted(broken):
+            notes.append(
+                AdmissionNote(
+                    device_id=device_id,
+                    rule="V6",
+                    outcome="warning",
+                    detail=(
+                        f"interlock {lock_id!r} references a channel that is not readable; "
+                        "it will evaluate as unsatisfied and hardline-deny guarded writes"
+                    ),
+                )
+            )
+        for index, channel in enumerate(channels):
+            required = set(channel.envelope.requires_interlocks)
+            missing = {name for name in required if context.interlock(name) is None}
+            if channel.is_writable and (missing or (required & broken)):
+                notes.append(
+                    AdmissionNote(
+                        device_id=device_id,
+                        rule="V6",
+                        outcome="warning",
+                        detail=(
+                            f"channel {channel.channel_id!r} requires interlocks that cannot be "
+                            f"evaluated ({', '.join(sorted(missing | (required & broken)))}); "
+                            "writes will be hardline-denied"
+                        ),
+                    )
+                )
+                # Left writable on purpose: the classifier denies with a specific,
+                # repairable reason, which teaches more than the channel vanishing.
+
+        return context.with_channels(tuple(channels))
+
+    # ── Access ──
+
+    def contexts(self) -> tuple[HardwareContext, ...]:
+        return tuple(self._contexts[key] for key in sorted(self._contexts))
+
+    def context(self, device_id: str) -> HardwareContext | None:
+        return self._contexts.get(str(device_id))
+
+    def channel_is_writable(self, device_id: str, channel_id: str) -> bool:
+        context = self.context(device_id)
+        channel = context.channel(channel_id) if context is not None else None
+        return bool(channel is not None and channel.is_writable)
+
+    async def read(self, device_id: str, channel_id: str) -> Any:
+        """Read a single channel value. Convenience wrapper around transport.read()."""
+        async with self.device_io(device_id):
+            transport = await self.transport(device_id)
+            return await transport.read(channel_id)
+
+    async def read_frame(self, device_id: str, channel_id: str, **kwargs: Any) -> Any:
+        """Read a frame from a camera channel. Requires FrameTransport."""
+        async with self.device_io(device_id):
+            transport = await self.transport(device_id)
+            from leapflow.hardware.transport import FrameTransport
+
+            if not isinstance(transport, FrameTransport):
+                raise TransportError(
+                    f"Transport for {device_id!r} does not support frame capture",
+                    failure_code="frame_transport_missing",
+                )
+            return await transport.read_frame(channel_id, **kwargs)
+
+    def get_open_transport(self, device_id: str) -> HardwareTransport:
+        """Return an already-opened transport for the device.
+
+        Unlike ``transport()`` which may open on first call (async + Lock),
+        this method only returns transports that are already open.  Raises
+        ``TransportError`` if the device has no open transport.
+
+        Safe to call from any thread — no asyncio primitives involved.
+        """
+        existing = self._transports.get(device_id)
+        if existing is None:
+            raise TransportError(
+                f"No open transport for device {device_id!r}. "
+                "Call transport() from the main event loop first.",
+                failure_code="transport_not_open",
+            )
+        return existing
+
+    async def transport(self, device_id: str) -> HardwareTransport:
+        """Return the open transport for *device_id*, opening it on first use.
+
+        Lazy on purpose: ``load()`` must not touch hardware, so the connection is
+        established the first time an operation actually needs it.
+
+        Guarded by a per-device lock because two concurrent first calls would
+        otherwise each build and open a transport, leaving one connected but
+        unreferenced -- a leaked serial port or socket that nothing will ever
+        close. ``open()`` being idempotent does not help here: the idempotence is
+        per instance, and this race produces two instances.
+        """
+        context = self.context(device_id)
+        if context is None:
+            raise TransportError(f"unknown device {device_id!r}", failure_code="unknown_device")
+        existing = self._transports.get(device_id)
+        if existing is not None:
+            return existing
+        lock = self._open_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            # Re-check under the lock: another coroutine may have opened it while
+            # this one waited.
+            existing = self._transports.get(device_id)
+            if existing is not None:
+                return existing
+            await self._release_orphan(device_id)
+            transport = build_transport(context.transport.kind, context.transport.config)
+            status = await transport.open(context)
+            if not status.connected:
+                raise TransportError(
+                    f"transport for {device_id!r} did not connect: {status.detail}",
+                    failure_code="transport_open_failed",
+                )
+            self._transports[device_id] = transport
+            return transport
+
+    async def halt(self, device_id: str) -> TransportStatus | None:
+        """Stop a device now, leaving the cache holding only open links.
+
+        A halt is the one operation that may legitimately end a link: a camera
+        releases its device when it stops and reports ``connected=False``. If
+        that instance stayed cached, ``transport()`` would keep handing it out
+        and ``open()`` would never run again -- the camera then answers "is not
+        open" for the life of the process, which is what a fleet-wide halt did to
+        every camera on the node. A link that survives the stop (an arm) stays
+        cached, so the next command reuses it instead of paying a bring-up.
+
+        Returns ``None`` when this process holds no link for the device: nothing
+        is being driven from here, so there is neither motion to stop nor a device
+        to wake. The per-device *open* lock is held across the transition so a
+        concurrent first use cannot open a second link to the same hardware while
+        this one is still being released. It is deliberately not the *I/O* lock: a
+        halt must preempt the very operation it exists to stop.
+
+        A retired instance is *closed*, not merely dropped. A driver whose halt is
+        its close has nothing left to release, but a remote link is still an open
+        socket holding frame claims -- and an instance dropped while unclosed kept
+        that socket until the process exited.
+        """
+        lock = self._open_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            transport = self._transports.pop(device_id, None)
+            if transport is None:
+                return None
+            try:
+                status = await transport.halt()
+            except asyncio.CancelledError:
+                # The link's state is unknown, so it may neither be cached nor be
+                # forgotten while it still holds its device: the next open
+                # releases it first.
+                self._orphans[device_id] = transport
+                raise
+            except Exception:
+                await self._cache_if_still_open(device_id, transport)
+                raise
+            if status.connected:
+                self._transports[device_id] = transport
+            else:
+                await self._retire(device_id, transport)
+            return status
+
+    async def _cache_if_still_open(
+        self, device_id: str, transport: HardwareTransport
+    ) -> None:
+        """Re-cache *transport* only if its driver still reports an open link.
+
+        Used when a halt failed. The cache may hold only open links, so an
+        instance whose driver reports a closed link is retired instead; one whose
+        link survived keeps its connection rather than paying a bring-up for a
+        stop that never ran.
+        """
+        try:
+            status = await transport.probe()
+        except Exception as exc:  # noqa: BLE001 - liveness is unknown, so do not cache
+            logger.debug(
+                "re-caching %r after a failed halt: probe failed: %s", device_id, exc
+            )
+            await self._retire(device_id, transport)
+            return
+        if status.connected:
+            self._transports.setdefault(device_id, transport)
+        else:
+            await self._retire(device_id, transport)
+
+    async def _retire(self, device_id: str, transport: HardwareTransport) -> None:
+        """Close a link that has left the cache, and never let teardown mask it.
+
+        Idempotent by the transport contract, so a driver that already released
+        its device when it stopped simply has nothing left to do here.
+        """
+        try:
+            await transport.close()
+        except Exception as exc:  # noqa: BLE001 - teardown must not become the failure
+            logger.warning("closing the retired link to %r failed: %s", device_id, exc)
+
+    async def _release_orphan(self, device_id: str) -> None:
+        """Close a link left behind by an interrupted halt, before opening another.
+
+        Nothing else would ever close it, and a forgotten RealSense keeps its USB
+        device claimed -- so the replacement open fails. Idempotent: closing a
+        link the driver already released is allowed by the transport contract.
+        """
+        orphan = self._orphans.pop(device_id, None)
+        if orphan is None:
+            return
+        await self._retire(device_id, orphan)
+
+    def opened_devices(self) -> tuple[str, ...]:
+        return tuple(sorted(self._transports))
+
+    # ── Streaming ──
+
+    def stream_sources(self) -> tuple[Any, ...]:
+        """Return one signal source per streaming channel, building them once.
+
+        Built lazily and cached because the manager they register with rejects
+        registration after it has started: handing out fresh instances on a second call
+        would leave the manager driving sources nobody else can see.
+        """
+        if not self._settings.stream_enabled:
+            return ()
+        if self._stream_sources is None:
+            from leapflow.hardware.alert_policy import build_alert_policy
+            from leapflow.hardware.stream import build_batch_coordinators, build_stream_sources
+
+            self._alert_policy = build_alert_policy(
+                self._settings,
+                orchestrator=self._alert_orchestrator,
+                registry=self,
+            )
+            batch_coordinators = build_batch_coordinators(
+                self,
+                ring_capacity=self._settings.stream_ring_capacity,
+                event_sink=self.publish_event,
+                reading_store=self.reading_store,
+                alert_policy=self._alert_policy,
+            )
+            batch_device_ids = frozenset(c._context.device_id for c in batch_coordinators)
+            individual_sources = build_stream_sources(
+                self,
+                ring_capacity=self._settings.stream_ring_capacity,
+                event_sink=self.publish_event,
+                reading_store=self.reading_store,
+                alert_policy=self._alert_policy,
+                batch_device_ids=batch_device_ids,
+            )
+            self._stream_sources = (*batch_coordinators, *individual_sources)
+        return self._stream_sources
+
+    @property
+    def reading_store(self) -> Any:
+        """Return the durable reading store, or None when persistence is off.
+
+        Built on first use rather than at construction so that a profile with hardware
+        enabled but no streaming channels never touches the filesystem.
+
+        Without this store samples exist only in a bounded in-memory ring and vanish with
+        the process, which makes every form of learning from physical experience
+        impossible -- there is nothing to learn *from*.
+        """
+        if not self._settings.persist_readings:
+            return None
+        if self._reading_store is None:
+            from leapflow.hardware.reading_store import ReadingStore
+
+            self._reading_store = ReadingStore(
+                raw_dir=Path(self._settings.readings_dir) if self._settings.readings_dir else None,
+                db_path=(
+                    Path(self._settings.instrument_db_path)
+                    if self._settings.instrument_db_path
+                    else None
+                ),
+                connection_holder=self._instrument_holder(),
+                cache_manager=self._cache_manager,
+                workspace_id=self._settings.workspace_id,
+                session_id=self._session_id,
+                reading_store_sensitive=self._settings.reading_store_sensitive,
+                raw_ttl_s=self._settings.raw_retention_days * 24 * 3600.0,
+                downsample_interval_s=self._settings.downsample_interval_s,
+                history_ttl_s=self._settings.history_retention_days * 24 * 3600.0,
+                raw_segment_bytes=int(self._settings.raw_segment_mb * 1024 * 1024),
+            )
+        return self._reading_store
+
+    def _instrument_holder(self) -> Any:
+        """Return the shared holder for ``instrument.duckdb``, building it once.
+
+        Profile-scoped, so it outlives session rebinds: unlike the reading store it is
+        never rebuilt in ``bind_persistence``, which lets the rebuilt store reattach to
+        the same connection rather than opening a second one to the same file. Returns
+        None when no instrument database is configured, so both stores fall back to
+        their bare-path behaviour.
+        """
+        if not self._settings.instrument_db_path:
+            return None
+        if self._instrument_conn is None:
+            from leapflow.storage.connection import LocalConnectionHolder
+
+            self._instrument_conn = LocalConnectionHolder(Path(self._settings.instrument_db_path))
+        return self._instrument_conn
+
+    @property
+    def calibration_store(self) -> Any:
+        """Return the versioned calibration store, or None without an instrument database.
+
+        Independent of ``persist_readings``: a bench can want its calibration history
+        durable without streaming sample history, so this is gated on the database path
+        alone. Shares the reading store's connection and its sensitivity posture, since
+        both tiers live in the one file.
+        """
+        if not self._settings.instrument_db_path:
+            return None
+        if self._calibration_store is None:
+            from leapflow.hardware.calibration_store import CalibrationStore
+
+            self._calibration_store = CalibrationStore(
+                db_path=Path(self._settings.instrument_db_path),
+                connection_holder=self._instrument_holder(),
+                cache_manager=self._cache_manager,
+                sensitive=self._settings.reading_store_sensitive,
+            )
+        return self._calibration_store
+
+    @property
+    def preview_broker(self) -> Any:
+        """Return the shared preview broker, building it on first use.
+
+        Lazy because most profiles have no previewable channel, and a broker that
+        exists starts a sweeper task the moment it holds a lease. Built here rather
+        than injected so there is exactly one per registry: two brokers would each
+        open the device and the second would be refused, since most cameras admit a
+        single reader.
+        """
+        if self._preview_broker is None:
+            from leapflow.hardware.preview import PreviewBroker
+
+            self._preview_broker = PreviewBroker(
+                self,
+                idle_timeout_s=self._settings.preview_idle_timeout_s,
+                max_fps=self._settings.preview_max_fps,
+                max_width=self._settings.preview_max_width,
+                quality=self._settings.preview_quality,
+            )
+        return self._preview_broker
+
+    def active_previews(self) -> tuple[dict[str, Any], ...]:
+        """Report live preview leases without building a broker to answer.
+
+        Deliberately not ``self.preview_broker.active()``: that property is lazy, so an
+        observability read would *create* the broker -- and a broker that exists starts a
+        sweeper task. A read-only view of what is switched on must not be the reason a
+        background task appears in a profile that has never previewed anything.
+
+        An empty tuple therefore means "nothing is being watched", which is exactly what
+        "no broker yet" means.
+        """
+        broker = self._preview_broker
+        if broker is None:
+            return ()
+        try:
+            return tuple(broker.active())
+        except Exception as exc:  # noqa: BLE001 - an observability read must not fail a page
+            logger.debug("active preview snapshot failed: %s", exc, exc_info=True)
+            return ()
+
+    def bind_persistence(
+        self,
+        *,
+        cache_manager: Any = None,
+        readings_dir: Any = None,
+        session_id: str = "",
+        experience_store: Any = None,
+    ) -> None:
+        """Attach session-scoped persistence and learning targets before sampling starts.
+
+        Separate from construction because the raw sample directory is session-scoped and
+        the session id is not known when the registry is built -- the registry is created
+        during context construction, well before any session exists. The experience store
+        arrives late for the same reason: it is wired during deferred initialization.
+        """
+        from dataclasses import replace
+
+        if experience_store is not None:
+            from leapflow.hardware.outcome import HardwareOutcomeRecorder
+
+            self._outcome_recorder = HardwareOutcomeRecorder(experience_store)
+
+        targets_changed = False
+        if cache_manager is not None:
+            self._cache_manager = cache_manager
+            targets_changed = True
+        if session_id and session_id != self._session_id:
+            self._session_id = session_id
+            targets_changed = True
+        if readings_dir is not None and str(readings_dir) != self._settings.readings_dir:
+            self._settings = replace(self._settings, readings_dir=str(readings_dir))
+            targets_changed = True
+
+        if not targets_changed:
+            # Attaching only the experience store must not discard the stream sources.
+            # This call arrives during deferred initialization, by which time sampling has
+            # already started; rebuilding the sources here would leave the running ones
+            # orphaned -- still reading, but no longer the objects stop_streams() stops.
+            return
+        self._reading_store = None
+        # The calibration store is left in place: its file is profile-scoped and it
+        # shares the instrument holder, which is deliberately not rebuilt here. Only its
+        # cache_manager could go stale, and it re-registers idempotently on next write.
+        self._stream_sources = None
+
+    @property
+    def outcome_recorder(self) -> Any:
+        """Return the physical outcome recorder, or None when no store is bound.
+
+        None rather than a no-op object so callers can skip the work entirely: with no
+        experience store there is nowhere for a numeric delta to go, and pretending
+        otherwise would accumulate pending commands nothing will ever resolve.
+        """
+        return self._outcome_recorder
+
+    @property
+    def pending_write_expectations(self) -> dict[tuple[str, str], list[Any]]:
+        """Return process-local expectations shared by all governed write entry points."""
+        return self._pending_write_expectations
+
+    def channel_history(
+        self, device_id: str, channel_id: str, *, limit: int = 200
+    ) -> tuple[dict[str, Any], ...]:
+        """Return downsampled history windows for a channel, oldest first."""
+        store = self.reading_store
+        if store is None:
+            return ()
+        return store.history(device_id, channel_id, limit=limit)
+
+    def channel_summary(self, device_id: str, channel_id: str) -> dict[str, Any] | None:
+        """Return the sampled history summary for a streaming channel, if any.
+
+        This is the only form in which sampled history is disclosed. The raw series
+        stays in the ring: handing it to a model is what makes an overnight run
+        unaffordable, and a summary is what a decision actually needs.
+        """
+        for source in self.stream_sources():
+            if source.source_id == f"hw:{device_id}:{channel_id}" and len(source.ring) > 0:
+                return source.ring.summary()
+        return None
+
+    async def start_streams(self) -> int:
+        """Start sampling every streaming channel, returning how many started.
+
+        The registry owns this lifecycle rather than delegating it to
+        ``ActiveSourceManager``, because that manager still has no production
+        caller: relying on it would mean shipping a sampling loop that never runs.
+
+        Events go to whatever ``set_event_emitter`` installed. Without it they are
+        still recorded for ``hw_status``, but nothing reacts to them -- a bench can
+        leave its declared envelope overnight with no watch, board or turn ever
+        hearing about it. The sink is read from the registry rather than taken as an
+        argument so that omitting it is one fact about the process instead of a
+        mistake each caller can make separately.
+        """
+        sources = self.stream_sources()
+        if not sources:
+            return 0
+        started = 0
+        for source in sources:
+            try:
+                await source.start(None)
+                started += 1
+            except Exception as exc:  # noqa: BLE001 - one source must not stop the rest
+                logger.warning(
+                    "Hardware stream %s failed to start: %s",
+                    source.source_id,
+                    exc,
+                    exc_info=True,
+                )
+        logger.info("Hardware streaming started: %d channel(s)", started)
+        return started
+
+    async def stop_streams(self) -> None:
+        """Stop every sampling loop. Idempotent, and isolates failures."""
+        for source in self.stream_sources():
+            try:
+                await source.stop()
+            except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+                logger.warning(
+                    "Hardware stream %s stop failed: %s", source.source_id, exc, exc_info=True
+                )
+
+    def record_event(self, event: Any) -> None:
+        """Keep a bounded tail of derived events for hw_status.
+
+        An alert-severity event also tightens the reading store's downsample window,
+        so the excursion that raised it is captured at finer resolution than the coarse
+        steady-state interval -- the shape of a breach is exactly what a later analysis
+        needs and what a sixty-second mean would average away. Routed through the same
+        sink the sampling loop already uses, and guarded so an unbuilt store (persistence
+        off) is simply skipped.
+        """
+        self._recent_events.append(event)
+        store = self._reading_store
+        if store is None:
+            return
+        # Lazy import, matching how the rest of the registry reaches observability, and
+        # so the alert taxonomy has one home (the digest) rather than a second copy here.
+        from leapflow.hardware.observability.digest import ALERT_KINDS
+
+        if str(getattr(event, "kind", "")) in ALERT_KINDS:
+            store.note_alert()
+
+    def set_event_emitter(self, emit: Any) -> None:
+        """Install the sink that carries hardware events onto the signal path.
+
+        One installation point rather than an argument threaded to each producer.
+        The sampling loop used to take its emitter as a parameter, which made
+        "forgot to pass it" a per-callsite mistake that no test could see from the
+        inside -- and it shipped exactly that way once: six detection rules produced
+        events that reached nothing. With the sink held here, whether anything is
+        listening is a single testable fact, and the command path can report through
+        the same channel as the sampling loop.
+        """
+        self._event_emitter = emit
+
+    def set_deliberative_observer(self, observer: HardwareDeliberativeObserver | None) -> None:
+        """Install the observer notified when a deliberative hardware event occurs.
+
+        The observer must implement ``HardwareDeliberativeObserver`` (Protocol).
+        Setting to ``None`` disables deliberative event forwarding.
+        """
+        self._deliberative_observer = observer
+
+    def _notify_deliberative_observer(self, event: Any) -> None:
+        """Forward a classified event to the deliberative observer, if applicable."""
+        observer = self._deliberative_observer
+        if observer is None:
+            return
+        from leapflow.hardware.stream import HardwareEvent, HardwareEventClass
+
+        if not isinstance(event, HardwareEvent):
+            return
+        event_class = event.resolved_event_class
+        if event_class != HardwareEventClass.DELIBERATIVE:
+            return
+        try:
+            observer.on_deliberative_event(event)
+        except Exception as exc:  # noqa: BLE001 - observer must not fail the command
+            logger.warning(
+                "Deliberative observer raised on %s event: %s",
+                getattr(event, "kind", "?"),
+                exc,
+                exc_info=True,
+            )
+
+    def publish_event(self, event: Any) -> None:
+        """Record an event and put it on the signal path.
+
+        Classification is applied here so every downstream consumer -- EventBus,
+        alert policy, dashboard, watch -- receives an event whose behavioural class
+        (reflex / deliberative / record) is already resolved. Events that arrive
+        pre-classified (e.g. WriteVerdictEvent with its own class) are left as-is.
+
+        Deliberative events are additionally forwarded to the registered
+        ``HardwareDeliberativeObserver``, which may schedule an agent reentry
+        round.  The observer is non-blocking by contract.
+
+        Not paced here: a command is a human-scale act and each refusal is one the
+        operator asked for, so suppressing repeats would hide the very thing that
+        makes a stalled bench visible. Downstream deduplication remains free to
+        collapse them.
+        """
+        event = self._ensure_classified(event)
+        self.record_event(event)
+        # Forward deliberative events to the reentry trigger observer.
+        self._notify_deliberative_observer(event)
+        emit = self._event_emitter
+        if emit is None:
+            return
+        try:
+            emit(event)
+        except Exception as exc:  # noqa: BLE001 - a sink must not fail the command
+            logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
+
+    @staticmethod
+    def _ensure_classified(event: Any) -> Any:
+        """Return the event with ``event_class`` populated if missing.
+
+        Only applies to ``HardwareEvent`` instances that have an empty
+        ``event_class`` field. Other event types (WriteVerdictEvent, etc.) are
+        returned unchanged.
+        """
+        from leapflow.hardware.stream import HardwareEvent, classify_hardware_event
+
+        if not isinstance(event, HardwareEvent):
+            return event
+        if event.event_class:
+            return event
+        return replace(event, event_class=classify_hardware_event(event.kind))
+
+    def recent_events(self, device_id: str = "", limit: int = 10) -> tuple[Any, ...]:
+        """Return the most recent derived events, newest last."""
+        items = [
+            event
+            for event in self._recent_events
+            if not device_id or getattr(event, "device_id", "") == device_id
+        ]
+        return tuple(items[-max(0, limit) :])
+
+    # ── Describe-before-write bookkeeping ──
+
+    def latch_degradation(self, outcome: Any) -> None:
+        """Fail closed by recording a governed degradation transition."""
+        device_id = str(getattr(outcome, "device_id", ""))
+        if device_id:
+            self._degradation_latches[device_id] = outcome
+
+    def clear_degradation(self, device_id: str, *, recovery: str) -> bool:
+        """Clear a non-manual latch after a verified recovery observation."""
+        outcome = self._degradation_latches.get(device_id)
+        if outcome is None:
+            return True
+        if bool(getattr(outcome, "requires_manual_clear", False)):
+            logger.warning(
+                "Refusing automatic degradation clear for %s: manual recovery required",
+                device_id,
+            )
+            return False
+        self._degradation_latches.pop(device_id, None)
+        logger.info("Cleared degradation latch for %s after %s", device_id, recovery)
+        return True
+
+    def degradation_outcome(self, device_id: str) -> Any | None:
+        """Return the current governed degradation outcome for one device."""
+        return self._degradation_latches.get(device_id)
+
+    def is_device_degraded(self, device_id: str) -> bool:
+        """Return whether a governed or in-flight degradation blocks writes."""
+        if device_id in self._degradation_latches:
+            return True
+        for source in self._stream_sources or ():
+            if getattr(source, "degradation_triggered", False):
+                # Match the source to the device.  Individual sources store
+                # the context on ``_context``; batch coordinators do the same.
+                ctx = getattr(source, "_context", None)
+                if ctx is not None and getattr(ctx, "device_id", None) == device_id:
+                    return True
+        return False
+
+    def mark_described(self, session_id: str, device_id: str) -> None:
+        self._described.add((str(session_id), str(device_id)))
+
+    def was_described(self, session_id: str, device_id: str) -> bool:
+        return (str(session_id), str(device_id)) in self._described
+
+    def device_io(self, device_id: str) -> Any:
+        """Return an async context manager serialising data-plane access to one device.
+
+        Per device, not per channel: a serial line, an I2C bus or a GPIB address is a
+        single conversation, and two coroutines reading different channels of the same
+        instrument interleave request and response frames. The result is not a failed
+        read -- it is a *plausible* reading carrying the wrong channel's value, which
+        no downstream check can detect. Streaming makes this the common case rather
+        than an edge one, because one task per channel starts automatically.
+
+        ``halt`` deliberately does not take this lock. Emergency stop must preempt a
+        queued read, not wait behind it.
+
+        A shared bus hosting several addresses still needs a coarser lock; that needs
+        a real device to size (see the transport conformance suite).
+        """
+        key = str(device_id)
+        lock = self._io_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._io_locks[key] = lock
+        return lock
+
+    def device_io_batch(self, device_id: str) -> Any:
+        """Acquire the device I/O lock for a batch operation.
+
+        Identical to ``device_io`` but named explicitly so batch vs single
+        operations are distinguishable in logs and metrics.  The lock is the
+        same per-device asyncio.Lock -- batch does not bypass it, it simply
+        acquires it once for multiple channels instead of once per channel.
+        """
+        key = str(device_id)
+        lock = self._io_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._io_locks[key] = lock
+        return lock
+
+    async def read_batch(self, device_id: str, channel_ids: tuple[str, ...]) -> Any:
+        """Read multiple channels in one atomic operation if the transport supports it.
+
+        Falls back to sequential reads if ``BatchTransport`` is not satisfied.
+        Returns a ``BatchReading`` or a synthesized equivalent from sequential reads.
+        """
+        from leapflow.hardware.transport import BatchReading, BatchTransport, Reading
+
+        transport = await self.transport(device_id)
+        if isinstance(transport, BatchTransport):
+            async with self.device_io_batch(device_id):
+                return await transport.read_batch(channel_ids)
+        else:
+            # Fallback: sequential reads under one lock acquisition.
+            async with self.device_io(device_id):
+                readings: list[Reading] = []
+                for ch_id in channel_ids:
+                    reading = await transport.read(ch_id)
+                    readings.append(reading)
+                return BatchReading(
+                    device_id=device_id,
+                    readings=tuple(readings),
+                )
+
+    # ── Safety policy enforcement ──
+
+    def check_safety_policy(
+        self,
+        context: HardwareContext,
+        channel: Channel,
+        value: Any,
+        *,
+        rate: float | None = None,
+    ) -> tuple[bool, str]:
+        """Check whether a write violates the device's declared SafetyPolicy.
+
+        Returns ``(allowed, reason)``.  When not allowed, *reason* explains
+        which constraint was violated.
+
+        Checks performed:
+
+        1. **max_velocity_rad_s** -- if the channel quantity is angular velocity
+           (or velocity) and the absolute commanded value exceeds the limit.
+        2. **max_force_n** -- if the channel quantity is force (or torque) and
+           the absolute commanded value exceeds the limit.
+        3. **collision_zones** -- reserved for future kinematics integration;
+           skipped today because evaluating Cartesian zones requires a forward
+           kinematics solver that is not yet available.
+        4. **require_safety_interlock** -- when set, every interlock on the
+           context must be satisfied.  The per-channel interlock check already
+           covers per-envelope interlocks; this flag adds a device-level
+           blanket requirement.  Actual evaluation is deferred to the existing
+           ``_failed_interlocks`` path in the tools layer, so here we only
+           verify the flag is honoured.
+
+        When ``SafetyPolicy`` is ``None`` (hc.v0 device) the check passes --
+        backward compatible by design.
+        """
+        safety = context.safety
+        if safety is None:
+            return True, ""
+
+        # 1. Global velocity limit
+        if safety.max_velocity_rad_s > 0 and channel.quantity in ("angular_velocity", "velocity"):
+            num = as_numeric(value)
+            if num is not None and abs(num) > safety.max_velocity_rad_s:
+                return (
+                    False,
+                    f"velocity {abs(num):.3f} rad/s exceeds device limit "
+                    f"{safety.max_velocity_rad_s:.3f} rad/s",
+                )
+
+        # 2. Global force limit
+        if safety.max_force_n > 0 and channel.quantity in ("force", "torque"):
+            num = as_numeric(value)
+            if num is not None and abs(num) > safety.max_force_n:
+                return (
+                    False,
+                    f"force {abs(num):.3f} N exceeds device limit {safety.max_force_n:.3f} N",
+                )
+
+        # 3. Collision zones -- requires forward kinematics (not yet available).
+        #    Placeholder for future integration.
+
+        # 4. Device-level interlock blanket -- the flag is checked, but the
+        #    actual interlock evaluation lives in the tools layer where the
+        #    transport is available for reading channel values.  When the flag
+        #    is set and the context has no interlocks at all, the device is
+        #    misconfigured: refuse rather than silently pass.
+        if safety.require_safety_interlock and not context.interlocks:
+            return (
+                False,
+                "require_safety_interlock is set but the device declares no "
+                "interlocks; add interlock declarations or disable the flag",
+            )
+
+        return True, ""
+
+    # ── Rate-limit baseline ──
+
+    def record_command(self, device_id: str, channel_id: str, value: float) -> None:
+        """Remember a value that reached the device, for rate limiting.
+
+        Recorded only after a write is known to have succeeded. A denied command
+        must not move the baseline, or refusing one command would relax the limit
+        on the next; and a failed command must not either, because its effect is
+        by definition unknown -- claiming it as the current value would be a guess
+        presented as a measurement.
+        """
+        self._last_command[(str(device_id), str(channel_id))] = (
+            float(value),
+            time.monotonic(),
+        )
+
+    def last_command(self, device_id: str, channel_id: str) -> tuple[float, float] | None:
+        """Return ``(value, monotonic_timestamp)`` of the last accepted command."""
+        return self._last_command.get((str(device_id), str(channel_id)))
+
+    # ── Control loop management ──
+
+    def create_control_bus(self, device_id: str, config: Any = None) -> Any:
+        """Create a :class:`HighFrequencyControlBus` for a device.
+
+        Caches per device — one bus per device at a time.  Returns the
+        existing bus if already created and still alive.
+        """
+        from leapflow.hardware.control_bus import ControlBusConfig, HighFrequencyControlBus
+
+        existing = self._control_buses.get(device_id)
+        if existing is not None:
+            return existing
+
+        bus_config = config if isinstance(config, ControlBusConfig) else ControlBusConfig()
+        bus = HighFrequencyControlBus(
+            self,
+            config=bus_config,
+            safety_checker=self.check_safety_policy,
+        )
+        self._control_buses[device_id] = bus
+        return bus
+
+    def start_control_loop(
+        self,
+        device_id: str,
+        policy: Any,
+        *,
+        config: Any = None,
+    ) -> None:
+        """Start a real-time control loop on a device.
+
+        Creates the bus if needed, then starts it with the given policy.
+        Raises ``RuntimeError`` if the device already has a running loop.
+        Raises ``RuntimeError`` if the transport is LHP (remote): the host must
+        never run a ControlBus across the network.
+        """
+        # Guard: refuse to run a local ControlBus on a remote device
+        context = self._contexts.get(device_id)
+        if context is not None:
+            transport_kind = getattr(getattr(context, "transport", None), "kind", "")
+            if transport_kind == "lhp":
+                raise RuntimeError(
+                    f"device {device_id!r} is served by an LHP node; the host must "
+                    "not run a ControlBus across the network. Use RemoteControlTransport "
+                    "(control.v1) instead."
+                )
+        bus = self.create_control_bus(device_id, config)
+        if bus.is_running:
+            raise RuntimeError(
+                f"device {device_id!r} already has a running control loop; "
+                "stop it before starting another"
+            )
+        bus.start(device_id, policy)
+        logger.info("Control loop started on %s", device_id)
+
+    def stop_control_loop(self, device_id: str) -> dict[str, Any]:
+        """Stop the control loop on a device.  Returns final stats.
+
+        Returns ``{"status": "no_loop"}`` if no loop was running.
+        """
+        bus = self._control_buses.get(device_id)
+        if bus is None or not bus.is_running:
+            return {"status": "no_loop", "device_id": device_id}
+        bus.stop()
+        stats = bus.stats.to_dict()
+        return {
+            "status": "stopped",
+            "device_id": device_id,
+            "stats": stats,
+        }
+
+    def control_loop_status(self, device_id: str) -> dict[str, Any] | None:
+        """Return control loop status, or None if no loop exists."""
+        bus = self._control_buses.get(device_id)
+        if bus is None:
+            return None
+        stats = bus.stats.to_dict()
+        return {
+            "running": bus.is_running,
+            "device_id": device_id,
+            "stats": stats,
+        }
+
+    # ── Teardown ──
+
+    async def drop_transport(self, device_id: str) -> None:
+        """Forget the cached transport for *device_id* so the next call reconnects.
+
+        ``transport()`` caches, and the cache is what makes a dead connection
+        permanent: a server that restarted leaves a session object that answers every
+        probe with "not connected", and since the instance is cached ``open()`` is
+        never called again. Without this, one transient outage would make a device
+        unusable for the life of the process.
+
+        Never raises. It is called from failure paths, where an exception would
+        replace the original diagnosis with a teardown error.
+        """
+        transport = self._transports.pop(device_id, None)
+        if transport is None:
+            return
+        try:
+            await transport.close()
+        except Exception as exc:  # noqa: BLE001 - as above
+            logger.warning(
+                "Hardware transport %r close failed while dropping it: %s",
+                device_id,
+                exc,
+                exc_info=True,
+            )
+
+    async def close_all(self) -> None:
+        """Stop sampling, then close every open transport, isolating failures.
+
+        Registered as an async effect on the owning scope so connections unwind in
+        reverse order of opening. Sampling stops first: a loop still reading from a
+        transport that is being closed would log a failure for every channel on the way
+        down, burying whatever actually caused the teardown.
+
+        Previews are released before transports for the same reason and one more: a
+        preview holds a device claimed, and releasing it here is what powers a camera
+        down on shutdown rather than at interpreter exit.
+        """
+        await self.stop_streams()
+        # Stop any running control loops before closing transports.
+        for device_id, bus in list(self._control_buses.items()):
+            try:
+                if bus.is_running:
+                    bus.stop()
+            except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+                logger.warning(
+                    "Control bus stop failed for %r during close_all: %s",
+                    device_id,
+                    exc,
+                    exc_info=True,
+                )
+        self._control_buses.clear()
+        if self._preview_broker is not None:
+            await self._preview_broker.close()
+        store = self._reading_store
+        if store is not None:
+            # Flushed before transports close: the last interval of a long run is exactly
+            # the data somebody will want, and it is still only buffered at this point.
+            store.close()
+        calibration = self._calibration_store
+        if calibration is not None:
+            calibration.close()
+        # The stores share this holder and neither owns it, so it is closed here, last of
+        # the instrument.duckdb writers. It reopens lazily if history is read afterwards.
+        if self._instrument_conn is not None:
+            try:
+                self._instrument_conn.close()
+            except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+                logger.debug("instrument holder close failed: %s", exc, exc_info=True)
+        for device_id, transport in list(self._transports.items()):
+            try:
+                await transport.close()
+            except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+                logger.warning(
+                    "Hardware transport %r close failed: %s", device_id, exc, exc_info=True
+                )
+        self._transports.clear()
+        for device_id in list(self._orphans):
+            await self._release_orphan(device_id)
+
+
+__all__ = [
+    "AdmissionNote",
+    "HardwareRegistry",
+    "HardwareSettings",
+    "LoadReport",
+    "UnverifiedContextPolicy",
+    "build_registry",
+]

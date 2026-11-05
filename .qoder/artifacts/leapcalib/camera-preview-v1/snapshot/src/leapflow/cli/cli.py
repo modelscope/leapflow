@@ -1,0 +1,549 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""CLI entrypoint for LeapFlow.
+
+Usage:
+    leap              — Show banner, enter interactive REPL
+    leap "question"   — Single-turn chat (one answer, then exit)
+    leap teach        — Interactive teaching mode (record → distill)
+    leap run          — Execute a skill by trigger match or explicit name
+    leap skills       — List / inspect learned skills
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+
+try:
+    import termios
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    termios = None
+
+try:
+    import gnureadline as readline  # noqa: F401
+except ImportError:
+    import readline  # noqa: F401
+
+from leapflow.cli.context import Context
+from leapflow.config import load_config
+
+
+async def _async_main(args: argparse.Namespace) -> int:
+    settings = load_config()
+    from leapflow.logging_setup import init_cli_logging
+    init_cli_logging(settings)
+    mock_host = getattr(args, "mock_host", False)
+    sys.stderr.write("\033[2m→ Initializing LeapFlow...\033[0m\n")
+    sys.stderr.flush()
+    ctx = Context(settings, mock_host)
+    await ctx.initialize()
+    sys.stderr.write("\033[2m→ Ready\033[0m\n")
+    sys.stderr.flush()
+
+    try:
+        cmd = args.command
+
+        if cmd == "interactive":
+            from leapflow.cli.commands.interactive import cmd_interactive
+            return await cmd_interactive(ctx, resume_id=getattr(args, "resume", None))
+        elif cmd == "chat":
+            from leapflow.cli.commands.chat import cmd_chat
+            return await cmd_chat(ctx, args.prompt, getattr(args, "thinking", False))
+        elif cmd == "teach":
+            resume_id = getattr(args, "resume", None)
+            if resume_id:
+                from leapflow.cli.commands.teach import cmd_teach_resume
+                return await cmd_teach_resume(ctx, resume_id, getattr(args, "timeout", None))
+            from leapflow.cli.commands.teach import cmd_teach
+            return await cmd_teach(
+                ctx, getattr(args, "goal", ""), getattr(args, "timeout", None),
+                field_args=getattr(args, "field", []),
+            )
+        elif cmd == "run":
+            from leapflow.cli.commands.run import cmd_run
+            prompt = getattr(args, "prompt", "")
+            return await cmd_run(
+                ctx, prompt, getattr(args, "skill", None),
+                step=getattr(args, "step", False),
+                auto=getattr(args, "auto", False),
+            )
+        elif cmd == "relearn":
+            from leapflow.cli.commands.relearn import cmd_relearn
+            return await cmd_relearn(ctx, args.trajectory_id)
+        elif cmd == "skills":
+            from leapflow.cli.commands.skills import cmd_skills
+            return await cmd_skills(
+                ctx,
+                getattr(args, "action", "list"),
+                getattr(args, "name", None),
+                getattr(args, "output", None),
+                getattr(args, "limit", 20),
+                include_suggestions=getattr(args, "include_suggestions", False),
+            )
+        else:
+            print("Unknown command. Use 'leap --help' for usage.")
+            return 1
+    finally:
+        await ctx.cleanup()
+
+
+async def _async_host(args: argparse.Namespace) -> int:
+    """Run host subcommand without Context initialization."""
+    from leapflow.cli.commands.host import cmd_host
+    return await cmd_host(args)
+
+
+class _StdinEchoGuard:
+    """Temporarily hide pre-TUI stdin echo while leapd starts."""
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._attrs: list | None = None
+
+    def __enter__(self) -> "_StdinEchoGuard":
+        if termios is None or not sys.stdin.isatty():
+            return self
+        try:
+            self._fd = sys.stdin.fileno()
+            self._attrs = termios.tcgetattr(self._fd)
+            muted = list(self._attrs)
+            muted[3] = muted[3] & ~termios.ECHO
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, muted)
+        except termios.error:
+            self._fd = None
+            self._attrs = None
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if termios is None or self._fd is None or self._attrs is None:
+            return
+        try:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._attrs)
+            termios.tcflush(self._fd, termios.TCIFLUSH)
+        except termios.error:
+            return
+
+
+async def _async_daemon_main(args: argparse.Namespace) -> int:
+    """Run chat/interactive through a shared leapd daemon."""
+    from leapflow.daemon.client import DaemonUnavailableError, recover_daemon_client
+
+    settings = load_config()
+    from leapflow.logging_setup import init_cli_logging
+    init_cli_logging(settings)
+    mock_host = getattr(args, "mock_host", False)
+
+    def _status(message: str) -> None:
+        sys.stderr.write(f"\033[2m→ {message}\033[0m\n")
+        sys.stderr.flush()
+
+    try:
+        with _StdinEchoGuard():
+            client = await recover_daemon_client(
+                settings,
+                mock_host=mock_host,
+                status_callback=_status,
+            )
+    except DaemonUnavailableError as exc:
+        sys.stderr.write(
+            "\033[33m→ leapd unavailable; falling back to local volatile-capable mode.\033[0m\n"
+        )
+        sys.stderr.write(f"\033[2m  {exc}\033[0m\n")
+        sys.stderr.flush()
+        return await _async_main(args)
+
+    cmd = args.command
+    if cmd == "interactive":
+        from leapflow.cli.commands.interactive import cmd_interactive_daemon
+
+        return await cmd_interactive_daemon(
+            client,
+            settings,
+            resume_id=getattr(args, "resume", None),
+            mock_host=mock_host,
+        )
+    if cmd == "chat":
+        from leapflow.cli.commands.chat import cmd_chat_daemon
+
+        return await cmd_chat_daemon(client, args.prompt, getattr(args, "thinking", False))
+
+    return await _async_main(args)
+
+
+def _daemon_enabled(args: argparse.Namespace) -> bool:
+    """Return whether chat/interactive should use leapd."""
+    if getattr(args, "no_daemon", False):
+        return False
+    raw = os.getenv("LEAPFLOW_DAEMON", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _suggest_known_command(token: str, known_commands: set[str]) -> str | None:
+    """Return the closest known command when a token looks like a typo, else None.
+
+    Uses a conservative similarity cutoff so genuine free-text prompts (e.g.
+    ``leap what is a daemon``) still route to chat, while near-miss command
+    typos (e.g. ``deamon`` -> ``daemon``) are caught and surfaced as a
+    suggestion instead of silently becoming an LLM chat turn that also spawns a
+    daemon.
+    """
+    import difflib
+
+    matches = difflib.get_close_matches(
+        token.lower(), sorted(known_commands), n=1, cutoff=0.82
+    )
+    return matches[0] if matches else None
+
+
+def main(argv: list[str] | None = None) -> int:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--mock-host",
+        action="store_true",
+        help="Force in-process mock platform (overrides LEAPFLOW_MOCK_HOST).",
+    )
+    common.add_argument(
+        "--no-daemon",
+        action="store_true",
+        help="Run chat/interactive in this process instead of leapd.",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="leap",
+        parents=[common],
+        description="LeapFlow — Learning and Evolving from Actual Practice",
+    )
+
+    parser.add_argument("--thinking", action="store_true", help="Enable LLM reasoning mode")
+    parser.add_argument("--resume", metavar="ID", help="Resume a previous chat session")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # leap teach
+    teach_parser = subparsers.add_parser("teach", parents=[common], help="Interactive teaching mode")
+    teach_parser.add_argument("goal", nargs="?", default="", help="Goal description")
+    teach_parser.add_argument("--prompt", dest="goal_flag", help="Goal description (alternative)")
+    teach_parser.add_argument("--goal", dest="goal_opt", default="", help="Goal description (alternative)")
+    teach_parser.add_argument("--timeout", type=float, help="Idle timeout in seconds")
+    teach_parser.add_argument("--resume", metavar="ID", help="Resume a previous teaching session")
+    teach_parser.add_argument(
+        "--field", action="append", default=[],
+        help="Session-scoped perceptual field rule (app:context[:level])",
+    )
+
+    # leap run
+    run_parser = subparsers.add_parser("run", parents=[common], help="Execute a skill")
+    run_parser.add_argument("prompt", nargs="?", default="", help="Natural language trigger")
+    run_parser.add_argument("--skill", help="Explicit skill name to execute")
+    run_parser.add_argument("--step", action="store_true", help="Step-through execution")
+    run_parser.add_argument("--auto", action="store_true", help="Skip confirmation, execute directly")
+
+    # leap skills
+    skills_parser = subparsers.add_parser("skills", parents=[common], help="Skill management")
+    skills_parser.add_argument("action", nargs="?", default="list", choices=["list", "show", "export", "import", "disable", "delete", "audit", "sessions"])
+    skills_parser.add_argument("name", nargs="?", help="Skill name (for 'show'/'export'/'audit') or file path (for 'import')")
+    skills_parser.add_argument("-o", "--output", help="Output file path (for 'export')")
+    skills_parser.add_argument("--limit", type=int, default=20, help="Limit rows (for 'audit')")
+    skills_parser.add_argument(
+        "--include-suggestions",
+        action="store_true",
+        help="Include pending skill update suggestions when listing (action='list').",
+    )
+
+    # leap relearn
+    relearn_parser = subparsers.add_parser("relearn", parents=[common], help="Re-learn from a saved trajectory")
+    relearn_parser.add_argument("trajectory_id", help="Trajectory ID to re-process")
+
+    # leap host
+    host_parser = subparsers.add_parser("host", help="Manage cua-driver and ObservationDaemon")
+    host_sub = host_parser.add_subparsers(dest="host_action")
+    host_sub.add_parser("start", help="Start ObservationDaemon (background observers)")
+    host_sub.add_parser("stop", help="Stop ObservationDaemon")
+    host_sub.add_parser("status", help="Show cua-driver and daemon status")
+    host_sub.add_parser("doctor", help="Run cua-driver connectivity health check")
+    host_sub.add_parser("install", help="Install cua-driver")
+
+    # leap daemon
+    daemon_parser = subparsers.add_parser("daemon", help="Manage leapd daemon")
+    daemon_sub = daemon_parser.add_subparsers(dest="daemon_action")
+    daemon_sub.add_parser("status", help="Show daemon status")
+    daemon_sub.add_parser("start", help="Start daemon for the active profile")
+    stop_parser = daemon_sub.add_parser("stop", help="Stop running daemon")
+    stop_parser.add_argument("--force", action="store_true", help="Escalate to SIGKILL if graceful stop times out")
+    restart_parser = daemon_sub.add_parser("restart", help="Restart daemon for the active profile")
+    restart_parser.add_argument("--force", action="store_true", help="Force old daemon shutdown before restart")
+    serve_parser = daemon_sub.add_parser("serve", help=argparse.SUPPRESS)
+    serve_parser.add_argument("--internal", action="store_true", help=argparse.SUPPRESS)
+
+    # leap board (LeapBoard monitoring dashboard)
+    dashboard_parser = subparsers.add_parser("board", help="Open the LeapBoard session analysis board")
+    dashboard_parser.add_argument("template", nargs="?", default="", help="Template lens to render (default: generic)")
+    dashboard_parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
+    dashboard_parser.add_argument("--token", default="", help=argparse.SUPPRESS)
+    dashboard_parser.add_argument("--port", type=int, default=0, help="Override the dashboard port")
+    dashboard_parser.add_argument("--bind", default="", help="Override the dashboard bind address")
+    dashboard_parser.add_argument("--no-open", action="store_true", help="Print the URL instead of opening a browser")
+
+    # leap evolve (run the learning boundary now)
+    evolve_parser = subparsers.add_parser(
+        "evolve", help="Run the learning boundary now and report what it did"
+    )
+    evolve_parser.add_argument(
+        "--session",
+        required=True,
+        help="Exact session id whose new evidence should be finalized",
+    )
+    evolve_parser.add_argument(
+        "--reason", default="manual",
+        help="Label recorded with this run (default: manual)",
+    )
+    evolve_parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for the durable teacher job to reach a terminal state",
+    )
+    evolve_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=180.0,
+        help="Maximum wait time in seconds when --wait is set",
+    )
+    evolve_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    # leap hw (hardware inspection and direct intervention)
+    hw_parser = subparsers.add_parser("hw", help="Inspect hardware and intervene in it directly")
+    hw_sub = hw_parser.add_subparsers(dest="hw_action")
+    hw_json = argparse.ArgumentParser(add_help=False)
+    hw_json.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    hw_sub.add_parser("list", parents=[hw_json], help="List admitted hardware devices")
+    hw_describe = hw_sub.add_parser("describe", parents=[hw_json], help="Show the full reference for one device")
+    hw_describe.add_argument("device", help="Device id from `leap hw list`")
+    hw_read = hw_sub.add_parser("read", parents=[hw_json], help="Read one channel")
+    hw_read.add_argument("device", help="Device id from `leap hw list`")
+    hw_read.add_argument("channel", help="Channel id from `leap hw describe`")
+    hw_status = hw_sub.add_parser("status", parents=[hw_json], help="Show transport health and recent events")
+    hw_status.add_argument("device", nargs="?", default="", help="Optional device id; omit to roll up every device")
+    hw_estop = hw_sub.add_parser("estop", parents=[hw_json], help="Emergency-stop a device (no approval required)")
+    hw_estop.add_argument("device", help="Device id from `leap hw list`")
+    hw_pause = hw_sub.add_parser("pause", parents=[hw_json], help="Pause daemon sampling for a device")
+    hw_pause.add_argument("device", help="Device id from `leap hw list`")
+    hw_resume = hw_sub.add_parser("resume", parents=[hw_json], help="Resume daemon sampling for a device")
+    hw_resume.add_argument("device", help="Device id from `leap hw list`")
+    hw_replay = hw_sub.add_parser("replay", parents=[hw_json], help="Replay a raw NDJSON segment through the event detector")
+    hw_replay.add_argument("segment_path", help="Path to the NDJSON segment file")
+    hw_serve = hw_sub.add_parser(
+        "serve",
+        help="Serve this machine's devices as an LHP fabric node (edge runtime)",
+    )
+    hw_serve.add_argument("--node-id", default="", help="Node id, [a-z0-9_]+ (env LEAPFLOW_LHP_NODE_ID)")
+    hw_serve.add_argument("--host", default="127.0.0.1", help="TCP bind address (default: 127.0.0.1)")
+    hw_serve.add_argument("--port", type=int, default=8767, help="TCP bind port (default: 8767; 0 picks a free port)")
+    hw_serve.add_argument("--unix", default="", dest="unix_path", help="Bind a Unix socket path instead of TCP")
+    hw_serve.add_argument("--token", default="", help="Shared hello secret (env LEAPFLOW_LHP_TOKEN)")
+    # Verification subcommands
+    hw_verify = hw_sub.add_parser("verify", parents=[hw_json], help="Verify a device declaration (digest-bound)")
+    hw_verify.add_argument("device", help="Device id to verify")
+    hw_verify.add_argument("--as", dest="verifier", default="", help="Verifier identity (e.g. operator name)")
+    hw_validate = hw_sub.add_parser("validate", parents=[hw_json], help="Validate a device YAML without loading")
+    hw_validate.add_argument("file_or_device", nargs="?", default="", help="Device id (default: all)")
+    hw_validate.add_argument(
+        "--workcells", nargs="?", const="", default=None, metavar="DIR",
+        help="Admit workcell declarations offline instead (default DIR: the profile's)",
+    )
+    hw_validate.add_argument("--devices", default="", metavar="DIR", help="Device YAML for --workcells")
+    hw_sub.add_parser("permit-key", parents=[hw_json], help="Generate an Ed25519 keypair for execution permits")
+    # Onboarding subcommands
+    hw_init = hw_sub.add_parser("init", parents=[hw_json], help="Generate an annotated hc.v1 device template")
+    hw_init.add_argument("device_id", help="Device id for the new template")
+    hw_probe = hw_sub.add_parser("probe", parents=[hw_json], help="Read-only device connectivity check")
+    hw_probe.add_argument("device", help="Device id to probe")
+    hw_commission = hw_sub.add_parser("commission", parents=[hw_json], help="Controlled first-write commissioning")
+    hw_commission.add_argument("device", help="Device id to commission")
+    hw_commission.add_argument("channel", nargs="?", default="", help="Optional channel id (default: first writable)")
+
+    # leap doctor
+    doctor_parser = subparsers.add_parser("doctor", help="Run system health diagnostics")
+    doctor_parser.add_argument("--fix", action="store_true", help="Attempt to auto-fix simple issues (e.g. missing directories)")
+    doctor_parser.add_argument("--section", choices=["platform", "config", "connectivity", "state", "tools"], help="Only run checks for this section")
+
+    # leap config
+    config_parser = subparsers.add_parser("config", help="View and update LeapFlow configuration")
+    config_sub = config_parser.add_subparsers(dest="config_action")
+    config_show = config_sub.add_parser("show", help="Show effective configuration or one config field")
+    config_show.add_argument("key", nargs="?", help="Optional config key, e.g. llm.model")
+    config_sub.add_parser("keys", help="List writable configuration keys")
+    config_list = config_sub.add_parser("list", help="List writable configuration fields with descriptions")
+    config_list.add_argument("category", nargs="?", help="Optional category or key prefix filter, e.g. llm or memory")
+    config_list.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    config_sub.add_parser("sources", help="List configuration sources")
+    config_get = config_sub.add_parser("get", help="Show one effective config value")
+    config_get.add_argument("key", help="Config key, e.g. llm.model")
+    config_set = config_sub.add_parser("set", help="Set a writable config value")
+    config_set.add_argument("key", help="Config key, e.g. llm.model")
+    config_set.add_argument("value", help="Config value")
+    config_set.add_argument("--scope", choices=["profile", "workspace"], default="profile", help="Durable config scope")
+    config_unset = config_sub.add_parser("unset", help="Unset a writable config value")
+    config_unset.add_argument("key", help="Config key, e.g. llm.model")
+    config_unset.add_argument("--scope", choices=["profile", "workspace"], default="profile", help="Durable config scope")
+
+    config_llm = config_sub.add_parser("llm", help="Configure the primary LLM provider")
+    config_llm_sub = config_llm.add_subparsers(dest="llm_action")
+    config_llm_sub.add_parser("show", help="Show LLM configuration")
+    config_llm_set = config_llm_sub.add_parser("set", help="Set LLM provider fields")
+    config_llm_set.add_argument("--api-key", help="LLM API key; prefer --ask-api-key for shell history safety")
+    config_llm_set.add_argument("--ask-api-key", action="store_true", help="Prompt securely for the LLM API key")
+    config_llm_set.add_argument("--base-url", help="OpenAI-compatible base URL")
+    config_llm_set.add_argument("--model", help="Model name")
+    config_llm_set.add_argument("--context-length", type=int, help="Runtime context budget in tokens")
+    config_llm_set.add_argument("--max-retries", type=int, help="Provider retry count")
+    config_llm_set.add_argument("--scope", choices=["profile", "workspace"], default="profile", help="Durable config scope")
+    config_llm_key = config_llm_sub.add_parser("key", help="Prompt securely for the LLM API key")
+    config_llm_key.add_argument("--scope", choices=["profile", "workspace"], default="profile", help="Durable config scope")
+
+    config_secret = config_sub.add_parser("secret", help="Manage profile/global secret refs")
+    config_secret_sub = config_secret.add_subparsers(dest="secret_action")
+    config_secret_set = config_secret_sub.add_parser("set", help="Store a secret value")
+    config_secret_set.add_argument("ref", help="secret:// ref or shorthand like llm.primary.api_key")
+    config_secret_set.add_argument("value", nargs="?", help="Secret value; prompts securely when omitted")
+    config_secret_set.add_argument("--scope", choices=["profile", "global"], default="profile", help="Scope for shorthand refs")
+    config_secret_get = config_secret_sub.add_parser("get", help="Check or reveal a secret value")
+    config_secret_get.add_argument("ref", help="secret:// ref or shorthand like llm.primary.api_key")
+    config_secret_get.add_argument("--scope", choices=["profile", "global"], default="profile", help="Scope for shorthand refs")
+    config_secret_get.add_argument("--reveal", action="store_true", help="Print the plaintext secret value")
+    config_secret_delete = config_secret_sub.add_parser("delete", help="Delete a secret ref")
+    config_secret_delete.add_argument("ref", help="secret:// ref or shorthand like llm.primary.api_key")
+    config_secret_delete.add_argument("--scope", choices=["profile", "global"], default="profile", help="Scope for shorthand refs")
+    config_secret_sub.add_parser("list", help="List stored secret refs without revealing values")
+
+    # ── Pre-parse: detect if first non-flag arg is a known subcommand ──
+    # If not, treat everything non-flag as a chat prompt.
+    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon", "config", "board", "hw", "evolve", "doctor"}
+    effective_argv = list(argv) if argv is not None else sys.argv[1:]
+
+    # Find first non-flag argument, skipping values owned by global options.
+    value_options = {"--resume"}
+    prompt_words: list[str] = []
+    first_pos = None
+    skip_next = False
+    for i, tok in enumerate(effective_argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in value_options:
+            skip_next = True
+            continue
+        if tok.startswith("-"):
+            continue
+        first_pos = i
+        break
+
+    if first_pos is not None and effective_argv[first_pos] not in known_commands:
+        first_token = effective_argv[first_pos]
+        non_flag_tokens = [tok for tok in effective_argv if not tok.startswith("-")]
+        # A short, command-like invocation whose first word is a near-miss of a
+        # known command is almost certainly a typo (e.g. `leap deamon status`).
+        # Surface a suggestion instead of silently spawning a daemon + LLM chat.
+        if len(non_flag_tokens) <= 3:
+            suggestion = _suggest_known_command(first_token, known_commands)
+            if suggestion is not None:
+                # Replace only the mistyped token so preceding global flags
+                # (e.g. --profile dev) and trailing args are preserved.
+                corrected_argv = list(effective_argv)
+                corrected_argv[first_pos] = suggestion
+                corrected = " ".join(["leap", *corrected_argv])
+                sys.stderr.write(
+                    f"leap: '{first_token}' is not a leap command. "
+                    f"Did you mean '{suggestion}'?\n"
+                    f"Try: {corrected}\n"
+                )
+                return 2
+        # Collect all non-option prompt tokens while preserving global option values.
+        flags: list[str] = []
+        prompt_words = []
+        skip_next = False
+        for tok in effective_argv:
+            if skip_next:
+                flags.append(tok)
+                skip_next = False
+                continue
+            if tok in value_options:
+                flags.append(tok)
+                skip_next = True
+                continue
+            if tok.startswith("-"):
+                flags.append(tok)
+            else:
+                prompt_words.append(tok)
+        effective_argv = flags
+
+    args = parser.parse_args(effective_argv)
+
+    # Resolve teach goal from positional, --prompt, or --goal
+    if args.command == "teach":
+        goal = getattr(args, "goal", "") or ""
+        if not goal:
+            goal = getattr(args, "goal_flag", "") or getattr(args, "goal_opt", "") or ""
+        args.goal = goal
+
+    # ── Route ──
+    if not args.command:
+        if prompt_words:
+            # leap "question" / leap some question here → single-turn chat
+            args.command = "chat"
+            args.prompt = " ".join(prompt_words)
+        else:
+            # leap → interactive REPL (Rich banner rendered inside cmd_interactive)
+            args.command = "interactive"
+
+    if args.command == "config":
+        from leapflow.cli.commands.config import cmd_config
+        return cmd_config(args)
+
+    # Doctor does not need full Context initialization
+    if args.command == "doctor":
+        from leapflow.cli.commands.doctor_cmd import cmd_doctor
+        return cmd_doctor(args)
+
+    # Host command does not need Context initialization
+    if args.command == "host":
+        try:
+            return asyncio.run(_async_host(args))
+        except KeyboardInterrupt:
+            sys.stderr.write("\n\033[2m→ Interrupted\033[0m\n")
+            return 130
+
+    # Daemon command does not need Context initialization
+    if args.command == "daemon":
+        from leapflow.cli.commands.daemon import cmd_daemon
+        return cmd_daemon(args)
+
+    # Dashboard is a view client (connects to leapd); no Context initialization
+    if args.command == "board":
+        from leapflow.cli.commands.dashboard import cmd_dashboard
+        return cmd_dashboard(args)
+
+    # Evolve routes to leapd, the sole writer of the durable event stream and
+    # teacher-job queue. A client-side Context would create a competing writer.
+    if args.command == "evolve":
+        from leapflow.cli.commands.evolve import cmd_evolve
+        return cmd_evolve(args)
+
+    # Hardware inspection/intervention: reads run in-process, pause/resume route
+    # to leapd over RPC. No engine Context is needed either way.
+    if args.command == "hw":
+        from leapflow.cli.commands.hardware import cmd_hardware
+        return cmd_hardware(args)
+
+    try:
+        if args.command in {"interactive", "chat"} and _daemon_enabled(args):
+            return asyncio.run(_async_daemon_main(args))
+        return asyncio.run(_async_main(args))
+    except KeyboardInterrupt:
+        sys.stderr.write("\n\033[2m→ Interrupted\033[0m\n")
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

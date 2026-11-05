@@ -1,0 +1,8 @@
+{
+  "mount_confirmation": null,
+  "uncertainty_evidence": null,
+  "whole_link_geometry_evidence": null,
+  "rate_bound_evidence": null,
+  "wrist_prior_evidence": null,
+  "supporting_image_manifest": "image-manifest.json"
+}

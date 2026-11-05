@@ -23,11 +23,15 @@ roles:
   arm: robot_piper_arm
   gripper: robot_piper_arm
   camera: sensor_realsense_435if
+  # Enable with the D405 declaration on the same node:
+  # camera.wrist: sensor_realsense_d405
 
 # Each frame names its parent and the calibration procedure that measures it.
 frames:
   tcp: {parent: flange, procedure: tcp.offset}
   camera: {parent: base, procedure: handeye.eye_to_hand}
+  # camera.wrist: {parent: flange, procedure: handeye.eye_in_hand}
+  # Calibrate with calib.handeye camera=camera.wrist; procedures must be distinct.
 
 workspace:
   procedure: workspace.safe_box
@@ -72,6 +76,18 @@ calibration:
   max_hand_eye_rotation_rms_deg: 0.5
   min_verify_points: 5
   max_verify_p95_mm: 5
+  max_verify_rms_mm: 5  # Set to 2 for the wrist held-out qualification.
+
+# Read-only grasp evidence acceptance; missing independent evidence fails closed.
+grasp_verify:
+  alignment_mm: 3
+  min_frames: 3
+  max_age_s: 1
+  min_proof_lift_mm: 5
+  max_proof_lift_mm: 10
+  max_relative_error_mm: 2
+  max_slip_mm: 1
+  max_uncertainty_mm: 1
 
 # Model name -> model-service device id. ``locator`` serves perceive.locate;
 # every other name is a policy embodied under ``policies`` below.

@@ -1,0 +1,67 @@
+"""Per-run evidence: one directory, one append-only event log, one verdict.
+
+Every stage writes here before it acts and after it acts, so a failed run can be
+diagnosed from the directory alone -- the robot's state at the decision, the
+number the decision used, and the same number measured afterwards.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+from . import config
+
+
+def _stamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+class Run:
+    def __init__(self, tag: str, root: Path | None = None):
+        self.tag = tag
+        base = (root or config.DATA / "runs") / f"{_stamp()}_{tag}"
+        self.dir = base
+        suffix = 2
+        while self.dir.exists():
+            self.dir = base.with_name(f"{base.name}-{suffix}")
+            suffix += 1
+        self.dir.mkdir(parents=True)
+        self.frames = self.dir / "frames"
+        self.frames.mkdir(exist_ok=True)
+        self.events = self.dir / "events.jsonl"
+        self._count = 0
+
+    def log(self, kind: str, /, **fields: Any) -> None:
+        # Board replies carry their own "kind" (e.g. a move's linear/point); keep both.
+        if "kind" in fields:
+            fields["reply_kind"] = fields.pop("kind")
+        record = {"t": round(time.time(), 3), "kind": kind, **fields}
+        with self.events.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._count += 1
+
+    def verdict(self, payload: dict) -> Path:
+        payload = {"tag": self.tag, "at": time.time(), **payload}
+        path = self.dir / "verdict.json"
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        self.log("verdict", ok=payload.get("ok"), reason=payload.get("reason", ""))
+        return path
+
+    def image(self, name: str, array) -> Path:
+        from PIL import Image
+
+        path = self.frames / f"{name}.png"
+        Image.fromarray(array).save(path)
+        return path
+
+    def json(self, name: str, payload: dict) -> Path:
+        path = self.frames / f"{name}.json"
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return path
+
+    @property
+    def count(self) -> int:
+        return self._count

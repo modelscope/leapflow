@@ -1,0 +1,98 @@
+platform_id: feishu
+display_name: "飞书 (Feishu/Lark)"
+description: "飞书企业协作平台（官方 lark-cli 后端）"
+category: im
+
+credentials: []
+
+options:
+  - key: profile
+    label: CLI Profile
+    type: string
+    default: ""
+    help_zh: "lark-cli profile 名称；为空时使用 lark-cli 当前默认 profile"
+    help_en: "lark-cli profile name; empty means the current default profile"
+  - key: identity
+    label: 执行身份
+    type: choice
+    choices: [bot, user]
+    default: bot
+    help_zh: "通过 lark-cli --as 指定 bot 或 user 身份"
+    help_en: "Identity passed through lark-cli --as"
+  - key: binary
+    label: CLI 命令
+    type: string
+    default: "lark-cli"
+    advanced: true
+    help_zh: "飞书官方 CLI 可执行文件名或路径"
+    help_en: "Official lark-cli executable name or path"
+  - key: max_message_length
+    label: 最大消息长度
+    type: integer
+    default: 8000
+    advanced: true
+    help_zh: "发送 IM 文本前在 LeapFlow 侧保留的最大字符数"
+    help_en: "Maximum text characters retained by LeapFlow before sending IM messages"
+  - key: events_enabled
+    label: 入站事件
+    type: boolean
+    default: false
+    help_zh: "启用后 LeapFlow 可接收飞书群消息并自动回复（需要先完成 lark-cli 事件总线配置）"
+    help_en: "When enabled, LeapFlow receives Feishu chat messages and can auto-reply (requires lark-cli event bus setup)"
+  - key: event_key
+    label: 事件键
+    type: string
+    default: "im.message.receive_v1"
+    advanced: true
+    help_zh: "lark-cli event consume 订阅的事件键"
+    help_en: "Event key for lark-cli event consume subscription"
+  - key: trigger_mode
+    label: 触发模式
+    type: choice
+    choices: [mention_only, all, keyword, manual]
+    default: mention_only
+    advanced: true
+    help_zh: "何时触发回复：mention_only=被@或私聊时, all=所有消息, keyword=关键词匹配, manual=手动"
+    help_en: "When to trigger replies: mention_only=@mention or DM, all=every message, keyword=keyword match, manual=never"
+
+setup_guide:
+  summary_zh: |
+    LeapFlow 使用飞书官方 lark-cli 接入飞书能力。请先安装并完成一次 CLI 应用配置与授权。
+  summary_en: |
+    LeapFlow uses the official lark-cli backend for Feishu/Lark. Install and authorize lark-cli first.
+  steps_zh:
+    - "安装：npx @larksuite/cli@latest install"
+    - "初始化应用配置：lark-cli config init --new"
+    - "登录授权：lark-cli auth login --recommend"
+    - "验证状态：lark-cli auth status"
+  steps_en:
+    - "Install: npx @larksuite/cli@latest install"
+    - "Initialize app config: lark-cli config init --new"
+    - "Authorize: lark-cli auth login --recommend"
+    - "Verify: lark-cli auth status"
+  console_url: "https://github.com/larksuite/cli"
+
+validation:
+  method: ""
+  timeout_s: 10
+
+backend:
+  kind: cli
+  binary: lark-cli
+  format: json
+
+actions:
+  pack: leapflow.gateway.action_packs.feishu
+  initial_domains: [im, docs, calendar, drive, sheets, mail, task]
+
+events:
+  kind: cli
+  status: available
+  command: "lark-cli event consume"
+  checkpoint: profile
+  note: "Requires lark-cli event bus; run 'lark-cli event status' to verify readiness."
+
+adapter:
+  module: leapflow.gateway.adapters.feishu
+  class: FeishuAdapter
+  dependencies: []

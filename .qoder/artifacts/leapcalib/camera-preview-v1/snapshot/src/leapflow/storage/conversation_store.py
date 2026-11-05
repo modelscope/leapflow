@@ -1,0 +1,971 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""Conversation session persistence — chat history storage with full-text search.
+
+Design (inspired by hermes hermes_state.py):
+- DuckDB-backed for consistency with leapflow's existing persistence layer
+- Full-text search via DuckDB FTS extension for session recall
+- Schema reconciliation on startup (no migration chains)
+- Write retry with jitter for concurrent access
+- Session lineage for compression continuations and subagent delegation
+- Protocol-first design (DIP) — core logic depends on ConversationStore, not DuckDB
+
+Fits into leapflow's event-driven architecture:
+- Persist on EventBus events (SessionCreated, MessageAppended)
+- Retrieve via semantic search or keyword-based FTS
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Union, runtime_checkable
+
+if TYPE_CHECKING:
+    from leapflow.engine.tools.tool_execution import ToolExecutionRecord
+    from leapflow.storage.connection import ConnectionHolder
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ConversationSession:
+    """Immutable snapshot of a conversation session's metadata."""
+    session_id: str
+    title: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    parent_session_id: Optional[str] = None
+    model: str = ""
+    source: str = "cli"
+    cwd: str = ""
+    message_count: int = 0
+    total_tokens: int = 0
+    is_active: bool = True
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    summary: str = ""
+    pinned: bool = False
+    hidden: bool = False
+
+
+@dataclass(frozen=True)
+class ConversationMessage:
+    """Immutable snapshot of a single message in a conversation."""
+    message_id: str
+    session_id: str
+    role: str
+    content: str
+    created_at: float = 0.0
+    tool_name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_calls_json: Optional[str] = None
+    active: bool = True
+    compacted: bool = False
+    token_count: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ConversationSearchResult:
+    """A single search hit with relevance score and context."""
+    message_id: str
+    session_id: str
+    session_title: str
+    role: str
+    content: str
+    score: float
+    created_at: float
+
+
+@dataclass(frozen=True)
+class SessionSnapshot:
+    """Immutable snapshot of PCD-relevant session state for cache-aware resumption.
+
+    Persisted alongside the session so that a resumed session can restore the
+    exact system prompt, tool schema, and disclosure level that produced the
+    last prefix-cache-friendly prompt assembly.
+    """
+    system_prompt: Optional[str] = None
+    tool_schema: Optional[str] = None
+    disclosure_level: Optional[str] = None
+
+
+@runtime_checkable
+class ConversationStore(Protocol):
+    """Protocol for conversation persistence (DIP)."""
+
+    def create_session(self, session_id: str, *, title: str = "", **kwargs: Any) -> ConversationSession: ...
+    def get_session(self, session_id: str) -> Optional[ConversationSession]: ...
+    def list_sessions(
+        self, *, limit: int = 20, active_only: bool = True, cwd: Optional[str] = None,
+        include_hidden: bool = False, include_archived: bool = False,
+    ) -> List[ConversationSession]: ...
+    def pin_session(self, session_id: str) -> None: ...
+    def unpin_session(self, session_id: str) -> None: ...
+    def hide_session(self, session_id: str) -> None: ...
+    def unhide_session(self, session_id: str) -> None: ...
+    def archive_session(self, session_id: str) -> None: ...
+    def append_message(self, session_id: str, role: str, content: str, **kwargs: Any) -> ConversationMessage: ...
+    def reserve_tool_execution(self, record: "ToolExecutionRecord") -> None: ...
+    def complete_tool_execution(self, record: "ToolExecutionRecord") -> None: ...
+    def get_tool_execution_by_key(self, session_id: str, idempotency_key: str) -> Optional["ToolExecutionRecord"]: ...
+    def get_messages(
+        self, session_id: str, *, limit: int = 100, active_only: bool = True, offset: int = 0
+    ) -> List[ConversationMessage]: ...
+    def search_messages(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        role_filter: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> List[ConversationSearchResult]: ...
+    def update_session_snapshot(
+        self,
+        session_id: str,
+        system_prompt: Optional[str],
+        tool_schema: Optional[str],
+        disclosure_level: Optional[str],
+    ) -> None: ...
+    def get_session_snapshot(self, session_id: str) -> Optional[SessionSnapshot]: ...
+    def close(self) -> None: ...
+
+
+class DuckDBConversationStore:
+    """DuckDB-backed conversation store with FTS and write-retry.
+
+    Schema:
+    - conversation_sessions: metadata, lineage (parent_session_id), model config
+    - conversation_messages: full transcript with soft-delete (active) and compaction flag
+    - FTS index on messages for keyword search
+
+    Accepts ``ConnectionHolder`` (shared) or legacy ``Path``.
+    """
+
+    def __init__(self, source: "Union[ConnectionHolder, Path, str]") -> None:
+        from leapflow.storage.connection import LocalConnectionHolder
+        self._owns_holder = isinstance(source, (str, Path))
+        if self._owns_holder:
+            source = LocalConnectionHolder(Path(source))
+        self._holder = source
+        self._db_path = str(self._holder.db_path)
+        self._write_count = 0
+        self._initialize_schema()
+
+    @property
+    def _conn(self) -> Any:
+        """Resolve per call, so each thread gets its own cursor.
+
+        See ``LocalConnectionHolder.connection``: the value is thread-specific, so
+        caching it puts two threads on one connection and the second blocks inside
+        DuckDB until the first query ends -- freezing the event loop when it is one
+        of them.
+        """
+        return self._holder.connection
+
+    def _initialize_schema(self) -> None:
+        """Create tables if they don't exist. Idempotent."""
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_sessions (
+                session_id VARCHAR PRIMARY KEY,
+                title VARCHAR DEFAULT '',
+                created_at DOUBLE DEFAULT 0.0,
+                updated_at DOUBLE DEFAULT 0.0,
+                parent_session_id VARCHAR,
+                model VARCHAR DEFAULT '',
+                source VARCHAR DEFAULT 'cli',
+                cwd VARCHAR DEFAULT '',
+                message_count INTEGER DEFAULT 0,
+                total_tokens INTEGER DEFAULT 0,
+                is_active BOOLEAN DEFAULT TRUE,
+                metadata_json VARCHAR DEFAULT '{}',
+                summary VARCHAR DEFAULT ''
+            )
+        """)
+        # Idempotent column migrations for pre-existing databases. DuckDB supports
+        # ADD COLUMN IF NOT EXISTS, a true no-op when the column is already present.
+        # A bare ALTER guarded only by try/except is unsafe: a failed DDL statement
+        # aborts the surrounding DuckDB transaction, so the next statement fails with
+        # "current transaction is aborted" on every restart against an already-migrated
+        # database — which silently broke session resume after a daemon restart.
+        for col, col_def in (
+            ("summary", "VARCHAR DEFAULT ''"),
+            ("system_prompt_snapshot", "TEXT"),
+            ("tool_schema_snapshot", "TEXT"),
+            ("disclosure_level", "TEXT"),
+            ("pinned", "BOOLEAN DEFAULT FALSE"),
+            ("hidden", "BOOLEAN DEFAULT FALSE"),
+        ):
+            self._conn.execute(
+                f"ALTER TABLE conversation_sessions ADD COLUMN IF NOT EXISTS {col} {col_def}"
+            )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+                message_id VARCHAR PRIMARY KEY,
+                session_id VARCHAR NOT NULL,
+                role VARCHAR NOT NULL,
+                content VARCHAR DEFAULT '',
+                created_at DOUBLE DEFAULT 0.0,
+                tool_name VARCHAR,
+                tool_call_id VARCHAR,
+                tool_calls_json VARCHAR,
+                active BOOLEAN DEFAULT TRUE,
+                compacted BOOLEAN DEFAULT FALSE,
+                token_count INTEGER DEFAULT 0,
+                metadata_json VARCHAR DEFAULT '{}'
+            )
+        """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS tool_executions (
+                execution_id VARCHAR PRIMARY KEY,
+                session_id VARCHAR NOT NULL,
+                turn_id VARCHAR NOT NULL,
+                command_id VARCHAR DEFAULT '',
+                tool_call_id VARCHAR DEFAULT '',
+                tool_name VARCHAR NOT NULL,
+                idempotency_key VARCHAR NOT NULL,
+                arguments_json VARCHAR DEFAULT '{}',
+                policy VARCHAR DEFAULT 'read_only',
+                status VARCHAR NOT NULL,
+                result_json VARCHAR,
+                created_at DOUBLE DEFAULT 0.0,
+                completed_at DOUBLE DEFAULT 0.0,
+                UNIQUE(session_id, idempotency_key)
+            )
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tool_executions_session
+            ON tool_executions (session_id, idempotency_key)
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tool_executions_turn
+            ON tool_executions (turn_id, created_at)
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conv_messages_session
+            ON conversation_messages (session_id, created_at)
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conv_sessions_updated
+            ON conversation_sessions (updated_at DESC)
+        """)
+        self._ensure_fts()
+
+    def _ensure_fts(self) -> None:
+        """Create FTS index on messages with CJK-friendly config.
+
+        Uses ``ignore := '(\\.|[^\\w])+'`` to preserve CJK characters,
+        ``stemmer := 'none'`` and ``stopwords := 'none'`` so Chinese tokens
+        are indexed rather than discarded by the default English pipeline.
+        """
+        try:
+            self._conn.execute("INSTALL fts; LOAD fts;")
+            # Drop existing index to re-create with correct parameters
+            try:
+                self._conn.execute("PRAGMA drop_fts_index('conversation_messages')")
+            except Exception:
+                pass  # No existing index to drop
+            try:
+                self._conn.execute("""
+                    PRAGMA create_fts_index(
+                        'conversation_messages', 'message_id',
+                        'content', 'role', 'tool_name',
+                        stemmer := 'none',
+                        stopwords := 'none',
+                        ignore := '(\\.|[^\\w])+',
+                        lower := 1,
+                        overwrite := 1
+                    )
+                """)
+                logger.debug("conversation_store: FTS index created (CJK-friendly)")
+            except Exception as e:
+                logger.debug("conversation_store: FTS index creation skipped: %s", e)
+        except Exception as e:
+            logger.debug("conversation_store: FTS extension unavailable: %s", e)
+
+    def _execute_write(self, sql: str, params: Any = None) -> None:
+        """Execute a write with jitter retry for concurrent access."""
+        from leapflow.storage.write_buffer import execute_with_retry
+        execute_with_retry(self._conn, sql, params)
+        self._write_count += 1
+
+    def create_session(
+        self,
+        session_id: str,
+        *,
+        title: str = "",
+        parent_session_id: Optional[str] = None,
+        model: str = "",
+        source: str = "cli",
+        cwd: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> ConversationSession:
+        now = time.time()
+        meta_json = json.dumps(metadata or {}, ensure_ascii=False)
+        self._execute_write(
+            """
+            INSERT INTO conversation_sessions
+                (session_id, title, created_at, updated_at,
+                 parent_session_id, model, source, cwd, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (session_id) DO UPDATE SET
+                updated_at = EXCLUDED.updated_at,
+                title = COALESCE(NULLIF(EXCLUDED.title, ''), conversation_sessions.title),
+                model = COALESCE(NULLIF(EXCLUDED.model, ''), conversation_sessions.model)
+            """,
+            [session_id, title, now, now, parent_session_id, model, source, cwd, meta_json],
+        )
+        return ConversationSession(
+            session_id=session_id, title=title, created_at=now, updated_at=now,
+            parent_session_id=parent_session_id, model=model, source=source, cwd=cwd,
+            metadata=metadata or {},
+        )
+
+    def get_session(self, session_id: str) -> Optional[ConversationSession]:
+        rows = self._conn.execute(
+            "SELECT * FROM conversation_sessions WHERE session_id = ?", [session_id]
+        ).fetchall()
+        if not rows:
+            return None
+        return self._row_to_session(rows[0])
+
+    def list_sessions(
+        self,
+        *,
+        limit: int = 20,
+        active_only: bool = True,
+        cwd: Optional[str] = None,
+        include_hidden: bool = False,
+        include_archived: bool = False,
+    ) -> List[ConversationSession]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        sql = "SELECT * FROM conversation_sessions"
+        if active_only and not include_archived:
+            conditions.append("is_active = TRUE")
+        if not include_hidden:
+            conditions.append("(hidden = FALSE OR hidden IS NULL)")
+        if cwd:
+            conditions.append("cwd = ?")
+            params.append(cwd)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        # Pinned sessions appear first, then by updated_at
+        sql += " ORDER BY COALESCE(pinned, FALSE) DESC, updated_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
+    def append_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        tool_name: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+        tool_calls: Optional[list] = None,
+        token_count: int = 0,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> ConversationMessage:
+        message_id = str(uuid.uuid4())
+        now = time.time()
+        tc_json = json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
+        meta_json = json.dumps(metadata or {}, ensure_ascii=False)
+
+        self._execute_write(
+            """
+            INSERT INTO conversation_messages
+                (message_id, session_id, role, content, created_at,
+                 tool_name, tool_call_id, tool_calls_json,
+                 token_count, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [message_id, session_id, role, content, now,
+             tool_name, tool_call_id, tc_json, token_count, meta_json],
+        )
+
+        self._execute_write(
+            """
+            UPDATE conversation_sessions SET
+                updated_at = ?,
+                message_count = message_count + 1,
+                total_tokens = total_tokens + ?
+            WHERE session_id = ?
+            """,
+            [now, token_count, session_id],
+        )
+
+        return ConversationMessage(
+            message_id=message_id, session_id=session_id, role=role,
+            content=content, created_at=now, tool_name=tool_name,
+            tool_call_id=tool_call_id, tool_calls_json=tc_json,
+            token_count=token_count, metadata=metadata or {},
+        )
+
+    def reserve_tool_execution(self, record: "ToolExecutionRecord") -> None:
+        """Reserve a tool execution idempotently."""
+        self._execute_write(
+            """
+            INSERT INTO tool_executions
+                (execution_id, session_id, turn_id, command_id, tool_call_id,
+                 tool_name, idempotency_key, arguments_json, policy, status,
+                 result_json, created_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (session_id, idempotency_key) DO NOTHING
+            """,
+            [
+                record.execution_id,
+                record.session_id,
+                record.turn_id,
+                record.command_id,
+                record.tool_call_id,
+                record.tool_name,
+                record.idempotency_key,
+                json.dumps(record.arguments, ensure_ascii=False, default=str),
+                record.policy,
+                record.status,
+                json.dumps(record.result, ensure_ascii=False, default=str) if record.result is not None else None,
+                record.created_at,
+                record.completed_at,
+            ],
+        )
+
+    def complete_tool_execution(self, record: "ToolExecutionRecord") -> None:
+        """Store the final status and result for a reserved tool execution."""
+        self._execute_write(
+            """
+            UPDATE tool_executions SET
+                status = ?,
+                result_json = ?,
+                completed_at = ?,
+                tool_call_id = COALESCE(NULLIF(?, ''), tool_call_id)
+            WHERE session_id = ? AND idempotency_key = ?
+            """,
+            [
+                record.status,
+                json.dumps(record.result, ensure_ascii=False, default=str) if record.result is not None else None,
+                record.completed_at,
+                record.tool_call_id,
+                record.session_id,
+                record.idempotency_key,
+            ],
+        )
+
+    def get_tool_execution_by_key(
+        self,
+        session_id: str,
+        idempotency_key: str,
+    ) -> Optional["ToolExecutionRecord"]:
+        """Return a stored tool execution by session and idempotency key."""
+        row = self._conn.execute(
+            """
+            SELECT execution_id, session_id, turn_id, command_id, tool_call_id,
+                   tool_name, idempotency_key, arguments_json, policy, status,
+                   result_json, created_at, completed_at
+            FROM tool_executions
+            WHERE session_id = ? AND idempotency_key = ?
+            """,
+            [session_id, idempotency_key],
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_tool_execution(row)
+
+    def get_messages(
+        self,
+        session_id: str,
+        *,
+        limit: int = 100,
+        active_only: bool = True,
+        offset: int = 0,
+    ) -> List[ConversationMessage]:
+        limit = max(0, int(limit))
+        offset = max(0, int(offset))
+        if limit <= 0:
+            return []
+        sql = "SELECT * FROM conversation_messages WHERE session_id = ?"
+        if active_only:
+            sql += " AND active = TRUE"
+        sql += " ORDER BY created_at ASC LIMIT ? OFFSET ?"
+        rows = self._conn.execute(sql, [session_id, limit, offset]).fetchall()
+        return [self._row_to_message(r) for r in rows]
+
+    def _prepare_fts_query(self, query: str) -> str:
+        """Prepare query for DuckDB FTS. CJK chars become individual tokens."""
+        parts = []
+        for segment in re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9]+', query):
+            if re.match(r'[\u4e00-\u9fff]', segment):
+                parts.extend(list(segment))
+            else:
+                parts.append(segment)
+        return ' '.join(parts) if parts else query
+
+    def search_messages(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        role_filter: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> List[ConversationSearchResult]:
+        """Full-text search across messages, optionally scoped to one workspace."""
+        if not query or len(query.strip()) < 2:
+            return []
+
+        query_safe = query[:2048]
+        fts_query = self._prepare_fts_query(query_safe)
+
+        try:
+            fts_sql = """
+                SELECT m.message_id, m.session_id, m.role, m.content, m.created_at,
+                       s.title as session_title,
+                       fts.score
+                FROM (
+                    SELECT *, fts_main_conversation_messages.match_bm25(
+                        message_id, ?, fields := 'content'
+                    ) AS score
+                    FROM conversation_messages
+                    WHERE score IS NOT NULL
+                ) m
+                JOIN conversation_sessions s ON m.session_id = s.session_id
+                WHERE m.active = TRUE
+            """
+            params: list[Any] = [fts_query]
+            if cwd:
+                fts_sql += " AND s.cwd = ?"
+                params.append(cwd)
+            if role_filter:
+                fts_sql += " AND m.role = ?"
+                params.append(role_filter)
+            fts_sql += " ORDER BY m.score DESC LIMIT ?"
+            params.append(limit)
+
+            rows = self._conn.execute(fts_sql, params).fetchall()
+            return [
+                ConversationSearchResult(
+                    message_id=r[0], session_id=r[1], role=r[2],
+                    content=r[3], created_at=r[4],
+                    session_title=r[5] or "", score=r[6] or 0.0,
+                )
+                for r in rows
+            ]
+        except Exception:
+            return self._fallback_search(query_safe, limit=limit, role_filter=role_filter, cwd=cwd)
+
+    def _fallback_search(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        role_filter: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> List[ConversationSearchResult]:
+        """LIKE-based fallback when FTS is unavailable. Uses OR-based keyword matching."""
+        # Tokenize into meaningful keywords for OR-based search
+        keywords = re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z0-9]{2,}', query)[:6]
+        if not keywords:
+            keywords = [query.strip()]
+
+        or_conds = " OR ".join(["m.content ILIKE ?"] * len(keywords))
+        sql = f"""
+            SELECT m.message_id, m.session_id, m.role, m.content, m.created_at,
+                   s.title as session_title
+            FROM conversation_messages m
+            JOIN conversation_sessions s ON m.session_id = s.session_id
+            WHERE m.active = TRUE AND ({or_conds})
+        """
+        params: list[Any] = [f"%{kw}%" for kw in keywords]
+        if cwd:
+            sql += " AND s.cwd = ?"
+            params.append(cwd)
+        if role_filter:
+            sql += " AND m.role = ?"
+            params.append(role_filter)
+        sql += " ORDER BY m.created_at DESC LIMIT ?"
+        params.append(limit)
+
+        rows = self._conn.execute(sql, params).fetchall()
+        return [
+            ConversationSearchResult(
+                message_id=r[0], session_id=r[1], role=r[2],
+                content=r[3], created_at=r[4],
+                session_title=r[5] or "", score=1.0,
+            )
+            for r in rows
+        ]
+
+    def get_anchored_view(
+        self,
+        session_id: str,
+        message_id: str,
+        *,
+        window: int = 5,
+    ) -> List[ConversationMessage]:
+        """Get messages around a specific message (+-window) for context."""
+        target = self._conn.execute(
+            "SELECT created_at FROM conversation_messages WHERE message_id = ?", [message_id]
+        ).fetchone()
+        if not target:
+            return []
+
+        target_ts = target[0]
+        rows = self._conn.execute(
+            """
+            SELECT * FROM conversation_messages
+            WHERE session_id = ? AND active = TRUE
+            ORDER BY ABS(created_at - ?)
+            LIMIT ?
+            """,
+            [session_id, target_ts, window * 2 + 1],
+        ).fetchall()
+
+        messages = [self._row_to_message(r) for r in rows]
+        messages.sort(key=lambda m: m.created_at)
+        return messages
+
+    def soft_delete_messages(
+        self, session_id: str, message_ids: List[str]
+    ) -> int:
+        """Soft-delete messages (set active=FALSE). Returns count affected."""
+        if not message_ids:
+            return 0
+        placeholders = ",".join(["?"] * len(message_ids))
+        self._execute_write(
+            f"UPDATE conversation_messages SET active = FALSE WHERE session_id = ? AND message_id IN ({placeholders})",
+            [session_id, *message_ids],
+        )
+        return len(message_ids)
+
+    def mark_compacted(self, session_id: str, message_ids: List[str]) -> None:
+        """Mark messages as compacted (preserved but excluded from new summaries)."""
+        if not message_ids:
+            return
+        placeholders = ",".join(["?"] * len(message_ids))
+        self._execute_write(
+            f"UPDATE conversation_messages SET compacted = TRUE WHERE session_id = ? AND message_id IN ({placeholders})",
+            [session_id, *message_ids],
+        )
+
+    def pin_session(self, session_id: str) -> None:
+        """Mark a session as pinned so it sorts to the top of listings."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET pinned = TRUE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def unpin_session(self, session_id: str) -> None:
+        """Remove the pinned flag from a session."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET pinned = FALSE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def hide_session(self, session_id: str) -> None:
+        """Hide a session from default listings without deleting it."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET hidden = TRUE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def unhide_session(self, session_id: str) -> None:
+        """Remove the hidden flag from a session."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET hidden = FALSE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def archive_session(self, session_id: str) -> None:
+        """Archive a session — marks it inactive and optionally hidden.
+
+        Reuses the ``is_active`` column (same as ``end_session``) so archived
+        sessions are excluded from active-only listings.
+        """
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET is_active = FALSE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def end_session(self, session_id: str, *, title: str | None = None, summary: str | None = None) -> None:
+        """Mark a session as inactive (completed/archived).
+
+        If *title* is provided, the session title is also updated (truncated to 80 chars).
+        If *summary* is provided, the session summary is persisted (truncated to 500 chars).
+        """
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET is_active = FALSE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+        if title:
+            self._execute_write(
+                "UPDATE conversation_sessions SET title = ?, updated_at = ? WHERE session_id = ?",
+                [title[:80], now, session_id],
+            )
+        if summary:
+            try:
+                self._execute_write(
+                    "UPDATE conversation_sessions SET summary = ?, updated_at = ? WHERE session_id = ?",
+                    [summary[:500], now, session_id],
+                )
+            except Exception:
+                logger.debug("conversation_store: summary update failed", exc_info=True)
+
+    def fork_session(
+        self,
+        parent_session_id: str,
+        *,
+        title: str = "",
+        model: str = "",
+        carry_messages: int = 0,
+    ) -> ConversationSession:
+        """Fork a new child session from a parent (compression continuation).
+
+        Optionally copies the last N messages from parent to child for context.
+        """
+        child_id = str(uuid.uuid4())
+        child = self.create_session(
+            child_id,
+            title=title or f"Fork of {parent_session_id[:8]}",
+            parent_session_id=parent_session_id,
+            model=model,
+        )
+
+        if carry_messages > 0:
+            recent = self.get_messages(parent_session_id, limit=carry_messages)
+            for msg in recent:
+                self.append_message(
+                    child_id, msg.role, msg.content,
+                    tool_name=msg.tool_name, tool_call_id=msg.tool_call_id,
+                )
+
+        return child
+
+    def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Export a session with all its messages as a portable dict.
+
+        Returns None if session not found. Suitable for JSON serialization.
+        """
+        session = self.get_session(session_id)
+        if session is None:
+            return None
+
+        messages = self.get_messages(session_id, limit=10_000, active_only=False)
+        return {
+            "session_id": session.session_id,
+            "title": session.title,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+            "parent_session_id": session.parent_session_id,
+            "model": session.model,
+            "source": session.source,
+            "cwd": session.cwd,
+            "metadata": session.metadata,
+            "messages": [
+                {
+                    "message_id": m.message_id,
+                    "role": m.role,
+                    "content": m.content,
+                    "created_at": m.created_at,
+                    "tool_name": m.tool_name,
+                    "tool_call_id": m.tool_call_id,
+                    "tool_calls_json": m.tool_calls_json,
+                    "token_count": m.token_count,
+                }
+                for m in messages
+            ],
+        }
+
+    def import_session(self, data: Dict[str, Any]) -> ConversationSession:
+        """Import a session from a portable dict (e.g. from export_session).
+
+        Creates the session and all its messages. Skips messages that already
+        exist (idempotent on message_id).
+        """
+        sid = data["session_id"]
+        session = self.create_session(
+            sid,
+            title=data.get("title", ""),
+            parent_session_id=data.get("parent_session_id"),
+            model=data.get("model", ""),
+            source=data.get("source", "imported"),
+            cwd=data.get("cwd", ""),
+            metadata=data.get("metadata"),
+        )
+
+        for msg in data.get("messages", []):
+            tc_json = msg.get("tool_calls_json")
+            tc_list = None
+            if tc_json:
+                try:
+                    tc_list = json.loads(tc_json)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            self.append_message(
+                sid,
+                msg["role"],
+                msg.get("content", ""),
+                tool_name=msg.get("tool_name"),
+                tool_call_id=msg.get("tool_call_id"),
+                tool_calls=tc_list,
+                token_count=msg.get("token_count", 0),
+            )
+
+        return session
+
+    def close(self) -> None:
+        """Close the database connection if owned by this store."""
+        if self._owns_holder:
+            try:
+                self._holder.close()
+            except Exception:
+                pass
+
+    def update_session_snapshot(
+        self,
+        session_id: str,
+        system_prompt: Optional[str],
+        tool_schema: Optional[str],
+        disclosure_level: Optional[str],
+    ) -> None:
+        """Persist the PCD session snapshot for cache-aware resumption.
+
+        Updates the system prompt, tool schema JSON, and disclosure level
+        columns on the ``conversation_sessions`` row identified by
+        *session_id*. Callers are responsible for serialising the tool
+        schema to a JSON string before passing it here.
+        """
+        now = time.time()
+        self._execute_write(
+            """
+            UPDATE conversation_sessions SET
+                system_prompt_snapshot = ?,
+                tool_schema_snapshot = ?,
+                disclosure_level = ?,
+                updated_at = ?
+            WHERE session_id = ?
+            """,
+            [system_prompt, tool_schema, disclosure_level, now, session_id],
+        )
+
+    def get_session_snapshot(self, session_id: str) -> Optional[SessionSnapshot]:
+        """Read the persisted PCD session snapshot.
+
+        Returns ``None`` when the session does not exist or when all three
+        snapshot columns are NULL (legacy sessions that predate the PCD
+        cache-aware migration).
+        """
+        try:
+            row = self._conn.execute(
+                """
+                SELECT system_prompt_snapshot, tool_schema_snapshot, disclosure_level
+                FROM conversation_sessions
+                WHERE session_id = ?
+                """,
+                [session_id],
+            ).fetchone()
+        except Exception:
+            # Column may not exist in a database that has not been migrated yet.
+            logger.debug("conversation_store: snapshot read failed", exc_info=True)
+            return None
+        if row is None:
+            return None
+        # All NULL means no snapshot was ever persisted.
+        if row[0] is None and row[1] is None and row[2] is None:
+            return None
+        return SessionSnapshot(
+            system_prompt=row[0],
+            tool_schema=row[1],
+            disclosure_level=row[2],
+        )
+
+    def _row_to_session(self, row: tuple) -> ConversationSession:
+        meta = {}
+        try:
+            meta = json.loads(row[11]) if row[11] else {}
+        except (json.JSONDecodeError, IndexError):
+            pass
+        summary = ""
+        try:
+            summary = row[12] or "" if len(row) > 12 else ""
+        except (IndexError, TypeError):
+            pass
+        # pinned/hidden columns may not exist in legacy databases
+        pinned = False
+        hidden = False
+        try:
+            # After snapshot columns (13, 14, 15), pinned=16, hidden=17
+            # but column positions depend on migration state.
+            # Safest: iterate column names if available, fall back to tail.
+            n = len(row)
+            if n > 16:
+                pinned = bool(row[n - 2]) if row[n - 2] is not None else False
+                hidden = bool(row[n - 1]) if row[n - 1] is not None else False
+        except (IndexError, TypeError):
+            pass
+        return ConversationSession(
+            session_id=row[0], title=row[1] or "", created_at=row[2] or 0.0,
+            updated_at=row[3] or 0.0, parent_session_id=row[4],
+            model=row[5] or "", source=row[6] or "cli", cwd=row[7] or "",
+            message_count=row[8] or 0, total_tokens=row[9] or 0,
+            is_active=bool(row[10]) if row[10] is not None else True,
+            metadata=meta, summary=summary,
+            pinned=pinned, hidden=hidden,
+        )
+
+    def _row_to_tool_execution(self, row: tuple) -> "ToolExecutionRecord":
+        from leapflow.engine.tools.tool_execution import ToolExecutionRecord
+
+        arguments: dict[str, Any] = {}
+        result: Any = None
+        try:
+            arguments_raw = row[7]
+            parsed_arguments = json.loads(arguments_raw) if arguments_raw else {}
+            if isinstance(parsed_arguments, dict):
+                arguments = parsed_arguments
+        except (json.JSONDecodeError, TypeError):
+            arguments = {}
+        try:
+            result = json.loads(row[10]) if row[10] else None
+        except (json.JSONDecodeError, TypeError):
+            result = row[10]
+        return ToolExecutionRecord(
+            execution_id=row[0] or "",
+            session_id=row[1] or "",
+            turn_id=row[2] or "",
+            command_id=row[3] or "",
+            tool_call_id=row[4] or "",
+            tool_name=row[5] or "",
+            idempotency_key=row[6] or "",
+            arguments=arguments,
+            policy=row[8] or "read_only",
+            status=row[9] or "reserved",
+            result=result,
+            created_at=row[11] or 0.0,
+            completed_at=row[12] or 0.0,
+        )
+
+    def _row_to_message(self, row: tuple) -> ConversationMessage:
+        meta = {}
+        try:
+            meta = json.loads(row[11]) if row[11] else {}
+        except (json.JSONDecodeError, IndexError):
+            pass
+        return ConversationMessage(
+            message_id=row[0], session_id=row[1], role=row[2] or "",
+            content=row[3] or "", created_at=row[4] or 0.0,
+            tool_name=row[5], tool_call_id=row[6],
+            tool_calls_json=row[7], active=bool(row[8]) if row[8] is not None else True,
+            compacted=bool(row[9]) if row[9] is not None else False,
+            token_count=row[10] or 0, metadata=meta,
+        )

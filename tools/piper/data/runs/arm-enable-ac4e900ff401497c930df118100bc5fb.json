@@ -1,0 +1,124 @@
+{
+  "ok": true,
+  "executed": false,
+  "preview": {
+    "version": 1,
+    "operation": "enable",
+    "declaration_digest": "4061e3ce917749911c479896da49fc10c334042cd2751a0a9ad36fb8750852ba",
+    "settings": {
+      "endpoint": "tcp://192.168.55.1:8767",
+      "node_id": "yahboom",
+      "device_id": "robot_piper_arm",
+      "token_file": "temp/devices/jetson/.lhp-token",
+      "issuer_key": "/Users/jason/.leapflow/profiles/default/hardware/lhp_permit_issuer.key",
+      "node_devices": "/Users/jason/.leapflow/profiles/default/hardware/devices",
+      "root": "/Users/jason/work/leap_work/leapflow/tools/piper",
+      "speed_pct": 10.0,
+      "waypoint_mm": 1.0,
+      "position_mm": 2.0,
+      "orientation_deg": 1.0,
+      "joint_deg": 0.5,
+      "grip_mm": 0.5,
+      "poll_s": 0.2,
+      "settled_samples": 6,
+      "move_timeout_s": 20.0,
+      "run_timeout_s": 600.0,
+      "request_timeout_s": 10.0,
+      "joint_margin_deg": 1.0,
+      "manual_joint_limits_deg": [
+        [
+          -150.0,
+          150.0
+        ],
+        [
+          0.0,
+          180.0
+        ],
+        [
+          -170.0,
+          0.0
+        ],
+        [
+          -89.0,
+          89.0
+        ],
+        [
+          -89.0,
+          89.0
+        ],
+        [
+          -165.0,
+          165.0
+        ]
+      ],
+      "joint_step_deg": 10.0,
+      "init_max_deg": 10.0,
+      "deviation_deg": 3.0,
+      "max_cycles": 20,
+      "max_dwell_s": 60.0,
+      "preflight_temp_c": 45.0,
+      "max_temp_c": 50.0,
+      "voltage_min_v": 21.6,
+      "voltage_max_v": 26.0,
+      "gripper_max_mm": 69.5,
+      "gripper_max_evidence": "Operator confirmed unchanged fitted gripper/jaws and validity of the previously measured 69.5 mm usable maximum on 2026-10-22. Fitted Piper X gripper vendor specification is nominal 0-100 mm, indexed in temp/devices/device_info/arm/PIPER_X.md. This confirmation is not a new mechanical-stop test or full-motion qualification.",
+      "gripper_spec_max_mm": 100.0,
+      "gripper_usable_max_mm": 69.5,
+      "node_python": "/Users/jason/miniconda3/envs/leap/bin/python",
+      "node_leap": "/Users/jason/miniconda3/envs/leap/bin/leap",
+      "node_control_python": null,
+      "node_workspace": "/Users/jason/leap_work",
+      "node_host": "0.0.0.0",
+      "node_port": 8767
+    },
+    "start": {
+      "joints": [
+        0.0,
+        109.652,
+        -50.927,
+        82.875,
+        5.192,
+        0.975
+      ],
+      "pose": {
+        "x": 230.649,
+        "y": -3.1899999999999995,
+        "z": 93.691,
+        "rx": 133.318,
+        "ry": -4.274,
+        "rz": -86.892
+      },
+      "gripper_mm": 1.5999999999999999
+    },
+    "arrival": {
+      "joint": 0.5,
+      "position": 2.0,
+      "orientation": 1.0,
+      "gripper": 0.5
+    },
+    "steps": [
+      {
+        "label": "enable",
+        "commands": [
+          [
+            "arm.enable",
+            1
+          ]
+        ],
+        "configure": true
+      }
+    ],
+    "warning": "Enable/resume can energize the arm"
+  },
+  "plan_hash": "aae02003c1a935aa57bf17c4fff9901f219c44fc2db8e6cc5e91fc2fa36886cd",
+  "events": [
+    {
+      "event": "connected",
+      "monotonic": 507796.151152708,
+      "node_id": "yahboom",
+      "write_mode": "permit_required",
+      "declaration_digest": "4061e3ce917749911c479896da49fc10c334042cd2751a0a9ad36fb8750852ba",
+      "execute": false
+    }
+  ]
+}

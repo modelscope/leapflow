@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
 
@@ -58,11 +59,13 @@ class ContextSource(str, Enum):
 
 
 class Direction(str, Enum):
-    """Whether a channel can be read, written, or both."""
+    """Available channel operations; demotion never grants a new operation."""
 
     READ = "read"
     WRITE = "write"
     READWRITE = "readwrite"
+    DISABLED = "disabled"
+    """A write-only channel whose write capability has been revoked."""
 
 
 class HardwareEffect(str, Enum):
@@ -177,7 +180,7 @@ class ContextProvenance:
         return {
             "source": self.source,
             "verified_by": self.verified_by,
-            "verified_at": self.verified_at,
+            "verified_at": iso_utc(self.verified_at) if self.verified_at else "",
             "upstream_version": self.upstream_version,
             "lossy_fields": list(self.lossy_fields),
             "notes": self.notes,
@@ -189,7 +192,7 @@ class ContextProvenance:
         return cls(
             source=str(data.get("source") or ContextSource.DECLARED.value),
             verified_by=str(data.get("verified_by") or ""),
-            verified_at=_as_float(data.get("verified_at"), default=0.0) or 0.0,
+            verified_at=epoch_seconds(data.get("verified_at")),
             upstream_version=str(data.get("upstream_version") or ""),
             lossy_fields=tuple(str(item) for item in data.get("lossy_fields") or ()),
             notes=str(data.get("notes") or ""),
@@ -552,11 +555,10 @@ class Channel:
         )
 
     def without_write(self) -> "Channel":
-        """Return this channel demoted to read-only.
+        """Revoke write capability, preserving only already-declared reads.
 
-        Used by admission checks that must revoke write capability while keeping the
-        channel readable, because reads remain valuable for diagnosis exactly when a
-        device is not trusted to be commanded.
+        Read/write channels remain readable for diagnosis. Write-only channels become
+        disabled: admission must not invent a getter that the transport never declared.
 
         ``effect`` is preserved rather than reset to ``read``. The declared effect is
         what the channel is *for*, and erasing it would make a demoted channel report
@@ -571,7 +573,7 @@ class Channel:
             return self
         return Channel(
             channel_id=self.channel_id,
-            direction=Direction.READ.value,
+            direction=Direction.READ.value if self.is_readable else Direction.DISABLED.value,
             quantity=self.quantity,
             unit=self.unit,
             effect=self.effect,
@@ -1109,6 +1111,44 @@ def as_numeric(value: Any, *, default: float | None = None) -> float | None:
 
 _as_float = as_numeric
 """Internal alias used by the declaration readers above."""
+
+
+_ISO_EPOCH_FORMATS = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z")
+"""Stamp formats a confirmation record or a declaration may carry.
+
+The first is what ``hardware.attestation`` writes: a confirmation is read by
+humans and audited long after the fact, so the record keeps an ISO-8601 UTC
+stamp instead of an opaque epoch number.
+"""
+
+
+def epoch_seconds(value: Any, *, default: float = 0.0) -> float:
+    """Coerce an attestation timestamp to Unix seconds.
+
+    Both wire forms are accepted -- the ISO stamp a confirmation is written
+    with, and the numeric form a caller may already hold -- because a reader
+    that understood only numbers silently turned every real stamp into ``0.0``
+    and reported a re-attested device as never verified.  An unparseable value
+    degrades to *default* rather than raising: provenance is reported, and a
+    malformed timestamp must not fail admission.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            for fmt in _ISO_EPOCH_FORMATS:
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                except ValueError:
+                    continue
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp()
+    return as_numeric(value, default=default) or default
+
+
+def iso_utc(value: float) -> str:
+    """Render Unix seconds in the stamp format confirmations are written in."""
+    return datetime.fromtimestamp(value, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _format_bound(value: float | None) -> str:

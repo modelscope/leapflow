@@ -33,6 +33,7 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_DEVICE_FAULT,
     FAILURE_SKILL_UNAVAILABLE,
     FAILURE_TARGET_NOT_FOUND,
+    CloudObservation,
     SkillError,
     TargetObservation,
 )
@@ -47,6 +48,7 @@ logger = logging.getLogger(__name__)
 TARGET_CHARUCO = "charuco"
 DEFAULT_DICTIONARY = "DICT_5X5_100"
 DEPTH_WINDOW_PX = 2  # half-width: the centre depth is the median of a 5x5 window
+CLOUD_POINT_LIMIT = 20000  # sampled depth pixels per cloud, evenly strided
 _REQUIRED_FIELDS = ("squares_x", "squares_y", "square_mm", "marker_mm")
 _TARGET_FIELDS = frozenset({*_REQUIRED_FIELDS, "type", "dictionary", "legacy", "min_corners"})
 _OPENCV_HINT = "install opencv-contrib-python-headless (cv2.aruco) and numpy on the node"
@@ -183,6 +185,28 @@ def detect_board(frame: RgbdFrame, target: CharucoTarget) -> BoardDetection | No
         return None
     if ids is None or len(ids) < target.min_corners:
         return None
+    # The detector's adaptive window can include nearby ArUco ink and bias a
+    # chess corner. Refine locally, bounded by the target's declared white margin.
+    pixels = corners.reshape(-1, 2)
+    distances = np.linalg.norm(pixels[:, None, :] - pixels[None, :, :], axis=2)
+    np.fill_diagonal(distances, np.inf)
+    margin_px = (
+        float(distances.min()) * (target.square_mm - target.marker_mm) / (2 * target.square_mm)
+    )
+    if not math.isfinite(margin_px) or margin_px <= 1.0:
+        return None  # too little white space to refine independently of marker ink
+    window = max(1, min(3, int(margin_px) - 1))
+    try:
+        corners = cv2.cornerSubPix(
+            cv2.cvtColor(image, cv2.COLOR_BGR2GRAY),
+            corners,
+            (window, window),
+            (-1, -1),
+            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001),
+        )
+    except cv2.error as exc:
+        logger.warning("ChArUco refinement failed on frame %s: %s", frame.sequence, exc)
+        return None
     pixels = corners.reshape(-1, 2).astype(np.float64).tolist()
     points = board.getChessboardCorners()[ids.reshape(-1)].astype(np.float64)
     if np.ptp(points[:, 0]) == 0.0 or np.ptp(points[:, 1]) == 0.0:
@@ -233,45 +257,103 @@ def depth_point(frame: RgbdFrame, point: Vec3, *, window: int = DEPTH_WINDOW_PX)
     return intrinsics.deproject(u, v, values[len(values) // 2])
 
 
+def cloud_points(
+    frame: RgbdFrame,
+    *,
+    limit: int = CLOUD_POINT_LIMIT,
+    near_mm: float | None = None,
+    far_mm: float | None = None,
+) -> tuple[Vec3, ...]:
+    """The frame's valid depth pixels, evenly strided, in the camera frame (mm).
+
+    Deprojection goes through ``CameraIntrinsics.deproject`` pixel by pixel: that
+    is the same inverse perception uses, so whatever lens model the stream
+    declares is honoured instead of assumed to be a pinhole. Sampling is by row
+    order across the image that survives the filter, which keeps the arm's
+    coverage even when its links cross several depth bands.
+
+    ``near_mm``/``far_mm`` cut *before* the stride, and that order is the whole
+    point of the window: a room-sized frame is mostly table, floor, and backdrop,
+    so striding first spends most of the budget on surfaces no calibration uses
+    and leaves the arm too sparse for a 3 mm occupancy grid -- a port that did
+    exactly that moved the measured mount 14 mm.
+    """
+    import numpy as np
+
+    depth = np.frombuffer(frame.depth, dtype=np.uint16).reshape(frame.height, frame.width)
+    mask = depth > 0
+    if near_mm is not None or far_mm is not None:
+        millimetres = depth.astype(np.float32) * (frame.depth_scale_m * 1000.0)
+        if near_mm is not None:
+            mask &= millimetres > float(near_mm)
+        if far_mm is not None:
+            mask &= millimetres < float(far_mm)
+    rows, columns = np.nonzero(mask)
+    if not len(rows):
+        return ()
+    stride = max(1, math.ceil(len(rows) / max(1, int(limit))))
+    intrinsics, scale = frame.intrinsics, frame.depth_scale_m * 1000.0
+    sampled = range(0, len(rows), stride)
+    return tuple(
+        intrinsics.deproject(
+            int(columns[index]), int(rows[index]), float(depth[rows[index], columns[index]]) * scale
+        )
+        for index in sampled
+    )
+
+
 # ── Port ─────────────────────────────────────────────────────────────────────
 
 
 class WorkcellVision:
-    """Calibration-target measurement for one skill context. Satisfies ``VisionPort``."""
+    """Calibration measurements for one skill context. Satisfies ``VisionPort``."""
 
-    def __init__(self, *, registry: Any, camera: str, target: CharucoTarget) -> None:
+    def __init__(self, *, registry: Any, camera: str, target: CharucoTarget | None = None) -> None:
         self._registry = registry
         self._camera = camera
         self._target = target
 
     @classmethod
-    def for_workcell(cls, registry: Any, spec: WorkcellSpec) -> "WorkcellVision":
-        """The port for *spec*; raises ``skill_unavailable`` without a camera or target."""
-        camera = spec.role(ROLE_CAMERA)
+    def for_workcell(
+        cls, registry: Any, spec: WorkcellSpec, *, role: str = ROLE_CAMERA
+    ) -> "WorkcellVision":
+        """The port for *spec*; raises ``skill_unavailable`` without a camera.
+
+        A declared ``calibration_target`` is parsed here, so a malformed board is
+        refused at admission time rather than halfway through a calibration. A
+        workcell may declare none -- a cloud calibration needs no board -- and
+        ``observe_target`` then answers for itself.
+        """
+        if role.split(".", 1)[0] != ROLE_CAMERA:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"{role!r} is not a camera role")
+        camera = spec.role(role)
         if not camera:
             raise SkillError(
-                FAILURE_SKILL_UNAVAILABLE, f"workcell {spec.workcell_id!r} binds no camera"
+                FAILURE_SKILL_UNAVAILABLE, f"workcell {spec.workcell_id!r} binds no {role}"
             )
-        if not spec.calibration_target:
-            raise SkillError(
-                FAILURE_SKILL_UNAVAILABLE,
-                f"workcell {spec.workcell_id!r} declares no calibration_target (the ChArUco "
-                "board: squares_x, squares_y, square_mm, marker_mm)",
-            )
-        try:
-            target = CharucoTarget.from_mapping(spec.calibration_target)
-        except ValueError as exc:
-            raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"calibration_target: {exc}") from exc
+        target = None
+        if spec.calibration_target:
+            try:
+                target = CharucoTarget.from_mapping(spec.calibration_target)
+            except ValueError as exc:
+                raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"calibration_target: {exc}") from exc
         return cls(registry=registry, camera=camera, target=target)
 
     @property
     def target(self) -> CharucoTarget:
+        if self._target is None:
+            raise SkillError(
+                FAILURE_SKILL_UNAVAILABLE,
+                f"workcell {self._camera!r} declares no calibration_target (the ChArUco "
+                "board: squares_x, squares_y, square_mm, marker_mm)",
+            )
         return self._target
 
     async def observe_target(self) -> TargetObservation:
+        target = self.target
         frame = await self._capture()
         try:
-            found = await asyncio.to_thread(detect_board, frame, self._target)
+            found = await asyncio.to_thread(detect_board, frame, target)
         except ImportError as exc:
             raise SkillError(
                 FAILURE_SKILL_UNAVAILABLE, f"target detection needs OpenCV ({exc}); {_OPENCV_HINT}"
@@ -282,10 +364,10 @@ class WorkcellVision:
             raise SkillError(
                 FAILURE_TARGET_NOT_FOUND,
                 f"the calibration board is not visible to {self._camera!r} (need at least "
-                f"{self._target.min_corners} ChArUco corners over two rows); check it is in "
+                f"{target.min_corners} ChArUco corners over two rows); check it is in "
                 "view, lit evenly, and matches calibration_target",
             )
-        center = self._target.center
+        center = target.center
         return TargetObservation(
             transform=found.transform,
             center=center,
@@ -296,30 +378,91 @@ class WorkcellVision:
             depth_point=depth_point(frame, found.transform.apply(center)),
         )
 
-    async def _capture(self) -> RgbdFrame:
-        try:
-            source = await self._registry.transport(self._camera)
-        except TransportError as exc:
+    async def observe_cloud(
+        self, *, near_mm: float | None = None, far_mm: float | None = None
+    ) -> CloudObservation:
+        frame = await self._capture()
+        points = await asyncio.to_thread(cloud_points, frame, near_mm=near_mm, far_mm=far_mm)
+        if not points:
             raise SkillError(
-                FAILURE_SKILL_UNAVAILABLE, f"{self._camera!r} is unavailable: {exc}"
-            ) from exc
-        if not isinstance(source, FrameSource):
-            raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"{self._camera!r} is not an RGB-D camera")
+                FAILURE_DEVICE_FAULT,
+                f"camera {self._camera!r} returned a frame with no valid depth; check the "
+                "depth stream and the lens is not covered",
+            )
+        return CloudObservation(
+            points=points, intrinsics=frame.intrinsics.to_dict(), observed_at=frame.observed_at
+        )
+
+    async def metric_readiness(
+        self,
+        *,
+        frames: int,
+        points: int,
+        role: str,
+        stamp_uncertainty_s: float,
+        ttl_s: float,
+        quota_bytes: int,
+    ) -> Mapping[str, Any]:
+        """Target-free readiness behind the existing camera and cache owners."""
+        from leapcalib.contracts.failures import CalibrationFailure
+        from leapflow.hardware.calibration.adapter import hardware_failure_code
+        from leapflow.hardware.calibration.readiness import metric_readiness
+
         try:
-            async with self._registry.device_io(self._camera):
-                return await source.capture_rgbd()
-        except TransportError as exc:
-            raise SkillError(
-                FAILURE_DEVICE_FAULT, f"camera {self._camera!r} capture failed: {exc}"
-            ) from exc
+            return await metric_readiness(
+                self._capture,
+                self._registry.evidence_cache,
+                frames=frames,
+                points=points,
+                role=role,
+                stamp_uncertainty_s=stamp_uncertainty_s,
+                ttl_s=ttl_s,
+                quota_bytes=quota_bytes,
+            )
+        except CalibrationFailure as exc:
+            raise SkillError(hardware_failure_code(exc), exc.message) from exc
+        except (OSError, asyncio.TimeoutError, ValueError) as exc:
+            raise SkillError(FAILURE_DEVICE_FAULT, f"metric readiness failed: {exc}") from exc
+
+    async def capture_metric(self, *, after_monotonic: float) -> RgbdFrame:
+        """Node-local exact-role capture through the same FrameHub used by previews."""
+        return await self._capture(after_monotonic=after_monotonic)
+
+    async def _capture(self, *, after_monotonic: float | None = None) -> RgbdFrame:
+        # The transport is resolved under the device lock, not before it: a preview
+        # release waiting on the same lock may otherwise close the camera between the
+        # lookup and the capture.
+        async with self._registry.device_io(self._camera):
+            try:
+                source = await self._registry.transport(self._camera)
+            except TransportError as exc:
+                raise SkillError(
+                    FAILURE_SKILL_UNAVAILABLE, f"{self._camera!r} is unavailable: {exc}"
+                ) from exc
+            if not isinstance(source, FrameSource):
+                raise SkillError(
+                    FAILURE_SKILL_UNAVAILABLE, f"{self._camera!r} is not an RGB-D camera"
+                )
+            try:
+                if after_monotonic is None:
+                    return await source.capture_rgbd()
+                from leapflow.hardware.vision.group import bounded_capture
+
+                return await bounded_capture(source.capture_rgbd)(after_monotonic)
+            except TransportError as exc:
+                raise SkillError(
+                    FAILURE_DEVICE_FAULT, f"camera {self._camera!r} capture failed: {exc}"
+                ) from exc
 
 
 __all__ = [
+    "CLOUD_POINT_LIMIT",
     "DEFAULT_DICTIONARY",
     "TARGET_CHARUCO",
     "BoardDetection",
     "CharucoTarget",
     "WorkcellVision",
+    "cloud_points",
     "depth_point",
     "detect_board",
 ]

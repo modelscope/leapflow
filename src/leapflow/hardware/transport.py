@@ -214,10 +214,26 @@ class FrameReading:
 
 @dataclass(frozen=True)
 class TransportStatus:
-    """Transport health and declared capabilities."""
+    """Transport health, declared capabilities, and the outcome of the last verb.
+
+    ``connected`` and ``halt_supported`` are *declarations* about the device: is
+    the link up, and can this device be stopped at all. Neither answers "did the
+    stop I just asked for reach it", and inferring that from them produces false
+    verdicts in both directions: a passive camera releases its capture and
+    answers ``connected=False, halt_supported=False`` -- a successful stop that
+    reads exactly like a dead link -- while a closed link to an arm that may
+    still be travelling reads like an idle device.
+
+    ``halt_delivered`` therefore states the delivery verdict explicitly: the stop
+    command reached the device, so "it may still be moving" is not a question the
+    caller has to guess at. A driver that returns a status at all has attempted
+    the stop, so the default is ``True``; only a transport that could not put the
+    command on the wire answers ``False``.
+    """
 
     connected: bool = False
     halt_supported: bool = False
+    halt_delivered: bool = True
     detail: str = ""
     latency_ms: float = 0.0
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -226,6 +242,7 @@ class TransportStatus:
         return {
             "connected": self.connected,
             "halt_supported": self.halt_supported,
+            "halt_delivered": self.halt_delivered,
             "detail": self.detail,
             "latency_ms": self.latency_ms,
         }
@@ -297,6 +314,12 @@ class HardwareTransport(Protocol):
         becomes a discoverable capability degradation instead of a silent
         assumption.
 
+        A transport that could not send the stop -- no link, or the send failed --
+        answers ``halt_delivered=False``. That flag is the only honest way to say
+        "this device may still be moving": ``connected`` describes the link after
+        the call, which a stop that released the device sets to ``False``, and
+        ``halt_supported`` describes the device, not this attempt.
+
         Lock-free for a stronger reason than ``probe``: waiting for a lock in order to
         stop a moving machine is physically wrong. Whatever holds the device's I/O lock is
         very often the thing that needs stopping, so acquiring it first would delay the
@@ -319,6 +342,16 @@ class FrameTransport(Protocol):
     discoverable degradation rather than a silent assumption: a device declaring a
     frame channel whose transport does not satisfy this Protocol has that channel
     refused at admission, with a reason, instead of failing on first preview.
+
+    Two optional extensions are discovered the same way, never required:
+
+    - ``min_sequence`` / ``after_monotonic`` keywords on ``read_frame`` -- freshness
+      bounds: wait for a capture newer than the given sequence or monotonic instant,
+      raising ``TransportError(failure_code="frame_timeout")`` when none arrives. A
+      caller asking for freshness from a transport without them is refused, not
+      served a stale frame.
+    - ``frame_reads_concurrent = True`` -- the transport serves concurrent readers
+      from one producer, so a node may read frames outside the device's I/O lock.
     """
 
     async def read_frame(

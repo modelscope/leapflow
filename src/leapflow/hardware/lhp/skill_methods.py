@@ -1,10 +1,13 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 """LHP ``skill.v1``: the wire face of the node's ``SkillRuntime``.
 
-Six methods, all answered with typed payloads rather than error frames for
+Seven methods, all answered with typed payloads rather than error frames for
 anything the runtime can explain (a refusal is an outcome with side effect
 NONE; only a malformed request is an error frame):
 
+- ``skill.reload``  -- preview an idle workcell replacement, or apply the exact
+  declaration under a one-shot permit bound to the old/new digests and owner
+  session. No disk writes, device commands, or node restart.
 - ``skill.list``    -- workcells and their skill cards, each available or why not.
 - ``skill.plan``    -- plan an actuating skill (returns the plan, the digest a
   run permit must bind, and the skill's consent scope), or run a READ skill
@@ -30,7 +33,7 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable, Mapping
 
-from leapflow.hardware.lhp.authority import WriteAuthority
+from leapflow.hardware.lhp.authority import WRITE_MODE_PERMIT_REQUIRED, WriteAuthority
 from leapflow.hardware.lhp.control_sessions import NodeSessions
 from leapflow.hardware.lhp.params import (
     optional_bool,
@@ -40,6 +43,8 @@ from leapflow.hardware.lhp.params import (
     require_bool,
     require_str,
 )
+from leapflow.hardware.lhp.permit import request_digest
+from leapflow.hardware.skills.workcell_reload import matches
 from leapflow.hardware.skills.episodes import MAX_INTENT_CHARS, MAX_LABEL_NOTE_CHARS
 from leapflow.hardware.skills.protocol import (
     FAILURE_DEVICE_BUSY,
@@ -115,7 +120,37 @@ class SkillMethods:
             "skill.status": self.status,
             "skill.stop": self.stop,
             "skill.label": self.label,
+            "skill.reload": self.reload,
         }
+
+    async def reload(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        workcell = require_str(params, "workcell")
+        preview = require_bool(params, "preview") if "preview" in params else True
+        prepared = self._runtime.prepare_workcell_reload(workcell)
+        if isinstance(prepared, SkillOutcome):
+            return _outcome(prepared)
+        binding = {"workcell": workcell, "preview": False,
+                   "previous_digest": prepared.previous_digest,
+                   "workcell_digest": prepared.candidate_digest,
+                   "node_session_id": prepared.node_session_id}
+        if preview:
+            return {"reload": {**prepared.to_dict(), "applied": False,
+                               "request": binding, "permit_digest": request_digest("skill.reload", binding)}}
+        stale = matches(prepared, previous_digest=require_str(params, "previous_digest"),
+                        expected_digest=require_str(params, "workcell_digest"),
+                        node_session_id=require_str(params, "node_session_id"))
+        if stale is not None:
+            return _outcome(stale)
+        if self._sessions.busy_device(prepared.devices):
+            return _outcome(SkillOutcome.failed(FAILURE_DEVICE_BUSY, "reload devices are held by a session"))
+        if self._authority.mode != WRITE_MODE_PERMIT_REQUIRED:
+            return _outcome(SkillOutcome.failed(FAILURE_WRITE_REFUSED, "live reload requires permit_required authority"))
+        refusal = self._authority.check("skill.reload", params)
+        if refusal is not None:
+            return _outcome(SkillOutcome.failed(refusal.failure_code or FAILURE_WRITE_REFUSED,
+                                                refusal.error or "reload authority refused"))
+        # No await between preparation, authority and commit: no stale plan can race.
+        return {"reload": self._runtime.commit_workcell_reload(prepared)}
 
     async def list(self, params: Mapping[str, Any]) -> dict[str, Any]:
         return self._runtime.list(optional_str(params, "workcell"))
@@ -146,20 +181,30 @@ class SkillMethods:
                     FAILURE_PLAN_UNKNOWN, "no such plan on this node (expired or already executed)"
                 )
             )
+        # Snapshot I/O must settle before consuming the one-shot authority.
+        model_basis = await runtime.execution_basis(plan)
+        if isinstance(model_basis, SkillOutcome):
+            return _outcome(model_basis)
+        if runtime.cached_plan(digest) is not plan:
+            return _outcome(
+                SkillOutcome.failed(FAILURE_PLAN_UNKNOWN, "plan expired or was executed during admission")
+            )
         # Busy before authority: a refusal for a held device must not burn the permit.
         busy = self._sessions.busy_device(runtime.plan_devices(plan))
         if busy:
             return _outcome(
                 SkillOutcome.failed(FAILURE_DEVICE_BUSY, f"device {busy!r} is held by a session")
             )
-        refusal = self._authority.check(
-            "skill.execute", params, expected_digest=runtime.permit_digest(plan)
+        refusal, admission = self._authority.admit_run(
+            params, expected_digest=runtime.permit_digest(plan)
         )
         if refusal is not None:
             code = refusal.failure_code or FAILURE_WRITE_REFUSED
             return _outcome(SkillOutcome.failed(code, refusal.error or code))
-        # No await between the busy check and adoption: the mutex is atomic.
-        started = await runtime.execute(digest, intent=intent)
+        # The prepared execution branch does not suspend before lease adoption.
+        started = await runtime.execute(
+            digest, intent=intent, admission=admission, model_basis=model_basis
+        )
         if isinstance(started, SkillOutcome):
             return _outcome(started)
         session = self._sessions.adopt(

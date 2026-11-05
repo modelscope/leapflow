@@ -1,0 +1,2281 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""Configuration loading from structured YAML with environment overrides.
+
+Loading priority (highest wins):
+    1. Process environment variables
+    2. Workspace ``.leapflow/config.yaml`` overrides
+    3. ``profiles/<profile>/config/*.yaml`` profile config
+    4. ``config/user.yaml`` user defaults
+    5. Hard-coded fallbacks
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict
+
+from leapflow.config_loader import load_config_bundle
+from leapflow.domain.trajectory import RecordingMode
+from leapflow.layout import (
+    PathLayout,
+    ProfileLayout,
+    ProfileManifest,
+    build_layout,
+    validate_profile_name,
+    workspace_id_for_path,
+)
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_LLM_MODEL = "qwen3.7-plus"
+DEFAULT_LLM_CONTEXT_LENGTH = 1_000_000
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_profile_name(profile: str) -> str:
+    """Return a safe profile name or raise before any path construction."""
+    return validate_profile_name(profile)
+
+
+ALL_SIGNAL_CHANNELS = frozenset(
+    {
+        "click",
+        "app_switch",
+        "clipboard",
+        "clipboard_content",
+        "keyboard",
+        "scroll",
+        "drag",
+    }
+)
+
+
+def _expand_path(value: str) -> Path:
+    return Path(value.replace("~", str(Path.home()))).expanduser()
+
+
+# Directory creation is owned by PathLayout/ProfileLayout.
+def ensure_data_dir(data_dir: Path, *, profile: str = "default") -> None:
+    """Create the LeapFlow data directory using the canonical layout."""
+    build_layout(data_dir).ensure(profile_id=_validate_profile_name(profile))
+
+
+def _bootstrap_data_dir() -> Path:
+    return _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
+
+
+def _bootstrap_profile() -> str:
+    return _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
+
+
+def _bootstrap_layout() -> PathLayout:
+    return build_layout(_bootstrap_data_dir())
+
+
+def _bootstrap_profile_layout() -> ProfileLayout:
+    return _bootstrap_layout().profile(_bootstrap_profile())
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Runtime settings for LeapFlow."""
+
+    llm_api_key: str
+    llm_base_url: str
+    llm_model: str
+    llm_max_retries: int
+    mock_host: bool
+    duckdb_path: Path
+    log_level: str
+
+    # ── Memory Providers ──
+    # ``0`` selects an adaptive fraction of the active model context window;
+    # positive values are an explicit operator cap.
+    memory_working_max_tokens: int = 0
+    memory_episodic_ttl_s: float = 300.0  # 5 minutes
+    memory_episodic_max_entries: int = 200
+    memory_evolution_max_episodes: int = 1000
+    memory_integration_enabled: bool = True  # wire MemoryManager into main loop
+    memory_prefetch_timeout_s: float = 2.0  # max wait for prefetch in PREPARING
+    memory_prefetch_limit: int = 5  # max entries injected per turn
+
+    # ── Data Root & Profile ──
+    data_dir: Path = field(default_factory=_bootstrap_data_dir)
+    profile: str = field(default_factory=_bootstrap_profile)
+    workspace_root: Path = field(default_factory=lambda: Path.cwd().resolve())
+    layout: PathLayout = field(default_factory=_bootstrap_layout)
+    profile_layout: ProfileLayout = field(default_factory=_bootstrap_profile_layout)
+    profile_manifest: ProfileManifest = field(
+        default_factory=lambda: ProfileManifest.default(_bootstrap_profile())
+    )
+    config_sources: tuple[str, ...] = ()
+    watched_config_paths: tuple[Path, ...] = ()
+    config_warnings: tuple[str, ...] = ()
+    disabled_plugins: tuple[str, ...] = ()
+    # LLM-driven plugin generation (self_management.plugin_generate). Off by
+    # default: turning it on lets the agent produce new plugin code via the
+    # active LLM. Installation is still separately approval-gated by
+    # ApprovalOrchestrator; this switch guards the earlier code-generation step
+    # so an unattended profile cannot spend tokens synthesizing plugins.
+    plugin_generation_enabled: bool = True
+    # Profile-scoped directory where plugin_install writes plugin code and
+    # loads it dynamically. None -> derive from the active ProfileLayout
+    # (profiles/<profile>/plugins/). Set an absolute path to override.
+    plugin_install_dir: str | None = None
+    # Optional local directory acting as a plugin marketplace source. When set,
+    # plugin_install(marketplace_name=...) resolves plugins from this directory.
+    # Opt-in; default None (no local marketplace).
+    plugin_marketplace_root: str | None = None
+    # Optional HTTP(S) marketplace registry base URL. When both this and
+    # plugin_marketplace_root are set, the URL source takes precedence.
+    # Opt-in; default None (no remote marketplace).
+    plugin_marketplace_url: str | None = None
+    # Hex-encoded Ed25519 public keys trusted to sign marketplace plugins.
+    # When non-empty, marketplace installs MUST carry a valid signature from
+    # one of these keys; empty tuple -> checksum-only integrity verification.
+    plugin_marketplace_trusted_pubkeys: tuple[str, ...] = ()
+    # Python plugin sandbox limits. Zero CPU/memory disables that individual
+    # operating-system limit; request and shutdown timeouts are always bounded.
+    plugin_sandbox_invoke_timeout_s: float = 15.0
+    plugin_sandbox_shutdown_timeout_s: float = 3.0
+    plugin_sandbox_cpu_time_s: int = 30
+    plugin_sandbox_max_memory_mb: int = 0
+    # Restricted DeepSeek Harness / Cordis bridge runtime. These are cold-path
+    # process limits; changing them requires rebuilding daemon-owned plugin
+    # wrappers and therefore takes effect after daemon restart.
+    plugins_dsh_invoke_timeout_s: float = 30.0
+    plugins_dsh_discovery_timeout_s: float = 10.0
+    plugins_dsh_max_message_bytes: int = 1_000_000
+    plugins_dsh_max_stderr_bytes: int = 64_000
+    plugins_dsh_max_memory_mb: int = 128
+
+    # Approval policy for tools supplied by external MCP servers. An MCP tool is
+    # third-party code reached over a local transport, running with this agent's
+    # privileges, and the protocol does not say what it does.
+    #   mutating_only -- assess every tool that does not declare readOnlyHint (default)
+    #   always        -- assess and audit every MCP call, including declared reads
+    #   off           -- no gate; logged once per process
+    # Absence of a read-only declaration is not a claim of safety, which is why the
+    # default gates unannotated servers in full rather than trusting them. A declared
+    # read is assessed LOW and auto-allowed on risk, so the practical difference between
+    # the first two modes is audit coverage rather than prompt frequency.
+    mcp_approval_mode: str = "mutating_only"
+
+    # Hardware Context Protocol. On by default: host metrics and passive local media
+    # enumeration are core observability, not an opt-in feature hidden behind an unrelated
+    # config task. Enumeration opens no camera, radio or network connection; a read that
+    # discloses the surrounding space still enters the approval chain and stays refused
+    # until a human grants it. Explicitly setting this False remains a hard disable.
+    #
+    # It is restart-required because the approval classifier is composed when the
+    # orchestrator is constructed.
+    hardware_enabled: bool = True
+    # Comma-separated discovery sources. Empty -> "yaml,host,media": declarations a person
+    # wrote plus this machine's own resources. The media provider only enumerates cameras
+    # and microphones; it never opens either. Scanners that transmit (bluetooth) or leave
+    # the host (mdns) are opt-in, because discovery must never be the reason a radio starts
+    # up or a packet leaves the machine.
+    hardware_providers: str = ""
+    # Directory holding device declarations. Empty -> the active profile's
+    # hardware/devices/ directory.
+    hardware_devices_dir: str = ""
+    # Admission cap. A declaration directory that suddenly lists hundreds of
+    # devices is far more likely to be a mistake than an intent.
+    hardware_max_devices: int = 16
+    # How to treat a device context no human has confirmed: deny_write (writable
+    # channels are demoted to read-only), prompt, or allow. The default keeps an
+    # unverified declaration observable but not commandable.
+    hardware_unverified_policy: str = "deny_write"
+    # Require hw_describe before the first command to a device in a session. The
+    # generic tool schemas cannot express per-channel limits, so this is what puts
+    # the envelope in front of the model before it commands anything.
+    hardware_require_describe: bool = True
+    # Allow one consent to cover a channel's whole declared envelope band. Turning it
+    # off asks separately for every command, which suits a bench where each operation
+    # deserves its own decision -- at the cost of prompting often enough that people
+    # start clicking through.
+    hardware_envelope_grant: bool = True
+    # Trust-based approval skip for reversible channels that have accumulated
+    # enough successful outcomes.  Off by default: enabling it is a deliberate
+    # operator decision, and the safety invariant (irreversible channels always
+    # require approval) holds regardless.
+    hardware_trust_skip_enabled: bool = False
+    # How long a post-write verdict may follow a value that is still travelling
+    # toward its command before it reports "pending". A declared settling time
+    # says when an observation becomes meaningful, not when a servo has arrived:
+    # judging a slow move by it alone reports a correct write as contradicted.
+    hardware_write_verification_follow_s: float = 10.0
+    # Continuous sampling for channels that declare a sample rate.
+    hardware_stream_enabled: bool = True
+    # Per-channel ring buffer depth for raw samples. Raw readings never enter the
+    # interaction signal buffer; only derived events cross that boundary.
+    hardware_stream_ring_capacity: int = 4096
+    # Persist sampled readings. Without this, samples live only in a bounded in-memory
+    # ring and vanish with the process, so nothing can be learned from physical
+    # experience afterwards -- there is no series to learn from.
+    hardware_persist_readings: bool = True
+    # Interval collapsed into one stored history window. Raw samples are kept separately
+    # as session-scoped sensitive artifacts; this governs the long-term tier.
+    hardware_downsample_interval_s: float = 60.0
+    # TTL for raw sample files, which are sensitive and non-syncable.
+    hardware_raw_retention_days: float = 7.0
+    # How long downsampled history is kept. Longer than the raw tier because this is
+    # what later analysis reads, but bounded: the table grows at a fixed rate per
+    # streaming channel and nothing else was ever going to delete from it.
+    hardware_history_retention_days: float = 90.0
+    # Byte cap per raw sample file before a new segment starts. Segments exist so a
+    # finished one is a write-once artifact -- its recorded size and TTL are correct,
+    # and old data can be dropped without discarding the file being written to.
+    hardware_raw_segment_mb: float = 32.0
+    # Whether the durable ``instrument.duckdb`` history tier is registered as sensitive
+    # and non-syncable, so a profile backup excludes physical series that may carry a
+    # trade secret or sample information. On by default; opt out only for a bench known
+    # to produce no sensitive data.
+    hardware_reading_store_sensitive: bool = True
+    # Sampling period for fast-moving host channels (cpu, memory, network); slower
+    # quantities multiply it. Empty/0 -> the provider default of 5s. One second would
+    # put twelve times as many rows into stored history for detail nobody diagnoses a
+    # machine from.
+    hardware_host_interval_s: float = 0.0
+    # Comma-separated channel-id prefixes to keep / drop from the discovered host set
+    # (e.g. "cpu,memory" or "net.utun"). Prefixes rather than exact ids because mounts
+    # and interfaces are discovered, so their full ids are not knowable in advance.
+    hardware_host_include: str = ""
+    hardware_host_exclude: str = ""
+    # Seconds between automatic rediscovery passes, so a peripheral plugged in after
+    # startup appears without a restart. 0 disables it; rediscovery is otherwise
+    # driven by `leap hw scan`. Runs on the monitor cadence, never on a turn.
+    hardware_rediscover_interval_s: float = 0.0
+    # Enumerate displays as previewable devices. Off by default: a platform that
+    # presents the screen as just another video input would otherwise put "stream this
+    # person's screen" on the board beside the webcam, one click away. Still available,
+    # because it is a legitimate capability -- it is the default that must not decide.
+    hardware_media_screens: bool = False
+    # Enumerate microphones alongside cameras.
+    hardware_media_microphones: bool = True
+    # Comma-separated USB identities ("vid" or "vid:pid", hex) whose video nodes a
+    # dedicated driver owns (e.g. "8086" for RealSense UVC endpoints); they are not
+    # listed as generic cameras, so the board never offers a second opener.
+    hardware_media_exclude_usb: str = ""
+    # The broker enforces hard ceilings. The board's default is a balanced profile below
+    # these limits (960px / 8fps / JPEG 75); Detail is 1280px / 30fps / JPEG 85. A viewer
+    # can choose a profile for its own live preview but never exceed these caps, and no
+    # profile changes durable configuration. The ceiling is declared at discovery.
+    hardware_preview_max_fps: float = 30.0
+    hardware_preview_max_width: int = 1280
+    hardware_preview_quality: int = 85
+    # Explicit browser Stop releases immediately. This is only the lost-client fallback.
+    hardware_preview_idle_timeout_s: float = 5.0
+    # JSON array of named LHP edge nodes.  Each entry has node_id, display_name,
+    # endpoint, and token_env (preferred) or token. Empty retains the legacy
+    # LEAPFLOW_FLEET_NODES environment fallback.
+    hardware_fleet_nodes: str = ""
+    # JSON array of event-to-action rules evaluated by hardware stream sources.
+    # Empty keeps reflex actions disabled until an operator declares them.
+    hardware_alert_policies: str = ""
+    # Node-local skills (S1.5). Comma-separated fnmatch patterns of enabled skill
+    # ids; empty enables every discovered skill. The speed cap bounds every
+    # skill plan; the duration cap bounds one skill execution end to end.
+    hardware_skills_enabled: str = ""
+    hardware_skills_speed_pct_max: float = 30.0
+    hardware_skills_max_duration_s: float = 120.0
+    # Skill-run timing: how long an unexecuted plan stays valid, how long one
+    # actuator's halt may take, how long a stopped skill may unwind before it is
+    # cancelled, and how long an in-flight write is awaited before the run ends
+    # with side effect UNKNOWN (its devices stay held until the write resolves).
+    hardware_skills_plan_ttl_s: float = 300.0
+    hardware_skills_halt_timeout_s: float = 2.0
+    hardware_skills_stop_grace_s: float = 1.0
+    hardware_skills_dispatch_settle_s: float = 2.0
+    # Every executed skill run is recorded as an episode under the profile's
+    # hardware/episodes at this rate (0 disables recording); recording is skipped
+    # when the disk has less than the free-space floor left.
+    hardware_skills_episode_fps: float = 30.0
+    hardware_skills_episode_min_free_mb: float = 2048.0
+    # Host consent to let the model look at workcell camera frames (perceive.snapshot).
+    # Both this and the workcell's own share_frames must be on; every frame shared
+    # is audited and none is persisted.
+    hardware_share_frames: bool = False
+    runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
+
+    # Audit
+    audit_log_path: Path = field(default_factory=lambda: _bootstrap_profile_layout().audit_log_path)
+
+    # Imitation Learning
+    pattern_library_path: str = ""  # Custom patterns.yaml path (empty = use default)
+    snapshot_level_default: str = "light"  # Default snapshot level
+
+    # Skill Code Generation
+    codegen_sandbox: bool = True  # Enable AST safety validation
+    codegen_max_retries: int = 2  # LLM code generation retries
+
+    # Task DAG
+    max_dag_concurrency: int = 3  # DAG max parallelism
+    dag_node_timeout: float = 300.0  # Per-node timeout (seconds)
+
+    # Intent Inference
+    intent_inference_enabled: bool = True  # Enable LLM intent inference
+    intent_inference_language: str = "zh"  # Intent inference language
+
+    # Learning / Execution
+    learn_idle_timeout: float = 300.0  # Auto-stop learning after idle (seconds)
+    learn_auto_distill: bool = True  # Auto-trigger distillation on learn stop
+    confirm_default_level: str = "confirm"  # Default confirmation level
+
+    # Skill Documents (SKILL.md)
+    skills_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().skills_dir)
+    skill_view_max_chars: int = 5000  # Max chars returned by skill_view tool
+    skill_min_quality: float = 0.5  # SkillIndex quality threshold
+
+    # Visual Track
+    visual_track_enabled: bool = False
+    visual_frame_cache_dir: Path = field(
+        default_factory=lambda: _bootstrap_profile_layout().cache.category_dir(
+            scope="workspace",
+            category="perception/keyframes",
+            workspace_id=workspace_id_for_path(Path.cwd()),
+        )
+    )
+    visual_sample_strategy: str = "keyframe"  # keyframe | periodic | all
+    vlm_model: str = ""  # 空则复用 llm_model
+    vlm_api_key: str = ""  # 空则复用 llm_api_key
+    vlm_base_url: str = ""  # 空则复用 llm_base_url
+    privacy_sensitive_apps: tuple = ()  # 隐私应用 bundle_id 黑名单
+
+    # ── VLM Optimization ──
+
+    # P1: Prefiltering
+    vlm_prefilter_enabled: bool = True
+    vlm_prefilter_skip_actions: tuple = (
+        "file.create",
+        "file.delete",
+        "file.rename",
+        "file.modify",
+        "clipboard.copy",
+        "app.switch",
+        "ui.type",
+    )
+    vlm_prefilter_confidence_threshold: float = 0.85
+
+    # P2: Frame Result Cache
+    vlm_cache_enabled: bool = True
+    vlm_cache_ttl: float = 300.0  # 缓存过期时间（秒）
+    vlm_cache_max_size: int = 1000  # 最大缓存条目数
+
+    # P3: Image Compression
+    vlm_compression_enabled: bool = True
+    vlm_compression_max_resolution: int = 1024  # 最大长边像素
+    vlm_compression_quality: int = 75  # JPEG 质量 (1-100)
+    vlm_compression_adaptive: bool = True  # 根据动作类型自适应
+
+    # P4: Frame Tiling
+    vlm_tiling_enabled: bool = True
+    vlm_tiling_max_frames: int = 4  # 单次拼接最大帧数
+    vlm_tiling_tile_size: int = 384  # 单帧缩放后最大长边
+    vlm_tiling_gap: int = 4  # 网格间距像素
+
+    # ── Perception Depth ──
+    text_capture_enabled: bool = True
+    text_capture_exclude_apps: tuple = ()
+    text_capture_secure_roles: tuple = ("AXSecureTextField",)
+    text_capture_max_length: int = 500
+    clipboard_max_length: int = 1024
+
+    # ── Perceptual Field ──
+    perceptual_field_enabled: bool = False
+    perceptual_field_config: str = ""
+
+    # ── Context Learning Attention ──
+    attention_foreground_gate: bool = True
+    attention_noise_patterns: tuple = ()
+    attention_goal_relevance_threshold: float = 0.1
+    attention_working_dir_inference: bool = True
+    attention_domain_whitelist: bool = True
+
+    # ── Recording Mode ──
+    recording_mode: RecordingMode = RecordingMode.DEFAULT
+
+    # ── Causal Inference ──
+    causal_reorder_window_ms: float = 300.0
+    causal_burst_limit: int = 50
+    causal_max_chain_events: int = 20
+    heuristic_time_decay_s: float = 0.5
+    heuristic_space_decay_px: float = 200.0
+
+    # ── World Model (Prediction Loop & Curiosity-Driven Learning) ──
+    prediction_enabled: bool = True
+    prediction_delta_threshold: float = 0.3
+    curiosity_alpha: float = 0.4
+    curiosity_beta: float = 0.3
+    curiosity_gamma: float = 0.3
+    curiosity_auto_balance: bool = True
+    prediction_budget: int = 50
+    comparison_budget: int = 20
+    replay_budget: int = 3
+    grading_budget: int = 5
+    distillation_budget: int = 2
+    # Evidence kinds the capability-observation layer accepts. Empty tuple keeps
+    # the shipped behaviour (``unknown_tool`` only). Adding
+    # ``"world_model_intent"`` lets the world-model teacher drive capability
+    # evolution; adding structural kinds (``"interface_drift"``,
+    # ``"affordance_removed"``) lets an environment probe do so. Every admitted
+    # kind still traverses the unchanged deterministic chain -- resolution, risk,
+    # approval, validation, trust -- so widening this set adds a *trigger*, never
+    # a permission.
+    # The self-evolution switch, and the only one a user should need to find.
+    #
+    # The world model runs regardless: it grades every episode, distils what it learned
+    # about the environment into the next session's context, and recommends which installed
+    # provider to prefer. None of that writes code, asks for approval, or changes what the
+    # agent is able to do -- it changes what the agent *knows*, and switching it off would
+    # cost adaptation for no reduction in risk.
+    #
+    # This switch governs the one branch that does write code: an ``acquire`` verdict
+    # becoming a queued proposal for a new plugin. Off by default because acquiring a
+    # capability is the most expensive and least reversible thing the system can decide to
+    # do, and because it should be a deliberate choice rather than something a user
+    # discovers after it has already happened. Queued is still not built -- generation,
+    # validation, approval, sandboxing and trust all remain in front of it -- so this is
+    # the outermost of several gates, not the only one.
+    evolution_enabled: bool = False
+
+    accepted_evidence_kinds: tuple[str, ...] = ()
+    # Requirement origins permitted to drive an *acquisition*. Empty means
+    # unrestricted (shipped behaviour): any origin may. Setting it to
+    # ``("world_model",)`` is the executable form of "all self-evolution's first
+    # driver is the world model" -- other origins keep being recorded and resolved,
+    # but can no longer authorise acquiring new code.
+    evolution_authorising_origins: tuple[str, ...] = ()
+    evolution_teacher_poll_interval_s: float = 1.0
+    evolution_teacher_lease_s: float = 120.0
+    evolution_teacher_timeout_s: float = 180.0
+    evolution_teacher_max_attempts: int = 3
+    evolution_teacher_retry_backoff_s: float = 5.0
+    evolution_autonomy_level: str = "generate_only"
+    # How many hours a capability proposal stays active before the cold-path
+    # sweep expires it. 0 disables TTL-based expiry entirely.
+    proposal_ttl_hours: int = 72
+    environment_mode: str = "production"
+    environment_leapspace_enabled: bool = False
+    environment_leapspace_state_root: str = ""
+    environment_leapspace_session_id: str = ""
+    environment_leapspace_poll_interval_s: float = 0.5
+    # Which registered policy chooses among admissible tool candidates. ``greedy``
+    # is the shipped default and reproduces the selection made before the policy
+    # seam existed: highest weighted score, stable tie-break.
+    #
+    # A flat typed key rather than a nested params dict because every durable
+    # setting must be discoverable through ``leap config`` -- a dict would become a
+    # YAML-only knob. Built-in policies that need parameters declare them as their
+    # own flat ``selection_*`` keys; a third-party policy registered through the
+    # entry point group configures itself, since it cannot add fields here.
+    selection_policy: str = "greedy"
+    # How long a distilled fact about the environment stays disclosed. An assertion
+    # about a changing world is only true for a while, and stale knowledge misleads
+    # rather than merely going unused -- the acting agent cannot tell a current fact
+    # from one that expired three upgrades ago. Configurable because the right horizon
+    # depends on how fast the environment moves; 0 disables expiry.
+    distilled_knowledge_ttl_s: float = 604800.0
+    #: Cap on how many distilled facts reach the prompt, so the channel meant to
+    #: improve context cannot come to dominate it.
+    distilled_knowledge_limit: int = 12
+
+    replay_on_session_end: bool = True
+    prediction_structural_blend: float = 0.4
+    prediction_semantic_blend: float = 0.6
+    prediction_semantic_threshold: float = 0.1
+    prediction_rag_advantage_floor: float = -0.3
+    prediction_failure_advantage: float = -0.5
+    replay_regression_sample_size: int = 200
+    memory_prune_age_days: float = 90.0
+
+    # ── Semantic RAG ──
+    semantic_embedding_provider: str = "tfidf"
+    semantic_rerank_weight: float = 0.4
+
+    # ── Budget Rebalancing ──
+    budget_discovery_baseline: int = 2
+    budget_regression_baseline: int = 1
+
+    # ── AST Pre-Check ──
+    ast_precheck_enabled: bool = True
+
+    # ── Causal Chain Builder ──
+    causal_window_s: float = 3.0
+    causal_app_window_overrides: Dict[str, float] = field(default_factory=dict)
+    causal_tier3_enabled: bool = False
+    causal_tier3_confidence_threshold: float = 0.7
+    mhms_fusion_enabled: bool = False
+
+    # ── Attention Learning Feedback ──
+    attention_curiosity_expand_threshold: float = 0.7
+    attention_accuracy_contract_threshold: float = 0.1
+
+    # ── Surprise Detection ──
+    surprise_enabled: bool = True
+    surprise_stat_weight: float = 0.4
+    surprise_temporal_weight: float = 0.3
+    surprise_pattern_weight: float = 0.3
+    surprise_annotation_threshold: float = 0.5
+    surprise_warmup_events: int = 50
+
+    # ── Video Recording ──
+    video_fps: int = 5
+    video_resolution_scale: float = 0.75
+    video_codec: str = "h264"
+    video_max_segment_s: int = 600
+    video_cache_dir: Path = field(
+        default_factory=lambda: _bootstrap_profile_layout().cache.category_dir(
+            scope="workspace",
+            category="video",
+            workspace_id=workspace_id_for_path(Path.cwd()),
+        )
+    )
+    video_cache_max_age_days: int = 7  # 视频缓存最大保留天数
+    video_cache_max_size_gb: float = 5.0  # 视频缓存最大占用空间(GB)
+    video_l2_enabled: bool = True
+    video_l3_enabled: bool = True
+    video_segmenter_min_s: float = 30.0
+    video_segmenter_max_s: float = 600.0
+    video_segmenter_idle_gap_s: float = 15.0
+    video_segmenter_app_gap_s: float = 5.0
+    video_segmenter_min_split_s: float = 1.0  # 分割最小片段长度（秒）
+    video_max_l2_requests: int = 10
+    video_max_l3_requests: int = 5
+    video_start_timeout_s: float = 10.0  # 录制启动超时（秒）
+    video_vlm_max_retries: int = 2  # VLM 调用最大重试次数
+    video_vlm_retry_backoff_s: float = 1.0  # VLM 重试退避基数（秒）
+    video_vlm_url_scheme: str = "base64"  # "base64" for local dev, HTTPS URL prefix for production
+    video_l2_time_window_s: float = 2.0  # L2分析时间窗口（前后各N秒）
+
+    # ── Video Timeline ──
+    video_timeline_max_markers: int = 5000  # 在线 timeline 最大标记数
+    video_timeline_compress_max: int = 200  # 压缩后保留的最大标记数
+    video_timeline_merge_channels: str = "keyboard,scroll"  # 合并策略通道（逗号分隔）
+
+    # ── Learnability Assessment ──
+    learnability_enabled: bool = True
+    learnability_min_steps: int = 3
+    learnability_min_duration_s: float = 5.0
+    learnability_max_idle_ratio: float = 0.80
+    learnability_min_action_diversity: int = 2
+    learnability_learn_threshold: float = 0.65
+    learnability_ask_threshold: float = 0.40
+    learnability_vlm_enabled: bool = True
+    learnability_llm_enabled: bool = True
+    learnability_rule_weight: float = 0.4
+    learnability_vlm_weight: float = 0.3
+    learnability_llm_weight: float = 0.3
+
+    # ── Execution Loop Budget ──
+    react_max_iterations: int = 20
+    react_soft_limit: int = 14
+    react_warning_threshold: int = 10
+    # Adaptive-depth elastic budget: baseline floor -> difficulty-scaled ceiling.
+    agent_iter_floor: int = 12
+    agent_iter_ceiling: int = 200
+    agent_budget_scale_k: float = 1.0
+    # Progress-gated continuation: when a task is productively unfinished (open
+    # ledger questions + still surfacing progress) and within resource limits,
+    # the effective cap extends past the elastic ceiling toward this hard cap in
+    # steps of ``agent_iter_extension_step``. Stall (no progress for
+    # ``agent_stall_rounds`` rounds) stops extension. The hard cap is the true
+    # backstop so a long task is bounded by progress/resources, not a fixed count.
+    agent_iter_hard_cap: int = 500
+    agent_iter_extension_step: int = 25
+    agent_stall_rounds: int = 6
+    agent_checkpoint_interval: int = 15  # Force checkpoint every N rounds in research posture
+    agent_cost_ceiling_context_multiple: float = 0.0
+    agent_subagent_max_depth: int = 2
+    agent_subagent_max_concurrent: int = 3
+    agent_subagent_max_iterations: int = 15
+    agent_max_parallel_tools: int = 8  # Max tool calls run in parallel within one response's batch
+    # Newest tool-result images kept in the live conversation; older ones become text.
+    agent_tool_images_kept: int = 2
+    agent_subagent_full_loop: bool = False
+    agent_calibration_enabled: bool = False
+    agent_calibration_min_confidence: float = 0.3
+    agent_calibration_interval_turns: int = 0
+    agent_calibration_difficulty_min_k: float = 0.25
+    agent_calibration_difficulty_max_k: float = 3.0
+    agent_calibration_finalizing_min_ratio: float = 0.6
+    agent_calibration_finalizing_max_ratio: float = 0.98
+    agent_compression_writeback: bool = False
+    agent_reentry_enabled: bool = False
+    agent_reentry_hardware_enabled: bool = False
+    agent_reentry_tick_seconds: float = 30.0
+    agent_reentry_global_budget: int = 100
+    agent_reentry_send_enabled: bool = False
+    agent_reentry_send_rate_per_hour: int = 4
+    agent_reentry_send_global_budget: int = 50
+    agent_reentry_send_verified_at: int = 3
+    tool_max_iterations: int = 30
+    native_tool_calling_enabled: bool = True  # Use native OpenAI tool_calls when available
+    stream_output: bool = True  # Enable LLM streaming in interactive mode
+    verbose_progress: bool = True  # Show detailed tool execution progress
+    show_thinking: bool = True  # Display LLM thinking/reasoning in TUI
+
+    # Context Compression
+    compress_threshold: int = 16
+    compress_keep_tail: int = 4
+    max_tool_output_chars: int = 3000
+    max_tool_result_chars: int = 3000  # Per-tool result truncation for LLM context
+    # code_search: best-effort seamless ripgrep auto-install (macOS/Homebrew, no
+    # sudo) when missing; always falls back to the pure-Python search + a manual
+    # install hint, so search works with zero install regardless.
+    tools_ripgrep_autoinstall: bool = True
+    tools_test_command: str = ""  # empty => auto-detect (pytest/npm/go/cargo)
+    tools_lint_command: str = ""  # empty => auto-detect (ruff/eslint/go vet/clippy)
+    tools_terminal_session_enabled: bool = True  # persistent shell sessions
+    tools_verify_edits: bool = True  # post-edit syntax check (advisory) for edit_file/file_write
+
+    # web_fetch: first-class read-only HTTP access, so reading a public page is
+    # not a side-effecting shell command. Limits are config-driven because the
+    # right timeout/size depends on the network and the target, not on LeapFlow.
+    web_transport: str = "auto"  # auto | httpx | curl
+    web_timeout_s: float = 20.0
+    web_max_bytes: int = 2_000_000  # response body cap before truncation
+    web_max_retries: int = 2  # retries for 429/5xx/timeouts (read-only, so safe)
+    web_max_redirects: int = 5
+    web_user_agent: str = ""  # empty => built-in browser-style default
+    web_extractor: str = "auto"  # auto (trafilatura when installed) | stdlib
+    web_private_targets: str = "approval"  # approval | deny | allow
+    web_cache_ttl_s: float = 900.0
+    agent_validate_tool_args: bool = (
+        True  # pre-execution required-argument validation + self-repair
+    )
+    context_hard_limit_ratio: float = 0.92
+    context_warning_ratio: float = 0.75
+    tool_evidence_max_chars: int = 4000
+    repeated_read_limit: int = 2
+    long_task_convergence_round: int = 12
+    # Adaptive convergence ceiling: on high-difficulty tasks the effective
+    # convergence round scales up (convergence_round * (1 + difficulty *
+    # convergence_scale)), bounded by this ceiling so genuinely stuck tasks
+    # still eventually converge.
+    convergence_round_ceiling: int = 40
+    convergence_scale: float = 2.0
+    # Shell safety ceiling: the internal shell-run process timeout is clamped
+    # here so individual shell calls can safely run beyond 2 minutes.
+    max_shell_timeout_s: float = 300.0
+    context_expanded_ratio: float = 0.60
+    context_finalizing_ratio: float = 0.90
+    context_expanded_evidence_threshold: int = 2
+    context_expanded_tool_call_threshold: int = 3
+    context_research_source_threshold: int = 3
+    context_research_evidence_threshold: int = 5
+
+    # ── Error Recovery ──
+    error_transient_max_retries: int = 3
+    error_rate_limit_base_delay: float = 5.0
+    max_consecutive_tool_failures: int = 3
+    # Per-turn recovery budget (bounds recovery attempts within one agent turn).
+    # A non-positive deadline means unlimited wall-clock time so a long-running
+    # task is never denied recovery for a late transient error; the action-count
+    # budget remains the real bound and scales for long tasks.
+    recovery_turn_deadline_s: float = 0.0
+    recovery_total_actions: int = 24
+    recovery_max_retry_per_category: int = 4
+
+    # ── Tool-loop Guardrails ──
+    # Progress-aware loop guards (repetition / stagnation / single-tool
+    # domination). Halts and finalize nudges are suppressed while the task is
+    # still making progress, so legitimate batch/sequential work on a long task
+    # is not cut short. Thresholds are configurable; the guard can be disabled.
+    guardrail_enabled: bool = True
+    approval_bypass: bool = False  # Skip all approval prompts for non-hardline actions
+    approval_advisory_risk_enabled: bool = (
+        True  # Surface auxiliary LLM risk score in approval prompts
+    )
+    guardrail_max_repeats: int = 3
+    guardrail_max_consecutive_same: int = 8
+    guardrail_stagnation_window: int = 10
+    guardrail_min_success_rate: float = 0.2
+    guardrail_max_calls_per_turn: int = 50
+
+    # ── Session Persistence ──
+    session_persistence_enabled: bool = True
+    # Session resume cache strategy: cache_priority keeps the persisted tool
+    # schema so the LLM prefix cache hits; tool_freshness re-discovers tools.
+    session_resume_cache_policy: str = "cache_priority"
+
+    # ── Compression Provider (PCD Cache-Aware) ──
+    # Dedicated provider for context compression. Empty strings fall back to
+    # the primary LLM provider/model/key/url respectively.
+    compression_provider: str = ""
+    compression_model: str = ""
+    compression_api_key: str = ""  # supports secret:// refs like llm_api_key
+    compression_base_url: str = ""
+    # Head/tail protection for the SummarizeStage compressor.  Module-level
+    # _DEFAULT_PROTECT_FIRST_N / _DEFAULT_SUMMARIZE_KEEP_RECENT serve as
+    # fallback defaults only; runtime values are read from these settings.
+    compression_protect_first_n: int = 3
+    compression_keep_recent_n: int = 6
+
+    # ── File Checkpoint Rollback ──
+    checkpoint_file_rollback_enabled: bool = True
+    checkpoint_max_inline_bytes: int = 262144  # 256 KiB threshold for inline vs temp copy
+    checkpoint_ttl_hours: int = 24
+
+    # ── Multi-Provider LLM ──
+    llm_fallback_providers: str = ""  # JSON array of fallback provider configs
+    llm_aux_model: str = ""  # Auxiliary model for cheap operations (empty = reuse primary)
+    llm_aux_api_key: str = ""  # Aux API key (empty = reuse primary)
+    llm_aux_base_url: str = ""  # Aux base URL (empty = reuse primary)
+    llm_context_length: int = (
+        DEFAULT_LLM_CONTEXT_LENGTH  # Primary provider's runtime context budget
+    )
+    llm_credential_cooldown_s: float = 60.0  # Per-key rate-limit cooldown
+
+    # ── Benchmark Qualification ──
+    benchmark_commands: str = "{}"  # JSON benchmark id -> explicit command template
+    benchmark_data_roots: str = "{}"  # JSON benchmark id -> licensed local data root
+    benchmark_license_acceptances: str = "{}"  # JSON license id -> operator acknowledgement
+    benchmark_hardware_profiles: str = "{}"  # JSON device id -> approved Tier4 profile
+
+    # ── Stream & Tool Robustness ──
+    stale_stream_timeout_s: float = 180.0  # Idle timeout for streaming responses
+    default_tool_timeout_s: float = 120.0  # Default per-tool execution timeout
+    daemon_request_ledger_ttl_s: float = (
+        600.0  # Replay cache retention for completed engine requests
+    )
+    daemon_request_ledger_max_entries: int = (
+        128  # Maximum completed engine requests kept for replay
+    )
+    # Concurrent turn execution (Stage 3). N=3 lets several fresh TUI sessions
+    # run concurrently by default on isolated per-session engines (turns within
+    # one session stay serialized). Set to 1 for strict serialized fallback.
+    daemon_max_concurrent_turns: int = 3
+    daemon_max_live_sessions: int = 16
+    daemon_session_idle_ttl_s: float = 1800.0
+    # File-log verbosity for the leapd process (stdout/stderr -> leapd.log).
+    # Independent from runtime.log_level so field diagnostics (deferred init
+    # progress, turn_usage, empty-response warnings) are captured without
+    # making the interactive CLI/TUI noisy. Requires `leap daemon restart`.
+    daemon_log_level: str = "INFO"
+    circuit_breaker_threshold: int = 5  # Consecutive failures before circuit opens
+    circuit_breaker_cooldown_s: float = 60.0  # Circuit breaker cooldown period
+
+    # ── Signal Fusion (vision_only mode) ──
+    # Default is the full 7-channel set; ``LEAPFLOW_SIGNAL_CHANNELS=none`` disables
+    # signal collection entirely (V0 baseline).
+    signal_channels: frozenset = frozenset()
+    signal_reactive_capture: bool = False
+    signal_noise_gate_enabled: bool = True
+
+    # Active signal sources (Phase 2.5)
+    active_signal_sources: tuple = ()
+    active_source_queue_capacity: int = 256
+    active_source_shutdown_timeout_s: float = 5.0
+    signal_noise_same_source_cooldown_s: float = 2.0
+    signal_noise_allow_fs_outside_workspace: bool = False
+    signal_noise_path_fragments: tuple = (
+        "/Library/Caches/",
+        "/Library/Logs/",
+        "/Library/Preferences/",
+        "/Application Support/Qoder/User/globalStorage/",
+        "/Application Support/Qoder/SharedClientCache/",
+        "/Application Support/Qoder/SharedCredentialCache/",
+        "/Application Support/Qoder/Partitions/native-browser/Cache/",
+        "/Application Support/Cursor/User/globalStorage/",
+        "/Application Support/DuetExpertCenter/",
+        "/.cache/",
+        "/.hermes/",
+        "/.r2c/logs/",
+    )
+    signal_noise_dir_names: tuple = (
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        "node_modules",
+        "Cache",
+        "Caches",
+        "SharedCredentialCache",
+        "globalStorage",
+        "Code Cache",
+        "GPUCache",
+    )
+    signal_noise_suffixes: tuple = (
+        ".tmp",
+        ".temp",
+        ".swp",
+        ".lock",
+        ".log",
+        ".pyc",
+        ".pyo",
+        "-journal",
+        "-shm",
+        "-wal",
+        ".db-shm",
+        ".db-wal",
+        ".sqlite-journal",
+    )
+
+    # ── RPC Transport ──
+    # Default fallback timeout (seconds) used by CuaDriverClient when no
+    # method-specific timeout applies.
+    rpc_timeout_default: float = 30.0
+
+    # ── Cua Driver ──
+    use_cua_driver: bool = True
+    cua_driver_cmd: str = "cua-driver"
+
+    # ── Workflow Copilot ──
+    copilot_enabled: bool = True
+    copilot_min_idle_ms: int = 500
+    copilot_max_idle_ms: int = 5000
+    copilot_cache_ttl_s: float = 30.0
+    copilot_speculative_cache_size: int = 100
+    copilot_action_ring_size: int = 10
+    copilot_warmup_event_types: str = "app.focus_change,context.change,ui.action"
+    notification_renderer: str = "auto"  # "os" | "stderr" | "log" | "auto" | "none"
+
+    # ── Engine Live Signals ──
+    live_signal_kinds: str = "app.focus_change,fs.change,context.change,intent.signal"
+
+    # ── Hub (cloud collaboration) ──
+    hub_type: str = "modelscope"
+    hub_default_owner: str = ""
+    hub_default_visibility: str = "private"
+    hub_sync_strategy: str = "remote-wins"
+    hub_sync_copilot: bool = True
+    hub_repo_prefix: str = "leapflow-"
+    hub_search_sources: str = "modelscope"  # comma-separated backend names for multi-source search
+
+    # ── Observer / Daemon ──
+    observer_auto_start: bool = False  # Auto-start ObservationDaemon on initialize
+    observer_enabled_set: Dict[str, bool] = field(
+        default_factory=lambda: {
+            "fs_watcher": True,
+            "app_focus": True,
+            "clipboard": True,
+            "input_tap": False,
+        }
+    )
+
+    # ── Scheduler ──
+    scheduler_enabled: bool = True
+    scheduler_tick_seconds: int = 60
+    scheduler_grace_seconds: float = 120.0
+    scheduler_default_tier: str = "auto"  # auto | local | cloud
+    scheduler_agent_max_iterations: int = 25
+    scheduler_agent_tool_blocklist: str = ""  # comma-separated tool names
+    scheduler_default_max_retries: int = 2
+    scheduler_default_retry_backoff_s: float = 60.0
+    scheduler_delivery_enabled: bool = False  # opt-in: deliver results to gateway
+
+    # ── Usage Pricing (config-driven cost accounting) ──
+    # Mapping keyed by model family or exact model name, each entry providing
+    # {input_per_mtok: float, output_per_mtok: float, cached_input_ratio: float}.
+    # Loaded from the layered config (user/profile/workspace).  When absent for
+    # the active model, cost is reported as unknown (graceful degradation).
+    usage_pricing: Dict[str, Any] = field(default_factory=dict)
+
+    # ── Dashboard (monitoring web view) ──
+    dashboard_enabled: bool = True
+    dashboard_bind: str = "127.0.0.1"
+    dashboard_port: int = 8765
+    dashboard_auto_open: bool = True
+    dashboard_token_ref: str = ""  # secret ref for the local dashboard access token
+
+    # ── Session analysis dashboard (domain=session watch) ──
+    monitor_session_batch_turns: int = 6
+    monitor_session_batch_tokens: int = 4000
+    monitor_session_use_model_salience: bool = False
+    monitor_session_debounce_s: float = 15.0
+    monitor_session_max_refresh_per_min: int = 4
+
+    @property
+    def profile_dir(self) -> Path:
+        """Root directory for the active profile."""
+        return self.profile_layout.root
+
+    @property
+    def has_llm_credentials(self) -> bool:
+        return bool(self.llm_api_key.strip())
+
+    @property
+    def has_vlm_credentials(self) -> bool:
+        """Return True when visual perception can call a VLM provider."""
+        return bool((self.vlm_api_key or self.llm_api_key).strip())
+
+
+def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge overlay into base. Overlay values take precedence."""
+    result = dict(base)
+    for key, value in overlay.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_config() -> Settings:
+    """Load settings from structured YAML and process environment overrides."""
+    data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
+    profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
+    workspace_root = _expand_path(
+        os.getenv("LEAPFLOW_WORKSPACE_ROOT", str(Path.cwd())).strip() or str(Path.cwd())
+    ).resolve()
+    layout = build_layout(data_dir)
+    try:
+        from leapflow.security.path_sensitivity import configure_path_sensitivity_roots
+
+        configure_path_sensitivity_roots((layout.root,))
+    except Exception:
+        logger.debug("Path sensitivity root configuration skipped", exc_info=True)
+    profile_layout = layout.ensure(profile_id=profile)
+    workspace_id = workspace_id_for_path(workspace_root)
+    try:
+        layout.write_workspace_manifest(workspace_root)
+        profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
+    except OSError:
+        logger.debug("Workspace manifest write skipped", exc_info=True)
+    bundle = load_config_bundle(layout, profile_layout, workspace_root)
+
+    original_env = dict(os.environ)
+    for key, value in bundle.env.items():
+        os.environ[key] = value
+    try:
+        settings = _build_settings_from_env(
+            layout=layout,
+            profile_layout=profile_layout,
+            profile_manifest=profile_layout.load_manifest(),
+            config_sources=tuple(str(source.path) for source in bundle.sources),
+            watched_config_paths=bundle.watched_paths,
+            config_warnings=bundle.warnings,
+        )
+    finally:
+        # Restore original env to avoid polluting caller's global state.
+        for key in bundle.env:
+            if key in original_env:
+                os.environ[key] = original_env[key]
+            else:
+                os.environ.pop(key, None)
+    return settings
+
+
+def _build_settings_from_env(
+    *,
+    layout: PathLayout | None = None,
+    profile_layout: ProfileLayout | None = None,
+    profile_manifest: ProfileManifest | None = None,
+    config_sources: tuple[str, ...] = (),
+    watched_config_paths: tuple[Path, ...] = (),
+    config_warnings: tuple[str, ...] = (),
+) -> Settings:
+    """Build Settings from current os.environ."""
+    api_key = os.getenv("LEAPFLOW_LLM_API_KEY", "").strip()
+    base_url = os.getenv(
+        "LEAPFLOW_LLM_BASE_URL",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    ).strip()
+    model = os.getenv("LEAPFLOW_LLM_MODEL", DEFAULT_LLM_MODEL).strip()
+    max_retries = int(os.getenv("LEAPFLOW_LLM_MAX_RETRIES", "3"))
+
+    data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
+    profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
+    workspace_root = _expand_path(
+        os.getenv("LEAPFLOW_WORKSPACE_ROOT", str(Path.cwd())).strip() or str(Path.cwd())
+    ).resolve()
+    layout = layout or build_layout(data_dir)
+    try:
+        from leapflow.security.path_sensitivity import configure_path_sensitivity_roots
+
+        configure_path_sensitivity_roots((layout.root,))
+    except Exception:
+        logger.debug("Path sensitivity root configuration skipped", exc_info=True)
+    profile_layout = profile_layout or layout.profile(profile)
+    profile_manifest = profile_manifest or profile_layout.load_manifest()
+    workspace_id = workspace_id_for_path(workspace_root)
+    try:
+        layout.write_workspace_manifest(workspace_root)
+        profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
+    except OSError:
+        logger.debug("Workspace manifest write skipped", exc_info=True)
+    _profile_dir = profile_layout.root
+    runtime_dir = os.getenv("LEAPFLOW_RUNTIME_DIR", str(profile_layout.runtime_dir)).strip()
+
+    mock_host = os.getenv("LEAPFLOW_MOCK_HOST", "0").strip() in ("1", "true", "True", "yes")
+    duckdb = os.getenv("LEAPFLOW_DUCKDB_PATH", str(profile_layout.duckdb_path)).strip()
+    # Interactive CLI/TUI surface verbosity. WARNING matches the historical
+    # visible behavior (quiet interactive surface); verbose field diagnostics
+    # belong to the daemon file log (daemon.log_level, default INFO).
+    log_level = os.getenv("LEAPFLOW_LOG_LEVEL", "WARNING").strip()
+
+    # Memory Providers. Zero is the safe default: derive capacity from the
+    # active context window instead of retaining the legacy fixed 8K ring.
+    memory_working_max_tokens = int(os.getenv("LEAPFLOW_MEMORY_WORKING_MAX_TOKENS", "0"))
+    memory_episodic_ttl_s = float(os.getenv("LEAPFLOW_MEMORY_EPISODIC_TTL_S", "300.0"))
+    memory_episodic_max_entries = int(os.getenv("LEAPFLOW_MEMORY_EPISODIC_MAX_ENTRIES", "200"))
+    memory_evolution_max_episodes = int(os.getenv("LEAPFLOW_MEMORY_EVOLUTION_MAX_EPISODES", "1000"))
+    memory_integration_enabled = os.getenv("LEAPFLOW_MEMORY_INTEGRATION_ENABLED", "1").strip() in (
+        "1",
+        "true",
+        "True",
+        "yes",
+    )
+    memory_prefetch_timeout_s = float(os.getenv("LEAPFLOW_MEMORY_PREFETCH_TIMEOUT_S", "2.0"))
+    memory_prefetch_limit = int(os.getenv("LEAPFLOW_MEMORY_PREFETCH_LIMIT", "5"))
+
+    # Audit
+    audit_log_path = os.getenv(
+        "LEAPFLOW_AUDIT_LOG_PATH", str(profile_layout.audit_log_path)
+    ).strip()
+
+    # Visual Track
+    visual_track_enabled = os.getenv("LEAPFLOW_VISUAL_TRACK_ENABLED", "0").strip() in (
+        "1",
+        "true",
+        "True",
+        "yes",
+    )
+    visual_frame_cache_dir = os.getenv(
+        "LEAPFLOW_VISUAL_FRAME_CACHE_DIR",
+        str(
+            profile_layout.cache.category_dir(
+                scope="workspace",
+                category="perception/keyframes",
+                workspace_id=workspace_id,
+            )
+        ),
+    ).strip()
+    visual_sample_strategy = os.getenv("LEAPFLOW_VISUAL_SAMPLE_STRATEGY", "keyframe").strip()
+    vlm_model = os.getenv("LEAPFLOW_VLM_MODEL", "").strip() or model
+    vlm_api_key = os.getenv("LEAPFLOW_VLM_API_KEY", "").strip()
+    vlm_base_url = os.getenv("LEAPFLOW_VLM_BASE_URL", "").strip()
+    privacy_sensitive_apps_raw = os.getenv("LEAPFLOW_PRIVACY_SENSITIVE_APPS", "").strip()
+    privacy_sensitive_apps = (
+        tuple(b.strip() for b in privacy_sensitive_apps_raw.split(",") if b.strip())
+        if privacy_sensitive_apps_raw
+        else ()
+    )
+
+    # Skill Documents
+    skills_dir = os.getenv("LEAPFLOW_SKILLS_DIR", str(profile_layout.skills_dir)).strip()
+    skill_view_max_chars = int(os.getenv("LEAPFLOW_SKILL_VIEW_MAX_CHARS", "5000"))
+    skill_min_quality = float(os.getenv("LEAPFLOW_SKILL_MIN_QUALITY", "0.5"))
+
+    _bool = lambda key, default: os.getenv(key, default).strip().lower() in ("1", "true", "yes")  # noqa: E731
+
+    # VLM Optimization – P1: Prefiltering
+    vlm_prefilter_enabled = _bool("LEAPFLOW_VLM_PREFILTER_ENABLED", "true")
+    vlm_prefilter_skip_raw = os.getenv(
+        "LEAPFLOW_VLM_PREFILTER_SKIP_ACTIONS",
+        "file.create,file.delete,file.rename,file.modify,clipboard.copy,app.switch,ui.type",
+    )
+    vlm_prefilter_skip_actions = tuple(
+        s.strip() for s in vlm_prefilter_skip_raw.split(",") if s.strip()
+    )
+    vlm_prefilter_confidence_threshold = float(
+        os.getenv("LEAPFLOW_VLM_PREFILTER_CONFIDENCE_THRESHOLD", "0.85")
+    )
+
+    # VLM Optimization – P2: Frame Result Cache
+    vlm_cache_enabled = _bool("LEAPFLOW_VLM_CACHE_ENABLED", "true")
+    vlm_cache_ttl = float(os.getenv("LEAPFLOW_VLM_CACHE_TTL", "300"))
+    vlm_cache_max_size = int(os.getenv("LEAPFLOW_VLM_CACHE_MAX_SIZE", "1000"))
+
+    # VLM Optimization – P3: Image Compression
+    vlm_compression_enabled = _bool("LEAPFLOW_VLM_COMPRESSION_ENABLED", "true")
+    vlm_compression_max_resolution = int(
+        os.getenv("LEAPFLOW_VLM_COMPRESSION_MAX_RESOLUTION", "1024")
+    )
+    vlm_compression_quality = int(os.getenv("LEAPFLOW_VLM_COMPRESSION_QUALITY", "75"))
+    vlm_compression_adaptive = _bool("LEAPFLOW_VLM_COMPRESSION_ADAPTIVE", "true")
+
+    # VLM Optimization – P4: Frame Tiling
+    vlm_tiling_enabled = _bool("LEAPFLOW_VLM_TILING_ENABLED", "true")
+    vlm_tiling_max_frames = int(os.getenv("LEAPFLOW_VLM_TILING_MAX_FRAMES", "4"))
+    vlm_tiling_tile_size = int(os.getenv("LEAPFLOW_VLM_TILING_TILE_SIZE", "384"))
+    vlm_tiling_gap = int(os.getenv("LEAPFLOW_VLM_TILING_GAP", "4"))
+
+    # Perception Depth
+    text_capture_enabled = _bool("LEAPFLOW_TEXT_CAPTURE_ENABLED", "true")
+    text_capture_exclude_apps_raw = os.getenv("LEAPFLOW_TEXT_CAPTURE_EXCLUDE_APPS", "").strip()
+    text_capture_exclude_apps = (
+        tuple(b.strip() for b in text_capture_exclude_apps_raw.split(",") if b.strip())
+        if text_capture_exclude_apps_raw
+        else ()
+    )
+    text_capture_secure_roles_raw = os.getenv(
+        "LEAPFLOW_TEXT_CAPTURE_SECURE_ROLES", "AXSecureTextField"
+    ).strip()
+    text_capture_secure_roles = tuple(
+        r.strip() for r in text_capture_secure_roles_raw.split(",") if r.strip()
+    )
+    text_capture_max_length = int(os.getenv("LEAPFLOW_TEXT_CAPTURE_MAX_LENGTH", "500"))
+    clipboard_max_length = int(os.getenv("LEAPFLOW_CLIPBOARD_MAX_LENGTH", "1024"))
+
+    # Perceptual Field
+    perceptual_field_enabled = _bool("LEAPFLOW_PERCEPTUAL_FIELD_ENABLED", "false")
+    perceptual_field_config = os.getenv(
+        "LEAPFLOW_PERCEPTUAL_FIELD_CONFIG",
+        str(profile_layout.config_dir / "perceptual_fields.yaml"),
+    ).strip()
+
+    # Context Learning Attention
+    attention_foreground_gate = _bool("LEAPFLOW_ATTENTION_FOREGROUND_GATE", "true")
+    attention_noise_patterns_raw = os.getenv("LEAPFLOW_ATTENTION_NOISE_PATTERNS", "").strip()
+    attention_noise_patterns = (
+        tuple(p.strip() for p in attention_noise_patterns_raw.split(",") if p.strip())
+        if attention_noise_patterns_raw
+        else ()
+    )
+    attention_goal_relevance_threshold = float(
+        os.getenv("LEAPFLOW_ATTENTION_GOAL_RELEVANCE_THRESHOLD", "0.1")
+    )
+    attention_working_dir_inference = _bool("LEAPFLOW_ATTENTION_WORKING_DIR_INFERENCE", "true")
+    attention_domain_whitelist = _bool("LEAPFLOW_ATTENTION_DOMAIN_WHITELIST", "true")
+
+    # Recording Mode
+    recording_mode = RecordingMode.from_str(os.getenv("LEAPFLOW_RECORDING_MODE", "default"))
+
+    # Causal Inference
+    causal_reorder_window_ms = float(os.getenv("LEAPFLOW_CAUSAL_REORDER_WINDOW_MS", "300"))
+    causal_burst_limit = int(os.getenv("LEAPFLOW_CAUSAL_BURST_LIMIT", "50"))
+    causal_max_chain_events = int(os.getenv("LEAPFLOW_CAUSAL_MAX_CHAIN_EVENTS", "20"))
+    heuristic_time_decay_s = float(os.getenv("LEAPFLOW_HEURISTIC_TIME_DECAY_S", "0.5"))
+    heuristic_space_decay_px = float(os.getenv("LEAPFLOW_HEURISTIC_SPACE_DECAY_PX", "200.0"))
+
+    # World Model
+    prediction_enabled = _bool("LEAPFLOW_PREDICTION_ENABLED", "true")
+    prediction_delta_threshold = float(os.getenv("LEAPFLOW_PREDICTION_DELTA_THRESHOLD", "0.3"))
+    curiosity_alpha = float(os.getenv("LEAPFLOW_CURIOSITY_ALPHA", "0.4"))
+    curiosity_beta = float(os.getenv("LEAPFLOW_CURIOSITY_BETA", "0.3"))
+    curiosity_gamma = float(os.getenv("LEAPFLOW_CURIOSITY_GAMMA", "0.3"))
+    curiosity_auto_balance = _bool("LEAPFLOW_CURIOSITY_AUTO_BALANCE", "true")
+    prediction_budget = int(os.getenv("LEAPFLOW_PREDICTION_BUDGET", "50"))
+    comparison_budget = int(os.getenv("LEAPFLOW_COMPARISON_BUDGET", "20"))
+    replay_budget = int(os.getenv("LEAPFLOW_REPLAY_BUDGET", "3"))
+    grading_budget = int(os.getenv("LEAPFLOW_GRADING_BUDGET", "5"))
+    distillation_budget = int(os.getenv("LEAPFLOW_DISTILLATION_BUDGET", "2"))
+    evolution_enabled = _bool("LEAPFLOW_EVOLUTION_ENABLED", "false")
+    accepted_evidence_kinds = tuple(
+        kind.strip()
+        for kind in os.getenv("LEAPFLOW_ACCEPTED_EVIDENCE_KINDS", "").split(",")
+        if kind.strip()
+    )
+    evolution_authorising_origins = tuple(
+        origin.strip()
+        for origin in os.getenv("LEAPFLOW_EVOLUTION_AUTHORISING_ORIGINS", "").split(",")
+        if origin.strip()
+    )
+    evolution_teacher_poll_interval_s = float(
+        os.getenv("LEAPFLOW_EVOLUTION_TEACHER_POLL_INTERVAL_S", "1.0")
+    )
+    evolution_teacher_lease_s = float(os.getenv("LEAPFLOW_EVOLUTION_TEACHER_LEASE_S", "120.0"))
+    evolution_teacher_timeout_s = float(os.getenv("LEAPFLOW_EVOLUTION_TEACHER_TIMEOUT_S", "180.0"))
+    evolution_teacher_max_attempts = int(os.getenv("LEAPFLOW_EVOLUTION_TEACHER_MAX_ATTEMPTS", "3"))
+    evolution_teacher_retry_backoff_s = float(
+        os.getenv("LEAPFLOW_EVOLUTION_TEACHER_RETRY_BACKOFF_S", "5.0")
+    )
+    evolution_autonomy_level = os.getenv(
+        "LEAPFLOW_EVOLUTION_AUTONOMY_LEVEL", "generate_only"
+    ).strip()
+    proposal_ttl_hours = int(os.getenv("LEAPFLOW_PROPOSAL_TTL_HOURS", "72"))
+    environment_mode = os.getenv("LEAPFLOW_ENVIRONMENT_MODE", "production").strip().lower()
+    environment_leapspace_enabled = _bool("LEAPFLOW_ENVIRONMENT_LEAPSPACE_ENABLED", "false")
+    environment_leapspace_state_root = os.getenv(
+        "LEAPFLOW_ENVIRONMENT_LEAPSPACE_STATE_ROOT", ""
+    ).strip()
+    environment_leapspace_session_id = os.getenv(
+        "LEAPFLOW_ENVIRONMENT_LEAPSPACE_SESSION_ID", ""
+    ).strip()
+    environment_leapspace_poll_interval_s = float(
+        os.getenv("LEAPFLOW_ENVIRONMENT_LEAPSPACE_POLL_INTERVAL_S", "0.5")
+    )
+    selection_policy = os.getenv("LEAPFLOW_SELECTION_POLICY", "greedy").strip() or "greedy"
+    replay_on_session_end = _bool("LEAPFLOW_REPLAY_ON_SESSION_END", "true")
+    distilled_knowledge_ttl_s = float(os.getenv("LEAPFLOW_DISTILLED_KNOWLEDGE_TTL_S", "604800"))
+    distilled_knowledge_limit = int(os.getenv("LEAPFLOW_DISTILLED_KNOWLEDGE_LIMIT", "12"))
+    prediction_structural_blend = float(os.getenv("LEAPFLOW_PREDICTION_STRUCTURAL_BLEND", "0.4"))
+    prediction_semantic_blend = float(os.getenv("LEAPFLOW_PREDICTION_SEMANTIC_BLEND", "0.6"))
+    prediction_semantic_threshold = float(
+        os.getenv("LEAPFLOW_PREDICTION_SEMANTIC_THRESHOLD", "0.1")
+    )
+    prediction_rag_advantage_floor = float(
+        os.getenv("LEAPFLOW_PREDICTION_RAG_ADVANTAGE_FLOOR", "-0.3")
+    )
+    prediction_failure_advantage = float(os.getenv("LEAPFLOW_PREDICTION_FAILURE_ADVANTAGE", "-0.5"))
+    replay_regression_sample_size = int(os.getenv("LEAPFLOW_REPLAY_REGRESSION_SAMPLE_SIZE", "200"))
+    memory_prune_age_days = float(os.getenv("LEAPFLOW_MEMORY_PRUNE_AGE_DAYS", "90.0"))
+    semantic_embedding_provider = os.getenv("LEAPFLOW_SEMANTIC_EMBEDDING_PROVIDER", "tfidf")
+    semantic_rerank_weight = float(os.getenv("LEAPFLOW_SEMANTIC_RERANK_WEIGHT", "0.4"))
+    budget_discovery_baseline = int(os.getenv("LEAPFLOW_BUDGET_DISCOVERY_BASELINE", "2"))
+    budget_regression_baseline = int(os.getenv("LEAPFLOW_BUDGET_REGRESSION_BASELINE", "1"))
+    ast_precheck_enabled = _bool("LEAPFLOW_AST_PRECHECK_ENABLED", "true")
+    causal_window_s = float(os.getenv("LEAPFLOW_CAUSAL_WINDOW_S", "3.0"))
+    causal_app_window_overrides: dict = {}
+    _raw_overrides = os.getenv("LEAPFLOW_CAUSAL_APP_WINDOW_OVERRIDES", "")
+    if _raw_overrides:
+        import json as _json
+
+        try:
+            causal_app_window_overrides = {
+                str(k): float(v) for k, v in _json.loads(_raw_overrides).items()
+            }
+        except Exception:
+            logger.warning("Invalid LEAPFLOW_CAUSAL_APP_WINDOW_OVERRIDES: %s", _raw_overrides)
+    causal_tier3_enabled = os.getenv("LEAPFLOW_CAUSAL_TIER3_ENABLED", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    causal_tier3_confidence_threshold = float(
+        os.getenv("LEAPFLOW_CAUSAL_TIER3_CONFIDENCE_THRESHOLD", "0.7")
+    )
+    mhms_fusion_enabled = os.getenv("LEAPFLOW_MHMS_FUSION_ENABLED", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    # Attention learning feedback
+    attention_curiosity_expand_threshold = float(
+        os.getenv("LEAPFLOW_ATTENTION_CURIOSITY_EXPAND_THRESHOLD", "0.7")
+    )
+    attention_accuracy_contract_threshold = float(
+        os.getenv("LEAPFLOW_ATTENTION_ACCURACY_CONTRACT_THRESHOLD", "0.1")
+    )
+    # Surprise detection
+    surprise_enabled = _bool("LEAPFLOW_SURPRISE_ENABLED", "true")
+    surprise_stat_weight = float(os.getenv("LEAPFLOW_SURPRISE_STAT_WEIGHT", "0.4"))
+    surprise_temporal_weight = float(os.getenv("LEAPFLOW_SURPRISE_TEMPORAL_WEIGHT", "0.3"))
+    surprise_pattern_weight = float(os.getenv("LEAPFLOW_SURPRISE_PATTERN_WEIGHT", "0.3"))
+    surprise_annotation_threshold = float(
+        os.getenv("LEAPFLOW_SURPRISE_ANNOTATION_THRESHOLD", "0.5")
+    )
+    surprise_warmup_events = int(os.getenv("LEAPFLOW_SURPRISE_WARMUP_EVENTS", "50"))
+
+    # Video Recording
+    video_fps = int(os.getenv("LEAPFLOW_VIDEO_FPS", "5"))
+    video_resolution_scale = float(os.getenv("LEAPFLOW_VIDEO_RESOLUTION_SCALE", "0.75"))
+    video_codec = os.getenv("LEAPFLOW_VIDEO_CODEC", "h264").strip()
+    video_max_segment_s = int(os.getenv("LEAPFLOW_VIDEO_MAX_SEGMENT_S", "600"))
+    video_cache_dir = os.getenv(
+        "LEAPFLOW_VIDEO_CACHE_DIR",
+        str(
+            profile_layout.cache.category_dir(
+                scope="workspace", category="video", workspace_id=workspace_id
+            )
+        ),
+    ).strip()
+    video_cache_max_age_days = int(os.getenv("LEAPFLOW_VIDEO_CACHE_MAX_AGE_DAYS", "7"))
+    video_cache_max_size_gb = float(os.getenv("LEAPFLOW_VIDEO_CACHE_MAX_SIZE_GB", "5.0"))
+    video_l2_enabled = _bool("LEAPFLOW_VIDEO_L2_ENABLED", "true")
+    video_l3_enabled = _bool("LEAPFLOW_VIDEO_L3_ENABLED", "true")
+    video_segmenter_min_s = float(os.getenv("LEAPFLOW_VIDEO_SEGMENTER_MIN_S", "30"))
+    video_segmenter_max_s = float(os.getenv("LEAPFLOW_VIDEO_SEGMENTER_MAX_S", "600"))
+    video_segmenter_idle_gap_s = float(os.getenv("LEAPFLOW_VIDEO_SEGMENTER_IDLE_GAP_S", "15"))
+    video_segmenter_app_gap_s = float(os.getenv("LEAPFLOW_VIDEO_SEGMENTER_APP_GAP_S", "5"))
+    video_segmenter_min_split_s = float(os.getenv("LEAPFLOW_VIDEO_SEGMENTER_MIN_SPLIT_S", "1.0"))
+    video_max_l2_requests = int(os.getenv("LEAPFLOW_VIDEO_MAX_L2_REQUESTS", "10"))
+    video_max_l3_requests = int(os.getenv("LEAPFLOW_VIDEO_MAX_L3_REQUESTS", "5"))
+    video_start_timeout_s = float(os.getenv("LEAPFLOW_VIDEO_START_TIMEOUT_S", "10.0"))
+    video_vlm_max_retries = int(os.getenv("LEAPFLOW_VIDEO_VLM_MAX_RETRIES", "2"))
+    video_vlm_retry_backoff_s = float(os.getenv("LEAPFLOW_VIDEO_VLM_RETRY_BACKOFF_S", "1.0"))
+    video_vlm_url_scheme = os.getenv("LEAPFLOW_VIDEO_VLM_URL_SCHEME", "base64").strip()
+    video_l2_time_window_s = float(os.environ.get("LEAPFLOW_VIDEO_L2_TIME_WINDOW_S", "2.0"))
+    video_timeline_max_markers = int(os.getenv("LEAPFLOW_VIDEO_TIMELINE_MAX_MARKERS", "5000"))
+    video_timeline_compress_max = int(os.getenv("LEAPFLOW_VIDEO_TIMELINE_COMPRESS_MAX", "200"))
+    video_timeline_merge_channels = os.getenv(
+        "LEAPFLOW_VIDEO_TIMELINE_MERGE_CHANNELS", "keyboard,scroll"
+    ).strip()
+
+    # Learnability Assessment
+    learnability_enabled = _bool("LEAPFLOW_LEARNABILITY_ENABLED", "true")
+    learnability_min_steps = int(os.getenv("LEAPFLOW_LEARNABILITY_MIN_STEPS", "3"))
+    learnability_min_duration_s = float(os.getenv("LEAPFLOW_LEARNABILITY_MIN_DURATION_S", "5.0"))
+    learnability_max_idle_ratio = float(os.getenv("LEAPFLOW_LEARNABILITY_MAX_IDLE_RATIO", "0.80"))
+    learnability_min_action_diversity = int(
+        os.getenv("LEAPFLOW_LEARNABILITY_MIN_ACTION_DIVERSITY", "2")
+    )
+    learnability_learn_threshold = float(os.getenv("LEAPFLOW_LEARNABILITY_LEARN_THRESHOLD", "0.65"))
+    learnability_ask_threshold = float(os.getenv("LEAPFLOW_LEARNABILITY_ASK_THRESHOLD", "0.40"))
+    learnability_vlm_enabled = _bool("LEAPFLOW_LEARNABILITY_VLM_ENABLED", "true")
+    learnability_llm_enabled = _bool("LEAPFLOW_LEARNABILITY_LLM_ENABLED", "true")
+    learnability_rule_weight = float(os.getenv("LEAPFLOW_LEARNABILITY_RULE_WEIGHT", "0.4"))
+    learnability_vlm_weight = float(os.getenv("LEAPFLOW_LEARNABILITY_VLM_WEIGHT", "0.3"))
+    learnability_llm_weight = float(os.getenv("LEAPFLOW_LEARNABILITY_LLM_WEIGHT", "0.3"))
+
+    # Execution Loop Budget
+    react_max_iterations = int(os.getenv("LEAPFLOW_REACT_MAX_ITERATIONS", "20"))
+    react_soft_limit = int(os.getenv("LEAPFLOW_REACT_SOFT_LIMIT", "14"))
+    react_warning_threshold = int(os.getenv("LEAPFLOW_REACT_WARNING_THRESHOLD", "10"))
+    agent_iter_floor = int(os.getenv("LEAPFLOW_AGENT_ITER_FLOOR", "12"))
+    agent_iter_ceiling = int(os.getenv("LEAPFLOW_AGENT_ITER_CEILING", "200"))
+    agent_budget_scale_k = float(os.getenv("LEAPFLOW_AGENT_BUDGET_SCALE_K", "1.0"))
+    agent_iter_hard_cap = int(os.getenv("LEAPFLOW_AGENT_ITER_HARD_CAP", "500"))
+    agent_iter_extension_step = int(os.getenv("LEAPFLOW_AGENT_ITER_EXTENSION_STEP", "25"))
+    agent_stall_rounds = int(os.getenv("LEAPFLOW_AGENT_STALL_ROUNDS", "6"))
+    agent_checkpoint_interval = int(os.getenv("LEAPFLOW_AGENT_CHECKPOINT_INTERVAL", "15"))
+    agent_cost_ceiling_context_multiple = float(
+        os.getenv("LEAPFLOW_AGENT_COST_CEILING_CONTEXT_MULTIPLE", "0.0")
+    )
+    agent_subagent_max_depth = int(os.getenv("LEAPFLOW_AGENT_SUBAGENT_MAX_DEPTH", "2"))
+    agent_subagent_max_concurrent = int(os.getenv("LEAPFLOW_AGENT_SUBAGENT_MAX_CONCURRENT", "3"))
+    agent_subagent_max_iterations = int(os.getenv("LEAPFLOW_AGENT_SUBAGENT_MAX_ITERATIONS", "15"))
+    agent_max_parallel_tools = int(os.getenv("LEAPFLOW_AGENT_MAX_PARALLEL_TOOLS", "8"))
+    agent_tool_images_kept = max(0, int(os.getenv("LEAPFLOW_AGENT_TOOL_IMAGES_KEPT", "2")))
+    agent_subagent_full_loop = os.getenv(
+        "LEAPFLOW_AGENT_SUBAGENT_FULL_LOOP", "0"
+    ).strip().lower() in ("1", "true", "yes")
+    agent_calibration_enabled = os.getenv(
+        "LEAPFLOW_AGENT_CALIBRATION_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes")
+    agent_calibration_min_confidence = float(
+        os.getenv("LEAPFLOW_AGENT_CALIBRATION_MIN_CONFIDENCE", "0.3")
+    )
+    agent_calibration_interval_turns = int(
+        os.getenv("LEAPFLOW_AGENT_CALIBRATION_INTERVAL_TURNS", "0")
+    )
+    agent_calibration_difficulty_min_k = float(
+        os.getenv("LEAPFLOW_AGENT_CALIBRATION_DIFFICULTY_MIN_K", "0.25")
+    )
+    agent_calibration_difficulty_max_k = float(
+        os.getenv("LEAPFLOW_AGENT_CALIBRATION_DIFFICULTY_MAX_K", "3.0")
+    )
+    agent_calibration_finalizing_min_ratio = float(
+        os.getenv("LEAPFLOW_AGENT_CALIBRATION_FINALIZING_MIN_RATIO", "0.6")
+    )
+    agent_calibration_finalizing_max_ratio = float(
+        os.getenv("LEAPFLOW_AGENT_CALIBRATION_FINALIZING_MAX_RATIO", "0.98")
+    )
+    agent_compression_writeback = os.getenv(
+        "LEAPFLOW_AGENT_COMPRESSION_WRITEBACK", "0"
+    ).strip().lower() in ("1", "true", "yes")
+    agent_reentry_enabled = os.getenv("LEAPFLOW_AGENT_REENTRY_ENABLED", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    agent_reentry_hardware_enabled = os.getenv(
+        "LEAPFLOW_AGENT_REENTRY_HARDWARE_ENABLED", "0"
+    ).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    agent_reentry_tick_seconds = float(os.getenv("LEAPFLOW_AGENT_REENTRY_TICK_SECONDS", "30"))
+    agent_reentry_global_budget = int(os.getenv("LEAPFLOW_AGENT_REENTRY_GLOBAL_BUDGET", "100"))
+    agent_reentry_send_enabled = os.getenv(
+        "LEAPFLOW_AGENT_REENTRY_SEND_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes")
+    agent_reentry_send_rate_per_hour = int(
+        os.getenv("LEAPFLOW_AGENT_REENTRY_SEND_RATE_PER_HOUR", "4")
+    )
+    agent_reentry_send_global_budget = int(
+        os.getenv("LEAPFLOW_AGENT_REENTRY_SEND_GLOBAL_BUDGET", "50")
+    )
+    agent_reentry_send_verified_at = int(os.getenv("LEAPFLOW_AGENT_REENTRY_SEND_VERIFIED_AT", "3"))
+    tool_max_iterations = int(os.getenv("LEAPFLOW_TOOL_MAX_ITERATIONS", "30"))
+    native_tool_calling_enabled = os.getenv(
+        "LEAPFLOW_NATIVE_TOOL_CALLING_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes")
+    stream_output = os.getenv("LEAPFLOW_STREAM_OUTPUT", "1").strip().lower() in ("1", "true", "yes")
+    verbose_progress = os.getenv("LEAPFLOW_VERBOSE_PROGRESS", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+    # Context Compression
+    compress_threshold = int(os.getenv("LEAPFLOW_COMPRESS_THRESHOLD", "16"))
+    compress_keep_tail = int(os.getenv("LEAPFLOW_COMPRESS_KEEP_TAIL", "4"))
+    max_tool_output_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_OUTPUT_CHARS", "3000"))
+    max_tool_result_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_RESULT_CHARS", "3000"))
+    tools_ripgrep_autoinstall = os.getenv(
+        "LEAPFLOW_TOOLS_RIPGREP_AUTOINSTALL", "1"
+    ).strip().lower() in ("1", "true", "yes")
+    tools_test_command = os.getenv("LEAPFLOW_TOOLS_TEST_COMMAND", "").strip()
+    tools_lint_command = os.getenv("LEAPFLOW_TOOLS_LINT_COMMAND", "").strip()
+    tools_terminal_session_enabled = os.getenv(
+        "LEAPFLOW_TOOLS_TERMINAL_SESSION_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes")
+    tools_verify_edits = os.getenv("LEAPFLOW_TOOLS_VERIFY_EDITS", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    plugin_sandbox_invoke_timeout_s = float(
+        os.getenv("LEAPFLOW_PLUGIN_SANDBOX_INVOKE_TIMEOUT_S", "15")
+    )
+    plugin_sandbox_shutdown_timeout_s = float(
+        os.getenv("LEAPFLOW_PLUGIN_SANDBOX_SHUTDOWN_TIMEOUT_S", "3")
+    )
+    plugin_sandbox_cpu_time_s = int(os.getenv("LEAPFLOW_PLUGIN_SANDBOX_CPU_TIME_S", "30"))
+    plugin_sandbox_max_memory_mb = int(os.getenv("LEAPFLOW_PLUGIN_SANDBOX_MAX_MEMORY_MB", "0"))
+    plugins_dsh_invoke_timeout_s = float(os.getenv("LEAPFLOW_PLUGINS_DSH_INVOKE_TIMEOUT_S", "30"))
+    plugins_dsh_discovery_timeout_s = float(
+        os.getenv("LEAPFLOW_PLUGINS_DSH_DISCOVERY_TIMEOUT_S", "10")
+    )
+    plugins_dsh_max_message_bytes = int(
+        os.getenv("LEAPFLOW_PLUGINS_DSH_MAX_MESSAGE_BYTES", "1000000")
+    )
+    plugins_dsh_max_stderr_bytes = int(os.getenv("LEAPFLOW_PLUGINS_DSH_MAX_STDERR_BYTES", "64000"))
+    plugins_dsh_max_memory_mb = int(os.getenv("LEAPFLOW_PLUGINS_DSH_MAX_MEMORY_MB", "128"))
+    mcp_approval_mode = (
+        os.getenv("LEAPFLOW_MCP_APPROVAL_MODE", "mutating_only").strip().lower() or "mutating_only"
+    )
+    if mcp_approval_mode not in ("mutating_only", "always", "off"):
+        logger.warning(
+            "Unknown mcp.approval_mode %r; falling back to mutating_only", mcp_approval_mode
+        )
+        mcp_approval_mode = "mutating_only"
+    hardware_enabled = os.getenv("LEAPFLOW_HARDWARE_ENABLED", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    hardware_providers = os.getenv("LEAPFLOW_HARDWARE_PROVIDERS", "").strip()
+    hardware_devices_dir = os.getenv("LEAPFLOW_HARDWARE_DEVICES_DIR", "").strip()
+    hardware_max_devices = int(os.getenv("LEAPFLOW_HARDWARE_MAX_DEVICES", "16"))
+    hardware_unverified_policy = (
+        os.getenv("LEAPFLOW_HARDWARE_UNVERIFIED_POLICY", "deny_write").strip().lower()
+        or "deny_write"
+    )
+    hardware_require_describe = os.getenv(
+        "LEAPFLOW_HARDWARE_REQUIRE_DESCRIBE", "1"
+    ).strip().lower() in ("1", "true", "yes")
+    hardware_envelope_grant = os.getenv(
+        "LEAPFLOW_HARDWARE_ENVELOPE_GRANT", "1"
+    ).strip().lower() in ("1", "true", "yes")
+    hardware_trust_skip_enabled = os.getenv(
+        "LEAPFLOW_HARDWARE_TRUST_SKIP_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes")
+    hardware_write_verification_follow_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_WRITE_VERIFICATION_FOLLOW_S", "10") or 10.0
+    )
+    hardware_stream_enabled = os.getenv(
+        "LEAPFLOW_HARDWARE_STREAM_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes")
+    hardware_stream_ring_capacity = int(os.getenv("LEAPFLOW_HARDWARE_STREAM_RING_CAPACITY", "4096"))
+    hardware_persist_readings = os.getenv(
+        "LEAPFLOW_HARDWARE_PERSIST_READINGS", "1"
+    ).strip().lower() in ("1", "true", "yes")
+    hardware_downsample_interval_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_DOWNSAMPLE_INTERVAL_S", "60")
+    )
+    hardware_raw_retention_days = float(os.getenv("LEAPFLOW_HARDWARE_RAW_RETENTION_DAYS", "7"))
+    hardware_history_retention_days = float(
+        os.getenv("LEAPFLOW_HARDWARE_HISTORY_RETENTION_DAYS", "90")
+    )
+    hardware_raw_segment_mb = float(os.getenv("LEAPFLOW_HARDWARE_RAW_SEGMENT_MB", "32"))
+    hardware_reading_store_sensitive = os.getenv(
+        "LEAPFLOW_HARDWARE_READING_STORE_SENSITIVE", "1"
+    ).strip().lower() in ("1", "true", "yes")
+    hardware_host_interval_s = float(os.getenv("LEAPFLOW_HARDWARE_HOST_INTERVAL_S", "0") or 0.0)
+    hardware_host_include = os.getenv("LEAPFLOW_HARDWARE_HOST_INCLUDE", "").strip()
+    hardware_host_exclude = os.getenv("LEAPFLOW_HARDWARE_HOST_EXCLUDE", "").strip()
+    hardware_rediscover_interval_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_REDISCOVER_INTERVAL_S", "0") or 0.0
+    )
+    hardware_media_screens = os.getenv("LEAPFLOW_HARDWARE_MEDIA_SCREENS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    hardware_media_microphones = os.getenv(
+        "LEAPFLOW_HARDWARE_MEDIA_MICROPHONES", "1"
+    ).strip().lower() in ("1", "true", "yes")
+    hardware_media_exclude_usb = os.getenv("LEAPFLOW_HARDWARE_MEDIA_EXCLUDE_USB", "").strip()
+    hardware_preview_max_fps = float(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_FPS", "30") or 30.0)
+    hardware_preview_max_width = int(
+        os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_WIDTH", "1280") or 1280
+    )
+    hardware_preview_quality = int(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_QUALITY", "85") or 85)
+    hardware_preview_idle_timeout_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_PREVIEW_IDLE_TIMEOUT_S", "5") or 5.0
+    )
+    # Typed fleet-node JSON. Read here so `leap config set hardware.fleet_nodes`
+    # (which persists into runtime.yaml) actually reaches Settings; the legacy
+    # LEAPFLOW_FLEET_NODES fallback is applied later, in fleet_config.
+    hardware_fleet_nodes = os.getenv("LEAPFLOW_HARDWARE_FLEET_NODES", "").strip()
+    hardware_alert_policies = os.getenv("LEAPFLOW_HARDWARE_ALERT_POLICIES", "").strip()
+    hardware_skills_enabled = os.getenv("LEAPFLOW_HARDWARE_SKILLS_ENABLED", "").strip()
+    hardware_skills_speed_pct_max = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_SPEED_PCT_MAX", "30") or 30.0
+    )
+    hardware_skills_max_duration_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_MAX_DURATION_S", "120") or 120.0
+    )
+    hardware_skills_plan_ttl_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_PLAN_TTL_S", "300") or 300.0
+    )
+    hardware_skills_halt_timeout_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_HALT_TIMEOUT_S", "2") or 2.0
+    )
+    hardware_skills_stop_grace_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_STOP_GRACE_S", "1") or 1.0
+    )
+    hardware_skills_dispatch_settle_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_DISPATCH_SETTLE_S", "2") or 2.0
+    )
+    hardware_skills_episode_fps = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_EPISODE_FPS", "30") or 30.0
+    )
+    hardware_skills_episode_min_free_mb = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_EPISODE_MIN_FREE_MB", "2048") or 2048.0
+    )
+    hardware_share_frames = os.getenv("LEAPFLOW_HARDWARE_SHARE_FRAMES", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    web_transport = os.getenv("LEAPFLOW_WEB_TRANSPORT", "auto").strip().lower() or "auto"
+    web_timeout_s = float(os.getenv("LEAPFLOW_WEB_TIMEOUT_S", "20"))
+    web_max_bytes = int(os.getenv("LEAPFLOW_WEB_MAX_BYTES", "2000000"))
+    web_max_retries = int(os.getenv("LEAPFLOW_WEB_MAX_RETRIES", "2"))
+    web_max_redirects = int(os.getenv("LEAPFLOW_WEB_MAX_REDIRECTS", "5"))
+    web_user_agent = os.getenv("LEAPFLOW_WEB_USER_AGENT", "").strip()
+    web_extractor = os.getenv("LEAPFLOW_WEB_EXTRACTOR", "auto").strip().lower() or "auto"
+    web_private_targets = (
+        os.getenv("LEAPFLOW_WEB_PRIVATE_TARGETS", "approval").strip().lower() or "approval"
+    )
+    web_cache_ttl_s = float(os.getenv("LEAPFLOW_WEB_CACHE_TTL_S", "900"))
+    agent_validate_tool_args = os.getenv(
+        "LEAPFLOW_AGENT_VALIDATE_TOOL_ARGS", "1"
+    ).strip().lower() in ("1", "true", "yes")
+    context_hard_limit_ratio = float(os.getenv("LEAPFLOW_CONTEXT_HARD_LIMIT_RATIO", "0.92"))
+    context_warning_ratio = float(os.getenv("LEAPFLOW_CONTEXT_WARNING_RATIO", "0.75"))
+    tool_evidence_max_chars = int(os.getenv("LEAPFLOW_TOOL_EVIDENCE_MAX_CHARS", "4000"))
+    repeated_read_limit = int(os.getenv("LEAPFLOW_REPEATED_READ_LIMIT", "2"))
+    long_task_convergence_round = int(os.getenv("LEAPFLOW_LONG_TASK_CONVERGENCE_ROUND", "12"))
+    convergence_round_ceiling = int(os.getenv("LEAPFLOW_CONVERGENCE_ROUND_CEILING", "40"))
+    convergence_scale = float(os.getenv("LEAPFLOW_CONVERGENCE_SCALE", "2.0"))
+    max_shell_timeout_s = float(os.getenv("LEAPFLOW_MAX_SHELL_TIMEOUT_S", "300.0"))
+    context_expanded_ratio = float(os.getenv("LEAPFLOW_CONTEXT_EXPANDED_RATIO", "0.60"))
+    context_finalizing_ratio = float(os.getenv("LEAPFLOW_CONTEXT_FINALIZING_RATIO", "0.90"))
+    context_expanded_evidence_threshold = int(
+        os.getenv("LEAPFLOW_CONTEXT_EXPANDED_EVIDENCE_THRESHOLD", "2")
+    )
+    context_expanded_tool_call_threshold = int(
+        os.getenv("LEAPFLOW_CONTEXT_EXPANDED_TOOL_CALL_THRESHOLD", "3")
+    )
+    context_research_source_threshold = int(
+        os.getenv("LEAPFLOW_CONTEXT_RESEARCH_SOURCE_THRESHOLD", "3")
+    )
+    context_research_evidence_threshold = int(
+        os.getenv("LEAPFLOW_CONTEXT_RESEARCH_EVIDENCE_THRESHOLD", "5")
+    )
+
+    # Error Recovery
+    error_transient_max_retries = int(os.getenv("LEAPFLOW_ERROR_TRANSIENT_MAX_RETRIES", "3"))
+    error_rate_limit_base_delay = float(os.getenv("LEAPFLOW_ERROR_RATE_LIMIT_BASE_DELAY", "5.0"))
+    max_consecutive_tool_failures = int(os.getenv("LEAPFLOW_MAX_CONSECUTIVE_TOOL_FAILURES", "3"))
+    recovery_turn_deadline_s = float(os.getenv("LEAPFLOW_RECOVERY_TURN_DEADLINE_S", "0"))
+    recovery_total_actions = int(os.getenv("LEAPFLOW_RECOVERY_TOTAL_ACTIONS", "24"))
+    recovery_max_retry_per_category = int(
+        os.getenv("LEAPFLOW_RECOVERY_MAX_RETRY_PER_CATEGORY", "4")
+    )
+    guardrail_enabled = os.getenv("LEAPFLOW_GUARDRAIL_ENABLED", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    approval_bypass = os.getenv("LEAPFLOW_APPROVAL_BYPASS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    guardrail_max_repeats = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_REPEATS", "3"))
+    guardrail_max_consecutive_same = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_CONSECUTIVE_SAME", "8"))
+    guardrail_stagnation_window = int(os.getenv("LEAPFLOW_GUARDRAIL_STAGNATION_WINDOW", "10"))
+    guardrail_min_success_rate = float(os.getenv("LEAPFLOW_GUARDRAIL_MIN_SUCCESS_RATE", "0.2"))
+    guardrail_max_calls_per_turn = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_CALLS_PER_TURN", "50"))
+
+    # Session Persistence
+    session_persistence_enabled = _bool("LEAPFLOW_SESSION_PERSISTENCE_ENABLED", "true")
+    session_resume_cache_policy = os.getenv(
+        "LEAPFLOW_SESSION_RESUME_CACHE_POLICY", "cache_priority"
+    ).strip()
+
+    # Compression Provider (PCD Cache-Aware)
+    compression_provider = os.getenv("LEAPFLOW_COMPRESSION_PROVIDER", "").strip()
+    compression_model = os.getenv("LEAPFLOW_COMPRESSION_MODEL", "").strip()
+    compression_api_key = os.getenv("LEAPFLOW_COMPRESSION_API_KEY", "").strip()
+    compression_base_url = os.getenv("LEAPFLOW_COMPRESSION_BASE_URL", "").strip()
+    compression_protect_first_n = int(os.getenv("LEAPFLOW_COMPRESSION_PROTECT_FIRST_N", "3"))
+    compression_keep_recent_n = int(os.getenv("LEAPFLOW_COMPRESSION_KEEP_RECENT_N", "6"))
+
+    # File Checkpoint Rollback
+    checkpoint_file_rollback_enabled = _bool("LEAPFLOW_CHECKPOINT_FILE_ROLLBACK_ENABLED", "true")
+    checkpoint_max_inline_bytes = int(os.getenv("LEAPFLOW_CHECKPOINT_MAX_INLINE_BYTES", "262144"))
+    checkpoint_ttl_hours = int(os.getenv("LEAPFLOW_CHECKPOINT_TTL_HOURS", "24"))
+
+    # Multi-Provider LLM
+    llm_fallback_providers = os.getenv("LEAPFLOW_LLM_FALLBACK_PROVIDERS", "").strip()
+    llm_aux_model = os.getenv("LEAPFLOW_LLM_AUX_MODEL", "").strip()
+    llm_aux_api_key = os.getenv("LEAPFLOW_LLM_AUX_API_KEY", "").strip()
+    llm_aux_base_url = os.getenv("LEAPFLOW_LLM_AUX_BASE_URL", "").strip()
+    llm_context_length = int(
+        os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", str(DEFAULT_LLM_CONTEXT_LENGTH))
+    )
+    llm_credential_cooldown_s = float(os.getenv("LEAPFLOW_LLM_CREDENTIAL_COOLDOWN_S", "60.0"))
+
+    # Benchmark Qualification
+    benchmark_commands = os.getenv("LEAPFLOW_BENCHMARK_COMMANDS", "{}").strip() or "{}"
+    benchmark_data_roots = os.getenv("LEAPFLOW_BENCHMARK_DATA_ROOTS", "{}").strip() or "{}"
+    benchmark_license_acceptances = (
+        os.getenv("LEAPFLOW_BENCHMARK_LICENSE_ACCEPTANCES", "{}").strip() or "{}"
+    )
+    benchmark_hardware_profiles = (
+        os.getenv("LEAPFLOW_BENCHMARK_HARDWARE_PROFILES", "{}").strip() or "{}"
+    )
+
+    # Stream & Tool Robustness
+    stale_stream_timeout_s = float(os.getenv("LEAPFLOW_STALE_STREAM_TIMEOUT_S", "180.0"))
+    default_tool_timeout_s = float(os.getenv("LEAPFLOW_DEFAULT_TOOL_TIMEOUT_S", "120.0"))
+    daemon_request_ledger_ttl_s = float(os.getenv("LEAPFLOW_DAEMON_REQUEST_LEDGER_TTL_S", "600.0"))
+    daemon_request_ledger_max_entries = int(
+        os.getenv("LEAPFLOW_DAEMON_REQUEST_LEDGER_MAX_ENTRIES", "128")
+    )
+    daemon_max_concurrent_turns = int(os.getenv("LEAPFLOW_DAEMON_MAX_CONCURRENT_TURNS", "3"))
+    daemon_max_live_sessions = int(os.getenv("LEAPFLOW_DAEMON_MAX_LIVE_SESSIONS", "16"))
+    daemon_session_idle_ttl_s = float(os.getenv("LEAPFLOW_DAEMON_SESSION_IDLE_TTL_S", "1800.0"))
+    daemon_log_level = os.getenv("LEAPFLOW_DAEMON_LOG_LEVEL", "INFO").strip() or "INFO"
+    circuit_breaker_threshold = int(os.getenv("LEAPFLOW_CIRCUIT_BREAKER_THRESHOLD", "5"))
+    circuit_breaker_cooldown_s = float(os.getenv("LEAPFLOW_CIRCUIT_BREAKER_COOLDOWN_S", "60.0"))
+
+    # Signal Fusion
+    # Default = "all": collect every supported channel (V7 full fusion). Set
+    # to "none" or empty list to disable; comma-separated list selects a
+    # specific subset for ablation experiments.
+    signal_channels_raw = os.getenv("LEAPFLOW_SIGNAL_CHANNELS", "all").strip().lower()
+    if signal_channels_raw == "none":
+        signal_channels: frozenset = frozenset()
+    elif signal_channels_raw in ("", "all"):
+        signal_channels = ALL_SIGNAL_CHANNELS
+    else:
+        signal_channels = (
+            frozenset(ch.strip() for ch in signal_channels_raw.split(",") if ch.strip())
+            & ALL_SIGNAL_CHANNELS
+        )
+    signal_reactive_capture = _bool("LEAPFLOW_SIGNAL_REACTIVE_CAPTURE", "false")
+
+    def _tuple_env(key: str, default: tuple) -> tuple:
+        raw = os.getenv(key, ",".join(str(item) for item in default)).strip()
+        return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+    signal_noise_gate_enabled = _bool("LEAPFLOW_SIGNAL_NOISE_GATE_ENABLED", "true")
+    signal_noise_same_source_cooldown_s = float(
+        os.getenv("LEAPFLOW_SIGNAL_NOISE_SAME_SOURCE_COOLDOWN_S", "2.0")
+    )
+    signal_noise_allow_fs_outside_workspace = _bool(
+        "LEAPFLOW_SIGNAL_NOISE_ALLOW_FS_OUTSIDE_WORKSPACE",
+        "false",
+    )
+    signal_noise_path_fragments = _tuple_env(
+        "LEAPFLOW_SIGNAL_NOISE_PATH_FRAGMENTS",
+        Settings.signal_noise_path_fragments,
+    )
+    signal_noise_dir_names = _tuple_env(
+        "LEAPFLOW_SIGNAL_NOISE_DIR_NAMES",
+        Settings.signal_noise_dir_names,
+    )
+    signal_noise_suffixes = _tuple_env(
+        "LEAPFLOW_SIGNAL_NOISE_SUFFIXES",
+        Settings.signal_noise_suffixes,
+    )
+
+    # RPC Transport
+    rpc_timeout_default = float(os.getenv("LEAPFLOW_RPC_TIMEOUT_DEFAULT", "30.0"))
+
+    # Cua Driver
+    use_cua_driver = _bool("LEAPFLOW_USE_CUA_DRIVER", "true")
+    cua_driver_cmd = os.getenv("LEAPFLOW_CUA_DRIVER_CMD", "cua-driver").strip()
+
+    # Workflow Copilot
+    copilot_enabled = _bool("LEAPFLOW_COPILOT_ENABLED", "true")
+    copilot_min_idle_ms = int(os.getenv("LEAPFLOW_COPILOT_MIN_IDLE_MS", "500"))
+    copilot_max_idle_ms = int(os.getenv("LEAPFLOW_COPILOT_MAX_IDLE_MS", "5000"))
+    copilot_cache_ttl_s = float(os.getenv("LEAPFLOW_COPILOT_CACHE_TTL_S", "30.0"))
+    copilot_speculative_cache_size = int(
+        os.getenv("LEAPFLOW_COPILOT_SPECULATIVE_CACHE_SIZE", "100")
+    )
+    copilot_action_ring_size = int(os.getenv("LEAPFLOW_COPILOT_ACTION_RING_SIZE", "10"))
+    copilot_warmup_event_types = os.getenv(
+        "LEAPFLOW_COPILOT_WARMUP_EVENT_TYPES",
+        "app.focus_change,context.change,ui.action",
+    )
+    notification_renderer = os.getenv("LEAPFLOW_NOTIFICATION_RENDERER", "auto")
+
+    live_signal_kinds = os.getenv(
+        "LEAPFLOW_LIVE_SIGNAL_KINDS",
+        "app.focus_change,fs.change,context.change,intent.signal",
+    )
+
+    # Hub (cloud collaboration)
+    hub_type = os.getenv("LEAPFLOW_HUB_TYPE", "modelscope")
+    hub_default_owner = os.getenv("LEAPFLOW_HUB_DEFAULT_OWNER", "")
+    hub_default_visibility = os.getenv("LEAPFLOW_HUB_DEFAULT_VISIBILITY", "private")
+    hub_sync_strategy = os.getenv("LEAPFLOW_HUB_SYNC_STRATEGY", "remote-wins")
+    hub_sync_copilot = _bool("LEAPFLOW_HUB_SYNC_COPILOT", "true")
+    hub_repo_prefix = os.getenv("LEAPFLOW_HUB_REPO_PREFIX", "leapflow-")
+    hub_search_sources = os.getenv("LEAPFLOW_HUB_SEARCH_SOURCES", "modelscope")
+
+    # Observer / Daemon
+    observer_auto_start = _bool("LEAPFLOW_OBSERVER_AUTO_START", "false")
+    _observer_enabled_raw = os.getenv("LEAPFLOW_OBSERVER_ENABLED_SET", "")
+    observer_enabled_set: Dict[str, bool] = {
+        "fs_watcher": True,
+        "app_focus": True,
+        "clipboard": True,
+        "input_tap": False,
+    }
+    if _observer_enabled_raw:
+        import json as _json_obs
+
+        try:
+            observer_enabled_set = {
+                str(k): bool(v) for k, v in _json_obs.loads(_observer_enabled_raw).items()
+            }
+        except Exception:
+            logger.warning("Invalid LEAPFLOW_OBSERVER_ENABLED_SET: %s", _observer_enabled_raw)
+
+    # Scheduler
+    scheduler_enabled = _bool("LEAPFLOW_SCHEDULER_ENABLED", "true")
+    scheduler_tick_seconds = int(os.getenv("LEAPFLOW_SCHEDULER_TICK_SECONDS", "60"))
+    scheduler_grace_seconds = float(os.getenv("LEAPFLOW_SCHEDULER_GRACE_SECONDS", "120.0"))
+    scheduler_default_tier = os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_TIER", "auto")
+    scheduler_agent_max_iterations = int(os.getenv("LEAPFLOW_SCHEDULER_AGENT_MAX_ITERATIONS", "25"))
+    scheduler_agent_tool_blocklist = os.getenv("LEAPFLOW_SCHEDULER_AGENT_TOOL_BLOCKLIST", "")
+    scheduler_default_max_retries = int(os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_MAX_RETRIES", "2"))
+    scheduler_default_retry_backoff_s = float(
+        os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_RETRY_BACKOFF_S", "60.0")
+    )
+    scheduler_delivery_enabled = _bool("LEAPFLOW_SCHEDULER_DELIVERY_ENABLED", "false")
+
+    # Dashboard
+    dashboard_enabled = _bool("LEAPFLOW_DASHBOARD_ENABLED", "true")
+    dashboard_bind = os.getenv("LEAPFLOW_DASHBOARD_BIND", "127.0.0.1").strip() or "127.0.0.1"
+    dashboard_port = int(os.getenv("LEAPFLOW_DASHBOARD_PORT", "8765"))
+    dashboard_auto_open = _bool("LEAPFLOW_DASHBOARD_AUTO_OPEN", "true")
+    dashboard_token_ref = os.getenv("LEAPFLOW_DASHBOARD_TOKEN_REF", "").strip()
+
+    # Usage Pricing (config-driven cost accounting)
+    usage_pricing: Dict[str, Any] = {}
+    _raw_pricing = os.getenv("LEAPFLOW_USAGE_PRICING", "")
+    if _raw_pricing:
+        import json as _json_pricing
+
+        try:
+            usage_pricing = {str(k): v for k, v in _json_pricing.loads(_raw_pricing).items()}
+        except Exception:
+            logger.warning("Invalid LEAPFLOW_USAGE_PRICING: %s", _raw_pricing)
+
+    # Session analysis dashboard
+    monitor_session_batch_turns = int(os.getenv("LEAPFLOW_MONITOR_SESSION_BATCH_TURNS", "6"))
+    monitor_session_batch_tokens = int(os.getenv("LEAPFLOW_MONITOR_SESSION_BATCH_TOKENS", "4000"))
+    monitor_session_use_model_salience = _bool(
+        "LEAPFLOW_MONITOR_SESSION_USE_MODEL_SALIENCE", "false"
+    )
+    monitor_session_debounce_s = float(os.getenv("LEAPFLOW_MONITOR_SESSION_DEBOUNCE_S", "15.0"))
+    monitor_session_max_refresh_per_min = int(
+        os.getenv("LEAPFLOW_MONITOR_SESSION_MAX_REFRESH_PER_MIN", "4")
+    )
+
+    settings = Settings(
+        llm_api_key=api_key,
+        llm_base_url=base_url.rstrip("/"),
+        llm_model=model,
+        llm_max_retries=max(1, max_retries),
+        mock_host=mock_host,
+        duckdb_path=_expand_path(duckdb),
+        log_level=log_level,
+        # Memory Providers
+        memory_working_max_tokens=memory_working_max_tokens,
+        memory_episodic_ttl_s=memory_episodic_ttl_s,
+        memory_episodic_max_entries=memory_episodic_max_entries,
+        memory_evolution_max_episodes=memory_evolution_max_episodes,
+        memory_integration_enabled=memory_integration_enabled,
+        memory_prefetch_timeout_s=memory_prefetch_timeout_s,
+        memory_prefetch_limit=memory_prefetch_limit,
+        data_dir=data_dir,
+        profile=profile,
+        workspace_root=workspace_root,
+        layout=layout,
+        profile_layout=profile_layout,
+        profile_manifest=profile_manifest,
+        config_sources=config_sources,
+        watched_config_paths=watched_config_paths,
+        config_warnings=config_warnings,
+        runtime_dir=_expand_path(runtime_dir),
+        audit_log_path=_expand_path(audit_log_path),
+        skills_dir=_expand_path(skills_dir),
+        skill_view_max_chars=skill_view_max_chars,
+        skill_min_quality=skill_min_quality,
+        visual_track_enabled=visual_track_enabled,
+        visual_frame_cache_dir=_expand_path(visual_frame_cache_dir),
+        visual_sample_strategy=visual_sample_strategy,
+        vlm_model=vlm_model,
+        vlm_api_key=vlm_api_key,
+        vlm_base_url=vlm_base_url,
+        privacy_sensitive_apps=privacy_sensitive_apps,
+        # VLM Optimization
+        vlm_prefilter_enabled=vlm_prefilter_enabled,
+        vlm_prefilter_skip_actions=vlm_prefilter_skip_actions,
+        vlm_prefilter_confidence_threshold=vlm_prefilter_confidence_threshold,
+        vlm_cache_enabled=vlm_cache_enabled,
+        vlm_cache_ttl=vlm_cache_ttl,
+        vlm_cache_max_size=vlm_cache_max_size,
+        vlm_compression_enabled=vlm_compression_enabled,
+        vlm_compression_max_resolution=vlm_compression_max_resolution,
+        vlm_compression_quality=vlm_compression_quality,
+        vlm_compression_adaptive=vlm_compression_adaptive,
+        vlm_tiling_enabled=vlm_tiling_enabled,
+        vlm_tiling_max_frames=vlm_tiling_max_frames,
+        vlm_tiling_tile_size=vlm_tiling_tile_size,
+        vlm_tiling_gap=vlm_tiling_gap,
+        # Perceptual Field
+        perceptual_field_enabled=perceptual_field_enabled,
+        perceptual_field_config=perceptual_field_config,
+        # Perception Depth
+        text_capture_enabled=text_capture_enabled,
+        text_capture_exclude_apps=text_capture_exclude_apps,
+        text_capture_secure_roles=text_capture_secure_roles,
+        text_capture_max_length=text_capture_max_length,
+        clipboard_max_length=clipboard_max_length,
+        # Context Learning Attention
+        attention_foreground_gate=attention_foreground_gate,
+        attention_noise_patterns=attention_noise_patterns,
+        attention_goal_relevance_threshold=attention_goal_relevance_threshold,
+        attention_working_dir_inference=attention_working_dir_inference,
+        attention_domain_whitelist=attention_domain_whitelist,
+        # Recording Mode
+        recording_mode=recording_mode,
+        # Causal Inference
+        causal_reorder_window_ms=causal_reorder_window_ms,
+        causal_burst_limit=causal_burst_limit,
+        causal_max_chain_events=causal_max_chain_events,
+        heuristic_time_decay_s=heuristic_time_decay_s,
+        heuristic_space_decay_px=heuristic_space_decay_px,
+        # World Model
+        prediction_enabled=prediction_enabled,
+        prediction_delta_threshold=prediction_delta_threshold,
+        curiosity_alpha=curiosity_alpha,
+        curiosity_beta=curiosity_beta,
+        curiosity_gamma=curiosity_gamma,
+        curiosity_auto_balance=curiosity_auto_balance,
+        prediction_budget=prediction_budget,
+        comparison_budget=comparison_budget,
+        replay_budget=replay_budget,
+        grading_budget=grading_budget,
+        distillation_budget=distillation_budget,
+        evolution_enabled=evolution_enabled,
+        accepted_evidence_kinds=accepted_evidence_kinds,
+        evolution_authorising_origins=evolution_authorising_origins,
+        evolution_teacher_poll_interval_s=evolution_teacher_poll_interval_s,
+        evolution_teacher_lease_s=evolution_teacher_lease_s,
+        evolution_teacher_timeout_s=evolution_teacher_timeout_s,
+        evolution_teacher_max_attempts=evolution_teacher_max_attempts,
+        evolution_teacher_retry_backoff_s=evolution_teacher_retry_backoff_s,
+        evolution_autonomy_level=evolution_autonomy_level,
+        proposal_ttl_hours=proposal_ttl_hours,
+        environment_mode=environment_mode,
+        environment_leapspace_enabled=environment_leapspace_enabled,
+        environment_leapspace_state_root=environment_leapspace_state_root,
+        environment_leapspace_session_id=environment_leapspace_session_id,
+        environment_leapspace_poll_interval_s=environment_leapspace_poll_interval_s,
+        selection_policy=selection_policy,
+        replay_on_session_end=replay_on_session_end,
+        distilled_knowledge_ttl_s=distilled_knowledge_ttl_s,
+        distilled_knowledge_limit=distilled_knowledge_limit,
+        prediction_structural_blend=prediction_structural_blend,
+        prediction_semantic_blend=prediction_semantic_blend,
+        prediction_semantic_threshold=prediction_semantic_threshold,
+        prediction_rag_advantage_floor=prediction_rag_advantage_floor,
+        prediction_failure_advantage=prediction_failure_advantage,
+        replay_regression_sample_size=replay_regression_sample_size,
+        memory_prune_age_days=memory_prune_age_days,
+        semantic_embedding_provider=semantic_embedding_provider,
+        semantic_rerank_weight=semantic_rerank_weight,
+        budget_discovery_baseline=budget_discovery_baseline,
+        budget_regression_baseline=budget_regression_baseline,
+        ast_precheck_enabled=ast_precheck_enabled,
+        causal_window_s=causal_window_s,
+        causal_app_window_overrides=causal_app_window_overrides,
+        causal_tier3_enabled=causal_tier3_enabled,
+        causal_tier3_confidence_threshold=causal_tier3_confidence_threshold,
+        mhms_fusion_enabled=mhms_fusion_enabled,
+        # Attention learning feedback
+        attention_curiosity_expand_threshold=attention_curiosity_expand_threshold,
+        attention_accuracy_contract_threshold=attention_accuracy_contract_threshold,
+        # Surprise detection
+        surprise_enabled=surprise_enabled,
+        surprise_stat_weight=surprise_stat_weight,
+        surprise_temporal_weight=surprise_temporal_weight,
+        surprise_pattern_weight=surprise_pattern_weight,
+        surprise_annotation_threshold=surprise_annotation_threshold,
+        surprise_warmup_events=surprise_warmup_events,
+        # Video Recording
+        video_fps=video_fps,
+        video_resolution_scale=video_resolution_scale,
+        video_codec=video_codec,
+        video_max_segment_s=video_max_segment_s,
+        video_cache_dir=_expand_path(video_cache_dir),
+        video_cache_max_age_days=video_cache_max_age_days,
+        video_cache_max_size_gb=video_cache_max_size_gb,
+        video_l2_enabled=video_l2_enabled,
+        video_l3_enabled=video_l3_enabled,
+        video_segmenter_min_s=video_segmenter_min_s,
+        video_segmenter_max_s=video_segmenter_max_s,
+        video_segmenter_idle_gap_s=video_segmenter_idle_gap_s,
+        video_segmenter_app_gap_s=video_segmenter_app_gap_s,
+        video_segmenter_min_split_s=video_segmenter_min_split_s,
+        video_max_l2_requests=video_max_l2_requests,
+        video_max_l3_requests=video_max_l3_requests,
+        video_start_timeout_s=video_start_timeout_s,
+        video_vlm_max_retries=video_vlm_max_retries,
+        video_vlm_retry_backoff_s=video_vlm_retry_backoff_s,
+        video_vlm_url_scheme=video_vlm_url_scheme,
+        video_l2_time_window_s=video_l2_time_window_s,
+        video_timeline_max_markers=video_timeline_max_markers,
+        video_timeline_compress_max=video_timeline_compress_max,
+        video_timeline_merge_channels=video_timeline_merge_channels,
+        # Learnability Assessment
+        learnability_enabled=learnability_enabled,
+        learnability_min_steps=learnability_min_steps,
+        learnability_min_duration_s=learnability_min_duration_s,
+        learnability_max_idle_ratio=learnability_max_idle_ratio,
+        learnability_min_action_diversity=learnability_min_action_diversity,
+        learnability_learn_threshold=learnability_learn_threshold,
+        learnability_ask_threshold=learnability_ask_threshold,
+        learnability_vlm_enabled=learnability_vlm_enabled,
+        learnability_llm_enabled=learnability_llm_enabled,
+        learnability_rule_weight=learnability_rule_weight,
+        learnability_vlm_weight=learnability_vlm_weight,
+        learnability_llm_weight=learnability_llm_weight,
+        # Execution Loop Budget
+        react_max_iterations=react_max_iterations,
+        react_soft_limit=react_soft_limit,
+        react_warning_threshold=react_warning_threshold,
+        agent_iter_floor=agent_iter_floor,
+        agent_iter_ceiling=agent_iter_ceiling,
+        agent_budget_scale_k=agent_budget_scale_k,
+        agent_iter_hard_cap=agent_iter_hard_cap,
+        agent_iter_extension_step=agent_iter_extension_step,
+        agent_stall_rounds=agent_stall_rounds,
+        agent_checkpoint_interval=agent_checkpoint_interval,
+        agent_cost_ceiling_context_multiple=agent_cost_ceiling_context_multiple,
+        agent_subagent_max_depth=agent_subagent_max_depth,
+        agent_subagent_max_concurrent=agent_subagent_max_concurrent,
+        agent_subagent_max_iterations=agent_subagent_max_iterations,
+        agent_max_parallel_tools=agent_max_parallel_tools,
+        agent_tool_images_kept=agent_tool_images_kept,
+        agent_subagent_full_loop=agent_subagent_full_loop,
+        agent_calibration_enabled=agent_calibration_enabled,
+        agent_calibration_min_confidence=agent_calibration_min_confidence,
+        agent_calibration_interval_turns=agent_calibration_interval_turns,
+        agent_calibration_difficulty_min_k=agent_calibration_difficulty_min_k,
+        agent_calibration_difficulty_max_k=agent_calibration_difficulty_max_k,
+        agent_calibration_finalizing_min_ratio=agent_calibration_finalizing_min_ratio,
+        agent_calibration_finalizing_max_ratio=agent_calibration_finalizing_max_ratio,
+        agent_compression_writeback=agent_compression_writeback,
+        agent_reentry_enabled=agent_reentry_enabled,
+        agent_reentry_hardware_enabled=agent_reentry_hardware_enabled,
+        agent_reentry_tick_seconds=agent_reentry_tick_seconds,
+        agent_reentry_global_budget=agent_reentry_global_budget,
+        agent_reentry_send_enabled=agent_reentry_send_enabled,
+        agent_reentry_send_rate_per_hour=agent_reentry_send_rate_per_hour,
+        agent_reentry_send_global_budget=agent_reentry_send_global_budget,
+        agent_reentry_send_verified_at=agent_reentry_send_verified_at,
+        tool_max_iterations=tool_max_iterations,
+        native_tool_calling_enabled=native_tool_calling_enabled,
+        stream_output=stream_output,
+        verbose_progress=verbose_progress,
+        # Context Compression
+        compress_threshold=compress_threshold,
+        compress_keep_tail=compress_keep_tail,
+        max_tool_output_chars=max_tool_output_chars,
+        max_tool_result_chars=max_tool_result_chars,
+        tools_ripgrep_autoinstall=tools_ripgrep_autoinstall,
+        tools_test_command=tools_test_command,
+        tools_lint_command=tools_lint_command,
+        tools_terminal_session_enabled=tools_terminal_session_enabled,
+        tools_verify_edits=tools_verify_edits,
+        plugin_sandbox_invoke_timeout_s=plugin_sandbox_invoke_timeout_s,
+        plugin_sandbox_shutdown_timeout_s=plugin_sandbox_shutdown_timeout_s,
+        plugin_sandbox_cpu_time_s=plugin_sandbox_cpu_time_s,
+        plugin_sandbox_max_memory_mb=plugin_sandbox_max_memory_mb,
+        plugins_dsh_invoke_timeout_s=plugins_dsh_invoke_timeout_s,
+        plugins_dsh_discovery_timeout_s=plugins_dsh_discovery_timeout_s,
+        plugins_dsh_max_message_bytes=plugins_dsh_max_message_bytes,
+        plugins_dsh_max_stderr_bytes=plugins_dsh_max_stderr_bytes,
+        plugins_dsh_max_memory_mb=plugins_dsh_max_memory_mb,
+        mcp_approval_mode=mcp_approval_mode,
+        hardware_enabled=hardware_enabled,
+        hardware_devices_dir=hardware_devices_dir,
+        hardware_providers=hardware_providers,
+        hardware_max_devices=hardware_max_devices,
+        hardware_unverified_policy=hardware_unverified_policy,
+        hardware_require_describe=hardware_require_describe,
+        hardware_envelope_grant=hardware_envelope_grant,
+        hardware_trust_skip_enabled=hardware_trust_skip_enabled,
+        hardware_write_verification_follow_s=hardware_write_verification_follow_s,
+        hardware_stream_enabled=hardware_stream_enabled,
+        hardware_stream_ring_capacity=hardware_stream_ring_capacity,
+        hardware_persist_readings=hardware_persist_readings,
+        hardware_downsample_interval_s=hardware_downsample_interval_s,
+        hardware_raw_retention_days=hardware_raw_retention_days,
+        hardware_history_retention_days=hardware_history_retention_days,
+        hardware_raw_segment_mb=hardware_raw_segment_mb,
+        hardware_reading_store_sensitive=hardware_reading_store_sensitive,
+        hardware_host_interval_s=hardware_host_interval_s,
+        hardware_host_include=hardware_host_include,
+        hardware_host_exclude=hardware_host_exclude,
+        hardware_rediscover_interval_s=hardware_rediscover_interval_s,
+        hardware_media_screens=hardware_media_screens,
+        hardware_media_microphones=hardware_media_microphones,
+        hardware_media_exclude_usb=hardware_media_exclude_usb,
+        hardware_preview_max_fps=hardware_preview_max_fps,
+        hardware_preview_max_width=hardware_preview_max_width,
+        hardware_preview_quality=hardware_preview_quality,
+        hardware_preview_idle_timeout_s=hardware_preview_idle_timeout_s,
+        hardware_fleet_nodes=hardware_fleet_nodes,
+        hardware_alert_policies=hardware_alert_policies,
+        hardware_skills_enabled=hardware_skills_enabled,
+        hardware_skills_speed_pct_max=hardware_skills_speed_pct_max,
+        hardware_skills_max_duration_s=hardware_skills_max_duration_s,
+        hardware_skills_plan_ttl_s=hardware_skills_plan_ttl_s,
+        hardware_skills_halt_timeout_s=hardware_skills_halt_timeout_s,
+        hardware_skills_stop_grace_s=hardware_skills_stop_grace_s,
+        hardware_skills_dispatch_settle_s=hardware_skills_dispatch_settle_s,
+        hardware_skills_episode_fps=hardware_skills_episode_fps,
+        hardware_skills_episode_min_free_mb=hardware_skills_episode_min_free_mb,
+        hardware_share_frames=hardware_share_frames,
+        web_transport=web_transport,
+        web_timeout_s=web_timeout_s,
+        web_max_bytes=web_max_bytes,
+        web_max_retries=web_max_retries,
+        web_max_redirects=web_max_redirects,
+        web_user_agent=web_user_agent,
+        web_extractor=web_extractor,
+        web_private_targets=web_private_targets,
+        web_cache_ttl_s=web_cache_ttl_s,
+        agent_validate_tool_args=agent_validate_tool_args,
+        context_hard_limit_ratio=context_hard_limit_ratio,
+        context_warning_ratio=context_warning_ratio,
+        tool_evidence_max_chars=tool_evidence_max_chars,
+        repeated_read_limit=repeated_read_limit,
+        long_task_convergence_round=long_task_convergence_round,
+        convergence_round_ceiling=convergence_round_ceiling,
+        convergence_scale=convergence_scale,
+        max_shell_timeout_s=max_shell_timeout_s,
+        context_expanded_ratio=context_expanded_ratio,
+        context_finalizing_ratio=context_finalizing_ratio,
+        context_expanded_evidence_threshold=context_expanded_evidence_threshold,
+        context_expanded_tool_call_threshold=context_expanded_tool_call_threshold,
+        context_research_source_threshold=context_research_source_threshold,
+        context_research_evidence_threshold=context_research_evidence_threshold,
+        # Error Recovery
+        error_transient_max_retries=error_transient_max_retries,
+        error_rate_limit_base_delay=error_rate_limit_base_delay,
+        max_consecutive_tool_failures=max_consecutive_tool_failures,
+        recovery_turn_deadline_s=recovery_turn_deadline_s,
+        recovery_total_actions=recovery_total_actions,
+        recovery_max_retry_per_category=recovery_max_retry_per_category,
+        guardrail_enabled=guardrail_enabled,
+        approval_bypass=approval_bypass,
+        guardrail_max_repeats=guardrail_max_repeats,
+        guardrail_max_consecutive_same=guardrail_max_consecutive_same,
+        guardrail_stagnation_window=guardrail_stagnation_window,
+        guardrail_min_success_rate=guardrail_min_success_rate,
+        guardrail_max_calls_per_turn=guardrail_max_calls_per_turn,
+        # Session Persistence
+        session_persistence_enabled=session_persistence_enabled,
+        session_resume_cache_policy=session_resume_cache_policy,
+        # Compression Provider (PCD Cache-Aware)
+        compression_provider=compression_provider,
+        compression_model=compression_model,
+        compression_api_key=compression_api_key,
+        compression_base_url=compression_base_url,
+        compression_protect_first_n=compression_protect_first_n,
+        compression_keep_recent_n=compression_keep_recent_n,
+        # File Checkpoint Rollback
+        checkpoint_file_rollback_enabled=checkpoint_file_rollback_enabled,
+        checkpoint_max_inline_bytes=checkpoint_max_inline_bytes,
+        checkpoint_ttl_hours=checkpoint_ttl_hours,
+        # Multi-Provider LLM
+        llm_fallback_providers=llm_fallback_providers,
+        llm_aux_model=llm_aux_model,
+        llm_aux_api_key=llm_aux_api_key,
+        llm_aux_base_url=llm_aux_base_url,
+        llm_context_length=llm_context_length,
+        llm_credential_cooldown_s=llm_credential_cooldown_s,
+        # Benchmark Qualification
+        benchmark_commands=benchmark_commands,
+        benchmark_data_roots=benchmark_data_roots,
+        benchmark_license_acceptances=benchmark_license_acceptances,
+        benchmark_hardware_profiles=benchmark_hardware_profiles,
+        # Stream & Tool Robustness
+        stale_stream_timeout_s=stale_stream_timeout_s,
+        default_tool_timeout_s=default_tool_timeout_s,
+        daemon_request_ledger_ttl_s=daemon_request_ledger_ttl_s,
+        daemon_request_ledger_max_entries=daemon_request_ledger_max_entries,
+        daemon_max_concurrent_turns=daemon_max_concurrent_turns,
+        daemon_max_live_sessions=daemon_max_live_sessions,
+        daemon_session_idle_ttl_s=daemon_session_idle_ttl_s,
+        daemon_log_level=daemon_log_level,
+        circuit_breaker_threshold=circuit_breaker_threshold,
+        circuit_breaker_cooldown_s=circuit_breaker_cooldown_s,
+        # Signal Fusion
+        signal_channels=signal_channels,
+        signal_reactive_capture=signal_reactive_capture,
+        signal_noise_gate_enabled=signal_noise_gate_enabled,
+        signal_noise_same_source_cooldown_s=signal_noise_same_source_cooldown_s,
+        signal_noise_allow_fs_outside_workspace=signal_noise_allow_fs_outside_workspace,
+        signal_noise_path_fragments=signal_noise_path_fragments,
+        signal_noise_dir_names=signal_noise_dir_names,
+        signal_noise_suffixes=signal_noise_suffixes,
+        # RPC Transport
+        rpc_timeout_default=rpc_timeout_default,
+        # Cua Driver
+        use_cua_driver=use_cua_driver,
+        cua_driver_cmd=cua_driver_cmd,
+        # Workflow Copilot
+        copilot_enabled=copilot_enabled,
+        copilot_min_idle_ms=copilot_min_idle_ms,
+        copilot_max_idle_ms=copilot_max_idle_ms,
+        copilot_cache_ttl_s=copilot_cache_ttl_s,
+        copilot_speculative_cache_size=copilot_speculative_cache_size,
+        copilot_action_ring_size=copilot_action_ring_size,
+        copilot_warmup_event_types=copilot_warmup_event_types,
+        notification_renderer=notification_renderer,
+        live_signal_kinds=live_signal_kinds,
+        # Hub
+        hub_type=hub_type,
+        hub_default_owner=hub_default_owner,
+        hub_default_visibility=hub_default_visibility,
+        hub_sync_strategy=hub_sync_strategy,
+        hub_sync_copilot=hub_sync_copilot,
+        hub_repo_prefix=hub_repo_prefix,
+        hub_search_sources=hub_search_sources,
+        # Observer / Daemon
+        observer_auto_start=observer_auto_start,
+        observer_enabled_set=observer_enabled_set,
+        # Scheduler
+        scheduler_enabled=scheduler_enabled,
+        scheduler_tick_seconds=scheduler_tick_seconds,
+        scheduler_grace_seconds=scheduler_grace_seconds,
+        scheduler_default_tier=scheduler_default_tier,
+        scheduler_agent_max_iterations=scheduler_agent_max_iterations,
+        scheduler_agent_tool_blocklist=scheduler_agent_tool_blocklist,
+        scheduler_default_max_retries=scheduler_default_max_retries,
+        scheduler_default_retry_backoff_s=scheduler_default_retry_backoff_s,
+        scheduler_delivery_enabled=scheduler_delivery_enabled,
+        # Dashboard
+        dashboard_enabled=dashboard_enabled,
+        dashboard_bind=dashboard_bind,
+        dashboard_port=dashboard_port,
+        dashboard_auto_open=dashboard_auto_open,
+        dashboard_token_ref=dashboard_token_ref,
+        # Usage Pricing
+        usage_pricing=usage_pricing,
+        monitor_session_batch_turns=monitor_session_batch_turns,
+        monitor_session_batch_tokens=monitor_session_batch_tokens,
+        monitor_session_use_model_salience=monitor_session_use_model_salience,
+        monitor_session_debounce_s=monitor_session_debounce_s,
+        monitor_session_max_refresh_per_min=monitor_session_max_refresh_per_min,
+    )
+
+    if not settings.llm_api_key:
+        logger.warning("LLM API key is empty; run `leap config llm key` before making LLM calls.")
+
+    settings.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for warning in validate_settings(settings):
+        logger.warning("config: %s", warning)
+
+    return settings
+
+
+def validate_settings(settings: Settings) -> list[str]:
+    """Post-load validation with actionable error messages.
+
+    Returns a list of warning strings (empty = no issues).
+    Does not raise — all issues are advisory.
+    """
+    warnings: list[str] = []
+
+    if settings.llm_context_length < 1024:
+        warnings.append(
+            f"llm_context_length={settings.llm_context_length} is suspiciously low; "
+            "expected at least 1024. Check LEAPFLOW_LLM_CONTEXT_LENGTH."
+        )
+
+    if settings.stale_stream_timeout_s < 10.0:
+        warnings.append(
+            f"stale_stream_timeout_s={settings.stale_stream_timeout_s} is very short; "
+            "may cause premature stream cancellations."
+        )
+
+    if settings.default_tool_timeout_s < 5.0:
+        warnings.append(
+            f"default_tool_timeout_s={settings.default_tool_timeout_s} is very short; "
+            "tools may timeout before completing."
+        )
+
+    if settings.react_soft_limit >= settings.react_max_iterations:
+        warnings.append(
+            f"react_soft_limit ({settings.react_soft_limit}) >= react_max_iterations "
+            f"({settings.react_max_iterations}); soft limit will never trigger."
+        )
+
+    if settings.llm_aux_model and not settings.llm_aux_api_key and not settings.llm_api_key:
+        warnings.append(
+            "llm_aux_model is set but no API key available (neither aux nor primary). "
+            "Auxiliary LLM calls will fail."
+        )
+
+    if settings.session_resume_cache_policy not in ("cache_priority", "tool_freshness"):
+        warnings.append(
+            f"session_resume_cache_policy='{settings.session_resume_cache_policy}' is not "
+            "a recognised value; expected 'cache_priority' or 'tool_freshness'. "
+            "Defaulting to cache_priority behaviour."
+        )
+
+    if settings.compression_model and not settings.compression_api_key and not settings.llm_api_key:
+        warnings.append(
+            "compression_model is set but no API key available (neither compression nor primary). "
+            "Compression LLM calls will fail."
+        )
+
+    if settings.llm_fallback_providers:
+        import json as _json
+
+        try:
+            _json.loads(settings.llm_fallback_providers)
+        except _json.JSONDecodeError as e:
+            warnings.append(
+                f"LEAPFLOW_LLM_FALLBACK_PROVIDERS is not valid JSON: {e}. "
+                "Fallback providers will be ignored."
+            )
+
+    return warnings
+
+
+# ── Global settings accessor (lazy singleton) ──
+
+_settings_instance: Settings | None = None
+
+
+def get_settings() -> Settings:
+    """Return the global Settings singleton, creating it on first access.
+
+    Safe to call from any module; avoids circular-import issues when used
+    inside constructors (deferred import pattern).
+    """
+    global _settings_instance
+    if _settings_instance is None:
+        _settings_instance = load_config()
+    return _settings_instance

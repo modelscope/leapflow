@@ -35,7 +35,7 @@ from leapflow.hardware.skills.geometry import (
     solve_linear,
     transpose,
 )
-from leapflow.hardware.skills.kinematics import DhChain
+from leapflow.hardware.skills.kinematics import KinematicModel
 
 _PROBE_DEG = 1e-4  # finite-difference step per joint
 _DAMPING_SCALE_MM = 10.0  # error at which the full damping applies
@@ -50,7 +50,7 @@ def _error(target: Transform, current: Transform, weight: float) -> list[float]:
 
 
 def _jacobian(
-    chain: DhChain, q: Sequence[float], at: Transform, weight: float
+    chain: KinematicModel, q: Sequence[float], at: Transform, weight: float
 ) -> list[list[float]]:
     """6 x n: rows are the error components, columns the joints."""
     columns: list[list[float]] = []
@@ -82,13 +82,15 @@ def _miss(target: Transform, current: Transform) -> tuple[float, float]:
 
 
 def solve_ik(
-    chain: DhChain,
+    chain: KinematicModel,
     target: Transform,
     seed: Sequence[float],
     limits: Limits,
     settings: IkSettings,
 ) -> tuple[float, ...]:
     """Joints (deg) that put the flange at *target*; raises ``ValueError`` if none converge."""
+    if not isinstance(chain, KinematicModel):
+        raise ValueError("IK requires the pure forward-transform model contract")
     if len(seed) != chain.dof:
         raise ValueError(f"IK seed has {len(seed)} joints, the chain {chain.dof}")
     padded = list(limits) + [(None, None)] * (chain.dof - len(limits))

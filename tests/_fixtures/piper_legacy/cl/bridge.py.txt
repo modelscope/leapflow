@@ -1,0 +1,308 @@
+"""Client for cl_armd: JSON Lines RPC, a live state stream, and a dead-man heartbeat.
+
+The board owns the 200 Hz loop; this client only plans, verifies and supervises.
+It keeps the last streamed snapshot so a vision round-trip (300-800 ms) can be
+bracketed by a pose read on both sides without a blocking RPC.
+"""
+
+from __future__ import annotations
+
+import itertools
+import json
+import math
+import socket
+import threading
+import time
+from typing import Any, Callable
+from dataclasses import asdict
+from enum import Enum
+
+from leapflow.engine.recovery.failure_envelope import (
+    FailureContext, FailureEnvelope, FailureSource, Recoverability, SideEffectState,
+)
+from leapflow.hardware.drivers._piper_feedback import receipt_problem
+
+RECEIVE_GROUPS = tuple(f"0x{i:03x}" for i in (
+    *range(0x2A1, 0x2A9), *range(0x251, 0x257), *range(0x261, 0x267)
+))
+
+HEARTBEAT_S = 0.5
+
+
+class BridgeError(RuntimeError):
+    def __init__(self, code: str, message: str, detail: str = ""):
+        super().__init__(f"{code}: {message}" + (f" ({detail})" if detail else ""))
+        self.code = code
+        self.message = message
+        self.detail = detail
+        self.envelope: dict = {}
+        self.side_effect_state = "none"
+
+
+def checkpoint(error: Exception, *, effects_attempted: bool, tool: str, session_id: str = "") -> dict:
+    """Preserve typed failure and uncertain effects in experiment evidence."""
+    effect = SideEffectState.UNKNOWN if effects_attempted else SideEffectState.NONE
+    envelope = FailureEnvelope.create(
+        source=FailureSource.TOOL, category="hardware_checkpoint",
+        failure_class=type(error).__name__, failure_code=getattr(error, "code", "qualification_failed"),
+        message=str(error), recoverability=Recoverability.USER_FIXABLE, side_effect_state=effect,
+        context=FailureContext(tool_name=tool, session_id=session_id),
+    )
+    return json.loads(json.dumps(asdict(envelope), default=lambda value: value.value if isinstance(value, Enum) else str(value)))
+
+
+class ArmBridge:
+    def __init__(self, host: str, port: int = 8771, timeout_s: float = 90.0):
+        self.host = host
+        self.port = port
+        self.timeout_s = timeout_s
+        self._sock: socket.socket | None = None
+        self._reader = None
+        self._ids = itertools.count(1)
+        self._pending: dict[int, tuple[threading.Event, dict]] = {}
+        self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._latest: dict = {}
+        self._history: list[dict] = []
+        self._reader_thread: threading.Thread | None = None
+        self._beat_thread: threading.Thread | None = None
+        self.hello: dict = {}
+        self.error: str = ""
+        self.effects_attempted = False
+        self._source_session = ""
+        self._source_sent = float("-inf")
+        self._source_received = 0.0
+
+    # -- lifecycle ---------------------------------------------------------
+    def connect(self) -> "ArmBridge":
+        try:
+            self._sock = socket.create_connection((self.host, self.port), timeout=4.0)
+        except OSError as error:
+            raise BridgeError(
+                "unreachable",
+                f"no cl_armd at {self.host}:{self.port}; start it on the board "
+                f"(python3 cl_board/cl_armd.py) and check the CAN link",
+                detail=str(error),
+            ) from error
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._reader = self._sock.makefile("rb")
+        self._reader_thread = threading.Thread(target=self._read_loop, name="cl-bridge", daemon=True)
+        self._reader_thread.start()
+        try:
+            self.hello = self.call("hello", timeout=5.0)
+            self.call("stream", on=True, timeout=3.0)
+            self._beat_thread = threading.Thread(target=self._beat_loop, name="cl-heartbeat", daemon=True)
+            self._beat_thread.start()
+            return self
+        except (BridgeError, OSError):
+            self.close()
+            raise
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            self.call("stream", on=False, timeout=1.0)
+        except BridgeError:
+            pass
+        if self._sock is not None:
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self._sock.close()
+        with self._lock:
+            for event, _ in self._pending.values():
+                event.set()
+        for thread in (self._reader_thread, self._beat_thread):
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=3.0)
+        if self._reader is not None:
+            self._reader.close()
+        self._sock = None
+
+    def __enter__(self) -> "ArmBridge":
+        return self.connect()
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    @property
+    def connected(self) -> bool:
+        return self._sock is not None and not self._stop.is_set() and not self.error
+
+    # -- rpc ---------------------------------------------------------------
+    def call(self, cmd: str, timeout: float | None = None, **args: Any) -> Any:
+        if self._sock is None:
+            raise BridgeError("not_connected", "connect() first")
+        mutating = cmd not in {"hello", "state", "check", "stream", "heartbeat", "ik"}
+        if mutating and cmd != "stop" and self.hello.get("lease_contract") != "connection-owned/v1":
+            raise BridgeError("lease_contract_missing", "deploy a connection-owned control daemon before writes")
+        ident = next(self._ids)
+        event = threading.Event()
+        slot: dict = {}
+        with self._lock:
+            self._pending[ident] = (event, slot)
+        payload = json.dumps({"id": ident, "cmd": cmd, "args": args}, separators=(",", ":")) + "\n"
+        try:
+            with self._send_lock:
+                if mutating:
+                    self.effects_attempted = True
+                self._sock.sendall(payload.encode())
+        except OSError as error:
+            with self._lock:
+                self._pending.pop(ident, None)
+            failure = BridgeError("send_failed", str(error))
+            failure.side_effect_state = "unknown" if mutating else "none"
+            raise failure from error
+        limit = self.timeout_s if timeout is None else timeout
+        if not event.wait(limit):
+            with self._lock:
+                self._pending.pop(ident, None)
+            failure = BridgeError("timeout", f"{cmd} did not answer in {limit:.0f}s")
+            failure.side_effect_state = "unknown" if mutating else "none"
+            raise failure
+        with self._lock:
+            self._pending.pop(ident, None)
+        reply = slot.get("reply", {})
+        if not reply.get("ok"):
+            error = reply.get("error") or {}
+            failure = BridgeError(error.get("code", "error"), error.get("message", "failed"),
+                                  error.get("detail", ""))
+            failure.envelope = error.get("envelope", {})
+            failure.side_effect_state = error.get("side_effect_state", "unknown" if mutating else "none")
+            raise failure
+        return reply.get("result")
+
+    def _read_loop(self) -> None:
+        assert self._reader is not None
+        try:
+            for raw in self._reader:
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if "stream" in message:
+                    snap = self._accept_snapshot(message["stream"])
+                    self._history.append(snap)
+                    if len(self._history) > 4000:
+                        del self._history[:2000]
+                    continue
+                with self._lock:
+                    slot = self._pending.get(message.get("id"))
+                if slot:
+                    slot[1]["reply"] = message
+                    slot[0].set()
+        except (OSError, ValueError) as error:
+            self.error = f"bridge_closed: {error}"
+        finally:
+            for event, slot in list(self._pending.values()):
+                slot["reply"] = {"ok": False, "error": {"code": "disconnected", "message": "bridge closed"}}
+                event.set()
+
+    def _beat_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.call("heartbeat", timeout=2.0)
+            except BridgeError:
+                pass
+            self._stop.wait(HEARTBEAT_S)
+
+    # -- reads -------------------------------------------------------------
+    def _accept_snapshot(self, snapshot: dict) -> dict:
+        """Anchor source clocks once; duplicate payloads cannot reset source age."""
+        snap = dict(snapshot)
+        session, sent = snap.get("session_id", ""), snap.get("sent_mono")
+        with self._lock:
+            if session != self._source_session:
+                self._source_session, self._source_sent, self._source_received = session, float("-inf"), 0.0
+            if type(sent) in (int, float) and math.isfinite(sent) and sent > self._source_sent:
+                self._source_sent, self._source_received = sent, time.monotonic()
+            snap["mono"] = self._source_received
+            self._latest = snap
+        return snap
+
+    def latest(self, max_age_s: float = 0.5) -> dict:
+        snap = self._latest
+        if not snap or time.monotonic() - snap.get("mono", 0) > max_age_s:
+            snap = self._accept_snapshot(self.call("state", timeout=5.0))
+        if not snap.get("session_id") or snap["session_id"] != self.hello.get("session_id"):
+            raise BridgeError("stale_session", "daemon identity changed or unavailable")
+        source, sent = snap.get("source_mono"), snap.get("sent_mono")
+        if any(type(stamp) not in (int, float) or not math.isfinite(stamp) for stamp in (source, sent)):
+            raise BridgeError("source_time_missing", "source sampling/send clocks unavailable")
+        now = sent + time.monotonic() - snap["mono"]
+        if sent < self._source_sent or not 0 <= now - source <= max_age_s:
+            raise BridgeError("stale_feedback", "source sampler is stale or source clock regressed")
+        receipts = snap.get("receive", {})
+        # Only the slow 0x26x thermal groups need the qualified 250 ms allowance.
+        # Pose/effort groups must not inherit it and conceal a frozen sampler.
+        fast = tuple(group for group in RECEIVE_GROUPS if not group.startswith("0x26"))
+        problem = receipt_problem(receipts, fast, now=now, max_age_s=0.12, max_skew_s=0.30)
+        problem = problem or receipt_problem(receipts, RECEIVE_GROUPS, now=now,
+                                              max_age_s=0.25, max_skew_s=0.30)
+        if problem or not snap.get("receive_coherent"):
+            raise BridgeError("stale_feedback", problem or "incoherent source capture")
+        return dict(snap)
+
+    def pose(self) -> list[float]:
+        snap = self.latest()
+        return [snap["x"], snap["y"], snap["z"], snap["rx"], snap["ry"], snap["rz"]]
+
+    def wait(self, predicate: Callable[[dict], bool], timeout_s: float = 10.0,
+             poll_s: float = 0.02) -> dict:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            snap = self.latest(max_age_s=1.0)
+            if predicate(snap):
+                return snap
+            time.sleep(poll_s)
+        raise BridgeError("wait_timeout", "condition not reached")
+
+    def check(self) -> dict:
+        return self.call("check", timeout=5.0)
+
+    def state(self) -> dict:
+        return self.call("state", timeout=5.0)
+
+    # -- motion ------------------------------------------------------------
+    def enable(self, confirm: str = "ENABLE") -> dict:
+        return self.call("enable", confirm=confirm, timeout=10.0)
+
+    def transit(self, x: float, y: float, z: float, rpy=(-180.0, 0.0, -90.0),
+                speed_pct: float = 10.0) -> dict:
+        return self.call("transit", x=x, y=y, z=z, rpy=list(rpy), speed_pct=speed_pct)
+
+    def move(self, x: float, y: float, z: float, rpy=(-180.0, 0.0, -90.0), *,
+             kind: str = "linear", speed_pct: float = 3.0, timeout_s: float = 40.0,
+             arrive_mm: float = 1.2, arrive_deg: float = 1.5, stable_s: float = 0.3,
+             settle_s: float = 0.15, stall_s: float | None = None) -> dict:
+        return self.call("move", x=x, y=y, z=z, rx=rpy[0], ry=rpy[1], rz=rpy[2],
+                         kind=kind, speed_pct=speed_pct, timeout_s=timeout_s,
+                         arrive_mm=arrive_mm, arrive_deg=arrive_deg, stable_s=stable_s,
+                         settle_s=settle_s, stall_s=stall_s)
+
+    def grip(self, width_mm: float, effort_nm: float = 0.5, timeout_s: float = 3.0) -> dict:
+        return self.call("grip", width_mm=width_mm, effort_nm=effort_nm, timeout_s=timeout_s)
+
+    def open_gripper(self, width_mm: float = 70.0) -> dict:
+        return self.call("open", width_mm=width_mm, timeout_s=10.0)
+
+    def descend(self, x: float, y: float, floor_z: float, rpy=(-180.0, 0.0, -90.0),
+                **kwargs: Any) -> dict:
+        return self.call("descend", x=x, y=y, floor_z=floor_z, rpy=list(rpy),
+                         timeout_s=120.0, **kwargs)
+
+    def ik(self, poses: list[list[float]], seed: list[float] | None = None) -> dict:
+        return self.call("ik", poses=poses, seed=seed, timeout=20.0)
+
+    def chunk(self, rows: list[list[float]], kind: str = "joint", fps: float = 30.0,
+              max_rate_deg_s: float = 45.0) -> dict:
+        return self.call("chunk", rows=rows, kind=kind, fps=fps,
+                         max_rate_deg_s=max_rate_deg_s, timeout_s=60.0)
+
+    def stop(self) -> dict:
+        return self.call("stop", timeout=5.0)
+
+    def recover(self, confirm: str = "RECOVER", support: bool = False) -> dict:
+        return self.call("recover", confirm=confirm, support=support, timeout_s=20.0)

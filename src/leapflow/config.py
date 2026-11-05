@@ -204,6 +204,11 @@ class Settings:
     # operator decision, and the safety invariant (irreversible channels always
     # require approval) holds regardless.
     hardware_trust_skip_enabled: bool = False
+    # How long a post-write verdict may follow a value that is still travelling
+    # toward its command before it reports "pending". A declared settling time
+    # says when an observation becomes meaningful, not when a servo has arrived:
+    # judging a slow move by it alone reports a correct write as contradicted.
+    hardware_write_verification_follow_s: float = 10.0
     # Continuous sampling for channels that declare a sample rate.
     hardware_stream_enabled: bool = True
     # Per-channel ring buffer depth for raw samples. Raw readings never enter the
@@ -252,6 +257,10 @@ class Settings:
     hardware_media_screens: bool = False
     # Enumerate microphones alongside cameras.
     hardware_media_microphones: bool = True
+    # Comma-separated USB identities ("vid" or "vid:pid", hex) whose video nodes a
+    # dedicated driver owns (e.g. "8086" for RealSense UVC endpoints); they are not
+    # listed as generic cameras, so the board never offers a second opener.
+    hardware_media_exclude_usb: str = ""
     # The broker enforces hard ceilings. The board's default is a balanced profile below
     # these limits (960px / 8fps / JPEG 75); Detail is 1280px / 30fps / JPEG 85. A viewer
     # can choose a profile for its own live preview but never exceed these caps, and no
@@ -271,6 +280,9 @@ class Settings:
     # Node-local skills (S1.5). Comma-separated fnmatch patterns of enabled skill
     # ids; empty enables every discovered skill. The speed cap bounds every
     # skill plan; the duration cap bounds one skill execution end to end.
+    # Compute-only calibration defaults off; JSON budgets may tighten initial ceilings.
+    hardware_calibration_worker_enabled: bool = False
+    hardware_calibration_worker_budgets: str = "{}"
     hardware_skills_enabled: str = ""
     hardware_skills_speed_pct_max: float = 30.0
     hardware_skills_max_duration_s: float = 120.0
@@ -1443,6 +1455,9 @@ def _build_settings_from_env(
     hardware_trust_skip_enabled = os.getenv(
         "LEAPFLOW_HARDWARE_TRUST_SKIP_ENABLED", "0"
     ).strip().lower() in ("1", "true", "yes")
+    hardware_write_verification_follow_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_WRITE_VERIFICATION_FOLLOW_S", "10") or 10.0
+    )
     hardware_stream_enabled = os.getenv(
         "LEAPFLOW_HARDWARE_STREAM_ENABLED", "1"
     ).strip().lower() in ("1", "true", "yes")
@@ -1475,6 +1490,7 @@ def _build_settings_from_env(
     hardware_media_microphones = os.getenv(
         "LEAPFLOW_HARDWARE_MEDIA_MICROPHONES", "1"
     ).strip().lower() in ("1", "true", "yes")
+    hardware_media_exclude_usb = os.getenv("LEAPFLOW_HARDWARE_MEDIA_EXCLUDE_USB", "").strip()
     hardware_preview_max_fps = float(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_FPS", "30") or 30.0)
     hardware_preview_max_width = int(
         os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_WIDTH", "1280") or 1280
@@ -1488,6 +1504,8 @@ def _build_settings_from_env(
     # LEAPFLOW_FLEET_NODES fallback is applied later, in fleet_config.
     hardware_fleet_nodes = os.getenv("LEAPFLOW_HARDWARE_FLEET_NODES", "").strip()
     hardware_alert_policies = os.getenv("LEAPFLOW_HARDWARE_ALERT_POLICIES", "").strip()
+    hardware_calibration_worker_enabled = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+    hardware_calibration_worker_budgets = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_BUDGETS", "{}").strip() or "{}"
     hardware_skills_enabled = os.getenv("LEAPFLOW_HARDWARE_SKILLS_ENABLED", "").strip()
     hardware_skills_speed_pct_max = float(
         os.getenv("LEAPFLOW_HARDWARE_SKILLS_SPEED_PCT_MAX", "30") or 30.0
@@ -1969,6 +1987,7 @@ def _build_settings_from_env(
         agent_calibration_finalizing_max_ratio=agent_calibration_finalizing_max_ratio,
         agent_compression_writeback=agent_compression_writeback,
         agent_reentry_enabled=agent_reentry_enabled,
+        agent_reentry_hardware_enabled=agent_reentry_hardware_enabled,
         agent_reentry_tick_seconds=agent_reentry_tick_seconds,
         agent_reentry_global_budget=agent_reentry_global_budget,
         agent_reentry_send_enabled=agent_reentry_send_enabled,
@@ -2007,6 +2026,7 @@ def _build_settings_from_env(
         hardware_require_describe=hardware_require_describe,
         hardware_envelope_grant=hardware_envelope_grant,
         hardware_trust_skip_enabled=hardware_trust_skip_enabled,
+        hardware_write_verification_follow_s=hardware_write_verification_follow_s,
         hardware_stream_enabled=hardware_stream_enabled,
         hardware_stream_ring_capacity=hardware_stream_ring_capacity,
         hardware_persist_readings=hardware_persist_readings,
@@ -2021,12 +2041,15 @@ def _build_settings_from_env(
         hardware_rediscover_interval_s=hardware_rediscover_interval_s,
         hardware_media_screens=hardware_media_screens,
         hardware_media_microphones=hardware_media_microphones,
+        hardware_media_exclude_usb=hardware_media_exclude_usb,
         hardware_preview_max_fps=hardware_preview_max_fps,
         hardware_preview_max_width=hardware_preview_max_width,
         hardware_preview_quality=hardware_preview_quality,
         hardware_preview_idle_timeout_s=hardware_preview_idle_timeout_s,
         hardware_fleet_nodes=hardware_fleet_nodes,
         hardware_alert_policies=hardware_alert_policies,
+        hardware_calibration_worker_enabled=hardware_calibration_worker_enabled,
+        hardware_calibration_worker_budgets=hardware_calibration_worker_budgets,
         hardware_skills_enabled=hardware_skills_enabled,
         hardware_skills_speed_pct_max=hardware_skills_speed_pct_max,
         hardware_skills_max_duration_s=hardware_skills_max_duration_s,

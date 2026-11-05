@@ -1,0 +1,190 @@
+"""One place for every constant the mission uses, overridable from cl_data/profile.json.
+
+The profile is deliberately small and flat-ish: geometry that a measurement will
+replace (tool length, platform contact z) is stored in ``cl_data/table_model.json``
+instead, so this file never becomes a second, staler copy of a measurement.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent  # temp/devices/piper
+DATA = ROOT / "cl_data"
+HANDEYE = ROOT / "handeye.json"
+WRIST_HANDEYE = ROOT / "wrist_handeye.json"
+D405_DEVICE_ID = "sensor_realsense_d405"
+D435_DEVICE_ID = "sensor_realsense_435if"
+PROFILE = DATA / "profile.json"
+TABLE_MODEL = DATA / "table_model.json"
+BOX_POSE = DATA / "box_pose.json"
+
+DEFAULTS: dict[str, Any] = {
+    "bridge": {"host": "192.168.55.1", "port": 8771, "timeout_s": 90.0},
+    "lhp": {
+        "host": "192.168.55.1",
+        "port": 8767,
+        "node_id": "yahboom",
+        "workcell": "piper_cell",
+        "snapshot_skill": "perceive.snapshot",
+        "lift_skill": "perceive.lift",
+    },
+    "geometry": {
+        "declared_table_z_mm": -15.5,
+        "tool_len_fallback_mm": 126.5,
+        "tilt_deg": 3.0,
+        "envelope": {"x": [70.0, 300.0], "y": [-80.0, 220.0], "z": [35.0, 215.0]},
+    },
+    "motion": {
+        "speed_transit_pct": 10.0,
+        "speed_approach_pct": 5.0,
+        "speed_grasp_pct": 3.0,
+        "hover_z_mm": 190.0,
+        "carry_z_mm": 150.0,
+        "park_mm": [150.0, 130.0, 190.0],
+        "approach_clearance_mm": 45.0,
+        "pre_clearance_mm": 12.0,
+        "lift_after_grasp_mm": 25.0,
+    },
+    "grasp": {
+        "jaw_max_mm": 70.0,
+        "open_max_mm": 68.0,
+        "close_margin_mm": 4.0,
+        "dip_max_mm": 14.0,
+        "dip_min_clearance_mm": 3.0,
+        "effort_nm": 0.5,
+        "hold_min_mm": 3.0,
+        "slip_mm": 2.5,
+    },
+    "place": {
+        "target_mm": [270.0, 80.0],
+        "clearance_mm": 1.0,
+        "open_width_mm": 65.0,
+        "settle_s": 0.5,
+    },
+    "contact": {
+        "points_mm": [[150.0, 130.0], [120.0, 100.0]],
+        "floor_z_mm": 40.0,
+        "hover_z_mm": 190.0,
+        "reach_mm": 90.0,
+        "speed_pct": 3.0,
+        "lift_mm": 25.0,
+    },
+    "vision": {
+        "min_saturation": 95,
+        "min_value": 40,
+        "min_area_px": 400,
+        "max_targets": 8,
+        "table_offsets_mm": [[-70, -70], [70, -70], [-70, 70], [70, 70],
+                             [0, -80], [0, 80], [-80, 0], [80, 0]],
+        "table_spread_max_mm": 4.0,
+        "top_grid": 4,
+        "top_inset": 0.15,
+        "top_band_mm": 5.0,
+        "reuse_frame_s": 1.2,
+    },
+    "wrist": {
+        "serial_number": "260422273928",
+        "mount_digest": "",
+        "max_frame_age_s": 1.2,
+        "max_capture_s": 1.2,
+        "alignment_mm": 3.0,
+        "max_correction_mm": 6.0,
+        "box_pnp_rms_px": 1.0,
+        "box_tilt_deg": 5.0,
+        "pose_drift_mm": 0.5,
+        "pose_drift_deg": 0.5,
+        "abort_speed_rad_s": 0.05,
+        "heldout_rms_mm": 2.0,
+        "min_blob_px": 300,
+        "hsv_low": [100, 80, 35],
+        "hsv_high": [135, 255, 255],
+        "inner_pad_tool_mm": None,
+        "pad_engagement_tolerance_mm": 2.0,
+        "depth_target_mm": 150.0,
+        "depth_target_tolerance_mm": 15.0,
+        "depth_temporal_p95_mm": 1.0,
+        "depth_frames": 20,
+    },
+    "qualification": {
+        "clearance_margin_mm": 3.0,
+        "proof_lift_mm": 8.0,
+        "proof_frames": 3,
+        "proof_rise_error_mm": 2.0,
+        "post_place_error_mm": 3.0,
+        "descent_planar_max_mm": 0.8,
+        "descent_z_max_mm": 0.8,
+        "descent_rz_max_deg": 1.0,
+        "planar_error_p95_mm": None,
+        "independent_dims_mm": None,
+    },
+    "vla": {
+        "service": "http://192.168.55.1:8000",
+        "fps": 30.0,
+        "chunk": 50,
+        "max_rate_deg_s": 45.0,
+        "timeout_s": 3.0,
+    },
+}
+
+
+class Cfg(dict):
+    """Dict with attribute access, so call sites read like prose."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            value = self[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+        return Cfg(value) if isinstance(value, dict) else value
+
+    def get_path(self, dotted: str, default: Any = None) -> Any:
+        node: Any = self
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+
+def _merge(base: dict, override: dict) -> dict:
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_profile() -> Cfg:
+    DATA.mkdir(parents=True, exist_ok=True)
+    if PROFILE.exists():
+        try:
+            override = json.loads(PROFILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            override = {}
+        return Cfg(_merge(DEFAULTS, override))
+    return Cfg(_merge(DEFAULTS, {}))
+
+
+def write_profile(patch: dict) -> Cfg:
+    current = json.loads(PROFILE.read_text(encoding="utf-8")) if PROFILE.exists() else {}
+    DATA.mkdir(parents=True, exist_ok=True)
+    PROFILE.write_text(json.dumps(_merge(current, patch), indent=2) + "\n", encoding="utf-8")
+    return load_profile()
+
+
+def load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def dump_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def handeye() -> dict:
+    return load_json(HANDEYE)

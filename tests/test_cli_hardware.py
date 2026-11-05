@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -30,6 +31,7 @@ from leapflow.hardware.context import (
     HC_VERSION,
     Channel,
     ContextProvenance,
+    ContextSource,
     Direction,
     Envelope,
     HardwareContext,
@@ -171,6 +173,49 @@ def test_hw_read_reads_one_channel_on_demand(monkeypatch, tmp_path, capsys) -> N
     assert payload["reading"]["value"] == 21.5
 
 
+def test_validate_checks_declarations_not_enumerated_resources(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A camera or a microphone must not be able to fail the declaration check.
+
+    Only a declaration can be reviewed by a human, and only a declaration has a
+    digest that stays put between machines.  Counting enumerated host resources
+    as "unverified" kept this command red on every host with a camera, so the one
+    signal it exists to give -- an edited declaration drifting away from the
+    reviewed one -- was buried under noise an operator could never clear.
+    """
+    from leapflow.cli.commands.hardware import cmd_hardware
+    from leapflow.hardware.attestation import declaration_digest, store_verification
+    from leapflow.layout import HardwareLayout
+
+    declared = _rig_context()
+    discovered = replace(
+        declared,
+        device_id="cam",
+        provenance=replace(declared.provenance, source=ContextSource.DISCOVERED.value),
+    )
+    registry = HardwareRegistry(
+        HardwareSettings(enabled=True, require_describe_before_write=False),
+        providers=[_StaticProvider(declared, discovered)],
+    )
+    registry.load()
+    layout = HardwareLayout(make_settings(str(tmp_path)).profile_dir / "hardware")
+    store_verification(
+        layout.verified_path,
+        "rig",
+        verifier="jason",
+        digest=declaration_digest(registry.context("rig")),
+    )
+    _install_local_registry(monkeypatch, tmp_path, registry)
+
+    assert cmd_hardware(_ns("validate")) == 0
+    payload = _json_out(capsys)
+    assert payload["ok"] is True
+    assert [item["device_id"] for item in payload["devices"]] == ["rig"]
+    assert payload["devices"][0]["status"] == "valid"
+    assert payload["skipped"] == [{"device_id": "cam", "source": "discovered"}]
+
+
 def test_the_read_plane_releases_every_device_before_it_exits(
     monkeypatch, tmp_path, capsys
 ) -> None:
@@ -248,6 +293,47 @@ def test_hw_read_unknown_device_is_nonzero(monkeypatch, tmp_path, capsys) -> Non
     assert cmd_hardware(_ns("read", device="ghost", channel="temp")) == 1
     payload = _json_out(capsys)
     assert payload["ok"] is False
+
+
+def test_hw_probe_uses_transport_contract_without_halting(monkeypatch, tmp_path, capsys) -> None:
+    from leapflow.cli.commands.hardware import cmd_hardware
+    from leapflow.hardware.transports.mock import MockTransport
+
+    registry = _loaded_registry()
+    _install_local_registry(monkeypatch, tmp_path, registry)
+
+    async def forbidden_halt(self) -> None:
+        pytest.fail("a read-only probe must never halt the device")
+
+    monkeypatch.setattr(MockTransport, "halt", forbidden_halt)
+    assert cmd_hardware(_ns("probe", device_id="rig")) == 0
+    payload = _json_out(capsys)
+    assert payload["ok"] is True
+    assert {check["check"] for check in payload["checks"]} == {
+        "transport", "read:temp", "halt_available",
+    }
+
+
+def test_hw_probe_skips_demoted_write_only_channels(monkeypatch, tmp_path, capsys) -> None:
+    from dataclasses import replace
+
+    from leapflow.cli.commands.hardware import cmd_hardware
+
+    context = _rig_context()
+    context = replace(
+        context,
+        provenance=ContextProvenance(),
+        channels=context.channels + (
+            Channel(channel_id="power", direction=Direction.WRITE.value,
+                    effect="actuate", envelope=Envelope(declared=True)),
+        ),
+    )
+    registry = HardwareRegistry(HardwareSettings(enabled=True), providers=[_StaticProvider(context)])
+    registry.load()
+    assert not registry.context("rig").channel("power").is_writable
+    _install_local_registry(monkeypatch, tmp_path, registry)
+    assert cmd_hardware(_ns("probe", device_id="rig")) == 0
+    assert all(check["check"] != "read:power" for check in _json_out(capsys)["checks"])
 
 
 def test_hw_disabled_hardware_fails_closed(monkeypatch, tmp_path, capsys) -> None:

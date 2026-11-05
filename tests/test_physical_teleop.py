@@ -344,7 +344,7 @@ class TestLeaderFollowerBridge:
         )
         await bridge.start()
         await asyncio.sleep(0.05)
-        trajectory = await bridge.stop()
+        await bridge.stop()
         # The bridge should have written to the mapped channels.
         transport = await registry.transport("follower")
         written_channels = {ch for ch, _ in transport.writes}

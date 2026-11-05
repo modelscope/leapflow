@@ -1,0 +1,266 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""CLI commands for leapd daemon management.
+
+``leap daemon status``  — show whether leapd is running
+``leap daemon start``   — start leapd for the active profile
+``leap daemon stop``    — stop running daemon and verify shutdown
+``leap daemon restart`` — restart leapd so code/config changes take effect
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+from argparse import Namespace
+from pathlib import Path
+
+
+def cmd_daemon(args: Namespace) -> int:
+    """Route daemon subcommands."""
+    from leapflow.config import load_config
+
+    settings = load_config()
+    runtime_dir = settings.runtime_dir
+
+    action = getattr(args, "daemon_action", None) or "status"
+
+    if action == "status":
+        return _status(runtime_dir)
+    if action == "start":
+        return _start(settings, getattr(args, "mock_host", False))
+    if action == "stop":
+        return _stop(runtime_dir, force=getattr(args, "force", False))
+    if action == "restart":
+        return _restart(settings, getattr(args, "mock_host", False), force=getattr(args, "force", False))
+    if action == "serve":
+        if not getattr(args, "internal", False):
+            sys.stderr.write("'leap daemon serve' is an internal command. Use 'leap daemon start'.\n")
+            return 2
+        return asyncio.run(_serve(settings, getattr(args, "mock_host", False)))
+
+    sys.stderr.write(f"Unknown daemon action: {action}\n")
+    return 1
+
+
+def _status(runtime_dir: Path) -> int:
+    from leapflow.daemon.lifecycle import DaemonInfo
+
+    info = DaemonInfo.discover(runtime_dir)
+    print(info.format_status())
+    if info.sock_path is not None:
+        print(f"socket: {info.sock_path}")
+    if info.is_healthy and info.sock_path is not None:
+        try:
+            details = asyncio.run(_runtime_status(info.sock_path))
+        except Exception as exc:
+            sys.stderr.write(
+                f"Could not fetch daemon runtime details within {_runtime_status_timeout():g}s: {exc}\n"
+                "leapd accepted the socket connection but did not answer RPC; "
+                "run 'leap daemon restart --force' if this persists.\n"
+            )
+        else:
+            _print_runtime_status(details)
+    return 0 if info.is_healthy else 1
+
+
+async def _runtime_status(sock_path: Path) -> dict:
+    from leapflow.daemon.client import DaemonClient
+
+    return await DaemonClient(sock_path, timeout_s=_runtime_status_timeout()).status()
+
+
+def _runtime_status_timeout() -> float:
+    raw = os.getenv("LEAPFLOW_DAEMON_STATUS_TIMEOUT", "3").strip()
+    try:
+        return max(0.5, float(raw))
+    except ValueError:
+        return 3.0
+
+
+def _print_runtime_status(status: dict) -> None:
+    connected_clients = status.get("connected_clients")
+    connection_suffix = (
+        f" connected={connected_clients}" if connected_clients is not None else ""
+    )
+    print(
+        "runtime: "
+        f"profile={status.get('profile')} "
+        f"clients={status.get('active_clients')}"
+        f"{connection_suffix} "
+        f"volatile={status.get('volatile')}"
+    )
+    print(
+        "model: "
+        f"{status.get('model')} "
+        f"context={status.get('context_used', 0)}/{status.get('llm_context_length', 0)}"
+    )
+    admission = status.get("turn_admission")
+    if isinstance(admission, dict):
+        print(
+            "turns: "
+            f"active={admission.get('active', 0)}/{admission.get('max_concurrent', 0)} "
+            f"available={admission.get('available', 0)} "
+            f"waiting={admission.get('waiting', 0)}"
+        )
+        active_ids = [str(item) for item in admission.get("active_request_ids") or []]
+        if active_ids:
+            print(f"active_request_ids: {', '.join(active_ids)}")
+    deferred = status.get("deferred_init")
+    if isinstance(deferred, dict):
+        initialized = bool(deferred.get("initialized"))
+        running = bool(deferred.get("running"))
+        degraded = bool(deferred.get("degraded"))
+        state = "ready" if initialized else "running" if running else "degraded" if degraded else "pending"
+        attempts = int(deferred.get("attempts", 0) or 0)
+        max_attempts = int(deferred.get("max_attempts", 0) or 0)
+        print(f"deferred_init: state={state} attempts={attempts}/{max_attempts}")
+        if deferred.get("error"):
+            print(f"deferred_error: {deferred['error']}")
+    if status.get("session_id"):
+        print(f"session: {status['session_id']}")
+    clients = status.get("clients")
+    if isinstance(clients, list) and clients:
+        print("clients:")
+        for client in clients:
+            if not isinstance(client, dict):
+                continue
+            workspace = client.get("workspace_root") or "?"
+            session = client.get("session_id") or "-"
+            print(
+                f"  - {client.get('kind', '?')}"
+                f" state={client.get('state', '?')}"
+                f" session={session}"
+                f" workspace={workspace}"
+            )
+    if status.get("runtime_version"):
+        print(f"version: {status['runtime_version']}")
+    if status.get("runtime_source"):
+        print(f"source: {status['runtime_source']}")
+    if status.get("runtime_executable"):
+        print(f"python: {status['runtime_executable']}")
+    if status.get("profile_config_dir"):
+        print(f"profile_config: {status['profile_config_dir']}")
+    if status.get("user_config_path"):
+        print(f"user_config: {status['user_config_path']}")
+    if status.get("workspace_config_path"):
+        print(f"workspace_config: {status['workspace_config_path']}")
+    if status.get("runtime_dir"):
+        print(f"runtime_dir: {status['runtime_dir']}")
+    if status.get("db_path"):
+        print(f"db: {status['db_path']}")
+    host = status.get("host_backend")
+    if isinstance(host, dict):
+        print(
+            "host: "
+            f"backend={host.get('backend')} "
+            f"started={host.get('started')} "
+            f"pid={host.get('pid')}"
+        )
+        if host.get("command"):
+            args = " ".join(str(arg) for arg in host.get("args") or [])
+            command = f"{host.get('command')} {args}".strip()
+            print(f"host_command: {command}")
+        if host.get("capability_version"):
+            print(f"host_capability: {host['capability_version']}")
+        if host.get("last_error"):
+            print(f"host_error: {host['last_error']}")
+    build = status.get("build")
+    if isinstance(build, dict) and build.get("commit"):
+        stale = build.get("stale")
+        stale_text = "UNKNOWN" if stale is None else ("STALE — restart with 'leap daemon restart'" if stale else "fresh")
+        dirty = " (dirty)" if build.get("dirty_digest") else ""
+        print(f"build: commit={build['commit']}{dirty} pid={build.get('pid')} status={stale_text}")
+
+
+def _start(settings: object, mock_host: bool) -> int:
+    from leapflow.daemon.client import DaemonUnavailableError, ensure_daemon_client
+
+    async def _run() -> int:
+        try:
+            client = await ensure_daemon_client(
+                settings,
+                mock_host=mock_host,
+                status_callback=lambda msg: print(f"→ {msg}"),
+            )
+            status = await client.status()
+        except DaemonUnavailableError as exc:
+            sys.stderr.write(f"Failed to start leapd: {exc}\n")
+            return 1
+        print(
+            "leapd ready "
+            f"(pid={status.get('pid')}, profile={status.get('profile')}, "
+            f"clients={status.get('active_clients')})"
+        )
+        return 0
+
+    return asyncio.run(_run())
+
+
+def _stop(runtime_dir: Path, *, force: bool = False, timeout_s: float = 10.0) -> int:
+    from leapflow.daemon.lifecycle import DaemonInfo, cleanup_stale, stop_daemon
+
+    info = DaemonInfo.discover(runtime_dir)
+    if not info.is_running:
+        if info.pid is not None:
+            cleanup_stale(runtime_dir)
+            print("Cleaned up stale daemon files.")
+        else:
+            print("leapd is not running.")
+        return 0
+
+    graceful_requested = False
+    if info.is_healthy and info.sock_path is not None:
+        graceful_requested = _request_shutdown(info.sock_path)
+    print(f"Stopping leapd (pid={info.pid})...")
+    result = stop_daemon(
+        runtime_dir,
+        timeout_s=timeout_s,
+        force=force,
+        grace_timeout_s=2.0 if graceful_requested else 0.0,
+    )
+    if result.stopped:
+        suffix = " with force" if result.forced else ""
+        print(f"leapd stopped{suffix}.")
+        return 0
+
+    sys.stderr.write(
+        f"Timed out waiting for leapd to stop (pid={result.pid}). "
+        "Run 'leap daemon stop --force' or inspect the process manually.\n"
+    )
+    return 1
+
+
+def _request_shutdown(sock_path: Path) -> bool:
+    from leapflow.daemon.client import DaemonClient, DaemonUnavailableError
+
+    async def _run() -> bool:
+        try:
+            await DaemonClient(sock_path, timeout_s=2.0).shutdown()
+            return True
+        except DaemonUnavailableError:
+            return False
+
+    return asyncio.run(_run())
+
+
+def _restart(settings: object, mock_host: bool, *, force: bool = False) -> int:
+    runtime_dir = settings.runtime_dir
+    print("Restarting leapd...")
+    stop_code = _stop(runtime_dir, force=force, timeout_s=10.0)
+    if stop_code != 0:
+        sys.stderr.write("Restart aborted because old leapd did not stop cleanly.\n")
+        return stop_code
+    return _start(settings, mock_host)
+
+
+
+async def _serve(settings: object, mock_host: bool) -> int:
+    from leapflow.daemon.server import serve_daemon
+    from leapflow.logging_setup import init_daemon_logging
+
+    # The daemon writes stdout/stderr to leapd.log; without an explicit logging
+    # setup Python's lastResort handler only emits WARNING+, hiding the INFO
+    # field evidence (deferred init progress, turn usage). daemon.log_level is
+    # independent from runtime.log_level and requires a daemon restart.
+    init_daemon_logging(settings)
+    return await serve_daemon(settings, mock_host=mock_host)

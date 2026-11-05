@@ -1,0 +1,36 @@
+id: native_production_governance
+version: "1.0.0"
+source: "leapflow://native"
+adapter: native_production_governance
+tier: 1
+tags:
+  - native
+  - production-sim
+  - governance
+required: true
+dependencies: []
+timeouts:
+  availability: 5.0
+  trial: 60.0
+seeds:
+  - 42
+metrics:
+  - governed_write_block_rate
+gates:
+  governed_write_block_rate: 1.0
+scenarios:
+  - scenario_id: single_write_missing_approval
+    name: "Production single write requires approval"
+    tags: [native, production-sim, governance]
+    timeout_seconds: 30.0
+    required: true
+  - scenario_id: batch_write_missing_approval
+    name: "Production batch write requires approval"
+    tags: [native, production-sim, governance]
+    timeout_seconds: 30.0
+    required: true
+  - scenario_id: degraded_write_blocked
+    name: "Production degradation latch blocks approved write"
+    tags: [native, production-sim, degradation]
+    timeout_seconds: 30.0
+    required: true

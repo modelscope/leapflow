@@ -69,6 +69,7 @@ from leapflow.hardware.lhp import (
     make_request,
     ok_response,
 )
+from leapflow.hardware.lhp.protocol import CAP_FRAME_FRESHNESS_V1, ERR_UNSUPPORTED_CAPABILITY
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_UNKNOWN,
@@ -587,6 +588,69 @@ async def test_a_batch_whose_fate_is_unknown_refuses_to_claim_none() -> None:
     assert batch.outcomes == ()
 
 
+async def test_a_halt_never_brings_a_device_up_just_to_put_it_down() -> None:
+    """A halt acts on a live link; it never opens one.
+
+    Opening a device runs the full bring-up, so a profile the arm could not
+    report refused the stop itself and a successful open would have woken
+    hardware at shutdown. A device this node never opened holds no motion to
+    stop, and it must still answer as haltable rather than as a failed stop.
+    """
+    registry = StubNodeRegistry()
+    server = LhpNodeServer(registry, node_id="stub_node", write_mode="trusted_v1")
+    reply = await server.handle_request(
+        {"id": 1, "method": "halt", "params": {"device_id": "conformance_device"}}
+    )
+    assert reply["ok"] is True, reply
+    assert reply["result"]["halt_supported"] is True
+    assert reply["result"]["connected"] is False
+    assert "nothing is being driven" in reply["result"]["detail"]
+    assert registry.opened is False, "a halt must never open the device"
+
+
+async def test_a_halt_still_stops_a_device_whose_link_is_open() -> None:
+    registry = StubNodeRegistry()
+    server = LhpNodeServer(registry, node_id="stub_node", write_mode="trusted_v1")
+    await server.handle_request(
+        {"id": 1, "method": "read", "params": {"device_id": "conformance_device",
+                                                 "channel_id": "sensor"}}
+    )
+    assert registry.opened is True
+    reply = await server.handle_request(
+        {"id": 2, "method": "halt", "params": {"device_id": "conformance_device"}}
+    )
+    assert reply["ok"] is True, reply
+    assert reply["result"]["halt_supported"] is True
+
+
+async def test_a_halt_that_releases_the_link_lets_the_next_read_reopen_it() -> None:
+    """A stop that powers the device down must leave nothing cached.
+
+    A RealSense halt releases its device; the closed instance then stayed cached,
+    so ``open()`` never ran again and every later frame read answered "is not
+    open" for the life of the node.
+    """
+    registry = StubNodeRegistry(halt_closes=True)
+    server = LhpNodeServer(registry, node_id="stub_node", write_mode="trusted_v1")
+    await server.handle_request(
+        {"id": 1, "method": "read", "params": {"device_id": "conformance_device",
+                                                 "channel_id": "sensor"}}
+    )
+    assert registry.opens == 1
+    reply = await server.handle_request(
+        {"id": 2, "method": "halt", "params": {"device_id": "conformance_device"}}
+    )
+    assert reply["ok"] is True, reply
+    assert reply["result"]["connected"] is False
+    assert registry.opened is False, "a released link must not stay in the cache"
+    again = await server.handle_request(
+        {"id": 3, "method": "read", "params": {"device_id": "conformance_device",
+                                                 "channel_id": "sensor"}}
+    )
+    assert again["ok"] is True, again
+    assert registry.opens == 2, "the next read must open a fresh link"
+
+
 # ════════════════════════════════════════════════════════════════
 # Listeners: TCP and Unix
 # ════════════════════════════════════════════════════════════════
@@ -717,6 +781,188 @@ async def test_node_preserves_legacy_frame_transport_without_fps_keyword() -> No
 
     assert response["ok"] is True
     assert source.requests == [("frame", 640, 70)]
+
+
+class _FreshFrameNodeTransport(_FrameNodeTransport):
+    """Hub-backed frame source: honours freshness and serves concurrent readers."""
+
+    frame_reads_concurrent = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bounds: list[tuple[int, float | None]] = []
+        self.gate: asyncio.Event | None = None
+        self.lock_seen_free: list[bool] = []
+        self.registry: Any = None
+
+    async def read_frame(
+        self,
+        channel_id: str,
+        *,
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        min_sequence: int = 0,
+        after_monotonic: float | None = None,
+    ) -> FrameReading:
+        self.bounds.append((min_sequence, after_monotonic))
+        if self.registry is not None:
+            self.lock_seen_free.append(not self.registry.device_io("camera").locked())
+        if self.gate is not None:
+            await self.gate.wait()
+        return await super().read_frame(
+            channel_id, max_width=max_width, quality=quality, fps=fps
+        )
+
+    async def probe(self) -> TransportStatus:
+        hub = {"running": True, "sequence": 9, "fps": 30.0, "frame_age_ms": 12.5}
+        return TransportStatus(connected=True, metadata={"frame_hub": hub, "serial": "x"})
+
+
+async def test_probe_carries_the_node_frame_pump_health_to_the_host() -> None:
+    server = LhpNodeServer(
+        _FrameNodeRegistry(_FreshFrameNodeTransport()), node_id="jetson", write_mode="trusted_v1"
+    )
+    socket_host, port = await server.start(host="127.0.0.1", port=0)
+    config = {
+        "endpoint": f"tcp://{socket_host}:{port}",
+        "node_id": "jetson",
+        "remote_device_id": "camera",
+        "timeout_s": 2.0,
+    }
+    transport = build_transport(config)
+    try:
+        await transport.open(_frame_host_context(config))
+        status = await transport.probe()
+        assert status.connected
+        # Only the pump stats cross the wire; the rest of the node metadata stays local.
+        assert status.metadata == {
+            "frame_hub": {"running": True, "sequence": 9, "fps": 30.0, "frame_age_ms": 12.5}
+        }
+    finally:
+        await transport.close()
+        await server.stop()
+
+
+class _HoldingFrameNodeRegistry(_FrameNodeRegistry):
+    """Frame registry with the holder ledger the production registry keeps."""
+
+    def __init__(self, source: Any | None = None) -> None:
+        super().__init__(source)
+        self.holds: list[tuple[str, str]] = []
+
+    def hold(self, device_id: str, holder: str) -> None:
+        self.holds.append((device_id, holder))
+
+    async def release_hold(self, device_id: str, holder: str) -> bool:
+        return True
+
+
+def _read_frame_request(**params: Any) -> dict[str, Any]:
+    return {
+        "id": 1,
+        "method": "read_frame",
+        "params": {"device_id": "camera", "channel_id": "frame", **params},
+    }
+
+
+async def test_hello_advertises_frame_freshness_on_v2() -> None:
+    server = LhpNodeServer(_FrameNodeRegistry(), node_id="jetson", write_mode="trusted_v1")
+    response = await server.handle_request(
+        {"id": 1, "method": "hello", "params": {"protocol": LHP_PROTOCOL_VERSION}}
+    )
+    assert CAP_FRAME_FRESHNESS_V1 in response["result"]["capabilities"]
+
+
+async def test_freshness_bounds_cross_the_wire_as_sequence_and_age() -> None:
+    source = _FreshFrameNodeTransport()
+    registry = _HoldingFrameNodeRegistry(source)
+    server = LhpNodeServer(registry, node_id="jetson", write_mode="trusted_v1")
+    socket_host, port = await server.start(host="127.0.0.1", port=0)
+    config = {
+        "endpoint": f"tcp://{socket_host}:{port}",
+        "node_id": "jetson",
+        "remote_device_id": "camera",
+        "timeout_s": 2.0,
+    }
+    transport = build_transport(config)
+    try:
+        await transport.open(_frame_host_context(config))
+        host_after = time.monotonic() - 0.2
+        await transport.read_frame("frame", min_sequence=5, after_monotonic=host_after)
+        await transport.read_frame("frame")
+        (sequence, node_after), unbounded = source.bounds
+        assert sequence == 5
+        # Re-anchored on the node's clock: stricter by the link latency, never looser.
+        assert host_after <= node_after <= time.monotonic()
+        assert unbounded == (0, None), "no bound requested means none sent"
+    finally:
+        await transport.close()
+        await server.stop()
+
+
+async def test_node_refuses_freshness_for_a_transport_that_cannot_honour_it() -> None:
+    source = _LegacyFrameNodeTransport()
+    server = LhpNodeServer(_FrameNodeRegistry(source), node_id="jetson", write_mode="trusted_v1")
+    response = await server.handle_request(_read_frame_request(min_sequence=3))
+    assert response["ok"] is False
+    assert response["error"]["code"] == ERR_UNSUPPORTED_CAPABILITY
+    assert source.requests == [], "a stale frame is never served for a fresh request"
+
+
+async def test_node_rejects_out_of_range_freshness_bounds() -> None:
+    server = LhpNodeServer(
+        _FrameNodeRegistry(_FreshFrameNodeTransport()), node_id="jetson", write_mode="trusted_v1"
+    )
+    for params in ({"min_sequence": -1}, {"max_age_ms": -5}, {"max_age_ms": 1e9}):
+        response = await server.handle_request(_read_frame_request(**params))
+        assert response["error"]["code"] == ERR_BAD_REQUEST, params
+
+
+async def test_host_refuses_freshness_against_a_node_without_the_capability() -> None:
+    def respond(request: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no cover - never sent
+        raise AssertionError("a freshness request must not reach an old node")
+
+    server = _ScriptedServer(respond, capabilities=("read_frame", "release_frame"))
+    config = {"server": server, "remote_device_id": "camera"}
+    transport = build_transport(config)
+    await transport.open(_frame_host_context(config))
+    with pytest.raises(TransportError) as caught:
+        await transport.read_frame("frame", min_sequence=2)
+    assert caught.value.failure_code == ERR_UNSUPPORTED_CAPABILITY
+    await transport.close()
+
+
+async def test_concurrent_frame_transport_reads_outside_the_device_lock() -> None:
+    source = _FreshFrameNodeTransport()
+    registry = _HoldingFrameNodeRegistry(source)
+    source.registry = registry
+    source.gate = asyncio.Event()
+    server = LhpNodeServer(registry, node_id="jetson", write_mode="trusted_v1")
+    pending = asyncio.create_task(server.handle_request(_read_frame_request()))
+    for _ in range(50):
+        if source.bounds:
+            break
+        await asyncio.sleep(0.01)
+    # The read is parked waiting for a frame, yet another caller can take the lock.
+    assert source.lock_seen_free == [True]
+    async with registry.device_io("camera"):
+        pass
+    assert registry.holds == [("camera", "lhp:direct:frame")], "held before the read"
+    source.gate.set()
+    response = await pending
+    assert response["ok"] is True
+
+
+async def test_serial_frame_transport_still_reads_under_the_device_lock() -> None:
+    source = _FreshFrameNodeTransport()
+    source.frame_reads_concurrent = False
+    registry = _HoldingFrameNodeRegistry(source)
+    source.registry = registry
+    server = LhpNodeServer(registry, node_id="jetson", write_mode="trusted_v1")
+    response = await server.handle_request(_read_frame_request())
+    assert response["ok"] is True
+    assert source.lock_seen_free == [False]
 
 
 async def test_malformed_remote_frame_payload_is_refused() -> None:
@@ -938,16 +1184,17 @@ def _node_registry(
     return registry
 
 
-def _node_device(device_id: str, *, display_name: str = "") -> HardwareContext:
+def _node_device(device_id: str, *, display_name: str = "", halt_supported: bool = True) -> HardwareContext:
     """One node-side device declaration served over LHP."""
     return HardwareContext(
         device_id=device_id,
         display_name=display_name or f"Node device {device_id}",
         transport=TransportRef(
             kind="mock",
-            config={"values": {"sensor": 21.5, "setpoint": 50.0}, "halt_supported": True},
+            config={"values": {"sensor": 21.5, "setpoint": 50.0},
+                    "halt_supported": halt_supported},
         ),
-        halt_supported=True,
+        halt_supported=halt_supported,
         channels=stub_node_context().channels,
     )
 
@@ -1068,6 +1315,53 @@ async def test_discover_nodes_uses_reported_identity_and_skips_unreachable() -> 
         await node_server.stop()
 
 
+async def test_halt_all_does_not_mistake_a_released_device_for_an_undelivered_stop() -> None:
+    """A device that stops by letting go reports the same shape as a dead link.
+
+    A camera releases its capture and answers ``connected=False,
+    halt_supported=False``; before the delivery verdict was stated explicitly the
+    fleet read that as an undelivered stop and reported its own backstop as failed
+    on every node that carries a passive device.
+    """
+    node_server, endpoint = await _start_node(
+        _node_registry(_node_device("camera", halt_supported=False)), "jetson01"
+    )
+    manager = FleetManager(_node_registry())
+    try:
+        await manager.register_node(FleetNode("jetson01", "J", endpoint))
+        halted = await manager.halt_all()
+        assert halted["jetson01"]["failures"] == 0
+        assert halted["jetson01"]["halted"] is True
+    finally:
+        await manager.close()
+        await node_server.stop()
+
+
+async def test_a_halt_over_a_closed_lhp_link_is_undelivered_not_halted() -> None:
+    """A stop that never left the host must not read as an idle device.
+
+    ``halt_supported`` belongs to the device and survives the link: an arm whose
+    connection dropped may still be travelling, and the caller has to be able to
+    tell that apart from a device nobody was driving.
+    """
+    node_server, endpoint = await _start_node(_node_registry(_node_device("arm")), "jetson01")
+    host_registry = _node_registry()
+    manager = FleetManager(host_registry)
+    try:
+        await manager.register_node(FleetNode("jetson01", "J", endpoint))
+        transport = await host_registry.transport("jetson01__arm")
+        await transport.close()
+
+        status = await transport.halt()
+
+        assert status.connected is False
+        assert status.halt_supported is True
+        assert status.halt_delivered is False
+    finally:
+        await manager.close()
+        await node_server.stop()
+
+
 async def test_halt_all_reports_an_undelivered_halt_instead_of_claiming_it() -> None:
     node_server, endpoint = await _start_node(_node_registry(_node_device("arm")), "jetson01")
     host_registry = _node_registry()
@@ -1080,6 +1374,25 @@ async def test_halt_all_reports_an_undelivered_halt_instead_of_claiming_it() -> 
         assert halted["jetson01"]["halted"] is False
     finally:
         await manager.close()
+
+
+async def test_halt_all_counts_an_idle_node_as_stopped_not_as_a_failure() -> None:
+    """An emergency stop over devices the node never opened did stop everything.
+
+    Nothing was being driven there, so reporting the stop as undelivered would
+    make the fleet's own backstop cry wolf -- and would send it looking for a
+    failure in hardware that was simply idle.
+    """
+    node_server, endpoint = await _start_node(_node_registry(_node_device("arm")), "jetson01")
+    manager = FleetManager(_node_registry())
+    try:
+        await manager.register_node(FleetNode("jetson01", "J", endpoint))
+        halted = await manager.halt_all()
+        assert halted["jetson01"]["failures"] == 0
+        assert halted["jetson01"]["halted"] is True
+    finally:
+        await manager.close()
+        await node_server.stop()
 
 
 # ── Registry: external sources (fabric nodes) ──

@@ -85,7 +85,13 @@ def test_the_shipped_piper_table_is_a_six_link_chain() -> None:
     chain = DhChain.from_mapping(declaration["kinematics"]["dh"])
     assert chain.dof == 6
     flange = chain.forward([0.0, 80.0, -55.0, 0.0, 70.0, 0.0])
-    assert 150.0 < flange.x < 450.0 and abs(flange.y) < 1e-6
+    assert 150.0 < flange.x < 450.0
+    # Piper X has a lateral wrist offset; yaw covariance holds without y == 0.
+    yaw = math.radians(20.)
+    turned = chain.forward([20.0, 80.0, -55.0, 0.0, 70.0, 0.0])
+    assert turned.position == pytest.approx((
+        flange.x * math.cos(yaw) - flange.y * math.sin(yaw),
+        flange.x * math.sin(yaw) + flange.y * math.cos(yaw), flange.z), abs=1e-8)
 
 
 # ── Chunk aggregation ────────────────────────────────────────────────────────

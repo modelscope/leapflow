@@ -32,6 +32,7 @@ live registry:
     grasp: {planner: top_down}            # planner name plus its own settings
     perception: {min_points: 40}          # optional perception tuning
     policy: {tick_hz: 50}                 # optional policy streaming tuning
+    vision: {sync_tolerance_ms: 50, sync_attempts: 3}  # multi-camera soft sync (see tuning)
     policies:                             # how each served policy embodies here (adapt.spec)
       cube: {actions: {arm: [joint.j1.position, ...], gripper: [gripper.position]}}
     calibration_target:                   # the ChArUco board calib.handeye observes
@@ -44,8 +45,10 @@ re-calibration invalidates every plan made before it. A record may also name
 the versions it was measured against (``parameters.depends_on``, e.g. a
 workspace measured with one TCP); when one of those is superseded the record
 is stale and resolves as uncalibrated. ``bootstrap_box`` is the one exception
-to "never inline" -- a conservative box only ``calib.*`` skills may move in, so
-the workspace can be calibrated at all.
+to "never inline" -- a conservative box a skill declaring
+``region: bootstrap_until_measured`` may plan in while no workspace record
+exists, and the only box ``calib.workspace`` itself verifies against, so the
+workspace can be calibrated at all.
 
 Models are devices too: ``models`` names the model-service devices a skill may
 query (``model:<name>`` in its requirements), so swapping a detector or a
@@ -76,7 +79,9 @@ from leapflow.hardware.skills.geometry import WorkspaceBox
 from leapflow.hardware.skills.tuning import (
     DEFAULT_CALIBRATION,
     DEFAULT_FRESHNESS,
+    DEFAULT_GRASP_VERIFY,
     DEFAULT_LIMITS,
+    DEFAULT_VISION,
     gripper_spec,
     tuned,
 )
@@ -101,12 +106,17 @@ WORKCELL_FIELDS = frozenset(
         "calibration",
         "models",
         "grasp",
+        "grasp_verify",
         "perception",
         "policy",
         "policies",
         "calibration_target",
+        "calibration_acquisition",
+        "calibration_reference",
+        "calibration_motion",
         "skills",
         "share_frames",
+        "vision",
     }
 )
 WORKSPACE_FIELDS = frozenset({"procedure", "tool_cone_deg", "bootstrap_box"})
@@ -164,10 +174,15 @@ class WorkcellSpec:
     calibration: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_CALIBRATION))
     models: Mapping[str, str] = field(default_factory=dict)
     grasp: Mapping[str, Any] = field(default_factory=dict)
+    grasp_verify: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_GRASP_VERIFY))
     perception: Mapping[str, float] = field(default_factory=dict)
     policy: Mapping[str, float] = field(default_factory=dict)
     policies: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     calibration_target: Mapping[str, Any] = field(default_factory=dict)
+    calibration_acquisition: Mapping[str, Any] = field(default_factory=dict)
+    calibration_reference: Mapping[str, Any] = field(default_factory=dict)
+    calibration_motion: Mapping[str, Any] = field(default_factory=dict)
+    vision: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_VISION))
     skills: tuple[str, ...] = ()
     # Whether camera frames may leave the node for the model to look at
     # (``perceive.snapshot``); off unless the operator declares it.
@@ -224,10 +239,15 @@ class WorkcellSpec:
             "calibration": dict(self.calibration),
             "models": dict(self.models),
             "grasp": {**dict(self.grasp), "planner": self.grasp_planner},
+            "grasp_verify": dict(self.grasp_verify),
             "perception": dict(self.perception),
             "policy": dict(self.policy),
             "policies": {name: dict(decl) for name, decl in self.policies.items()},
             "calibration_target": dict(self.calibration_target),
+            "calibration_acquisition": dict(self.calibration_acquisition),
+            "calibration_reference": dict(self.calibration_reference),
+            "calibration_motion": dict(self.calibration_motion),
+            "vision": dict(self.vision),
             "share_frames": self.share_frames,
         }
 
@@ -254,10 +274,16 @@ class WorkcellSpec:
             raise WorkcellError(f"workspace has unknown fields {unknown}")
         try:
             bootstrap = workspace.get("bootstrap_box")
+            frames = _parse_frames(data.get("frames") or {}, roles=roles)
+            procedures = [decl.procedure for decl in frames.values()]
+            if workspace.get("procedure"):
+                procedures.append(str(workspace["procedure"]))
+            if len(set(procedures)) != len(procedures):
+                raise WorkcellError("calibration procedures must be unique within a workcell")
             return cls(
                 workcell_id=workcell_id,
                 roles=roles,
-                frames=_parse_frames(data.get("frames") or {}),
+                frames=frames,
                 workspace_procedure=str(workspace.get("procedure") or ""),
                 tool_cone_deg=_positive(workspace.get("tool_cone_deg", 30.0), "tool_cone_deg"),
                 bootstrap_box=WorkspaceBox.from_mapping(bootstrap) if bootstrap else None,
@@ -270,12 +296,17 @@ class WorkcellSpec:
                 ),
                 models=_parse_models(data.get("models") or {}),
                 grasp=_parse_grasp(data.get("grasp") or {}),
+                grasp_verify=_parse_grasp_verify(data.get("grasp_verify") or {}),
                 perception=_float_map(data.get("perception") or {}, "perception"),
                 policy=_float_map(data.get("policy") or {}, "policy"),
                 policies=_parse_policies(data.get("policies") or {}),
                 calibration_target=_mapping(
                     data.get("calibration_target") or {}, "calibration_target"
                 ),
+                calibration_acquisition=_parse_acquisition(data.get("calibration_acquisition") or {}, roles=roles, frames=frames),
+                calibration_reference=_parse_reference(data.get("calibration_reference") or {}, acquisition=data.get("calibration_acquisition") or {}),
+                calibration_motion=_parse_motion_collection(data.get("calibration_motion") or {}),
+                vision=_parse_vision(data.get("vision") or {}),
                 skills=tuple(str(item) for item in data.get("skills") or ()),
                 share_frames=_flag(data.get("share_frames", False), "share_frames"),
                 source=source,
@@ -284,6 +315,41 @@ class WorkcellSpec:
             raise
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkcellError(f"workcell {workcell_id!r}: {exc}") from exc
+
+
+def _parse_acquisition(data: Mapping[str, Any], *, roles: Mapping[str, str], frames: Mapping[str, FrameDecl]) -> dict[str, Any]:
+    if not data:
+        return {}
+    from leapflow.hardware.calibration.acquisition import CollectionProfile
+
+    profile = CollectionProfile.from_mapping(data)
+    if profile.camera_role not in roles:
+        raise WorkcellError("calibration_acquisition camera role is not bound")
+    frame = frames.get(profile.camera_role)
+    if frame is None or frame.parent != ("flange" if profile.camera_method == "wrist" else "base"):
+        raise WorkcellError("calibration_acquisition method must match the declared camera frame parent")
+    return profile.to_dict()
+
+
+def _parse_reference(data: Mapping[str, Any], *, acquisition: Mapping[str, Any]) -> dict[str, Any]:
+    if not data:
+        return {}
+    from leapflow.hardware.calibration.acquisition import CollectionProfile
+    from leapflow.hardware.calibration.reference import ReferenceProfile
+
+    profile = ReferenceProfile.from_mapping(data)
+    collection = CollectionProfile.from_mapping(acquisition)
+    if profile.max_frames > collection.max_frames:
+        raise WorkcellError("reference frame budget exceeds the acquisition declaration")
+    return profile.to_dict()
+
+
+def _parse_motion_collection(data: Mapping[str, Any]) -> dict[str, Any]:
+    if not data:
+        return {}
+    from leapflow.hardware.calibration.pose_policy import PoseCollectionPolicy
+
+    return PoseCollectionPolicy.from_mapping(data).to_dict()
 
 
 # ── Admission ────────────────────────────────────────────────────────────────
@@ -527,16 +593,22 @@ def _writable(context: Any, channel_id: str) -> bool:
 # ── Parsing helpers ──────────────────────────────────────────────────────────
 
 
-def _parse_frames(raw: Any) -> dict[str, FrameDecl]:
+def _parse_frames(raw: Any, *, roles: Mapping[str, str]) -> dict[str, FrameDecl]:
     if not isinstance(raw, Mapping):
         raise WorkcellError("'frames' must be a mapping")
     frames: dict[str, FrameDecl] = {}
     for name, decl in raw.items():
         name = str(name)
+        if not _ROLE_NAME.fullmatch(name):
+            raise WorkcellError(f"invalid frame name {name!r}")
+        if role_kind(name) == ROLE_CAMERA and name not in roles:
+            raise WorkcellError(f"camera frame {name!r} must bind a camera role")
         if name == WORKSPACE_FRAME or name in FRAME_PARENTS:
             raise WorkcellError(f"frame name {name!r} is reserved")
         if not isinstance(decl, Mapping):
             raise WorkcellError(f"frame {name!r} must be a mapping")
+        if set(decl) - {"parent", "procedure"}:
+            raise WorkcellError(f"frame {name!r} has unknown fields")
         parent = str(decl.get("parent") or "")
         if parent not in FRAME_PARENTS:
             raise WorkcellError(f"frame {name!r} parent must be one of {sorted(FRAME_PARENTS)}")
@@ -601,6 +673,29 @@ def _mapping(raw: Any, name: str) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise WorkcellError(f"{name!r} must be a mapping")
     return {str(key): value for key, value in raw.items()}
+
+
+def _parse_grasp_verify(raw: Any) -> dict[str, float]:
+    values = tuned(raw, "grasp_verify", DEFAULT_GRASP_VERIFY)
+    count = values["min_frames"]
+    if count != int(count) or not 3 <= count <= 10:
+        raise WorkcellError("grasp_verify.min_frames must be a whole number in [3, 10]")
+    if values["min_proof_lift_mm"] > values["max_proof_lift_mm"]:
+        raise WorkcellError("grasp_verify proof-lift bounds are reversed")
+    if values["poll_s"] * count >= values["max_age_s"]:
+        raise WorkcellError("grasp_verify sampling window must fit within max_age_s")
+    budget = values["cycle_max_waypoints"]
+    if budget != int(budget) or not 7 <= budget <= 4096:
+        raise WorkcellError("grasp_verify.cycle_max_waypoints must be a whole number in [7, 4096]")
+    return values
+
+
+def _parse_vision(raw: Any) -> dict[str, float]:
+    values = tuned(raw, "vision", DEFAULT_VISION)
+    attempts = values["sync_attempts"]
+    if attempts != int(attempts) or not 1 <= attempts <= 10:
+        raise WorkcellError("vision.sync_attempts must be a whole number in [1, 10]")
+    return values
 
 
 def _parse_limits(raw: Any) -> dict[str, float]:

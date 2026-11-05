@@ -7,11 +7,11 @@ width); this module owns *how*, in one place:
 
 - **Frames.** A TCP target becomes a flange target through the calibrated
   ``T_flange_tcp``: ``T_base_flange = T_base_tcp · inv(T_flange_tcp)``.
-- **Region.** Every TCP target must lie inside the calibrated workspace box --
-  or, for ``calib.*`` runs, inside the human-declared bootstrap box when there
-  is one (calibration never trusts the geometry it is about to re-measure) --
-  with the tool inside the declared cone around straight down, and the flange
-  target inside the arm's own declared envelopes.
+- **Region.** Every TCP target must lie inside the box the skill declares it
+  plans in: the calibrated workspace, or -- for the skills that have to move
+  before that box exists -- the human-declared bootstrap box standing in for it.
+  The tool also has to stay inside the declared cone around straight down, and
+  the flange target inside the arm's own declared envelopes.
 - **Speed.** The commanded speed rides in the same batch as the target when the
   arm declares ``arm.speed_pct``, capped by the run's effective limit and
   quantized *down* to the channel's declared step, so it never exceeds the cap.
@@ -48,6 +48,7 @@ import math
 import time
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
+from leapflow.hardware.arm_status import ARM_FAULTS, TARGET_REFUSALS
 from leapflow.hardware.context import as_numeric
 from leapflow.hardware.node_gate import NodeWriteGate, merged_batch_state, rate_delta
 from leapflow.hardware.skills.episodes import NULL_TAP, EpisodeTap
@@ -72,6 +73,9 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_TIMEOUT,
     FAILURE_UNREACHABLE,
     FAILURE_WRITE_REFUSED,
+    REGION_BOOTSTRAP,
+    REGION_BOOTSTRAP_UNTIL_MEASURED,
+    REGION_WORKSPACE,
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_PARTIAL,
     SIDE_EFFECT_UNKNOWN,
@@ -102,22 +106,39 @@ from leapflow.hardware.transport import TransportError
 
 POLL_S = 0.05
 
-# Vendor ``arm_status`` codes that mean "this target was refused, nothing moved".
-# They are a planning verdict the firmware delivers late -- after the command has
-# been accepted -- so they must be read as a refusal, not as a slow arrival: the
-# timeout path halts, and a halt engages the emergency stop, which releases the
-# drives and drops the arm under gravity.
-_ARM_STATUS_REFUSALS = {
-    0x02: "no inverse-kinematics solution for the target",
-    0x03: "the target lies on a singularity",
-    0x04: "the target exceeds a joint limit",
-}
+# The firmware's answer to a target, read while a move is in flight: a refusal
+# leaves the arm where the command found it, a fault stops it on the way. Both
+# have to end the move before the arrival timeout does -- the timeout path halts,
+# and a halt engages the emergency stop, which releases the drives and drops the
+# arm under gravity. The codes themselves live in ``hardware.arm_status`` so the
+# transport reads the same answer the same way when a write is reported.
+#
 # A refusing code can also be left over from an earlier target, so it only ends
 # the move once the arm is demonstrably still where the command found it for
 # long enough that a real move would have left the tolerance band.
 _REFUSAL_DWELL_S = 1.5
+# The control mode a move is commanded in; leaving it means the controller is no
+# longer executing the target, whatever its status word says.
+_CAN_CONTROL = "can"
+
+# Slack on the tilt ceiling, in degrees.  A move that holds a posture computes
+# the same tilt twice through two FK paths, and float noise must not turn
+# "unchanged" into "worse" and refuse a recovery.
+_CONE_EPSILON_DEG = 1e-6
 
 Sleep = Callable[[float], Awaitable[None]]
+
+
+def _within_gripper_tolerance(actual: float, target: float, tolerance: float) -> bool:
+    """Honor the declared tolerance, accounting only for binary arithmetic roundoff."""
+    if not all(math.isfinite(v) for v in (actual, target, tolerance)) or tolerance < 0:
+        return False
+    if tolerance == 0:
+        return actual == target
+    # SI conversion/subtraction can put a boundary sample a few ULPs outside.
+    # This is a floating-point error budget, not sensor uncertainty or extra mm.
+    roundoff = math.ulp(actual) + math.ulp(target) + math.ulp(tolerance)
+    return abs(actual - target) <= tolerance + roundoff
 
 
 class GovernedMotion:
@@ -133,7 +154,7 @@ class GovernedMotion:
         limits: Mapping[str, float],
         cancel: asyncio.Event,
         deadline: float,
-        allow_bootstrap: bool = False,
+        region: str = REGION_WORKSPACE,
         allow_writes: bool = True,
         clock: Callable[[], float] = time.monotonic,
         sleep: Sleep = asyncio.sleep,
@@ -147,7 +168,7 @@ class GovernedMotion:
         self._limits = dict(limits)
         self._cancel = cancel
         self._deadline = float(deadline)
-        self._allow_bootstrap = allow_bootstrap
+        self._region_mode = region
         self._allow_writes = allow_writes
         self._clock = clock
         self._sleep = sleep
@@ -258,6 +279,9 @@ class GovernedMotion:
         arm_status = (
             as_numeric(reported.get("arm_status")) if isinstance(reported, Mapping) else None
         )
+        comm_errors = (
+            reported.get("joint_communication_errors") if isinstance(reported, Mapping) else None
+        )
         return ArmState(
             flange=flange,
             tcp=self.flange_to_tcp(flange),
@@ -272,6 +296,7 @@ class GovernedMotion:
             observed_at=time.time(),
             ctrl_mode=None if ctrl_mode in (None, "") else str(ctrl_mode),
             arm_status=None if arm_status is None else int(arm_status),
+            joint_communication_errors=tuple(int(j) for j in comm_errors or ()),
         )
 
     def flange_to_tcp(self, flange: Pose) -> Pose:
@@ -286,17 +311,20 @@ class GovernedMotion:
     # ── Region ──
 
     def check_target(self, pose: Pose) -> None:
+        """Refuse a pose the arm may not hold: outside the cell, or aimed off-cone."""
+        self.check_reach(pose)
+        self.check_orientation(pose)
+
+    def check_reach(self, pose: Pose) -> None:
+        """Refuse a tool position outside the cell or a flange outside its envelope.
+
+        Position is a property of where the tool is, so it applies to every
+        instant of a move -- a transit sample included.
+        """
         box = self._region()
         violation = box.violation(pose.position)
         if violation is not None:
             raise SkillError(FAILURE_OUT_OF_WORKSPACE, f"target leaves the workspace: {violation}")
-        cone = tool_cone_deg(pose)
-        if cone > self._spec.tool_cone_deg:
-            raise SkillError(
-                FAILURE_UNREACHABLE,
-                f"tool would tilt {cone:.1f} deg from straight down; "
-                f"the workcell allows {self._spec.tool_cone_deg:.1f}",
-            )
         flange = self.tcp_to_flange(pose)
         for channel_id, value in zip(POSE_CHANNELS, flange.as_tuple()):
             channel = self._arm.channel(channel_id)
@@ -306,15 +334,52 @@ class GovernedMotion:
                     f"flange {channel_id}={value:.1f} is outside the arm's declared envelope",
                 )
 
-    def _region(self) -> WorkspaceBox:
-        box = self._frames.workspace
-        if self._allow_bootstrap and self._spec.bootstrap_box is not None:
-            box = self._spec.bootstrap_box
-        if box is None:
+    def check_orientation(self, pose: Pose) -> None:
+        """Refuse a tool attitude tilted further than the workcell allows.
+
+        This is the rule for a *commanded* attitude: a cartesian target says
+        where the tool must point, so it has to point within the cone.  It is
+        applied to the destination of a move, never to every sample of the path
+        that reaches it -- see ``check_joints`` for the joint-space case, which
+        has to be able to leave a posture this rule would forbid.
+        """
+        self._require_cone(pose, self._spec.tool_cone_deg)
+
+    def _require_cone(self, pose: Pose, ceiling_deg: float) -> None:
+        cone = tool_cone_deg(pose)
+        if cone > ceiling_deg + _CONE_EPSILON_DEG:
             raise SkillError(
-                FAILURE_CALIBRATION_MISSING,
-                "the workspace is not calibrated (run calib.workspace)",
+                FAILURE_UNREACHABLE,
+                f"tool would tilt {cone:.1f} deg from straight down; "
+                f"the workcell allows {ceiling_deg:.1f}",
             )
+
+    def _region(self) -> WorkspaceBox:
+        """The box this skill's tool positions must stay inside.
+
+        The measured workspace is the geometry the cell is run in, so it is what
+        a skill plans against whenever it exists. Calibration is the exception it
+        has to be: a skill that has to move before that box is known plans in the
+        cell's conservative bootstrap box instead (``bootstrap_until_measured``),
+        and the skill that measures the workspace plans in it always, because the
+        box it is about to write is not evidence it may move inside yet.
+        """
+        measured = self._frames.workspace
+        bootstrap = self._spec.bootstrap_box
+        box = measured
+        if self._region_mode == REGION_BOOTSTRAP or (
+            self._region_mode == REGION_BOOTSTRAP_UNTIL_MEASURED and measured is None
+        ):
+            box = bootstrap
+        if box is None:
+            if self._region_mode == REGION_BOOTSTRAP:
+                detail = (
+                    f"workcell {self._spec.workcell_id!r} declares no bootstrap_box, so this "
+                    "skill has no region to plan in before the workspace is measured"
+                )
+            else:
+                detail = "the workspace is not calibrated (run calib.workspace)"
+            raise SkillError(FAILURE_CALIBRATION_MISSING, detail)
         return box
 
     def _chain(self) -> DhChain:
@@ -364,7 +429,11 @@ class GovernedMotion:
     def check_joints(
         self, targets: Mapping[str, float], current: Mapping[str, float] | None
     ) -> Pose:
-        """Check every sampled FK pose of a joint-space move and return its endpoint TCP."""
+        """Check every sampled FK pose of a joint-space move and return its endpoint TCP.
+
+        Each sample is judged by ``check_joint_target``, so the move as a whole may
+        hold or reduce the tilt it started from but never add to it.
+        """
         if not targets:
             raise SkillError(FAILURE_INVALID_ARGS, "joint targets are empty")
         unknown = sorted(set(targets) - set(self._joints))
@@ -401,12 +470,51 @@ class GovernedMotion:
                 tuple(before + (after - before) * index / count for before, after in zip(begin, end))
                 for index in range(1, count + 1)
             )
-        target: Pose | None = None
-        for sample in samples:
-            target = self.flange_to_tcp(chain.forward(sample))
-            self.check_target(target)
-        assert target is not None
-        return target
+        poses = [self.flange_to_tcp(chain.forward(sample)) for sample in samples]
+        started_at = None if current is None else self.flange_to_tcp(chain.forward(begin))
+        for pose in poses:
+            self.check_joint_target(pose, start=started_at)
+        return poses[-1]
+
+    def check_joint_target(self, pose: Pose, *, start: Pose | None) -> None:
+        """Check one sample of a joint-space move, from the tilt the move started at.
+
+        Position applies to every instant of a move: that is where the arm
+        physically is.  The tilt ceiling is different.  A joint-space move starts
+        from wherever the arm already is, and an arm a halt or a hand left tilted
+        sits outside the cone before the first command.  Requiring the sample to
+        be inside the cone would make that posture impossible to leave -- no skill
+        could recover the cell without a write outside the skill path -- while
+        requiring nothing would let a joint move introduce the very tilt the cone
+        exists to prevent.  So the ceiling is the cone, raised to the tilt the
+        move started from: a joint move may hold or reduce the tilt, never add.
+
+        The streamed-policy shield judges a joint-space row by this same rule,
+        because a policy's joint action is the same kind of command.
+        """
+        self.check_reach(pose)
+        ceiling = self._spec.tool_cone_deg
+        if start is not None:
+            ceiling = max(ceiling, tool_cone_deg(start) + self.joint_tilt_slack_deg())
+        self._require_cone(pose, ceiling)
+
+    def joint_tilt_slack_deg(self) -> float:
+        """How much tilt the declared joint tolerance alone can add.
+
+        A joint vector held within its declared tolerance describes a slightly
+        different attitude than the one intended, so a move that really holds a
+        posture measures a little more tilt than it started with.  The sum of the
+        per-joint tolerances bounds that error.  It widens only the *starting*
+        tilt a joint move may keep, never the workcell's cone, which is a rule
+        about intent rather than about precision.
+        """
+        return sum(
+            float(self._arm.channel(name).envelope.tolerance or 0.0) for name in self._joints
+        )
+
+    def check_cartesian_path(self, state: ArmState, targets: Sequence[Pose]) -> tuple[Mapping[str, Any], ...]:
+        from leapflow.hardware.skills.grasp_path import check_path
+        return check_path(self, state, targets)
 
     # ── Motion ──
 
@@ -578,7 +686,11 @@ class GovernedMotion:
         state = await self.state()
         refused_since: float | None = None
         while not (state.arrived is not False and self._within(commands, flange_target, state)):
-            refusal = _ARM_STATUS_REFUSALS.get(state.arm_status or 0)
+            # A stop is the run's own verdict and outranks what the arm reports:
+            # an emergency stop the caller asked for must not read as a fault.
+            self._checkpoint()
+            self._raise_if_faulted(state)
+            refusal = TARGET_REFUSALS.get(state.arm_status or 0)
             if refusal is None or not self._still_at(before, state):
                 refused_since = None
             else:
@@ -596,6 +708,33 @@ class GovernedMotion:
             await self._pause(self._poll_s)
             state = await self.state()
         return state
+
+    def _raise_if_faulted(self, state: ArmState) -> None:
+        """Fail at once when the arm has stopped executing the command.
+
+        A fault is the opposite of a late arrival: the controller has already
+        dropped out of CAN control and released the drives, so no amount of
+        waiting produces progress -- the remaining poll budget only defers the
+        halt, and a halt engages the emergency stop on an arm that is already
+        falling. The status word is read first because it names the cause and
+        the joints; leaving CAN control without a code is still a fault, just an
+        unnamed one.
+        """
+        fault = ARM_FAULTS.get(state.arm_status or 0)
+        if fault is None and state.ctrl_mode not in (None, _CAN_CONTROL):
+            fault = f"it left CAN control ({state.ctrl_mode})"
+        if fault is None:
+            return
+        joints = state.joint_communication_errors
+        affected = f" (joints {', '.join(str(j) for j in joints)})" if joints else ""
+        raise SkillError(
+            FAILURE_DEVICE_FAULT,
+            f"the arm stopped executing the command: {fault}{affected}; "
+            "it has to be re-enabled and inspected before it can move again",
+            side_effect_state=self._failure_state(),
+            status=STATUS_HALTED,
+            result={"state": state.to_dict(), "fault": fault},
+        )
 
     def _still_at(self, before: ArmState | None, state: ArmState) -> bool:
         """Whether *state* is still where *before* found the arm, within tolerance."""
@@ -672,7 +811,7 @@ class GovernedMotion:
         return GripperResult(
             width_mm=width,
             target_mm=float(width_mm),
-            blocked=abs(width - width_mm) > tolerance,
+            blocked=not _within_gripper_tolerance(width, width_mm, tolerance),
             elapsed_s=self._clock() - started,
         )
 
@@ -690,9 +829,9 @@ class GovernedMotion:
         while True:
             width = await self._gripper_width()
             now = self._clock()
-            if abs(width - target) <= tolerance:
+            if _within_gripper_tolerance(width, target, tolerance):
                 return width
-            if anchor is None or abs(width - anchor) > tolerance:
+            if anchor is None or not _within_gripper_tolerance(width, anchor, tolerance):
                 anchor, anchored_at = width, now
             elif now - anchored_at >= settle_s:
                 return width

@@ -84,6 +84,11 @@ leapspace = [
     "cua-sandbox; python_version >= '3.11' and python_version < '3.14'",
     "pydantic>=2",
 ]
+# Contracts/inspection remain stdlib-only. NumPy is loaded only during bounded
+# motion/response solves; no SciPy/OpenCV dependency is needed by these methods.
+leapcalib = ["numpy>=1.24"]
+# Lightweight opt-in preview encoder; no policy-learning or ROS dependencies.
+vision = ["numpy>=1.24", "opencv-python>=4.8"]
 robot = [
     "torch>=2.0",
     "torchvision>=0.15",
@@ -107,22 +112,34 @@ benchmark = [
 [project.scripts]
 leap = "leapflow.__main__:main"
 leap-bench = "benchmarks.cli:main"
+leap-calib = "leapcalib.cli:main"
 
 # RealSense is a node-local optional transport.  Its module imports the Intel
 # SDK only when opened, so host-only installations stay dependency-free; the
 # Jetson installs the compatible pyrealsense2 binding alongside LeapFlow.
 [project.entry-points."leapflow.hardware.transports"]
 realsense = "leapflow.hardware.drivers.realsense:build_transport"
-# Piper follows the same node-local placement: piper_sdk is imported only when
-# a declared arm is opened, so the CAN-owning node owns the vendor SDK while
-# host-only installations stay dependency-free.
+# Piper follows the same node-local placement: pyAgxArm (the model/firmware-
+# aware AgileX SDK) is imported only when a declared arm is opened, so the
+# CAN-owning node owns the vendor SDK while host-only installations stay
+# dependency-free.
 piper = "leapflow.hardware.drivers.piper:build_transport"
+
+# Numerical method discovery grants no acquisition, motion or activation authority.
+[project.entry-points."leapcalib.methods"]
+metric_motion = "leapcalib.estimation.handeye:MotionMethod"
+task_response = "leapcalib.estimation.response:ResponseMethod"
+raw_joint_response = "leapcalib.estimation.raw_response:RawResponseMethod"
 
 # Node skills (S1.5). Built-ins register exactly like third-party skill packs.
 [project.entry-points."leapflow.hardware.skills"]
 builtin_motion = "leapflow.hardware.skills.builtin.motion:skills"
 builtin_calibration = "leapflow.hardware.skills.builtin.calibration:skills"
 builtin_camera_calibration = "leapflow.hardware.skills.builtin.camera_calibration:skills"
+builtin_metric_readiness = "leapflow.hardware.skills.builtin.metric_readiness:skills"
+builtin_governed_calibration = "leapflow.hardware.skills.builtin.governed_calibration:skills"
+builtin_grasp_verify = "leapflow.hardware.skills.builtin.grasp_verify:skills"
+builtin_grasp_cycle = "leapflow.hardware.skills.builtin.grasp_cycle:skills"
 builtin_scene = "leapflow.hardware.skills.builtin.scene:skills"
 builtin_sequence = "leapflow.hardware.skills.builtin.sequence:skills"
 builtin_policy = "leapflow.hardware.skills.builtin.policy:skills"
@@ -137,7 +154,7 @@ version = {attr = "leapflow.version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["leapflow*", "leapspace*", "benchmarks*"]
+include = ["leapflow*", "leapspace*", "leapcalib*", "benchmarks*"]
 
 [tool.setuptools.package-data]
 "leapflow.gateway.action_packs" = ["*.yaml"]
@@ -156,7 +173,7 @@ include = ["leapflow*", "leapspace*", "benchmarks*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = ["src", "tests"]
+pythonpath = ["src", "tests", "tools/piper"]
 testpaths = ["tests"]
 # Markers are applied by path in tests/conftest.py, so existing files need no
 # edit. Only files that do real local IO opt in explicitly with `pytestmark`.

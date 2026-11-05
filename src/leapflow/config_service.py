@@ -190,6 +190,12 @@ _FIELD_DESCRIPTIONS = {
         "Enumerate microphones alongside cameras. Only an input level is exposed, never "
         "audio. Applied at discovery, so a change needs a daemon restart."
     ),
+    "hardware.media_exclude_usb": (
+        "Comma-separated USB identities ('vid' or 'vid:pid', hex) whose video nodes a "
+        "dedicated driver owns, e.g. '8086' for RealSense UVC endpoints. They are not "
+        "listed as generic cameras, so nothing offers a second opener of that hardware. "
+        "Linux only; applied at discovery, so a change needs a daemon restart."
+    ),
     "hardware.preview_max_fps": (
         "Hard capture ceiling for page-selected economy/balanced/detail profiles. The "
         "default balanced profile is 8fps; this 12fps ceiling is also declared at media "
@@ -234,6 +240,13 @@ _FIELD_DESCRIPTIONS = {
         "Off by default; irreversible channels always require approval regardless. "
         "Read at startup, so a change needs a daemon restart."
     ),
+    "hardware.write_verification_follow_s": (
+        "How long a post-write verdict may follow a value that is still travelling "
+        "toward its command before reporting 'pending'. A declared settling time says "
+        "when an observation becomes meaningful, not when a servo has arrived, so a "
+        "slow move judged by it alone looks contradicted. Read when the verification "
+        "coordinator is built, so a change needs a daemon restart."
+    ),
     "hardware.stream_enabled": (
         "Sample channels that declare a sample rate. Sampling loops start during "
         "initialization, so a change needs a daemon restart."
@@ -273,6 +286,16 @@ _FIELD_DESCRIPTIONS = {
         "trade secret or sample information. On by default; opt out only for a bench "
         "known to produce no sensitive data. Applied when the store is built, so a "
         "change needs a daemon restart."
+    ),
+    "hardware.calibration_worker_enabled": (
+        "Enable the lazy node-owned compute-only calibration subprocess. Defaults off; "
+        "does not grant acquisition, motion, or model activation. Requires node restart."
+    ),
+    "hardware.calibration_worker_budgets": (
+        "JSON worker budgets: request_bytes (16777216), response_bytes (2097152), queued_jobs (2), "
+        "max_keyframes (128), max_tracks (2048), roi_width (640), roi_height (480), startup_s (10), "
+        "update_s (2), solve_s (30), rss_bytes (536870912). Values may tighten, never expand "
+        "these ceilings. Socket location is profile-layout-owned. Requires node restart."
     ),
     "hardware.skills_enabled": (
         "Comma-separated patterns (fnmatch) of node skills a hardware node offers; empty "

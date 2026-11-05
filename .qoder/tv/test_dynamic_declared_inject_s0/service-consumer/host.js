@@ -1,0 +1,1 @@
+return {inject:['greeter','tools'],apply(ctx){harness.registerTool(ctx,harness.defineTool({name:'greet',description:'greet',parameters:{},execute:async()=>ctx.greeter.greet('x')}))}}

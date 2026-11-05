@@ -1,0 +1,1216 @@
+{
+  "node_id": "yahboom",
+  "write_mode": "permit_required",
+  "service": [
+    "MainPID=72820",
+    "ActiveState=active"
+  ],
+  "active_runs": 0,
+  "active_control_sessions": 0,
+  "original_files_unchanged": true,
+  "staged_files_verified": 41,
+  "workcell_path": "/home/jetson/.leapflow/profiles/default/hardware/workcells/piper_cell.yaml",
+  "workcell_sha256": "bcc71db8cb20181b0644f030f4aba73324b1b904576fd747aa90994620f0613e",
+  "workcell_readiness_allowed": true,
+  "workcell_skill_patterns": [],
+  "global_skill_patterns": [
+    "*"
+  ],
+  "catalog": {
+    "workcells": [
+      {
+        "workcell": "piper_cell",
+        "roles": {
+          "arm": "robot_piper_arm",
+          "gripper": "robot_piper_arm",
+          "camera": "sensor_realsense_435if",
+          "camera.wrist": "sensor_realsense_d405"
+        },
+        "frames": {
+          "tcp": {
+            "parent": "flange",
+            "procedure": "tcp.offset"
+          },
+          "camera": {
+            "parent": "base",
+            "procedure": "handeye.eye_to_hand"
+          },
+          "camera.wrist": {
+            "parent": "flange",
+            "procedure": "handeye.eye_in_hand"
+          }
+        },
+        "workspace_procedure": "workspace.safe_box",
+        "tool_cone_deg": 30.0,
+        "home": {},
+        "gripper_spec": {
+          "min_hold_width_mm": 3.0,
+          "max_width_mm": 69.5
+        },
+        "limits": {
+          "speed_pct_max": 30.0,
+          "default_speed_pct": 20.0,
+          "move_timeout_s": 20.0,
+          "fk_tolerance_mm": 5.0,
+          "fk_tolerance_deg": 2.0,
+          "joint_path_step_deg": 2.0,
+          "max_steps": 16.0,
+          "max_wait_s": 10.0
+        },
+        "freshness": {
+          "start_mm": 2.0,
+          "start_deg": 1.0,
+          "drift_planar_mm": 8.0,
+          "drift_height_mm": 10.0,
+          "drift_yaw_deg": 10.0,
+          "yaw_defined_mm": 10.0,
+          "hold_tolerance_mm": 5.0
+        },
+        "calibration": {
+          "tcp": 1792466846.5792692,
+          "workspace": 1792470598.2829092
+        },
+        "models": {
+          "smolvla": "policy_smolvla"
+        },
+        "grasp": {
+          "planner": "top_down",
+          "closing_axis_deg": 0,
+          "approach_mm": 80,
+          "retreat_mm": 80
+        },
+        "grasp_verify": {
+          "alignment_mm": 3.0,
+          "max_age_s": 1.0,
+          "min_frames": 3.0,
+          "min_proof_lift_mm": 5.0,
+          "max_proof_lift_mm": 10.0,
+          "max_relative_error_mm": 2.0,
+          "max_slip_mm": 1.0,
+          "max_uncertainty_mm": 1.0,
+          "capture_drift_mm": 0.5,
+          "capture_drift_deg": 0.5,
+          "poll_s": 0.05,
+          "clearance_mm": 3.0,
+          "jaw_stroke_error_mm": 1.5,
+          "max_sync_skew_s": 0.1,
+          "pad_midpoint_mm": 2.0,
+          "empty_gap_mm": 1.0,
+          "contact_geometry_mm": 1.5,
+          "contact_contour_px": 2.0,
+          "contact_axis_deg": 2.0,
+          "support_mm": 1.0,
+          "effort_uncertainty_n": 0.2,
+          "effort_error_n": 0.5,
+          "effort_width_scope_mm": 1.0,
+          "effort_pose_scope_mm": 10.0,
+          "effort_pose_scope_deg": 1.0,
+          "cycle_path_step_mm": 5.0,
+          "cycle_max_waypoints": 128.0,
+          "placement_mm": 3.0,
+          "warmup_timeout_s": 5.0
+        },
+        "perception": {
+          "min_score": 0.3,
+          "memory_ttl_s": 30.0
+        },
+        "policy": {
+          "tick_hz": 50.0,
+          "max_jump_s": 1.0,
+          "prefetch_ratio": 0.85
+        },
+        "policies": {
+          "smolvla": {
+            "actions": {
+              "arm": [
+                "joint.j1.position",
+                "joint.j2.position",
+                "joint.j3.position",
+                "joint.j4.position",
+                "joint.j5.position",
+                "joint.j6.position"
+              ],
+              "gripper": [
+                "gripper.position"
+              ]
+            },
+            "cameras": {
+              "camera1": "camera",
+              "camera2": "camera.wrist",
+              "camera3": "camera"
+            },
+            "aggregate": "crossfade"
+          }
+        },
+        "calibration_target": {
+          "type": "charuco",
+          "squares_x": 5,
+          "squares_y": 4,
+          "square_mm": 30,
+          "marker_mm": 22
+        },
+        "vision": {
+          "sync_tolerance_ms": 50.0,
+          "sync_attempts": 3.0
+        },
+        "share_frames": true,
+        "calibration_stale": {
+          "camera": "the record carries no measured target mount and no screw-motion evidence"
+        },
+        "skills": [
+          {
+            "skill_id": "arm.state",
+            "version": "1.1.0",
+            "card": "Read the arm without moving it: the tool centre point and flange poses in the arm base frame (mm, deg), joint positions (deg), gripper width (mm), whether the arm is enabled, the calibrated workspace box, and the table plane when measured.",
+            "args_schema": {
+              "type": "object",
+              "properties": {}
+            },
+            "effect": "read",
+            "requires": [
+              "role:arm"
+            ],
+            "consent": "session",
+            "leased": false,
+            "region": "workspace",
+            "available": true,
+            "reason": ""
+          },
+          {
+            "skill_id": "calib.bringup",
+            "version": "1.1.0",
+            "card": "First-run check of the arm: it reports every joint and is enabled; with expect_zero=true (the user has put the arm at its mechanical zero) every joint must read zero within the workcell's declared max_zero_error_deg; with gripper_travel=true the gripper opens fully, closes fully, and returns to its width. The arm itself does not move. Run it before calib.tcp on new or re-assembled hardware.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "expect_zero": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "gripper_travel": {
+                  "type": "boolean",
+                  "default": true
+                }
+              }
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm"
+            ],
+            "consent": "each_run",
+            "leased": false,
+            "region": "workspace",
+            "available": true,
+            "reason": ""
+          },
+          {
+            "skill_id": "calib.grasp_evidence",
+            "version": "1.0.0",
+            "card": "Validate and persist independently measured geometry and stationary N-unit force qualification bound to current calibrations. No arm or gripper motion. Incomplete, synthetic or mismatched certificates are refused.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "qualification": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "required": [
+                "qualification"
+              ]
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm",
+              "role:camera.wrist",
+              "calib:camera.wrist",
+              "role:gripper",
+              "calib:tcp",
+              "calib:workspace"
+            ],
+            "consent": "each_run",
+            "leased": false,
+            "region": "workspace",
+            "available": false,
+            "reason": "camera.wrist is not calibrated (run calib.handeye)"
+          },
+          {
+            "skill_id": "calib.handeye",
+            "version": "1.2.0",
+            "card": "Calibrate where the camera sits (hand-eye). The workcell's calibration board must be in view: held in the gripper or fixed to the flange for a fixed camera, lying still in the cell for a wrist camera. The arm visits `poses` poses around the current one -- tilted up to tilt_deg, yawed up to yaw_deg, shifted up to spread_mm -- slowly, observing the board at each, then returns. Start with the board centred in the image. Run calib.verify afterwards.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "poses": {
+                  "type": "integer",
+                  "minimum": 8,
+                  "maximum": 24,
+                  "default": 12
+                },
+                "tilt_deg": {
+                  "type": "number",
+                  "minimum": 5,
+                  "maximum": 30,
+                  "default": 15.0
+                },
+                "yaw_deg": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 60,
+                  "default": 30.0
+                },
+                "spread_mm": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 80,
+                  "default": 30.0
+                },
+                "lift_mm": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 50,
+                  "default": 15.0
+                },
+                "camera": {
+                  "type": "string",
+                  "pattern": "^camera(\\.[a-z0-9_]+)*$",
+                  "default": "camera"
+                },
+                "settle_s": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 5,
+                  "default": 0.5
+                },
+                "speed_pct": {
+                  "type": "number",
+                  "minimum": 1,
+                  "maximum": 100,
+                  "default": 10.0
+                }
+              }
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm"
+            ],
+            "consent": "each_run",
+            "leased": false,
+            "region": "bootstrap_until_measured",
+            "available": true,
+            "reason": ""
+          },
+          {
+            "skill_id": "calib.screws",
+            "version": "1.1.0",
+            "card": "Calibrate where a fixed camera sits without a calibration board. The arm swings `joints` one at a time, `excursion_deg` each way from `stand` -- a joint posture it transits to first when one is given, checked like any joint move -- or from where it is now. The camera watches the surfaces that joint carries: at the right mount the firmware's own rotation lands them on the surface it saw, and the residual is reported per joint in millimetres. The base joint's swing is what measures the vertical, so neither a table nor a board has to be in view; the arm does have to be unobstructed. Needs at least three joints with different axes: the base joint, plus one horizontal.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "joints": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "minItems": 3,
+                  "maxItems": 4,
+                  "default": [
+                    "j1",
+                    "j4",
+                    "j5"
+                  ]
+                },
+                "stand": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "number"
+                  },
+                  "description": "Joint posture to swing from, as {j1: deg, ...} (labels or channel ids); the arm transits there before the first still and stays there between swings"
+                },
+                "excursion_deg": {
+                  "type": "number",
+                  "minimum": 5,
+                  "maximum": 30,
+                  "default": 15.0
+                },
+                "near_mm": {
+                  "type": "number",
+                  "minimum": 100,
+                  "maximum": 600,
+                  "default": 200.0
+                },
+                "far_mm": {
+                  "type": "number",
+                  "minimum": 300,
+                  "maximum": 2000,
+                  "default": 750.0
+                },
+                "camera": {
+                  "type": "string",
+                  "pattern": "^camera(\\.[a-z0-9_]+)*$",
+                  "default": "camera"
+                },
+                "frames": {
+                  "type": "number",
+                  "minimum": 1,
+                  "maximum": 6,
+                  "default": 3
+                },
+                "settle_s": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 5,
+                  "default": 0.5
+                },
+                "speed_pct": {
+                  "type": "number",
+                  "minimum": 1,
+                  "maximum": 100,
+                  "default": 10.0
+                }
+              }
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm"
+            ],
+            "consent": "each_run",
+            "leased": false,
+            "region": "bootstrap_until_measured",
+            "available": true,
+            "reason": ""
+          },
+          {
+            "skill_id": "calib.tcp",
+            "version": "1.1.0",
+            "card": "Calibrate the tool centre point (TCP) on the flange. method=declared takes offset=[x, y, z] or [x, y, z, rx, ry, rz] (mm, deg; e.g. the gripper length from its drawing). method=pivot takes 4-12 flange poses [x, y, z, rx, ry, rz] read with arm.state while the tool tip rests on one fixed point in different orientations (at least 20 deg apart) and fits the tip. Nothing moves. Plans and a workspace measured with the previous TCP become stale.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "enum": [
+                    "declared",
+                    "pivot"
+                  ],
+                  "default": "declared"
+                },
+                "offset": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 3,
+                  "maxItems": 6,
+                  "description": "TCP in the flange frame"
+                },
+                "samples": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 6,
+                    "maxItems": 6,
+                    "description": "flange pose"
+                  },
+                  "minItems": 4,
+                  "maxItems": 12
+                }
+              }
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm"
+            ],
+            "consent": "each_run",
+            "leased": false,
+            "region": "workspace",
+            "available": true,
+            "reason": ""
+          },
+          {
+            "skill_id": "calib.verify",
+            "version": "1.2.0",
+            "card": "Measure camera accuracy after calib.handeye, with the calibration board mounted exactly as it was then. The arm moves over a 3 x 3 grid spacing_mm apart around the current pose; at each stop the arm predicts the board centre and the camera measures it through depth -- the chain perceive.locate uses. The workcell's max_verify_p95_mm is the acceptance limit.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "spacing_mm": {
+                  "type": "number",
+                  "minimum": 10,
+                  "maximum": 80,
+                  "default": 40.0
+                },
+                "poses": {
+                  "type": "integer",
+                  "minimum": 4,
+                  "maximum": 9,
+                  "default": 9
+                },
+                "camera": {
+                  "type": "string",
+                  "pattern": "^camera(\\.[a-z0-9_]+)*$",
+                  "default": "camera"
+                },
+                "settle_s": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 5,
+                  "default": 0.5
+                },
+                "speed_pct": {
+                  "type": "number",
+                  "minimum": 1,
+                  "maximum": 100,
+                  "default": 10.0
+                }
+              }
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm"
+            ],
+            "consent": "each_run",
+            "leased": false,
+            "region": "bootstrap_until_measured",
+            "available": true,
+            "reason": ""
+          },
+          {
+            "skill_id": "calib.workspace",
+            "version": "1.0.0",
+            "card": "Calibrate the workspace: the box (arm base frame, mm) the TCP may move in. Give x=[min, max], y=[min, max], z_max, and exactly one floor: z_min; table_z (the table height; the floor is clearance_mm above it); or table_points, 3-12 [x, y, z] TCP positions touched on the table (read with arm.state), fitted as a plane. With verify=true the arm visits the box's 8 corners slowly, inside the workcell's bootstrap box. Requires calib.tcp.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "description": "[min, max] mm"
+                },
+                "y": {
+                  "type": "array",
+                  "items": {
+                    "type": "number"
+                  },
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "description": "[min, max] mm"
+                },
+                "z_max": {
+                  "type": "number"
+                },
+                "z_min": {
+                  "type": "number"
+                },
+                "table_z": {
+                  "type": "number"
+                },
+                "table_points": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    },
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "description": "TCP position on the table"
+                  },
+                  "minItems": 3,
+                  "maxItems": 12
+                },
+                "clearance_mm": {
+                  "type": "number",
+                  "minimum": 5,
+                  "maximum": 200,
+                  "default": 30.0
+                },
+                "verify": {
+                  "type": "boolean",
+                  "default": true
+                },
+                "speed_pct": {
+                  "type": "number",
+                  "minimum": 1,
+                  "maximum": 100,
+                  "default": 10.0
+                }
+              },
+              "required": [
+                "x",
+                "y",
+                "z_max"
+              ]
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm",
+              "calib:tcp"
+            ],
+            "consent": "each_run",
+            "leased": false,
+            "region": "bootstrap",
+            "available": true,
+            "reason": ""
+          },
+          {
+            "skill_id": "episode.record",
+            "version": "1.0.0",
+            "card": "Record a teleoperated demonstration as a training episode. The node commands nothing: an operator moves the arm (e.g. with a leader arm) while the node samples state and camera frames and holds the workcell's devices, so no other run or write can move it meanwhile. 'task' is the demonstration's instruction, kept as the episode's language label. The run lasts duration_s or until hw_skill_stop (start it with wait=false); label the finished episode with hw_skill_label. Unavailable when the node does not record episodes.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "task": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "description": "The instruction the demonstration performs."
+                },
+                "duration_s": {
+                  "type": "number",
+                  "minimum": 1,
+                  "default": 60.0,
+                  "description": "Longest recording; stop the run earlier when done."
+                }
+              },
+              "required": [
+                "task"
+              ]
+            },
+            "effect": "read",
+            "requires": [
+              "role:arm"
+            ],
+            "consent": "each_run",
+            "leased": true,
+            "region": "workspace",
+            "available": true,
+            "reason": ""
+          },
+          {
+            "skill_id": "grasp.cycle",
+            "version": "1.0.0",
+            "card": "Run one fixed-orientation grasp cycle with bounded IK paths, wrist alignment, on-support contact, a 5\u201310 mm proof lift, monitored carry, release and fresh overview-camera placement verification. Every failure stops the cycle with no retry, reset, disable or automatic retreat. One preview and approval per run.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "grasp_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "place": {
+                  "type": "object",
+                  "additionalProperties": true
+                },
+                "proof_lift_mm": {
+                  "type": "number",
+                  "minimum": 5,
+                  "maximum": 10,
+                  "default": 5
+                },
+                "samples": {
+                  "type": "integer",
+                  "minimum": 3,
+                  "maximum": 10,
+                  "default": 3
+                },
+                "speed_pct": {
+                  "type": "number",
+                  "minimum": 1,
+                  "maximum": 30,
+                  "default": 10
+                }
+              },
+              "required": [
+                "grasp_id",
+                "place"
+              ]
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm",
+              "role:gripper",
+              "role:camera",
+              "calib:camera",
+              "role:camera.wrist",
+              "calib:camera.wrist",
+              "calib:tcp",
+              "calib:workspace"
+            ],
+            "consent": "each_run",
+            "leased": false,
+            "region": "workspace",
+            "available": false,
+            "reason": "camera calibration is stale (the record carries no measured target mount and no screw-motion evidence); run calib.handeye again; camera.wrist is not calibrated (run calib.handeye)"
+          },
+          {
+            "skill_id": "grasp.inspect",
+            "version": "1.0.0",
+            "card": "Read installed physical grasp qualification, calibration dependencies and fresh wrist depth measurements for reporting. No motion or certificate installation.",
+            "args_schema": {
+              "type": "object",
+              "properties": {}
+            },
+            "effect": "read",
+            "requires": [
+              "role:arm",
+              "role:camera.wrist",
+              "calib:camera.wrist",
+              "role:gripper",
+              "calib:tcp",
+              "calib:workspace"
+            ],
+            "consent": "session",
+            "leased": false,
+            "region": "workspace",
+            "available": false,
+            "reason": "camera.wrist is not calibrated (run calib.handeye)"
+          },
+          {
+            "skill_id": "grasp.propose",
+            "version": "1.0.0",
+            "card": "Propose grasps for one object id from perceive.locate, without moving: each grasp has an id, the TCP poses pregrasp / grasp / retreat (mm, deg, arm base frame), the width the jaws should open to, the expected closed width, a score, and the planner that produced it. Every candidate is inside the workspace at planning time. Grasp ids expire with their object.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "object": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 16
+                },
+                "top_k": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10,
+                  "default": 3
+                }
+              },
+              "required": [
+                "object"
+              ]
+            },
+            "effect": "read",
+            "requires": [
+              "role:arm",
+              "role:gripper",
+              "calib:tcp",
+              "role:camera",
+              "calib:camera",
+              "calib:workspace"
+            ],
+            "consent": "session",
+            "leased": false,
+            "region": "workspace",
+            "available": false,
+            "reason": "camera calibration is stale (the record carries no measured target mount and no screw-motion evidence); run calib.handeye again"
+          },
+          {
+            "skill_id": "grasp.verify",
+            "version": "1.0.0",
+            "card": "Read stationary wrist RGB-D, qualified pad geometry, jaw stroke and force evidence. Stages pre_grasp, hold and empty never command motion. A standalone hold cannot prove a lift without a continuous on-support baseline in the same run.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "stage": {
+                  "type": "string",
+                  "enum": [
+                    "pre_grasp",
+                    "hold",
+                    "empty"
+                  ]
+                },
+                "samples": {
+                  "type": "integer",
+                  "minimum": 3,
+                  "maximum": 10,
+                  "default": 3
+                },
+                "grasp": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "required": [
+                "stage"
+              ]
+            },
+            "effect": "read",
+            "requires": [
+              "role:arm",
+              "role:camera.wrist",
+              "calib:camera.wrist",
+              "role:gripper",
+              "calib:tcp",
+              "calib:workspace"
+            ],
+            "consent": "session",
+            "leased": false,
+            "region": "workspace",
+            "available": false,
+            "reason": "camera.wrist is not calibrated (run calib.handeye)"
+          },
+          {
+            "skill_id": "gripper.qualify",
+            "version": "1.0.0",
+            "card": "Acquire command and settled jaw feedback at approved widths in empty air. No arm movement. Independent caliper train/holdout readings are required for a jaw-stroke certificate; encoder feedback alone never certifies it.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "widths": {
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "minItems": 3,
+                  "maxItems": 10
+                }
+              },
+              "required": [
+                "widths"
+              ]
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm",
+              "role:gripper"
+            ],
+            "consent": "each_run",
+            "leased": false,
+            "region": "workspace",
+            "available": true,
+            "reason": ""
+          },
+          {
+            "skill_id": "motion.home",
+            "version": "1.1.0",
+            "card": "Move the arm to the workcell's declared home posture in joint space. The declared FK, workspace and tool cone are checked before approval and execution.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "speed_pct": {
+                  "type": "number",
+                  "minimum": 1,
+                  "maximum": 100,
+                  "description": "Speed, percent of the arm maximum; capped by the workcell limit."
+                }
+              }
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm"
+            ],
+            "consent": "session",
+            "leased": false,
+            "region": "workspace",
+            "available": true,
+            "reason": ""
+          },
+          {
+            "skill_id": "motion.sequence",
+            "version": "1.0.0",
+            "card": "Run a motion program on the arm and gripper, approved once as a whole. Each step has an op: move (the arm's default path) or move_linear (straight line) to a TCP target; move_joints {joint: deg}; gripper (width_mm, or grip open|close; ref grasp:gN opens to that grasp's open_mm and records the object as held when the jaws close on it); wait (seconds). A move target is one of: pose {x, y, z, rx?, ry?, rz?} in mm/deg (frame base, or table: z above the table surface); relative {dx, dy, dz, frame base|tool} from the previous target; or ref object:oN[.top|.bottom] / grasp:gN.pregrasp|grasp|retreat plus an optional offset {dx, dy, dz} in the base frame. Omitted angles keep the previous target's orientation. A move may name path: linear|point to ride that path when the arm declares it (move_linear always rides linear); a target whose straight line is infeasible from the current configuration, such as one starting on a wrist singularity, needs point. A step may declare expect: held (the jaws hold something), released (the jaws opened freely), reached (the TCP is at the last target), or no_contact (the move arrived and the jaws were not pushed); on_fail stop halts the arm, hold leaves it in place. Plan uses the arm's declared FK to sample every joint path and refuses any tool target outside the workspace; execute repeats that check from fresh joint state and refuses when the tool or a referenced object moved.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "steps": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "op": {
+                        "type": "string",
+                        "enum": [
+                          "move",
+                          "move_linear",
+                          "move_joints",
+                          "gripper",
+                          "wait"
+                        ]
+                      },
+                      "pose": {
+                        "type": "object",
+                        "properties": {
+                          "x": {
+                            "type": "number"
+                          },
+                          "y": {
+                            "type": "number"
+                          },
+                          "z": {
+                            "type": "number"
+                          },
+                          "rx": {
+                            "type": "number",
+                            "minimum": -180,
+                            "maximum": 180
+                          },
+                          "ry": {
+                            "type": "number",
+                            "minimum": -180,
+                            "maximum": 180
+                          },
+                          "rz": {
+                            "type": "number",
+                            "minimum": -180,
+                            "maximum": 180
+                          },
+                          "frame": {
+                            "type": "string",
+                            "enum": [
+                              "base",
+                              "table"
+                            ],
+                            "default": "base"
+                          }
+                        },
+                        "required": [
+                          "x",
+                          "y",
+                          "z"
+                        ]
+                      },
+                      "relative": {
+                        "type": "object",
+                        "properties": {
+                          "dx": {
+                            "type": "number",
+                            "minimum": -1000,
+                            "maximum": 1000,
+                            "default": 0.0
+                          },
+                          "dy": {
+                            "type": "number",
+                            "minimum": -1000,
+                            "maximum": 1000,
+                            "default": 0.0
+                          },
+                          "dz": {
+                            "type": "number",
+                            "minimum": -1000,
+                            "maximum": 1000,
+                            "default": 0.0
+                          },
+                          "frame": {
+                            "type": "string",
+                            "enum": [
+                              "base",
+                              "tool"
+                            ],
+                            "default": "base"
+                          }
+                        }
+                      },
+                      "ref": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 40
+                      },
+                      "path": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "offset": {
+                        "type": "object",
+                        "properties": {
+                          "dx": {
+                            "type": "number",
+                            "minimum": -1000,
+                            "maximum": 1000,
+                            "default": 0.0
+                          },
+                          "dy": {
+                            "type": "number",
+                            "minimum": -1000,
+                            "maximum": 1000,
+                            "default": 0.0
+                          },
+                          "dz": {
+                            "type": "number",
+                            "minimum": -1000,
+                            "maximum": 1000,
+                            "default": 0.0
+                          }
+                        }
+                      },
+                      "joints": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "width_mm": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "grip": {
+                        "type": "string",
+                        "enum": [
+                          "open",
+                          "close"
+                        ]
+                      },
+                      "effort": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "seconds": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "speed_pct": {
+                        "type": "number",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Speed, percent of the arm maximum; capped by the run's limit."
+                      },
+                      "expect": {
+                        "type": "string",
+                        "enum": [
+                          "held",
+                          "released",
+                          "reached",
+                          "no_contact"
+                        ]
+                      },
+                      "on_fail": {
+                        "type": "string",
+                        "enum": [
+                          "stop",
+                          "hold"
+                        ],
+                        "default": "stop"
+                      }
+                    },
+                    "required": [
+                      "op"
+                    ]
+                  },
+                  "minItems": 1,
+                  "maxItems": 64
+                },
+                "speed_pct": {
+                  "type": "number",
+                  "minimum": 1,
+                  "maximum": 100,
+                  "description": "Speed, percent of the arm maximum; capped by the run's limit."
+                }
+              },
+              "required": [
+                "steps"
+              ]
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm",
+              "calib:tcp",
+              "calib:workspace"
+            ],
+            "consent": "session",
+            "leased": false,
+            "region": "workspace",
+            "available": true,
+            "reason": ""
+          },
+          {
+            "skill_id": "perceive.lift",
+            "version": "1.0.0",
+            "card": "Turn what you point at in a perceive.snapshot frame into objects, without moving. Each target has a label and either a point [u, v] on the object's surface or a box [x0, y0, x1, y1] around it; coords says whether they are pixels of the shared image, fractions (0-1) of its sides, or thousandths (0-1000). Each lifted target gets an object id with the same fields as perceive.locate (a point gives a surface point with no size); a target with no depth behind it is reported as dropped. Lifted ids live beside located ones until the next perceive.locate.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "frame": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 16
+                },
+                "capture_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$"
+                },
+                "targets": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 8,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "label": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80
+                      },
+                      "point": {
+                        "type": "array",
+                        "items": {
+                          "type": "number",
+                          "minimum": 0
+                        },
+                        "minItems": 2,
+                        "maxItems": 2
+                      },
+                      "box": {
+                        "type": "array",
+                        "items": {
+                          "type": "number",
+                          "minimum": 0
+                        },
+                        "minItems": 4,
+                        "maxItems": 4
+                      }
+                    },
+                    "required": [
+                      "label"
+                    ]
+                  }
+                },
+                "coords": {
+                  "type": "string",
+                  "enum": [
+                    "pixel",
+                    "unit",
+                    "per_mille"
+                  ],
+                  "default": "pixel"
+                }
+              },
+              "required": [
+                "frame",
+                "targets"
+              ]
+            },
+            "effect": "read",
+            "requires": [
+              "role:camera",
+              "calib:camera",
+              "calib:workspace",
+              "share:frames"
+            ],
+            "consent": "session",
+            "leased": false,
+            "region": "workspace",
+            "available": false,
+            "reason": "camera calibration is stale (the record carries no measured target mount and no screw-motion evidence); run calib.handeye again"
+          },
+          {
+            "skill_id": "perceive.locate",
+            "version": "2.0.0",
+            "card": "Look at the table with the workcell camera and report every detection of the queried descriptions (e.g. ['red cup', 'plate']): id, label, score, centre (mm, arm base frame), size, yaw, how many depth points support it, and its geometry (mask or box; a point has no size), plus what the gripper holds. Several detections may answer one query; all of them are returned. Ids replace those of earlier calls and expire after a short while.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "queries": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80
+                  },
+                  "minItems": 1,
+                  "maxItems": 8
+                },
+                "min_score": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "description": "Lowest detection score reported; the workcell's when omitted."
+                }
+              },
+              "required": [
+                "queries"
+              ]
+            },
+            "effect": "read",
+            "requires": [
+              "role:camera",
+              "calib:camera",
+              "calib:workspace",
+              "model:locator"
+            ],
+            "consent": "session",
+            "leased": false,
+            "region": "workspace",
+            "available": false,
+            "reason": "camera calibration is stale (the record carries no measured target mount and no screw-motion evidence); run calib.handeye again; workcell 'piper_cell' binds no 'locator' model (declare it under 'models')"
+          },
+          {
+            "skill_id": "perceive.snapshot",
+            "version": "1.0.0",
+            "card": "Capture one frame from the workcell camera and return it as an image you can see, with its frame id and size in pixels. Point into it with perceive.lift to turn what you see into objects in the arm base frame. Only the newest few frames are kept, and they expire after a short while.",
+            "args_schema": {
+              "type": "object",
+              "properties": {}
+            },
+            "effect": "read",
+            "requires": [
+              "role:camera",
+              "calib:camera",
+              "calib:workspace",
+              "share:frames"
+            ],
+            "consent": "session",
+            "leased": false,
+            "region": "workspace",
+            "available": false,
+            "reason": "camera calibration is stale (the record carries no measured target mount and no screw-motion evidence); run calib.handeye again"
+          },
+          {
+            "skill_id": "policy.run",
+            "version": "2.0.0",
+            "card": "Run a learned visuomotor policy closed-loop for at most duration_s seconds. 'policy' is a model the workcell binds under 'models' that serves action chunks; 'task' is the instruction for it. A model whose instruction_policy is 'exact' accepts only the tasks it declares; 'open' takes free language. Planning previews the first chunk without moving; every action is checked by the safety shield and the run halts at the first refusal. The run ends when the model reports done or duration_s elapses (result 'ended'); 'progress' is the model's own estimate when it reports one, not a verification. The run's duration cap bounds duration_s.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "policy": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64,
+                  "description": "The model name bound under the workcell's 'models'."
+                },
+                "task": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "description": "The instruction the policy should perform."
+                },
+                "duration_s": {
+                  "type": "number",
+                  "minimum": 0.5,
+                  "default": 30.0,
+                  "description": "Upper bound on streaming after the first chunk arrives."
+                },
+                "speed_pct": {
+                  "type": "number",
+                  "minimum": 1,
+                  "maximum": 100,
+                  "description": "Speed, percent of the arm maximum; capped by the workcell."
+                }
+              },
+              "required": [
+                "policy",
+                "task"
+              ]
+            },
+            "effect": "actuate",
+            "requires": [
+              "role:arm",
+              "calib:tcp",
+              "calib:workspace"
+            ],
+            "consent": "each_run",
+            "leased": false,
+            "region": "workspace",
+            "available": true,
+            "reason": ""
+          }
+        ]
+      }
+    ],
+    "rejected": []
+  }
+}

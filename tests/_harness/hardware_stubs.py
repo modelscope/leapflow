@@ -28,7 +28,7 @@ from leapflow.hardware.context import (
     TransportRef,
 )
 from leapflow.hardware.lhp import LhpNodeServer
-from leapflow.hardware.transport import BatchReading, TransportError
+from leapflow.hardware.transport import BatchReading, TransportError, TransportStatus
 from leapflow.hardware.transports import build_transport
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest
 
@@ -104,6 +104,7 @@ class StubNodeRegistry:
         *,
         values: Mapping[str, Any] | None = None,
         halt_supported: bool = True,
+        halt_closes: bool = False,
         fail_writes: bool = False,
         read_only: bool = False,
         safety_deny_reason: str = "",
@@ -139,6 +140,8 @@ class StubNodeRegistry:
         self._safety_deny_reason = str(safety_deny_reason or "")
         self._io_lock = asyncio.Lock()
         self._opened = False
+        self._halt_closes = bool(halt_closes)
+        self.opens = 0
 
     # ── The registry surface the LHP node server depends on ──
 
@@ -164,7 +167,46 @@ class StubNodeRegistry:
         if not self._opened:
             await self._transport.open(self._context)
             self._opened = True
+            self.opens += 1
         return self._transport
+
+    def get_open_transport(self, device_id: str) -> Any:
+        """The live link only; never opens one (matches ``HardwareRegistry``)."""
+        if device_id != self._context.device_id:
+            raise TransportError(f"unknown device {device_id!r}", failure_code="unknown_device")
+        if not self._opened:
+            raise TransportError(
+                f"No open transport for device {device_id!r}.",
+                failure_code="transport_not_open",
+            )
+        return self._transport
+
+    @property
+    def opened(self) -> bool:
+        """Whether the node has a live link to its device."""
+        return self._opened
+
+    async def halt(self, device_id: str) -> TransportStatus | None:
+        """Stop the device over its live link, mirroring ``HardwareRegistry.halt``.
+
+        Never opens a link, and retires the link when the stop ended it -- a
+        device left cached after it closed answers every later read with "is not
+        open".
+        """
+        if device_id != self._context.device_id:
+            raise TransportError(f"unknown device {device_id!r}", failure_code="unknown_device")
+        if not self._opened:
+            return None
+        status = await self._transport.halt()
+        if self._halt_closes or not status.connected:
+            self._opened = False
+            return TransportStatus(
+                connected=False,
+                halt_supported=status.halt_supported,
+                halt_delivered=status.halt_delivered,
+                detail=status.detail or "closed by the stop",
+            )
+        return status
 
     async def read_batch(self, device_id: str, channel_ids: tuple[str, ...]) -> BatchReading:
         transport = await self.transport(device_id)

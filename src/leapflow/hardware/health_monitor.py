@@ -5,6 +5,8 @@ Aggregates health signals from multiple sources:
 - HardwareStreamSource / BatchStreamCoordinator: comm_loss, sensor_loss events
 - HighFrequencyControlBus: overrun, safety_violation stats
 - HardwareRegistry: device probe results
+- FrameHub stats in a camera's probe: stale / recovered / frame-loss transitions,
+  published on the registry's signal path as ordinary ``HardwareEvent`` kinds
 - FleetManager: node heartbeat status
 
 Executes DegradationPolicy actions based on aggregated health:
@@ -29,10 +31,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Mapping
 
 from leapflow.hardware.degradation import DegradationCoordinator
+from leapflow.hardware.vision.health import FrameHealthTracker
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +128,9 @@ class HardwareHealthMonitor:
 
         # Per-device health tracking.
         self._records: dict[str, DeviceHealthRecord] = {}
+        self._frames = FrameHealthTracker()
+        from leapflow.hardware.calibration.lifecycle import LifecycleReceiver
+        self._calibration_lifecycle = LifecycleReceiver(registry)
         self._poll_task: asyncio.Task[None] | None = None
         self._stopped = asyncio.Event()
         self._started = False
@@ -292,15 +298,17 @@ class HardwareHealthMonitor:
             record.degradation_reason = f"{reason}: {outcome.error}"
 
     async def _execute_halt(self, device_id: str, reason: str) -> None:
-        """Halt a device immediately via the registry transport."""
+        """Halt a device immediately through the registry, which owns the link cache."""
         logger.warning(
             "HealthMonitor: halting device %s (reason: %s)",
             device_id,
             reason,
         )
         try:
-            transport = await self._registry.transport(device_id)
-            await transport.halt()
+            # The halt must reach the device, so a link is opened when none is open;
+            # the registry owns the cache and retires a link the stop closed.
+            await self._registry.transport(device_id)
+            await self._registry.halt(device_id)
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "HealthMonitor: halt failed for %s: %s",
@@ -544,8 +552,33 @@ class HardwareHealthMonitor:
         except Exception:  # noqa: BLE001 — probe failure is a data point, not an error
             record.last_probe_ok = False
             record.consecutive_probe_failures += 1
+            probe_result = None
 
         record.last_probe_time = time.monotonic()
+        self._observe_frames(device_id, probe_result)
+        if probe_result is not None:
+            try:
+                accepted = self._calibration_lifecycle.observe(device_id, probe_result)
+                acknowledge = getattr(transport, "acknowledge_calibration", None)
+                if callable(acknowledge):
+                    acknowledge(accepted)
+            except (ValueError, TypeError):
+                logger.warning("Calibration lifecycle delivery refused; records remain pending", exc_info=True)
+
+    def _observe_frames(self, device_id: str, status: Any) -> None:
+        """Publish the frame-pump transitions a camera's probe reveals as signals."""
+        metadata = getattr(status, "metadata", None)
+        stats = metadata.get("frame_hub") if isinstance(metadata, Mapping) else None
+        events = self._frames.observe(device_id, stats)
+        publish = getattr(self._registry, "publish_event", None)
+        for event in events:
+            logger.info("HealthMonitor: %s", event.to_detail())
+            if publish is None:
+                continue
+            try:
+                publish(event)
+            except Exception:  # noqa: BLE001 — telemetry must not break monitoring
+                logger.warning("HealthMonitor: frame event publish failed", exc_info=True)
 
     async def _poll_fleet_nodes(self) -> None:
         """Check fleet node health and update device records accordingly.

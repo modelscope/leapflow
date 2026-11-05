@@ -1,0 +1,76 @@
+{
+  "schema": "leapflow.private_environment_evidence_manifest.v1",
+  "images": [
+    {
+      "path": "/Users/jason/work/leap_work/leapflow/temp/devices/env_images/微信图片_20261029201439_2_3.jpg",
+      "sha256": "406bf63f139f015207d09f14a2478a501a14eb76c7ceb06f0a11b1459e8ee9fa",
+      "size_bytes": 4912449,
+      "dimensions_px": [
+        5712,
+        4284
+      ],
+      "is_metric_measurement": false,
+      "is_calibration_factor_source": false
+    },
+    {
+      "path": "/Users/jason/work/leap_work/leapflow/temp/devices/env_images/微信图片_20261029201443_3_3.jpg",
+      "sha256": "e336c69b1d0020998e3e4d38809cc668e6eef7201c8455daadf489fcc07055ba",
+      "size_bytes": 5556869,
+      "dimensions_px": [
+        5712,
+        4284
+      ],
+      "is_metric_measurement": false,
+      "is_calibration_factor_source": false
+    },
+    {
+      "path": "/Users/jason/work/leap_work/leapflow/temp/devices/env_images/微信图片_20261029201446_4_3.jpg",
+      "sha256": "0817a59b06241f6d15ea3117c7a2680ad0045edb6ca574cf9c10c791f313e495",
+      "size_bytes": 5185290,
+      "dimensions_px": [
+        5712,
+        4284
+      ],
+      "is_metric_measurement": false,
+      "is_calibration_factor_source": false
+    },
+    {
+      "path": "/Users/jason/work/leap_work/leapflow/temp/devices/env_images/微信图片_20261029201448_5_3.jpg",
+      "sha256": "0f4264c118eebd35e58fd009aa3c5c07e31d850ef24403d4c6b4e3e7bdcb0936",
+      "size_bytes": 5165508,
+      "dimensions_px": [
+        5712,
+        4284
+      ],
+      "is_metric_measurement": false,
+      "is_calibration_factor_source": false
+    }
+  ],
+  "review_sha256": "ab8811da00d93d09335ca99aade7c5b89f477f63c98f5ef400f0549f3628951b",
+  "diagnostics": [
+    {
+      "path": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/environment-followup-v1/wrist-diagnostic.jpg",
+      "sha256": "5402e877de5ce2ddd99fc0c28c1d272694469b44c51d27775e15e0ef8f95a3c1",
+      "size_bytes": 27448,
+      "dimensions_px": [
+        640,
+        480
+      ],
+      "is_metric_measurement": false,
+      "is_calibration_factor_source": false
+    },
+    {
+      "path": "/Users/jason/work/leap_work/leapflow/.qoder/artifacts/leapcalib/environment-followup-v1/global-diagnostic.jpg",
+      "sha256": "9ef27483c8563403269d59b6a8ac1fd33e618c90080f97b5ac4389271e00c35c",
+      "size_bytes": 21955,
+      "dimensions_px": [
+        640,
+        480
+      ],
+      "is_metric_measurement": false,
+      "is_calibration_factor_source": false
+    }
+  ],
+  "remote_changes_performed": false,
+  "physical_qualification": false
+}

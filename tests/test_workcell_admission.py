@@ -21,6 +21,7 @@ from leapflow.hardware.skills.workcell import (
 )
 from tests._harness.skill_stubs import (
     ARM_ID,
+    IDENTITY_MATRIX,
     WORKCELL_ID,
     WORKCELL_YAML,
     SkillNodeRegistry,
@@ -41,6 +42,13 @@ def test_shipped_shape_parses_and_reports_its_devices() -> None:
     assert spec.calibration["max_pivot_residual_mm"] == 1.0
     assert spec.calibration["max_verify_p95_mm"] == 5.0
     assert spec.bootstrap_box is not None and spec.bootstrap_box.z_min == 120
+    assert spec.vision == {"sync_tolerance_ms": 50.0, "sync_attempts": 3.0}
+
+
+def test_vision_sync_tuning_overrides_and_is_reported() -> None:
+    spec = WorkcellSpec.from_mapping(_with(vision={"sync_tolerance_ms": 20, "sync_attempts": 2}))
+    assert spec.vision == {"sync_tolerance_ms": 20.0, "sync_attempts": 2.0}
+    assert spec.to_dict()["vision"] == spec.vision
 
 
 @pytest.mark.parametrize(
@@ -63,6 +71,10 @@ def test_shipped_shape_parses_and_reports_its_devices() -> None:
         (_with(roles={"arm": ARM_ID, "Camera Wrist": "cam"}), "role name"),
         (_with(roles={"arm": ARM_ID, "camera.wrist": ""}), "device id"),
         (_with(roles=[ARM_ID]), "needs 'roles'"),
+        (_with(vision={"sync_attempts": 1.5}), "sync_attempts"),
+        (_with(vision={"sync_attempts": 11}), "sync_attempts"),
+        (_with(vision={"sync_tolerance_ms": 0}), "positive finite"),
+        (_with(vision={"hardware_sync": True}), "vision does not understand"),
     ],
 )
 def test_malformed_declarations_are_refused(data: dict[str, Any], match: str) -> None:
@@ -95,6 +107,72 @@ def test_missing_directory_admits_nothing(tmp_path: Path) -> None:
     assert admitted == {} and report.rejected == ()
 
 
+def test_a_camera_frame_without_a_measured_target_mount_is_not_a_calibration(
+    tmp_path: Path,
+) -> None:
+    """A hand-eye record that never measured a target mount is an assertion.
+
+    Such a record is what an import or a hand-edited matrix leaves behind, and
+    it survives the camera being remounted: the transform stays plausible, no
+    downstream consumer can tell it apart from a measurement, and perception
+    keeps reporting geometry for a view that no longer exists.
+    """
+    registry = SkillNodeRegistry(store_path=tmp_path / "instrument.duckdb")
+    spec = WorkcellSpec.from_mapping(_with(
+        roles={"arm": ARM_ID, "camera": ARM_ID},
+        frames={
+            "tcp": {"parent": "flange", "procedure": "tcp.offset"},
+            "camera": {"parent": "base", "procedure": "handeye.eye_to_hand"},
+        },
+    ))
+    registry.calibrate("handeye.eye_to_hand", pose={"x": 500., "y": 0., "z": 0.})
+    frames = FrameGraph.snapshot(spec, registry.calibration_store)
+    assert frames.transform("camera") is None
+    assert frames.parameters("camera") == {}
+    assert "target mount" in frames.stale["camera"]
+    assert unmet_requirements(("calib:camera",), spec, frames) == [
+        "camera calibration is stale (the record carries no measured target mount and "
+        "no screw-motion evidence); run calib.handeye again"
+    ]
+
+
+def test_a_record_naming_a_method_without_its_evidence_is_not_a_calibration(
+    tmp_path: Path,
+) -> None:
+    """Naming a board-free method does not stand in for having used one.
+
+    The gate asks each method for the evidence that method produces. Declaring
+    ``markerless_screw`` with no joint list, or with two joints, is the same
+    assertion as a bare matrix: two rotations share the vertical, so no mount can
+    come out of them.
+    """
+    registry = SkillNodeRegistry(store_path=tmp_path / "instrument.duckdb")
+    spec = WorkcellSpec.from_mapping(_with(
+        roles={"arm": ARM_ID, "camera": ARM_ID},
+        frames={
+            "tcp": {"parent": "flange", "procedure": "tcp.offset"},
+            "camera": {"parent": "base", "procedure": "handeye.eye_to_hand"},
+        },
+    ))
+    pair = {"joint": "j1", "angle_deg": 30.0, "agreement": 0.6, "shift_gap_mm": 4.0}
+    for evidence, reason in (
+        ({"method": "markerless_screw"}, "lists no joints"),
+        ({"method": "markerless_screw", "pairs": [pair]}, "covers 1 joints"),
+        ({"method": "guess"}, "names no measurement method"),
+        ({"method": "markerless_screw", "pairs": [pair] * 3}, ""),
+    ):
+        record = registry.calibrate(
+            "handeye.eye_to_hand",
+            matrix=[[1, 0, 0, 500], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+            parameters={"screw_evidence": evidence},
+        )
+        frames = FrameGraph.snapshot(spec, registry.calibration_store)
+        stale = frames.stale.get("camera", "")
+        assert reason in stale, (evidence, stale)
+        assert (frames.transform("camera") is not None) is (reason == "")
+        assert record
+
+
 def test_frames_resolve_from_the_latest_calibration_preferring_a_matrix(tmp_path: Path) -> None:
     registry = SkillNodeRegistry(store_path=tmp_path / "instrument.duckdb")
     spec = WorkcellSpec.from_mapping(
@@ -120,6 +198,7 @@ def test_frames_resolve_from_the_latest_calibration_preferring_a_matrix(tmp_path
             recorded_at=3.0,
             matrix=matrix,
             pose={"x": 1, "y": 1, "z": 1},
+            parameters={"target_mount": IDENTITY_MATRIX},
         )
     )
     frames = FrameGraph.snapshot(spec, store)
@@ -177,6 +256,64 @@ def test_admission_halts_every_writable_device_and_checks_each_role_kind(tmp_pat
     assert admitted[WORKCELL_ID].role("gripper.aux") == ARM_ID
     (note,) = report.rejected
     assert note.workcell == "no_wrist" and "camera.wrist device 'absent'" in note.detail
+
+
+@pytest.mark.parametrize("tuning", [
+    {"min_frames": 2}, {"min_frames": 3.5}, {"min_frames": 11},
+    {"min_proof_lift_mm": 11}, {"poll_s": 1}, {"alignment_mm": True},
+])
+def test_grasp_evidence_tuning_is_admitted_fail_closed(tuning: dict[str, Any]) -> None:
+    with pytest.raises(WorkcellError, match="grasp_verify"):
+        WorkcellSpec.from_mapping(_with(grasp_verify=tuning))
+
+
+def test_camera_frames_resolve_independent_mount_versions(tmp_path: Path) -> None:
+    registry = SkillNodeRegistry(store_path=tmp_path / "instrument.duckdb")
+    spec = WorkcellSpec.from_mapping(_with(
+        roles={"arm": ARM_ID, "camera": "overview", "camera.wrist": "wrist"}, frames={
+            "camera": {"parent": "base", "procedure": "handeye.eye_to_hand"},
+            "camera.wrist": {"parent": "flange", "procedure": "handeye.eye_in_hand"},
+        },
+    ))
+    mount = {"target_mount": IDENTITY_MATRIX}
+    registry.calibrate("handeye.eye_to_hand", parameters=mount,
+                       pose={"x": 500., "y": 0., "z": 0.}, recorded_at=1.)
+    registry.calibrate("handeye.eye_in_hand", parameters=mount,
+                       pose={"x": 60., "y": 0., "z": 0.}, recorded_at=2.)
+    frames = FrameGraph.snapshot(spec, registry.calibration_store)
+    assert frames.transform("camera").translation == (500., 0., 0.)
+    assert frames.transform("camera.wrist").translation == (60., 0., 0.)
+    assert frames.versions == {"camera": 1., "camera.wrist": 2.}
+    registry.calibrate("handeye.eye_in_hand", parameters=mount,
+                       pose={"x": 61., "y": 0., "z": 0.}, recorded_at=3.)
+    assert FrameGraph.snapshot(spec, registry.calibration_store).versions == {
+        "camera": 1., "camera.wrist": 3.,
+    }
+
+
+def test_camera_frames_keep_distinct_calibration_procedures() -> None:
+    data = _with(roles={"arm": ARM_ID, "camera": "overview", "camera.wrist": "wrist"}, frames={
+        "camera": {"parent": "base", "procedure": "handeye.eye_to_hand"},
+        "camera.wrist": {"parent": "flange", "procedure": "handeye.eye_in_hand"},
+    })
+    spec = WorkcellSpec.from_mapping(data)
+    assert spec.frames["camera.wrist"].parent == "flange"
+    assert "calib.handeye" in unmet_requirements(
+        ("calib:camera.wrist",), spec, FrameGraph(spec, {}, None, {}),
+    )[0]
+    data["frames"]["camera.wrist"]["procedure"] = "handeye.eye_to_hand"
+    with pytest.raises(WorkcellError, match="unique"):
+        WorkcellSpec.from_mapping(data)
+
+
+@pytest.mark.parametrize("frames", [
+    {"camera.wrist": {"parent": "base", "procedure": "p"}},
+    {"camera": {"parent": "tcp", "procedure": "p"}},
+    {"camera": {"parent": "base", "procedure": "p", "ignored": True}},
+])
+def test_camera_frames_refuse_unbound_roles_and_invalid_mounts(frames: dict[str, Any]) -> None:
+    with pytest.raises(WorkcellError):
+        WorkcellSpec.from_mapping(_with(roles={"arm": ARM_ID, "camera": "overview"}, frames=frames))
 
 
 def test_a_speed_cap_below_the_arms_lowest_speed_is_refused(tmp_path: Path) -> None:

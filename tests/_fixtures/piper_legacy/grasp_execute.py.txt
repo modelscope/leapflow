@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""Phase D: fresh observation, full-path preflight, and three gated pick/replaces.
+
+Default is read-only. --execute never enables, recovers, or resets an arm.
+All failed or ambiguous effects checkpoint the run; no motion is replayed.
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from cl import config, eye, plan as planning, wrist_verify
+from cl.bridge import ArmBridge, BridgeError, checkpoint
+from c5_jaw_test import qualified_report as qualified_jaw
+from dual_camera_qualify import qualified_depth
+
+
+def observe_box(cfg: config.Cfg, output: Path) -> dict:
+    image, metadata = eye.grab()
+    eye.save(image, output / "overview.png")
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+    mask = cv2.inRange(hsv, np.array(cfg.wrist.hsv_low), np.array(cfg.wrist.hsv_high))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    candidates = [i for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] >= cfg.vision.min_area_px]
+    observation = {"frame": metadata, "observed_mono": time.monotonic(), "candidate_count": len(candidates)}
+    if len(candidates) != 1:
+        config.dump_json(output / "observation.json", observation)
+        raise ValueError("need exactly one visible box; absent or ambiguous overview")
+    dimensions = cfg.qualification.independent_dims_mm
+    if dimensions is None:
+        observation["qualified"] = False
+        observation["reason"] = "independent operator dimensions missing"
+        config.dump_json(output / "observation.json", observation)
+        raise ValueError(observation["reason"])
+    dims = np.asarray(dimensions, dtype=float)
+    if dims.shape != (3,) or not np.isfinite(dims).all() or (dims <= 0).any():
+        raise ValueError("positive independently measured long/short/height dimensions required")
+    table_z = float(cfg.geometry.declared_table_z_mm)
+    blob = labels == candidates[0]
+    if blob[0].any() or blob[-1].any() or blob[:, 0].any() or blob[:, -1].any():
+        raise ValueError("overview box contour clipped")
+    foot = eye.footprint(eye.Camera(), blob, table_z + dims[2])
+    rectangle = cv2.minAreaRect(np.column_stack(np.nonzero(blob))[:, ::-1].astype(np.float32))
+    area = float(rectangle[1][0] * rectangle[1][1])
+    if area <= 0:
+        raise ValueError("degenerate overview footprint")
+    foot["fill"] = float(blob.sum() / area)
+    if max(abs(foot["long_mm"] - dims[0]), abs(foot["short_mm"] - dims[1])) > cfg.wrist.alignment_mm:
+        raise ValueError("overview footprint disagrees with independent dimensions")
+    observation.update({"footprint": foot, "height_mm": float(dims[2]), "height_quality": "ok",
+                        "projection_z": table_z, "table": {"z": table_z},
+                        "qualified": True, "height_source": cfg.qualification.get("independent_dims_evidence_ref")})
+    config.dump_json(output / "observation.json", observation)
+    return observation
+
+
+def preconditions(cfg: config.Cfg, artifacts: dict | None = None) -> list[str]:
+    problems = []
+    for key in ("proof_rise_error_mm", "clearance_margin_mm", "proof_lift_mm", "post_place_error_mm"):
+        value = cfg.qualification.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            problems.append(f"qualification.{key} must be finite and positive")
+    if problems:
+        return problems
+    if (not 0 < cfg.qualification.proof_rise_error_mm <= 2.0
+            or cfg.qualification.clearance_margin_mm < 3.0
+            or type(cfg.qualification.proof_frames) is not int or cfg.qualification.proof_frames < 3
+            or not 5 <= cfg.qualification.proof_lift_mm <= 10):
+        problems.append("at least three proof frames and a 5-10 mm lift required")
+    for key in ("independent_dims_mm", "independent_dims_evidence_ref", "planar_error_p95_mm", "planar_error_evidence_ref"):
+        if cfg.qualification.get(key) is None or cfg.qualification.get(key) == "":
+            problems.append(f"qualification.{key} missing")
+    dims = cfg.qualification.independent_dims_mm
+    if (not isinstance(dims, (list, tuple)) or len(dims) != 3
+            or not all(type(v) in (int, float) and math.isfinite(v) and v > 0 for v in dims)
+            or dims[0] < dims[1]):
+        problems.append("positive independent long/short/height dimensions required")
+    planar = cfg.qualification.planar_error_p95_mm
+    if type(planar) not in (int, float) or not math.isfinite(planar) or planar < 0:
+        problems.append("finite nonnegative independent planar P95 required")
+    pads = cfg.wrist.inner_pad_tool_mm
+    if (not isinstance(pads, dict) or not pads.get("evidence_ref")
+            or not all(type(pads.get(k)) in (int, float) and math.isfinite(pads[k]) for k in ("z_mm", "width_bias_mm"))):
+        problems.append("independent inner-pad geometry missing or invalid")
+    try:
+        record = artifacts.get("wrist", {}).get("data", {}) if artifacts is not None else None
+        eye.WristCamera([150, 130, 190, -180, 0, -90], record)
+    except (ValueError, KeyError, OSError, TypeError) as error:
+        problems.append(str(error))
+    for name, path in (("depth", config.DATA / "d405_depth" / "commission.json"),
+                       ("jaw_latest", config.DATA / "calibration" / "c5_jaw_latest.json")):
+        try:
+            evidence = artifacts.get(name, {}).get("data", {}) if artifacts is not None else config.load_json(path)
+            passed = (qualified_depth(evidence.get("depth")) if name == "depth" else qualified_jaw(evidence)) if isinstance(evidence, dict) else False
+            if not passed:
+                problems.append(f"unqualified evidence: {name}")
+        except (ValueError, OSError, KeyError, TypeError):
+            problems.append(f"qualification evidence missing: {path}")
+    return problems
+
+
+def full_path(grasp: dict, place: dict, park: list[float]) -> list[list[float]]:
+    carry_at_place = [place["x"], place["y"], grasp["carry_z"], -180, 0, grasp["rz"]]
+    place_poses = planning.place_poses(place)
+    return [park, *planning.grasp_poses(grasp).values(), planning.carry_pose(grasp),
+            carry_at_place, *[place_poses[key] for key in ("approach", "pre", "place")],
+            carry_at_place, park]
+
+
+def interpolate_path(poses: list[list[float]], step_mm: float = 5.0) -> list[list[float]]:
+    return planning.interpolate_path(poses, step_mm)
+
+
+def validate_path(arm: ArmBridge, grasp: dict, cfg: config.Cfg, park: list[float],
+                  start_pose: list[float] | None = None) -> dict:
+    if not 5 <= cfg.qualification.proof_lift_mm <= 10:
+        raise ValueError("proof lift must stay within the approved 5-10 mm budget")
+    candidates = {}
+    places = {}
+    for rz in grasp["rz_options"]:
+        candidate = planning.with_rz(grasp, rz)
+        candidate["retreat_z"] = candidate["grasp_z"] + cfg.qualification.proof_lift_mm
+        place = planning.place_plan(candidate, cfg)
+        places[rz] = place
+        poses = full_path(candidate, place, park)
+        if start_pose is not None:
+            poses = [start_pose, *poses]
+        trajectory = interpolate_path(poses)
+        issues = planning.validate_grasp(candidate, cfg) + planning.validate_place(place, candidate, cfg)
+        # Tolerances include angular error: the long axis consumes gap when yaw is off.
+        angular = math.radians(float(cfg.qualification.get("angular_error_p95_deg", 5.0)))
+        projected = candidate["short_mm"] * math.cos(angular) + candidate["long_mm"] * abs(math.sin(angular))
+        error = float(cfg.qualification.planar_error_p95_mm)
+        if (not math.isfinite(angular) or not 0 <= angular < math.pi/2
+                or not math.isfinite(error) or error < 0
+                or not math.isfinite(projected) or (candidate["open_mm"] - projected)/2 <= error + cfg.qualification.clearance_margin_mm):
+            issues.append("projected jaw clearance does not exceed planar P95 + 3 mm")
+        for pose in poses:
+            if not all(cfg.geometry.envelope[axis][0] <= value <= cfg.geometry.envelope[axis][1]
+                       for axis, value in zip(("x", "y", "z"), pose[:3])):
+                issues.append("full trajectory leaves declared workspace")
+        if issues:
+            candidates[f"{rz:.2f}"] = [{"feasible": False, "error": "; ".join(issues)}]
+        else:
+            # IK every intermediate Cartesian waypoint, not just endpoints.
+            rows = arm.ik(trajectory)["results"]
+            if (len(rows) != len(trajectory) or not rows
+                    or any(row.get("feasible") is not True or not row.get("margins_deg")
+                           or not all(math.isfinite(v) and v > 0 for v in row["margins_deg"]) for row in rows)):
+                rows = [{"feasible": False, "error": "incomplete, infeasible, or nonfinite full-path IK"}]
+            candidates[f"{rz:.2f}"] = rows
+    rz, verdict = planning.choose_rz(candidates, grasp["rz_options"])
+    if not verdict["feasible"]:
+        raise ValueError(f"full-path validation refused: {verdict['reason']}")
+    grasp = planning.with_rz(grasp, rz)
+    grasp["retreat_z"] = grasp["grasp_z"] + cfg.qualification.proof_lift_mm
+    return {"grasp": grasp, "place": places[rz], "ik": candidates, "choice": verdict}
+
+
+def move_to(arm: ArmBridge, pose: list[float], speed: float) -> dict:
+    # Linear motion matches the interpolated path used by preflight.
+    result = arm.move(*pose[:3], rpy=pose[3:], kind="linear", speed_pct=speed)
+    if result.get("why") != "arrived":
+        raise ValueError("motion did not prove settlement")
+    return result
+
+
+def check_wrist(arm: ArmBridge, grasp: dict, name: str, output: Path, previous: dict | None = None,
+                *, require_expected: bool = True) -> dict:
+    frame = wrist_verify.capture_wrist(arm)
+    pose = [frame.after[k] for k in ("x", "y", "z", "rx", "ry", "rz")]
+    verdict = (wrist_verify.verify_pre_grasp(pose, frame, grasp) if name.startswith("pre")
+               else wrist_verify.verify_hold(pose, frame, grasp))
+    if previous:
+        eye.require_new_frame(frame.metadata, previous["frame"])
+    record = {"verdict": asdict(verdict), "frame": frame.metadata, "pose": pose}
+    eye.save(frame.image, output / f"{name}.png")
+    config.dump_json(output / f"{name}.json", record)
+    expected = "aligned" if name.startswith("pre") else "held"
+    if require_expected and verdict.verdict != expected:
+        raise ValueError(f"{name} verification: {verdict.verdict}: {verdict.reason}")
+    return record
+
+
+def abort_visual_failure(arm: ArmBridge, grasp: dict, cfg: config.Cfg, output: Path) -> None:
+    """Release/retreat only from a proven settled pose within the bounded proof height."""
+    state, check = arm.latest(max_age_s=0.12), arm.check()
+    pose = [state[k] for k in ("x", "y", "z", "rx", "ry", "rz")]
+    speeds = state.get("speeds_rad_s", [])
+    if (len(speeds) != 6 or not np.isfinite([*pose, *speeds]).all()
+            or max(abs(v) for v in speeds) > cfg.wrist.abort_speed_rad_s
+            or max(abs((a-b+180) % 360-180) for a, b in zip(pose[3:], [-180, 0, grasp["rz"]])) > cfg.wrist.pose_drift_deg
+            or check.get("ok") is not True or check.get("enabled") is not True or check.get("halted")
+            or math.dist(pose[:2], grasp["centre"]) > cfg.wrist.pose_drift_mm
+            or not grasp["grasp_z"] - 1.5 <= pose[2] <= grasp["retreat_z"] + 1.5):
+        raise ValueError("visual abort needs operator intervention: live pose not safe to release")
+    retreat = planning.grasp_poses(grasp)["pre"]
+    path = interpolate_path([pose, retreat])
+    rows = arm.ik(path)["results"]
+    if len(rows) != len(path) or not all(row.get("feasible") is True for row in rows):
+        raise ValueError("visual abort retreat IK refused")
+    opened = arm.open_gripper(grasp["open_mm"])
+    if opened.get("why") != "reached":
+        raise ValueError("visual abort release not settled")
+    result = move_to(arm, retreat, cfg.motion.speed_grasp_pct)
+    config.dump_json(output / "abort.json", {"released": opened, "retreat": result, "qualified": False})
+
+
+def verify_proof(held: dict, proof: dict, grasp: dict, cfg: config.Cfg) -> None:
+    """An arm rise alone is not proof: the independently scaled box must rise with it."""
+    start = np.array(held["verdict"]["evidence"]["object_top_base_mm"])
+    end = np.array(proof["verdict"]["evidence"]["object_top_base_mm"])
+    tool = np.array(proof["pose"][:3]) - held["pose"][:3]
+    rise = end - start
+    if (not np.isfinite([*start, *end, *tool]).all()
+            or not 5 <= tool[2] <= 10
+            or np.linalg.norm(rise - tool) > cfg.qualification.proof_rise_error_mm
+            or abs(start[2] - grasp["table_z"] - grasp["height_mm"]) > cfg.wrist.alignment_mm
+            or end[2] <= grasp["table_z"] + grasp["height_mm"] + 3):
+        raise ValueError("proof lift did not demonstrate the box leaving support with the jaws")
+
+
+def run_cycle(arm: ArmBridge, cfg: config.Cfg, output: Path) -> dict:
+    park = [*cfg.motion.park_mm, -180, 0, -90]
+    initial = arm.pose()
+    parking = interpolate_path([initial, park])
+    rows = arm.ik(parking)["results"]
+    if len(rows) != len(parking) or not all(row.get("feasible") is True for row in rows):
+        raise ValueError("initial-to-park path IK refused")
+    move_to(arm, park, cfg.motion.speed_transit_pct)
+    observation = observe_box(cfg, output)
+    table = planning.table_from_model(config.load_json(config.TABLE_MODEL), cfg)
+    validated = validate_path(arm, planning.grasp_plan(observation, table, cfg), cfg, park)
+    grasp, place = validated["grasp"], validated["place"]
+    config.dump_json(output / "validated_plan.json", validated)
+    if time.monotonic() - observation["observed_mono"] > cfg.wrist.max_frame_age_s:
+        raise ValueError("overview observation expired during preflight")
+    opened = arm.open_gripper(grasp["open_mm"])
+    if opened.get("why") != "reached":
+        raise ValueError("gripper opening not settled")
+    grasp["open_mm"] = min(grasp["open_mm"], float(arm.latest()["gripper_mm"]))
+    validated = validate_path(arm, grasp, cfg, park)
+    grasp, place = validated["grasp"], validated["place"]
+    config.dump_json(output / "validated_plan.json", validated)
+    poses = planning.grasp_poses(grasp)
+    move_to(arm, poses["approach"], cfg.motion.speed_approach_pct)
+    move_to(arm, poses["pre"], cfg.motion.speed_approach_pct)
+    pre = check_wrist(arm, grasp, "pre", output, require_expected=False)
+    if pre["verdict"]["verdict"] == "misaligned":
+        correction = pre["verdict"]["evidence"]["correction_mm"]
+        if math.hypot(*correction) > cfg.wrist.max_correction_mm:
+            raise ValueError("wrist correction exceeds bounded pre-height adjustment")
+        adjusted = dict(grasp, centre=[a+b for a, b in zip(grasp["centre"], correction)],
+                        rz_options=[grasp["rz"]])
+        # Keep wrist orientation fixed and revalidate correction plus all subsequent paths.
+        corrected_pre = planning.grasp_poses(adjusted)["pre"]
+        correction_path = interpolate_path([arm.pose(), corrected_pre])
+        rows = arm.ik(correction_path)["results"]
+        if len(rows) != len(correction_path) or not all(row.get("feasible") is True for row in rows):
+            raise ValueError("wrist correction IK refused")
+        validated = validate_path(arm, adjusted, cfg, park)
+        grasp, place = validated["grasp"], validated["place"]
+        poses = planning.grasp_poses(grasp)
+        config.dump_json(output / "corrected_plan.json", validated)
+        move_to(arm, poses["pre"], cfg.motion.speed_grasp_pct)
+        pre = check_wrist(arm, grasp, "pre_corrected", output, pre)
+    elif pre["verdict"]["verdict"] != "aligned":
+        raise ValueError(f"pre verification: {pre['verdict']}")
+    move_to(arm, poses["grasp"], cfg.motion.speed_grasp_pct)
+    grasp["closure"] = arm.grip(grasp["close_mm"], cfg.grasp.effort_nm)
+    try:
+        held = check_wrist(arm, grasp, "held", output, pre)
+    except ValueError:
+        abort_visual_failure(arm, grasp, cfg, output)
+        raise
+    before_gap = arm.latest()["gripper_mm"]
+    move_to(arm, poses["retreat"], cfg.motion.speed_grasp_pct)
+    try:
+        proof_samples = []
+        previous = held
+        for index in range(cfg.qualification.proof_frames):
+            proof = check_wrist(arm, grasp, f"proof_{index+1}", output, previous)
+            verify_proof(held, proof, grasp, cfg)
+            proof_samples.append(proof)
+            previous = proof
+        if abs(arm.latest()["gripper_mm"] - before_gap) > cfg.grasp.slip_mm:
+            raise ValueError("jaw gap changed during proof lift")
+    except ValueError:
+        abort_visual_failure(arm, grasp, cfg, output)
+        raise
+    move_to(arm, planning.carry_pose(grasp), cfg.motion.speed_approach_pct)
+    move_to(arm, [place["x"], place["y"], grasp["carry_z"], -180, 0, grasp["rz"]], cfg.motion.speed_approach_pct)
+    place_poses = planning.place_poses(place)
+    for key in ("approach", "pre", "place"):
+        move_to(arm, place_poses[key], cfg.motion.speed_grasp_pct)
+    opened = arm.open_gripper(grasp["open_mm"])
+    if opened.get("why") != "reached":
+        raise ValueError("release opening not settled")
+    move_to(arm, [place["x"], place["y"], grasp["carry_z"], -180, 0, grasp["rz"]], cfg.motion.speed_approach_pct)
+    empty_frame = wrist_verify.capture_wrist(arm)
+    empty = wrist_verify.verify_empty(arm.pose(), empty_frame, grasp)
+    eye.require_new_frame(empty_frame.metadata, proof["frame"])
+    eye.save(empty_frame.image, output / "empty.png")
+    config.dump_json(output / "empty.json", {"verdict": asdict(empty), "frame": empty_frame.metadata})
+    if empty.verdict != "empty":
+        raise ValueError(f"post-release jaws: {empty.verdict}")
+    move_to(arm, park, cfg.motion.speed_transit_pct)
+    final = observe_box(cfg, output / "post")
+    error = math.dist(final["footprint"]["centre_mm"], [place["x"], place["y"]])
+    if error > cfg.qualification.post_place_error_mm:
+        raise ValueError(f"post-place position error {error:.2f} mm")
+    return {"success": True, "grasp": grasp, "pre": pre, "held": held, "proof": proof_samples,
+            "empty": {"verdict": asdict(empty), "frame": empty_frame.metadata},
+            "post_frame": final["frame"], "post_place_error_mm": error, "completed_at": time.time()}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--execute", action="store_true")
+    args = parser.parse_args()
+    cfg = config.load_profile()
+    output = config.DATA / "dual_grasp" / str(time.time_ns())
+    report: dict = {"cycles": [], "consecutive_successes": 0, "qualified": False, "started_at": time.time()}
+    problems = preconditions(cfg)
+    report["preconditions"] = problems
+    if problems or not args.execute:
+        try:
+            report["observation"] = observe_box(cfg, output)
+        except (RuntimeError, ValueError, OSError, KeyError, cv2.error) as error:
+            report["observation_error"] = str(error)
+        report["status"] = "blocked" if problems else "read_only"
+        config.dump_json(output / "report.json", report)
+        print(report)
+        return 1 if problems else 0
+    arm = ArmBridge(cfg.bridge.host, cfg.bridge.port)
+    try:
+        arm.connect()
+        report["session_id"] = arm.hello["session_id"]
+        check = arm.check()
+        if not check.get("ok") or check.get("halted") or not check.get("enabled"):
+            raise ValueError(f"arm not ready: {check}")
+        jaw = config.load_json(config.DATA / "calibration" / "c5_jaw_latest.json")
+        if jaw["session_id"] != arm.hello["session_id"]:
+            raise ValueError("jaw convention lost on daemon restart; requalify first")
+        for index in range(3):
+            report["cycles"].append(run_cycle(arm, cfg, output / f"cycle_{index+1}"))
+            report["consecutive_successes"] += 1
+            config.dump_json(output / "report.json", report)
+        report["qualified"] = report["consecutive_successes"] == 3
+        report["status"] = "qualified"
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError, cv2.error) as error:
+        report.update({"failure": str(error), "consecutive_successes": 0, "status": "halted", "qualified": False,
+                       "envelope": checkpoint(error, effects_attempted=arm.effects_attempted,
+                                              tool="dual_grasp", session_id=arm.hello.get("session_id", ""))})
+        if arm.effects_attempted:
+            try:
+                report["stop"] = arm.stop()
+            except BridgeError as stop_error:
+                report["stop_error"] = str(stop_error)
+                report["operator_action"] = "Use the physical emergency stop immediately."
+    finally:
+        report["completed_at"] = time.time()
+        try:
+            config.dump_json(output / "report.json", report)
+        finally:
+            arm.close()
+    print(report)
+    return 0 if report["qualified"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

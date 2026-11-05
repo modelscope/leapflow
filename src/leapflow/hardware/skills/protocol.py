@@ -88,6 +88,12 @@ REQUIRE_MODEL = "model:"
 REQUIRE_SHARE = "share:"
 SHARE_FRAMES = "frames"
 
+# How a camera mount was measured. A calibration record names its method, and the
+# frame graph checks the evidence that method produces -- a board's measured mount
+# for the board path, per-joint screw agreement for the board-free one -- so a
+# record cannot borrow the standing of a method it was not measured by.
+METHOD_MARKERLESS_SCREW = "markerless_screw"
+
 # Who grounded a ``LocatedObject``: the workcell's locator model, or S2 itself
 # pointing into a shared frame (``perceive.lift``).
 SOURCE_LOCATOR = "locator"
@@ -107,6 +113,18 @@ COORDS = (COORDS_PIXEL, COORDS_UNIT, COORDS_PER_MILLE)
 CONSENT_SESSION = "session"
 CONSENT_EACH_RUN = "each_run"
 CONSENT_SCOPES = frozenset({CONSENT_SESSION, CONSENT_EACH_RUN})
+
+# Which box a skill's tool positions have to stay inside. ``workspace`` is the
+# measured workspace -- the geometry the cell is run in. The other two exist
+# because calibration has to move before the box it is about to measure is
+# known: ``bootstrap_until_measured`` is that same box standing on the cell's
+# conservative ``bootstrap_box`` only while no workspace record exists, and
+# ``bootstrap`` is that conservative box alone, for the one skill that measures
+# the workspace and so must not trust it beforehand.
+REGION_WORKSPACE = "workspace"
+REGION_BOOTSTRAP_UNTIL_MEASURED = "bootstrap_until_measured"
+REGION_BOOTSTRAP = "bootstrap"
+SKILL_REGIONS = frozenset({REGION_WORKSPACE, REGION_BOOTSTRAP_UNTIL_MEASURED, REGION_BOOTSTRAP})
 
 SIDE_EFFECT_STATES = (
     SIDE_EFFECT_NONE,
@@ -165,6 +183,10 @@ class SkillSpec:
     ``leased`` marks a READ skill that still runs as a leased run holding the
     workcell's devices (a recording) instead of answering from ``plan``: it is
     planned and approved like an actuating skill, and its run can command nothing.
+
+    ``region`` names the box the skill's motions must stay inside (see the
+    ``REGION_*`` values): a skill declares it rather than being recognised by its
+    id, so the exception for calibration is visible where the skill is defined.
     """
 
     skill_id: str
@@ -175,8 +197,12 @@ class SkillSpec:
     requires: tuple[str, ...] = ()
     consent: str = CONSENT_SESSION
     leased: bool = False
+    region: str = REGION_WORKSPACE
+    motion_allowed: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.motion_allowed) is not bool:
+            raise ValueError("motion permission must be an explicit boolean")
         if self.effect not in SKILL_EFFECTS:
             raise ValueError(
                 f"skill {self.skill_id!r} effect must be one of {sorted(SKILL_EFFECTS)}"
@@ -185,12 +211,21 @@ class SkillSpec:
             raise ValueError(
                 f"skill {self.skill_id!r} consent must be one of {sorted(CONSENT_SCOPES)}"
             )
+        if self.region not in SKILL_REGIONS:
+            raise ValueError(
+                f"skill {self.skill_id!r} region must be one of {sorted(SKILL_REGIONS)}"
+            )
         if not self.card.strip():
             raise ValueError(f"skill {self.skill_id!r} needs a card")
 
     @property
     def is_actuating(self) -> bool:
         return self.effect == EFFECT_ACTUATE
+
+    @property
+    def uses_motion(self) -> bool:
+        """Effectful persistence still needs a permit, but cannot command an actuator."""
+        return self.is_actuating and self.motion_allowed
 
     @property
     def runs_leased(self) -> bool:
@@ -308,8 +343,12 @@ class ArmState:
     ctrl_mode: str | None = None
     # The vendor's verdict on the last commanded target (0 = normal). A refusing
     # code means its inverse kinematics rejected the pose before moving: the arm
-    # is not late, it is never going to arrive.
+    # is not late, it is never going to arrive. A faulting code means the arm
+    # stopped carrying the command out.
     arm_status: int | None = None
+    # Joints the firmware's fault word implicates as having lost communication
+    # with the controller; empty when the status word implicates none.
+    joint_communication_errors: tuple[int, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -321,6 +360,7 @@ class ArmState:
             "arrived": self.arrived,
             "ctrl_mode": self.ctrl_mode,
             "arm_status": self.arm_status,
+            "joint_communication_errors": list(self.joint_communication_errors),
         }
 
 
@@ -562,6 +602,25 @@ class TargetObservation:
             if self.depth_point is None
             else [round(v, 1) for v in self.depth_point],
         }
+
+
+@dataclass(frozen=True)
+class CloudObservation:
+    """The camera's measured surface in one fresh frame, in the camera frame (mm).
+
+    ``points`` is the deprojected depth image, every valid pixel represented where
+    the node sampled it -- evenly strided, so the cloud keeps the image's coverage
+    at a bounded size. It is the arm and whatever else is in the cell: segmenting
+    it is the calibration's job, not the camera's, because what counts as the arm
+    depends on where the mount turns out to be.
+    """
+
+    points: tuple[Vec3, ...]
+    intrinsics: Mapping[str, Any]
+    observed_at: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"points": len(self.points), "observed_at": round(self.observed_at, 3)}
 
 
 @dataclass(frozen=True)

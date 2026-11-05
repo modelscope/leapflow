@@ -11,13 +11,15 @@ lease: renewal keeps a run alive, expiry or a dropped connection stops it with
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from typing import Any, Mapping
 
 import pytest
 
+from leapflow.hardware.calibration.generations import GenerationStore
 from leapflow.hardware.lhp.client import SocketLhpClient
-from leapflow.hardware.lhp.permit import PermitIssuer, PermitVerifier, generate_keypair
+from leapflow.hardware.lhp.permit import ExecutionPermit, PermitIssuer, PermitVerifier, generate_keypair
 from leapflow.hardware.lhp.protocol import CAP_SKILL_V1
 from leapflow.hardware.lhp.server import (
     WRITE_MODE_OBSERVE_ONLY,
@@ -31,6 +33,7 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_DEVICE_BUSY,
     FAILURE_LEASE_LOST,
     FAILURE_PLAN_UNKNOWN,
+    FAILURE_PLAN_STALE,
     FAILURE_SKILL_UNAVAILABLE,
     FAILURE_STOPPED,
     SIDE_EFFECT_NONE,
@@ -181,17 +184,24 @@ async def test_a_permit_for_another_plan_is_refused_and_moves_nothing(tmp_path: 
     node = _Node(tmp_path, write_mode=WRITE_MODE_PERMIT_REQUIRED)
     approved = await node.plan(SEQUENCE, move_by(10))
     other = await node.plan(SEQUENCE, move_by(40))
+    proof = node.permit(approved["permit_digest"])
     result = await node.call(
         "skill.execute",
         {
             "plan_digest": other["plan"]["digest"],
-            "permit": node.permit(approved["permit_digest"]),
+            "permit": proof,
         },
     )
     outcome = result["outcome"]
     assert outcome["failure_code"] == "permit_digest_mismatch"
     assert outcome["side_effect_state"] == SIDE_EFFECT_NONE
     assert node.sim.batches == []
+    started = await node.call(
+        "skill.execute", {"plan_digest": approved["plan"]["digest"], "permit": proof}
+    )
+    run = await node.until_done(started["run"]["run_id"])
+    assert run["status"] == STATUS_SUCCEEDED
+    assert node.sim.batches, "the unchanged permit remains valid for its original plan"
 
 
 async def test_execute_without_a_permit_is_refused(tmp_path: Path) -> None:
@@ -241,6 +251,108 @@ async def test_busy_refusal_does_not_burn_the_permit(tmp_path: Path) -> None:
     retried = await node.call("skill.execute", request)
     assert "run" in retried, "the same permit still authorizes the plan once the device is free"
     await node.until_done(retried["run"]["run_id"])
+
+
+async def test_generation_stale_refusal_preserves_exact_permit(tmp_path: Path) -> None:
+    node = _Node(tmp_path, write_mode=WRITE_MODE_PERMIT_REQUIRED)
+    store = GenerationStore(node.registry.calibration_store._holder)
+    node.registry.calibration_generations = store
+    node.registry.node_sessions = node.server.sessions
+    planned = await node.plan(SEQUENCE, move_by(10))
+    request = {"plan_digest": planned["plan"]["digest"], "permit": node.permit(planned["permit_digest"])}
+    await asyncio.to_thread(
+        store.commit_generation, workcell_id=WORKCELL_ID, request_id="isolated-change",
+        expected_generation=None, dependency_digest="synthetic", model={"synthetic": True},
+        accepted_blocks={"test-only": {}}, causal={"software_verification_only": True},
+    )
+    refused = await node.call("skill.execute", request)
+    assert refused["outcome"]["failure_code"] == FAILURE_PLAN_STALE
+    assert refused["outcome"]["side_effect_state"] == SIDE_EFFECT_NONE
+    assert not node.sim.batches and not node.server.sessions.reserved_device(ARM_ID)
+    await asyncio.to_thread(
+        store.rollback, workcell_id=WORKCELL_ID, request_id="isolated-deactivate",
+        expected_generation=1, dependency_digest="synthetic", causal={"test": True},
+    )
+    stopped = await node.call("skill.execute", request)
+    assert stopped["outcome"]["failure_code"] == FAILURE_PLAN_STALE
+    assert stopped["outcome"]["side_effect_state"] == SIDE_EFFECT_NONE
+    assert node.server._authority.verifier.verify(
+        ExecutionPermit.from_dict(request["permit"]), expected_digest=planned["permit_digest"],
+    ) is None, "stop-use and stale refusals must not consume the unchanged permit"
+    refused = await node.call("skill.plan", {"workcell": WORKCELL_ID, "skill": SEQUENCE, "args": move_by(10)})
+    assert refused["outcome"]["failure_code"] == FAILURE_SKILL_UNAVAILABLE
+    assert "invalidated" in refused["outcome"]["message"]
+    diagnostic = await node.call("skill.plan", {"workcell": WORKCELL_ID, "skill": "arm.state", "args": {}})
+    assert diagnostic["outcome"]["status"] == STATUS_SUCCEEDED
+    assert not node.sim.batches
+
+
+async def test_snapshot_reservation_blocks_competing_activation_before_permit(tmp_path: Path, monkeypatch) -> None:
+    node = _Node(tmp_path, write_mode=WRITE_MODE_PERMIT_REQUIRED)
+    store = GenerationStore(node.registry.calibration_store._holder)
+    node.registry.calibration_generations = store
+    node.registry.node_sessions = node.server.sessions
+    planned = await node.plan(SEQUENCE, move_by(10))
+    request = {"plan_digest": planned["plan"]["digest"], "permit": node.permit(planned["permit_digest"])}
+    entered, release = threading.Event(), threading.Event()
+    state = store.state
+
+    def delayed(workcell):
+        entered.set()
+        assert release.wait(5)
+        return state(workcell)
+
+    monkeypatch.setattr(store, "state", delayed)
+    executing = asyncio.create_task(node.call("skill.execute", request))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        with pytest.raises(ValueError, match="busy"):
+            node.server.sessions.reserve((ARM_ID,), owner_id="competing-activation")
+        refused = await node.call("skill.execute", request)
+        assert refused["outcome"]["failure_code"] == FAILURE_DEVICE_BUSY
+        assert not node.sim.batches
+        release.set()
+        started = await executing
+        assert "run" in started, "the competing refusal must leave the first permit usable"
+        await node.until_done(started["run"]["run_id"])
+    finally:
+        release.set()
+        await asyncio.gather(executing, return_exceptions=True)
+        await node.server.stop()
+
+
+async def test_cancelled_snapshot_releases_reservation_without_consuming_permit(tmp_path: Path, monkeypatch) -> None:
+    node = _Node(tmp_path, write_mode=WRITE_MODE_PERMIT_REQUIRED)
+    store = GenerationStore(node.registry.calibration_store._holder)
+    node.registry.calibration_generations = store
+    node.registry.node_sessions = node.server.sessions
+    planned = await node.plan(SEQUENCE, move_by(10))
+    request = {"plan_digest": planned["plan"]["digest"], "permit": node.permit(planned["permit_digest"])}
+    entered, release = threading.Event(), threading.Event()
+    state = store.state
+
+    def delayed(workcell):
+        entered.set()
+        assert release.wait(5)
+        return state(workcell)
+
+    monkeypatch.setattr(store, "state", delayed)
+    executing = asyncio.create_task(node.call("skill.execute", request))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        executing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await executing
+        assert not node.server.sessions.reserved_device(ARM_ID)
+        assert not node.sim.batches
+        release.set()
+        monkeypatch.setattr(store, "state", state)
+        started = await node.call("skill.execute", request)
+        assert "run" in started
+        await node.until_done(started["run"]["run_id"])
+    finally:
+        release.set()
+        await node.server.stop()
 
 
 async def test_wire_writes_are_refused_while_a_run_holds_the_device(tmp_path: Path) -> None:

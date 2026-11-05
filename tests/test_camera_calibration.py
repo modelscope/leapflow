@@ -226,11 +226,17 @@ def _cell(
     workcell: Mapping[str, Any] | None = None,
     intrinsics: CameraIntrinsics = SIM_INTRINSICS,
     render: bool = False,
+    additional_cameras: Mapping[str, tuple[str, CameraIntrinsics, bool]] | None = None,
 ) -> tuple[SkillRuntime, SimBoardCamera]:
     arm = SimArmTransport()
     camera = SimBoardCamera(arm, mounting, intrinsics=intrinsics, render=render)
+    devices = {CAMERA_ID: camera}
+    for device_id, (mode, camera_intrinsics, camera_render) in (additional_cameras or {}).items():
+        devices[device_id] = SimBoardCamera(
+            arm, mode, intrinsics=camera_intrinsics, render=camera_render,
+        )
     registry = SkillNodeRegistry(
-        arm, store_path=tmp_path / "instrument.duckdb", devices={CAMERA_ID: camera}
+        arm, store_path=tmp_path / "instrument.duckdb", devices=devices
     )
     registry.last_command = lambda device_id, channel_id: None  # type: ignore[method-assign]
     registry.calibrate("tcp.offset", pose={"x": 0, "y": 0, "z": TOOL_LENGTH_MM})
@@ -413,12 +419,84 @@ async def test_verify_catches_a_bumped_camera(tmp_path: Path, analytic_detector:
 
     tolerant, camera = _cell(
         tmp_path / "tolerant",
-        workcell=_workcell(EYE_TO_HAND, calibration={"max_verify_p95_mm": 12.0}),
+        workcell=_workcell(EYE_TO_HAND, calibration={"max_verify_p95_mm": 12.0, "max_verify_rms_mm": 12.0}),
     )
     assert (await _run(tolerant, "calib.handeye", FAST)).ok
     camera.camera = BASE_CAMERA.compose(Transform.from_pose(Pose(8.0, 6.0, 0.0)))
     accepted = await _run(tolerant, "calib.verify", FAST)
     assert accepted.ok and accepted.result["p95_mm"] == pytest.approx(10.0, abs=0.5)
+
+
+@pytest.mark.parametrize("render", [False, True])
+async def test_wrist_role_calibrates_without_borrowing_the_overview_camera(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, render: bool,
+) -> None:
+    if render:
+        cv2 = pytest.importorskip("cv2")
+        if not hasattr(getattr(cv2, "aruco", None), "CharucoDetector"):
+            pytest.skip("this OpenCV build has no ChArUco detector")
+    else:
+        def detect(frame: RgbdFrame, target: CharucoTarget) -> BoardDetection | None:
+            board = frame.metadata.get("board")
+            return None if board is None else BoardDetection(board, 12, 0.05)
+        monkeypatch.setattr(vision_module, "detect_board", detect)
+    wrist_id = "wrist_camera"
+    data = _workcell(EYE_TO_HAND)
+    data["roles"] = {**data["roles"], "camera.wrist": wrist_id}
+    data["frames"] = {**data["frames"], "camera.wrist": {
+        "parent": "flange", "procedure": "handeye.eye_in_hand",
+    }}
+    intrinsics = CameraIntrinsics(640, 480, 900., 900., 320., 240.)
+    runtime, overview = _cell(
+        tmp_path, workcell=data,
+        additional_cameras={wrist_id: (EYE_IN_HAND, intrinsics, render)},
+    )
+    registry = _registry(runtime)
+    result = await _run(runtime, "calib.handeye", {**FAST, "camera": "camera.wrist"})
+    assert result.ok, result
+    frames = _frames(runtime)
+    assert frames.transform("camera") is None
+    assert overview.captures == 0
+    _assert_close(frames.transform("camera.wrist"), FLANGE_CAMERA, mm=2., deg=0.5)
+    verified = await _run(runtime, "calib.verify", {**FAST, "camera": "camera.wrist"})
+    assert verified.ok, verified
+    record = registry.calibration_store.latest(WORKCELL_ID, "camera.wrist.verify")
+    assert record.parameters["depends_on"] == {"camera.wrist": frames.versions["camera.wrist"]}
+    assert record.parameters["training_disjoint"] is True
+
+
+@pytest.mark.parametrize("role,code", [
+    ("camera.wrist", FAILURE_SKILL_UNAVAILABLE),
+    ("gripper", FAILURE_SKILL_UNAVAILABLE),
+    ("camera.unknown", FAILURE_SKILL_UNAVAILABLE),
+])
+async def test_camera_selection_fails_closed_without_the_exact_role(
+    tmp_path: Path, analytic_detector: None, role: str, code: str,
+) -> None:
+    runtime, camera = _cell(tmp_path)
+    outcome = await _refusal(runtime, "calib.handeye", {"camera": role})
+    assert outcome.failure_code == code
+    assert camera.captures == 0 and camera.arm.batches == []
+
+
+async def test_calibration_refuses_flange_drift_during_capture(
+    tmp_path: Path, analytic_detector: None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, camera = _cell(tmp_path)
+    plan = await _plan(runtime, "calib.handeye", FAST)
+    capture = camera.capture_rgbd
+
+    async def moving_capture() -> RgbdFrame:
+        frame = await capture()
+        camera.arm.pose[0] += 6.0
+        return frame
+
+    monkeypatch.setattr(camera, "capture_rgbd", moving_capture)
+    run = await runtime.execute(plan.digest)
+    finished = await runtime.wait(run.run_id, timeout_s=20.)
+    assert finished.outcome.failure_code == FAILURE_CHECK_FAILED
+    assert finished.outcome.side_effect_state == SIDE_EFFECT_COMMITTED
+    assert _frames(runtime).transform("camera") is None
 
 
 # ── Real ChArUco images ──────────────────────────────────────────────────────
@@ -442,6 +520,31 @@ async def test_handeye_and_verify_on_rendered_charuco_images(tmp_path: Path) -> 
     _assert_close(measured, BASE_CAMERA, mm=2.0, deg=0.3)
     verified = await _run(runtime, "calib.verify", FAST)
     assert verified.ok and verified.result["p95_mm"] < 2.0, verified
+
+
+@pytest.mark.parametrize("focal_length", [500., 900.])
+async def test_charuco_refinement_stays_clear_of_marker_ink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, focal_length: float,
+) -> None:
+    cv2 = pytest.importorskip("cv2")
+    if not hasattr(getattr(cv2, "aruco", None), "CharucoDetector"):
+        pytest.skip("this OpenCV build has no cv2.aruco.CharucoDetector")
+    original = cv2.cornerSubPix
+    windows = []
+
+    def refine(image: Any, corners: Any, window: tuple[int, int], zero_zone: Any, criteria: Any) -> Any:
+        windows.append(window)
+        return original(image, corners, window, zero_zone, criteria)
+    monkeypatch.setattr(cv2, "cornerSubPix", refine)
+    intrinsics = CameraIntrinsics(640, 480, focal_length, focal_length, 320., 240.)
+    _, camera = _cell(tmp_path, intrinsics=intrinsics, render=True)
+    frame = await camera.capture_rgbd()
+    found = vision_module.detect_board(frame, TARGET)
+    assert found is not None and found.corners == 12
+    a = intrinsics.project(camera.truth().apply((0., 0., 0.)))
+    b = intrinsics.project(camera.truth().apply((TARGET.square_mm, 0., 0.)))
+    margin = math.dist(a, b) * (TARGET.square_mm - TARGET.marker_mm) / (2 * TARGET.square_mm)
+    assert windows == [(max(1, min(3, int(margin) - 1)),) * 2]
 
 
 # ── Board declaration and admission ──────────────────────────────────────────

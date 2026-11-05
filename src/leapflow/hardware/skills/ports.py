@@ -20,6 +20,7 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 from leapflow.hardware.skills.geometry import Plane, Pose, Transform, WorkspaceBox
 from leapflow.hardware.skills.protocol import (
     ArmState,
+    CloudObservation,
     GraspCandidate,
     GripperResult,
     HeldObject,
@@ -54,6 +55,9 @@ class WorkcellView(Protocol):
     def gripper_spec(self) -> Mapping[str, float]:
         """``max_width_mm`` and ``min_hold_width_mm``, resolved at admission."""
         ...
+
+    @property
+    def grasp_verify(self) -> Mapping[str, float]: ...
 
     @property
     def home(self) -> Mapping[str, float]: ...
@@ -124,6 +128,12 @@ class MotionFacade(Protocol):
         """Check a joint endpoint and path with FK; return its predicted TCP."""
         ...
 
+    def check_cartesian_path(
+        self, state: ArmState, targets: Sequence[Pose]
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Bounded IK waypoints whose actual joint-space paths pass workspace checks."""
+        ...
+
     @property
     def paths(self) -> tuple[str, ...]:
         """The pose path modes this arm declares (``linear``, ``point``); may be empty."""
@@ -172,7 +182,12 @@ class ScenePort(Protocol):
         ...
 
     async def lift(
-        self, frame_id: str, targets: Sequence[PixelTarget], *, coords: str
+        self,
+        frame_id: str,
+        targets: Sequence[PixelTarget],
+        *,
+        coords: str,
+        capture_id: str | None = None,
     ) -> tuple[tuple[LocatedObject, ...], tuple[Mapping[str, str], ...]]:
         """The base-frame objects under *targets* in a remembered frame, each under a new
         id, and the targets that lifted to nothing (``label``, ``reason``)."""
@@ -210,13 +225,40 @@ class ScenePort(Protocol):
 
 @runtime_checkable
 class VisionPort(Protocol):
-    """Node-local camera measurement of the workcell's declared calibration target.
+    """Node-local camera measurements a calibration may take.
 
-    Images never leave the node. Not seeing the target is ``target_not_found``
-    (NONE); a missing target declaration or vision library is ``skill_unavailable``.
+    Two of them: the declared target's pose, and the raw measured surface. Both
+    stay on the node. Not seeing the target is ``target_not_found`` (NONE); a
+    missing target declaration or vision library is ``skill_unavailable``.
     """
 
     async def observe_target(self) -> TargetObservation: ...
+
+    async def observe_cloud(
+        self, *, near_mm: float | None = None, far_mm: float | None = None
+    ) -> CloudObservation:
+        """A fresh frame's valid depth points, in the camera frame.
+
+        The depth window is applied before the cloud is thinned, so a caller that
+        names the region it cares about gets its whole point budget there.
+        """
+        ...
+
+
+@runtime_checkable
+class MetricReadinessPort(Protocol):
+    """Target-free bounded capture; raw samples stay in the owning node's cache."""
+
+    async def metric_readiness(
+        self,
+        *,
+        frames: int,
+        points: int,
+        role: str,
+        stamp_uncertainty_s: float,
+        ttl_s: float,
+        quota_bytes: int,
+    ) -> Mapping[str, Any]: ...
 
 
 @runtime_checkable
@@ -269,6 +311,68 @@ class PolicyPort(Protocol):
 
 
 @runtime_checkable
+class GraspVerificationPort(Protocol):
+    """A run's continuous qualified observer; read-only and no transport ownership."""
+
+    def admit(self, data: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def qualification(self) -> Mapping[str, Any]: ...
+
+    async def inspect(self) -> Mapping[str, Any]: ...
+
+    async def verify(
+        self, stage: str, *, samples: int, grasp: Mapping[str, Any] | None = None
+    ) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class CalibrationPort(Protocol):
+    """Private admitted acquisition and redacted diagnostics through the hardware owner."""
+
+    async def collection_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def collect(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+    async def inspect(self, *, evidence_digest: str = "") -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class CalibrationReferencePort(Protocol):
+    """Stationary task-local registration, separately optional from collection."""
+
+    async def reference_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def align_reference(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class CalibrationTrialPort(Protocol):
+    """Indexed camera-only candidate assessment; no activation or actuator access."""
+
+    async def trial_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def assess_motion(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class CalibrationPosePort(Protocol):
+    """Bounded nominal-only acquisition through the ordinary governed motion facade."""
+
+    async def poses_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def collect_poses(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class CalibrationRollbackPort(Protocol):
+    """Optional governed between-run rollback; persistence is effectful, never motion."""
+
+    async def rollback_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def rollback(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
 class SkillContext(Protocol):
     """Everything a skill may touch. Nothing else is reachable from a skill."""
 
@@ -295,6 +399,16 @@ class SkillContext(Protocol):
     def vision(self) -> VisionPort:
         """Calibration-target measurement; raises ``SkillError`` when there is no camera."""
         ...
+
+    def camera_vision(self, role: str = "camera") -> VisionPort:
+        """Target observation through the named camera role and its mount."""
+        ...
+
+    @property
+    def grasp_verification(self) -> GraspVerificationPort: ...
+
+    @property
+    def calibration(self) -> CalibrationPort: ...
 
     @property
     def policies(self) -> PolicyPort: ...
@@ -348,9 +462,14 @@ __all__ = [
     "PATH_DEFAULT",
     "PATH_LINEAR",
     "PATH_POINT",
+    "CalibrationPort",
+    "CalibrationReferencePort",
+    "CalibrationRollbackPort",
     "FrameView",
     "GraspPlanner",
+    "GraspVerificationPort",
     "MotionFacade",
+    "MetricReadinessPort",
     "NodeSkill",
     "PolicyPort",
     "ScenePort",
