@@ -34,7 +34,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from leapflow.hardware.degradation import DegradationCoordinator
+from leapflow.hardware.degradation import (
+    DegradationCoordinator,
+    degradation_actions_enabled,
+    report_suppressed,
+)
 from leapflow.hardware.vision.health import FrameHealthTracker
 
 logger = logging.getLogger(__name__)
@@ -245,7 +249,9 @@ class HardwareHealthMonitor:
         if new_status in (_HEALTH_DEGRADED, _HEALTH_CRITICAL) and prev_status == _HEALTH_OK:
             await self._apply_degradation_policy(device_id, record)
         elif new_status == _HEALTH_OFFLINE:
-            await self._execute_halt(device_id, reason="device offline (probe failed)")
+            # A withheld halt is reported once per offline episode, not per probe.
+            if prev_status != _HEALTH_OFFLINE or degradation_actions_enabled(self._registry):
+                await self._execute_halt(device_id, reason="device offline (probe failed)")
 
     @staticmethod
     def _compute_health_status(record: DeviceHealthRecord) -> str:
@@ -293,12 +299,25 @@ class HardwareHealthMonitor:
             policy_action,
             reason=reason,
         )
-        record.degradation_policy_active = outcome.action
+        record.degradation_policy_active = "" if outcome.suppressed else outcome.action
+        if outcome.suppressed:
+            record.degradation_reason = f"{reason}: reported only (degradation actions disabled)"
         if outcome.error:
             record.degradation_reason = f"{reason}: {outcome.error}"
 
     async def _execute_halt(self, device_id: str, reason: str) -> None:
-        """Halt a device immediately through the registry, which owns the link cache."""
+        """Halt a device immediately through the registry, which owns the link cache.
+
+        Subject to the same opt-in as every other supervisory action: while
+        degradation actions are disabled the condition is reported, not acted on.
+        """
+        if not degradation_actions_enabled(self._registry):
+            report_suppressed(self._registry, device_id, action="halt", reason=reason)
+            self._emit_event(
+                "device.halt_suppressed",
+                {"device_id": device_id, "reason": reason},
+            )
+            return
         logger.warning(
             "HealthMonitor: halting device %s (reason: %s)",
             device_id,

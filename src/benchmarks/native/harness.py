@@ -231,6 +231,10 @@ def make_registry(*contexts: HardwareContext) -> HardwareRegistry:
         unverified_context_policy=UnverifiedContextPolicy.ALLOW,
         require_describe_before_write=False,
         trust_skip_enabled=True,
+        # Qualification exercises the opt-in supervisory actions themselves, on a
+        # sample-count rule rather than wall-clock debounce.
+        degradation_actions_enabled=True,
+        sensor_loss_debounce_s=0.0,
         stream_enabled=False,
         persist_readings=False,
     )

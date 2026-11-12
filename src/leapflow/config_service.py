@@ -240,6 +240,18 @@ _FIELD_DESCRIPTIONS = {
         "Off by default; irreversible channels always require approval regardless. "
         "Read at startup, so a change needs a daemon restart."
     ),
+    "hardware.degradation_actions_enabled": (
+        "Let a triggered degradation policy (comm/sensor loss) and the health monitor's "
+        "offline halt act on the device (halt, safe_state, switch_sensor). Off by default: "
+        "the condition is still detected, logged and shown on the board as a warning, "
+        "but nothing is sent to the device. Read at startup, so a change needs a daemon "
+        "restart."
+    ),
+    "hardware.sensor_loss_debounce_s": (
+        "Minimum seconds a sensor-loss streak must last (on top of three consecutive "
+        "degraded samples) before the sensor-loss policy triggers. Read at startup, so a "
+        "change needs a daemon restart."
+    ),
     "hardware.write_verification_follow_s": (
         "How long a post-write verdict may follow a value that is still travelling "
         "toward its command before reporting 'pending'. A declared settling time says "

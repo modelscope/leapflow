@@ -69,6 +69,12 @@ class HardwareSettings:
     require_describe_before_write: bool = True
     envelope_grant: bool = True
     trust_skip_enabled: bool = False
+    # Supervisory degradation actions (halt / safe_state / switch_sensor and the
+    # health monitor's offline halt) are opt-in. Off, a triggered policy is only
+    # logged and reported to the board; nothing is sent to the device or latched.
+    degradation_actions_enabled: bool = False
+    # Minimum duration a sensor-loss streak must last before the policy fires.
+    sensor_loss_debounce_s: float = 0.5
     stream_enabled: bool = True
     stream_ring_capacity: int = 4096
     persist_readings: bool = True
@@ -154,6 +160,12 @@ class HardwareSettings:
             ),
             envelope_grant=bool(getattr(settings, "hardware_envelope_grant", True)),
             trust_skip_enabled=bool(getattr(settings, "hardware_trust_skip_enabled", False)),
+            degradation_actions_enabled=bool(
+                getattr(settings, "hardware_degradation_actions_enabled", False)
+            ),
+            sensor_loss_debounce_s=float(
+                getattr(settings, "hardware_sensor_loss_debounce_s", 0.5) or 0.0
+            ),
             stream_enabled=bool(getattr(settings, "hardware_stream_enabled", True)),
             stream_ring_capacity=int(
                 getattr(settings, "hardware_stream_ring_capacity", 4096) or 4096

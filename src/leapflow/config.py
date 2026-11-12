@@ -204,6 +204,15 @@ class Settings:
     # operator decision, and the safety invariant (irreversible channels always
     # require approval) holds regardless.
     hardware_trust_skip_enabled: bool = False
+    # Whether a triggered DegradationPolicy (comm/sensor loss) and the health
+    # monitor's offline halt may act on a device (halt, safe_state, ...). Off by
+    # default: a supervisory stop the operator did not ask for has repeatedly
+    # dropped an arm mid-task on a transient feedback gap. While off, the
+    # condition is still detected, logged and reported to the board as a warning.
+    hardware_degradation_actions_enabled: bool = False
+    # Minimum duration a sensor-loss streak must last before the policy fires,
+    # so a fast channel cannot reach its sample-count threshold in one transient.
+    hardware_sensor_loss_debounce_s: float = 0.5
     # How long a post-write verdict may follow a value that is still travelling
     # toward its command before it reports "pending". A declared settling time
     # says when an observation becomes meaningful, not when a servo has arrived:
@@ -1455,6 +1464,12 @@ def _build_settings_from_env(
     hardware_trust_skip_enabled = os.getenv(
         "LEAPFLOW_HARDWARE_TRUST_SKIP_ENABLED", "0"
     ).strip().lower() in ("1", "true", "yes")
+    hardware_degradation_actions_enabled = os.getenv(
+        "LEAPFLOW_HARDWARE_DEGRADATION_ACTIONS_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes")
+    hardware_sensor_loss_debounce_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SENSOR_LOSS_DEBOUNCE_S", "0.5") or 0.5
+    )
     hardware_write_verification_follow_s = float(
         os.getenv("LEAPFLOW_HARDWARE_WRITE_VERIFICATION_FOLLOW_S", "10") or 10.0
     )
@@ -2026,6 +2041,8 @@ def _build_settings_from_env(
         hardware_require_describe=hardware_require_describe,
         hardware_envelope_grant=hardware_envelope_grant,
         hardware_trust_skip_enabled=hardware_trust_skip_enabled,
+        hardware_degradation_actions_enabled=hardware_degradation_actions_enabled,
+        hardware_sensor_loss_debounce_s=hardware_sensor_loss_debounce_s,
         hardware_write_verification_follow_s=hardware_write_verification_follow_s,
         hardware_stream_enabled=hardware_stream_enabled,
         hardware_stream_ring_capacity=hardware_stream_ring_capacity,

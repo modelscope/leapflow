@@ -258,7 +258,15 @@ a lost sample is already visible in the trace, so neither should interrupt anyon
 """
 
 _NOTABLE_KINDS = frozenset(
-    {"quality_degraded", "sample_loss", "calibration_failed", "calibration_expired"}
+    {
+        "quality_degraded",
+        "sample_loss",
+        "calibration_failed",
+        "calibration_expired",
+        # A degradation policy fired while actions are disabled: worth a warning,
+        # but nothing was stopped, so it must not page anyone like an alert.
+        "degradation_suppressed",
+    }
 )
 
 

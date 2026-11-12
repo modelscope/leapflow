@@ -1842,6 +1842,8 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.require_describe",
         "hardware.envelope_grant",
         "hardware.trust_skip_enabled",
+        "hardware.degradation_actions_enabled",
+        "hardware.sensor_loss_debounce_s",
         "hardware.write_verification_follow_s",
         "hardware.stream_enabled",
         "hardware.stream_ring_capacity",
