@@ -141,9 +141,43 @@ def _segment(context: HardwareContext, chain: DhChain, origin: Pose, destination
     return rows, seed
 
 
+def _joint_path(context: HardwareContext, chain: DhChain, origin: tuple[float, ...], goal: tuple[float, ...],
+                settings: Settings) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Linear joint interpolation to an absolute target, bounded per step and swept.
+
+    Every step stays within the joint step budget and the declared per-channel jump,
+    and a fine sweep (at most one degree apart) of the whole segment must stay inside
+    the declared workspace, so the swept volume the operator clears is the one checked.
+    """
+    span = max(abs(b - a) for a, b in zip(origin, goal))
+    if span == 0:
+        raise Refusal("joint target equals the current posture")
+    count = max(1, math.ceil(span / settings.joint_step_deg))
+    samples = max(count, math.ceil(span))
+    swept = []
+    for i in range(1, samples + 1):
+        q = tuple(a + (b - a) * i / samples for a, b in zip(origin, goal))
+        pose = chain.forward(q)
+        _pose_check(context, pose)
+        swept.append({"joints": q, "pose": asdict(pose)})
+    rows, previous = [], origin
+    for index in range(1, count + 1):
+        q = tuple(a + (b - a) * index / count for a, b in zip(origin, goal))
+        for cid, a, b in zip(JOINTS, previous, q):
+            channel = context.channel(cid)
+            if channel is None or channel.envelope.max_jump is None or abs(a - b) > channel.envelope.max_jump:
+                raise Refusal("joint step exceeds a declared joint jump")
+        row = step(f"joints.{index:03d}", tuple(zip(JOINTS, q)), joints=q, pose=chain.forward(q))
+        row["joint_space"] = True
+        rows.append(row)
+        previous = q
+    return rows, swept
+
+
 def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, operation: str,
             dx: float = 0.0, dy: float = 0.0, dz: float = 0.0,
-            width: float | None = None, cycles: int = 0, dwell_s: float = 0.0) -> dict[str, Any]:
+            width: float | None = None, cycles: int = 0, dwell_s: float = 0.0,
+            target: tuple[float, ...] | None = None) -> dict[str, Any]:
     """A complete immutable-by-hash request, including return and safety configuration."""
     settings.validate()
     dx, dy, dz = number(dx), number(dy), number(dz)
@@ -222,11 +256,21 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
                           grip=start.gripper_mm)
             paused["dwell_s"] = dwell_s
             rows.append(paused)
+    elif operation == "joints":
+        # An absolute joint-space return, e.g. to a recorded posture after a controller
+        # fault changed the wrist orientation, which no orientation-preserving line can undo.
+        if target is None or len(target) != 6:
+            raise Refusal("joints needs a six-value absolute target")
+        goal = tuple(number(q) for q in target)
+        if any(not low <= q <= high for q, (low, high) in zip(goal, safe)):
+            raise Refusal("joint target is outside the conservative intervals")
+        path, swept = _joint_path(context, chain, origin_q, goal, settings)
+        rows.extend(path)
     elif operation == "gripper":
-        target = maximum if width is None else number(width)
-        if not 0 <= target <= maximum:
+        opening = maximum if width is None else number(width)
+        if not 0 <= opening <= maximum:
             raise Refusal("requested opening exceeds fitted maximum")
-        rows.append(step("gripper", (("gripper.position", target),), joints=seed, pose=origin_pose, grip=target))
+        rows.append(step("gripper", (("gripper.position", opening),), joints=seed, pose=origin_pose, grip=opening))
     elif operation != "initialize":
         raise Refusal("unknown motion operation")
     # Bind effective arrival tolerances to the same preview as every numeric target.
@@ -239,6 +283,7 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
                                                     "gripper_mm": start.gripper_mm},
             "origin_joints": origin_q, "origin_pose": asdict(origin_pose), "gripper_max_mm": maximum,
             "delta_base_mm": {"x": dx, "y": dy, "z": dz}, "cycles": cycles, "dwell_s": dwell_s,
+            "target_joints": None if target is None else tuple(number(q) for q in target),
             "finish": "enabled",
             "arrival": arrival, "initialization_sweep": swept, "steps": rows,
             "clearance": "Operator must confirm unobstructed swept volume, empty jaws and accessible physical emergency stop"}
@@ -291,8 +336,9 @@ async def wait_arrived(session: Session, row: dict[str, Any], before: Snapshot,
         if q is not None and any(not min(a, b) - settings.deviation_deg <= c <= max(a, b) + settings.deviation_deg
                                  for a, b, c in zip(before.joints, q, current.joints)):
             raise Refusal("observed joint deviation exceeds planned segment", state=SideEffectState.UNKNOWN)
-        # The initialization intentionally changes orientation; translations and jaw moves must not.
-        if target is not None and row["label"] != "initialize":
+        # Initialization and joint-space returns intentionally change orientation;
+        # translations and jaw moves must not.
+        if target is not None and row["label"] != "initialize" and not row.get("joint_space"):
             if target.rotation_to_deg(current.pose) > arrival["orientation"]:
                 raise Refusal("orientation changed during translation/gripper operation", state=SideEffectState.UNKNOWN)
             a, b, p = before.pose.position, target.position, current.pose.position

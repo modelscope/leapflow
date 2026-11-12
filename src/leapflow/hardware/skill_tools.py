@@ -552,18 +552,28 @@ class SkillService:
         return tracked
 
     async def _renew(self, tracked: _HostRun, client: SkillNodeClient) -> None:
-        """Keep the run's lease alive until the node ends it or renewal fails.
+        """Keep the run's lease alive until the node ends it or the lease lapses.
 
-        A failure is recorded, never raised: the node's deadman halts the run.
+        A failed renewal is retried while the lease it renews still has time left,
+        because the node is busy running the very skill this lease protects: it is
+        momentarily slow, not gone. Ending renewal on the first failure turned one
+        slow reply into a deadman halt of a healthy run -- the arm dropped to standby
+        mid-capture, the host then read the halt as an unreadable status, and the
+        cleanup could no longer reach the node either. Only a lease that has run out
+        is recorded, and the node's deadman owns that outcome.
         """
         interval = max(0.05, tracked.lease_s / 3.0)
+        loop = asyncio.get_running_loop()
+        lapses_at = loop.time() + tracked.lease_s
         while True:
             await asyncio.sleep(interval)
             try:
                 reply = as_mapping(
                     await asyncio.wait_for(
                         client.request("control.renew", {"control_id": tracked.control_id}),
-                        timeout=tracked.lease_s,
+                        # Never the whole lease: a renewal that spends the lease by
+                        # waiting has already lost it, so bound the wait by what is left.
+                        timeout=max(0.05, lapses_at - loop.time()),
                     )
                 )
             except asyncio.TimeoutError:
@@ -572,12 +582,15 @@ class SkillService:
                 tracked.lease_error = f"lease renewal failed: {exc}"
             else:
                 if reply.get("ok"):
+                    lapses_at = loop.time() + tracked.lease_s
                     continue
                 if reply.get("failure_code") == "session_halted":
                     return  # the run ended; its lease went with it
                 tracked.lease_error = str(reply.get("error") or reply.get("failure_code"))
             logger.warning("skill run %s: %s", tracked.run_id[:8], tracked.lease_error)
-            return
+            if loop.time() >= lapses_at:
+                return  # the lease is spent; the node's deadman ends the run
+            interval = max(0.05, (lapses_at - loop.time()) / 3.0)
 
     async def _await_run(
         self, tracked: _HostRun, link: _Link, timeout_s: float
@@ -593,7 +606,7 @@ class SkillService:
         run: dict[str, Any] | None = None
         try:
             while (remaining := deadline - loop.time()) > 0:
-                run = await self._poll(tracked, link, min(STATUS_WAIT_S, remaining))
+                run = await self._poll(tracked, link, self._poll_wait(tracked, remaining))
                 if run is None:
                     await self._stop_run(tracked, link, "the host lost the run's status")
                     return None, False
@@ -605,6 +618,16 @@ class SkillService:
             raise
         await self._stop_run(tracked, link, f"host wait timed out after {timeout_s:g}s")
         return (await self._poll(tracked, link, 0.0)) or run, True
+
+    @staticmethod
+    def _poll_wait(tracked: _HostRun, remaining: float) -> float:
+        """How long one ``skill.status`` may hold the wire, never over a third of the lease.
+
+        The status wait used to be the full ``STATUS_WAIT_S`` (2 s), which is the whole
+        default lease: one long-poll could then consume the period its sibling renewal
+        had to land in, and a node that answered slowly answered the renewal too late.
+        """
+        return min(STATUS_WAIT_S, max(0.05, tracked.lease_s / 3.0), remaining)
 
     async def _poll(self, tracked: _HostRun, link: _Link, wait_s: float) -> dict[str, Any] | None:
         try:

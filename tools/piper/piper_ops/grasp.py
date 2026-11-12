@@ -8,7 +8,7 @@ from typing import Any
 from . import calibration, motion
 from .evidence import Refusal
 from .qualification import load
-from .session import Session, unverified_digest
+from .session import Session, outcome_requires_stop, unverified_digest
 
 
 def preview(session: Session, workcell: str, skill: str, arguments: dict[str, Any],
@@ -40,6 +40,7 @@ async def run(session: Session, *, workcell: str, skill: str, arguments: dict[st
         session.evidence.record("qualification_result", result=result)
         if approved is not None:
             session.touched |= result.get("side_effect_state", "unknown") != "none"
+            session.stop_required = outcome_requires_stop(result)
         session.success = result.get("ok") is True
     if approved is not None:
         if result.get("ok") is True:

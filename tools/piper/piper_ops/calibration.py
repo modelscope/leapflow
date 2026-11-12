@@ -18,7 +18,7 @@ from leapflow.security.approval import ApprovalDecision, ApprovalRequest, Sessio
 from leapflow.security.orchestrator import ApprovalOrchestrator
 
 from .evidence import Evidence, Refusal
-from .session import Session, complete_cleanup
+from .session import Session, complete_cleanup, outcome_requires_stop
 
 
 async def reload_workcell(session: Session, *, workcell: str,
@@ -154,5 +154,8 @@ async def run(session: Session, *, workcell: str = "", skill: str = "", args: di
         session.evidence.record("calibration_result", result=result)
         if approved is not None:
             session.touched |= result.get("side_effect_state", "unknown") != "none"
+            # A measured-out-of-tolerance result is finished work, not a hazard: its
+            # own verdict says whether a stop is owed (see session.outcome_requires_stop).
+            session.stop_required = outcome_requires_stop(result)
         session.success = result.get("ok") is True
         return result

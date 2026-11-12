@@ -163,6 +163,7 @@ async def sources(monkeypatch: pytest.MonkeyPatch, **values: Any):
         node_session_id="node-boot",
         pose_semantics=NOMINAL_FLANGE,
         clock=clock,
+        sleep=clock.sleep,
     )
     return registry, transport, feedback, clock
 
@@ -394,6 +395,97 @@ async def test_bad_receipts_and_measured_drift_refuse(
         with pytest.raises(SkillError):
             await observation(feedback, Camera(clock), clock).capture()
         assert transport.write_log == ()
+    finally:
+        await registry.close_all()
+
+
+async def test_transient_reception_dip_requalifies_within_the_settled_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One unqualified draw is a dip, not a verdict: a fresh cohort must be accepted.
+
+    The receiver publishes the groups of one cycle in sequence, so an interpreter
+    burst leaves the first cohort a cycle behind the clock that judges it.  The
+    admission must retry within the declared budget and accept the same bounds.
+    """
+    registry, transport, feedback, clock = await sources(monkeypatch)
+    original = transport.read
+    reads = 0
+
+    async def dipping(cid: str):
+        nonlocal reads
+        reads += 1
+        reading = await original(cid)
+        # Two complete cohorts (11 channels each) arrive late, the third does not.
+        return replace(reading, monotonic_at=clock() - 1) if reads <= 22 else reading
+
+    monkeypatch.setattr(transport, "read", dipping)
+    camera = Camera(clock)
+    try:
+        settled = await observation(feedback, camera, clock).capture()
+        assert camera.calls and settled.feedback
+        # The requalified cohort is judged by the declared bounds, not a wider one.
+        assert all(
+            sample.last_receipt_s - sample.first_receipt_s <= profile().max_coherence_s
+            for sample in settled.feedback
+        )
+    finally:
+        await registry.close_all()
+
+
+async def test_settled_windows_are_spaced_by_the_declared_cohort_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adjacent settled windows must not claim the same receipt.
+
+    A cohort's oldest receipt trails its newest by up to one declared cycle, so a
+    wait shorter than that cycle re-reads channels the previous window already
+    claimed and the accumulation refuses a window that is not new.
+    """
+    registry, transport, feedback, clock = await sources(monkeypatch)
+    original = transport.read
+
+    async def lagging(cid: str):
+        reading = await original(cid)
+        # The leading channel of every cohort is a full cycle behind the trailing one.
+        return replace(reading, monotonic_at=clock() - 0.019) if cid == "joint" else reading
+
+    monkeypatch.setattr(transport, "read", lagging)
+    camera = Camera(clock)
+    try:
+        settled = await observation(feedback, camera, clock, profile=profile(poll_s=0.01)).capture()
+        assert len(settled.feedback) >= 4 and camera.calls
+        assert all(
+            current.first_receipt_s > previous.last_receipt_s
+            for previous, current in zip(settled.feedback, settled.feedback[1:])
+        )
+    finally:
+        await registry.close_all()
+
+
+async def test_consumer_latency_after_capture_is_not_mistaken_for_staleness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow ROI decode is latency in this process, not decay of the receipt.
+
+    The age bound is judged once, by the admission that holds the read clock.  The
+    decode that follows runs in a worker thread behind every camera callback, so its
+    duration must not read as an aged-out cohort.
+    """
+    from leapflow.hardware.calibration import acquisition as module
+
+    registry, transport, feedback, clock = await sources(monkeypatch)
+    decode = module.metric_roi
+
+    def stalled(*args: Any, **kwargs: Any):
+        clock.now += 0.25  # a contended interpreter behind a depth decode
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(module, "metric_roi", stalled)
+    camera = Camera(clock)
+    try:
+        settled = await observation(feedback, camera, clock).capture()
+        assert settled.feedback and camera.calls
     finally:
         await registry.close_all()
 

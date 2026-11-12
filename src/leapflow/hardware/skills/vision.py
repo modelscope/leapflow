@@ -150,6 +150,32 @@ class BoardDetection:
     transform: Transform  # T_camera_board, mm
     corners: int
     reprojection_px: float
+    corner_ids: tuple[int, ...] = ()
+    image_points: tuple[tuple[float, float], ...] = ()
+    board_points_mm: tuple[Vec3, ...] = ()
+    marker_ids: tuple[int, ...] = ()
+    marker_points: tuple[tuple[tuple[float, float], ...], ...] = ()
+    pose_gap_px: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Lossless correspondence evidence, not the display-rounded observation."""
+        return {**vars(self), "transform": {"rotation": self.transform.rotation,
+                                            "translation": self.transform.translation}}
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "BoardDetection":
+        if not isinstance(data, Mapping) or set(data) != set(cls.__dataclass_fields__):
+            raise ValueError("exact board detection fields required")
+        transform = data["transform"]
+        if not isinstance(transform, Mapping) or set(transform) != {"rotation", "translation"}:
+            raise ValueError("lossless board transform required")
+        return cls(**{**data, "transform": Transform(tuple(tuple(r) for r in transform["rotation"]),
+                                                     tuple(transform["translation"])),
+                      "corner_ids": tuple(data["corner_ids"]),
+                      "image_points": tuple(tuple(p) for p in data["image_points"]),
+                      "board_points_mm": tuple(tuple(p) for p in data["board_points_mm"]),
+                      "marker_ids": tuple(data["marker_ids"]),
+                      "marker_points": tuple(tuple(tuple(p) for p in row) for row in data["marker_points"])})
 
 
 def detect_board(frame: RgbdFrame, target: CharucoTarget) -> BoardDetection | None:
@@ -177,7 +203,7 @@ def detect_board(frame: RgbdFrame, target: CharucoTarget) -> BoardDetection | No
         board.setLegacyPattern(True)
     image = np.frombuffer(frame.color, dtype=np.uint8).reshape(frame.height, frame.width, 3)
     try:
-        corners, ids, _, _ = aruco.CharucoDetector(board).detectBoard(
+        corners, ids, marker_corners, marker_ids = aruco.CharucoDetector(board).detectBoard(
             cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         )
     except cv2.error as exc:
@@ -232,7 +258,26 @@ def detect_board(frame: RgbdFrame, target: CharucoTarget) -> BoardDetection | No
             return None  # a pose behind the camera is a mirrored, wrong solution
         errors.append(math.dist(intrinsics.project(camera_point), pixel))
     rms = math.sqrt(sum(e * e for e in errors) / len(errors))
-    return BoardDetection(transform=transform, corners=len(pixels), reprojection_px=rms)
+    # Preserve the planar alternative's pixel separation. Paired admission uses a
+    # declared gap; ordinary single-camera observations remain backward compatible.
+    alternatives = cv2.solvePnPGeneric(points, normalized, identity, None, flags=cv2.SOLVEPNP_IPPE)
+    alternate_errors = []
+    for rv, tv in zip(alternatives[1], alternatives[2]):
+        rotation = cv2.Rodrigues(rv)[0]
+        projected = [rotation @ p + tv.reshape(3) for p in points]
+        if all(p[2] > 0 for p in projected):
+            alternate_errors.append(math.sqrt(sum(math.dist(intrinsics.project(p), q) ** 2
+                                                  for p, q in zip(projected, pixels)) / len(pixels)))
+    alternate_errors.sort()
+    gap = max(0.0, alternate_errors[1] - alternate_errors[0]) if len(alternate_errors) > 1 else 0.0
+    return BoardDetection(transform=transform, corners=len(pixels), reprojection_px=rms,
+                          corner_ids=tuple(int(i) for i in ids.reshape(-1)),
+                          image_points=tuple(tuple(p) for p in pixels),
+                          board_points_mm=tuple(tuple(float(v) for v in p) for p in points),
+                          marker_ids=tuple(int(i) for i in marker_ids.reshape(-1)) if marker_ids is not None else (),
+                          marker_points=tuple(tuple(tuple(float(v) for v in p) for p in row.reshape(4, 2))
+                                              for row in marker_corners) if marker_corners is not None else (),
+                          pose_gap_px=gap)
 
 
 def depth_point(frame: RgbdFrame, point: Vec3, *, window: int = DEPTH_WINDOW_PX) -> Vec3 | None:

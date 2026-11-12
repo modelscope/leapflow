@@ -88,6 +88,7 @@ class RunContext:
         self._policies: WorkcellPolicies | None = None
         self._grasp_verification: Any = None
         self._calibration: Any = None
+        self._bridge: Any = None
         self._committed = False
         self.evidence: dict[str, Any] = {}
 
@@ -171,6 +172,13 @@ class RunContext:
             from leapflow.hardware.calibration.collection import WorkcellCalibration
             self._calibration = WorkcellCalibration(self, self._registry, node_session_id=self._node_session_id)
         return self._calibration
+
+    @property
+    def bridge(self) -> Any:
+        if self._bridge is None:
+            from leapflow.hardware.calibration.bridge_port import WorkcellBridge
+            self._bridge = WorkcellBridge(self.calibration)
+        return self._bridge
 
     @property
     def policies(self) -> WorkcellPolicies:

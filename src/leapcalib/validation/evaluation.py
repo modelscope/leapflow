@@ -49,6 +49,17 @@ class EvaluationConfig:
     def to_dict(self) -> dict[str, Any]:
         return {**vars(self), "max_error_m_rad": list(self.max_error_m_rad)}
 
+    def reachability(self, uncertainty_floor_m_rad: Sequence[float]) -> dict[str, Any]:
+        """Zero-residual diagnostic only; never alters the strict verdict policy."""
+        floors = finite_vector(uncertainty_floor_m_rad, 4)
+        if any(v < 0 for v in floors):
+            raise ValueError("nonnegative complete uncertainty lower bound required")
+        confidence_floor = [self.confidence_multiplier * v for v in floors]
+        margins = [cap - floor for cap, floor in zip(self.max_error_m_rad, confidence_floor)]
+        return {"reachable": all(v >= 0 for v in margins),
+                "zero_residual_floor_m_rad": confidence_floor, "available_residual_m_rad": margins,
+                "scope": "lower_bound_only; measured acquisition terms can further reduce margin"}
+
 
 @dataclass(frozen=True)
 class EvaluationUnit:

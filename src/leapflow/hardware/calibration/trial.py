@@ -287,6 +287,8 @@ async def run_motion_trial(
         "tracking_refusals": refused,
         "split": {"accepted_ids": accepted, "holdout_ids": holdouts},
         "rate_provenance": "declared_settled_drift_over_span_not_measured_peak",
+        "acceptance_reachability": policy.evaluation.reachability(
+            (policy.solve.translation_sigma_m,) * 3 + (policy.solve.rotation_sigma_rad,)),
     }
     if not factors:
         return {

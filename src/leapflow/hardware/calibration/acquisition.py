@@ -204,16 +204,27 @@ class SettledObservation:
         return digest_of(self.to_dict())
 
 
+class _ReceptionDip(SkillError):
+    """A transiently inadmissible cohort: retryable within the settled budget.
+
+    Deliberately a ``SkillError`` so an exhausted budget reports the same typed
+    verdict it always did; what changes is only that one bad draw is not yet a
+    refusal.
+    """
+
+
 class RegistryFeedbackSource:
     """Actual raw samples from registry.read_batch, never ArmState.observed_at."""
     def __init__(self, registry: Any, *, device_id: str, model: ModelIdentity,
                  joint_ids: Sequence[str], pose_ids: Sequence[str], health_ids: Sequence[str],
                  allowed_modes: Sequence[str], profile: SettledProfile,
                  node_session_id: str, pose_semantics: str,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], Any] = asyncio.sleep) -> None:
         self._registry, self._device, self._model = registry, device_id, model
         self._joints, self._poses, self._health = tuple(joint_ids), tuple(pose_ids), tuple(health_ids)
         self._modes, self._profile, self._clock = tuple(allowed_modes), profile, clock
+        self._sleep = sleep
         if not isinstance(node_session_id, str) or not node_session_id or pose_semantics != NOMINAL_FLANGE:
             raise ValueError("explicit owner-session and nominal firmware flange semantics required")
         self._node_session = node_session_id
@@ -236,6 +247,28 @@ class RegistryFeedbackSource:
         return self._model
 
     async def sample(self) -> FeedbackSnapshot:
+        """Return one admissible raw cohort, requalifying a transient reception dip.
+
+        Reception is a state, not an instant.  The receiver publishes the groups
+        certifying one cycle in sequence, so a momentary burst in this process --
+        permit verification, an evidence write -- can leave the cohort one cycle
+        behind the clock that judges it, and a single draw then reports a bus
+        that is in fact carrying feedback.  Requalify within the declared
+        settled budget and refuse only when the whole budget stays inadmissible,
+        exactly as the write path does; the accepted cohort must still satisfy
+        these same bounds, so nothing here weakens the evidence.
+        """
+        deadline = self._clock() + self._profile.timeout_s
+        while True:
+            try:
+                return await self._attempt()
+            except _ReceptionDip:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise
+                await self._sleep(min(self._profile.poll_s, remaining))
+
+    async def _attempt(self) -> FeedbackSnapshot:
         batch = await self._registry.read_batch(self._device, (*self._joints, *self._poses, *self._health))
         readings = {r.channel_id: r for r in batch.readings}
         requested = (*self._joints, *self._poses, *self._health)
@@ -244,13 +277,21 @@ class RegistryFeedbackSource:
             raise SkillError(FAILURE_CHECK_FAILED, "raw feedback declaration changed during acquisition")
         if batch.device_id != self._device or set(readings) != set(requested) or len(batch.readings) != len(requested):
             raise SkillError(FAILURE_DEVICE_FAULT, "incomplete raw feedback cohort")
+        # Structural faults are not reception dips: a misbound channel, a unit
+        # mismatch or a malformed sequence will not heal on the next cycle.
+        if any(r.device_id != self._device or r.unit != self._units[r.channel_id] or type(r.sequence) is not int or r.sequence < 0 for r in readings.values()):
+            raise SkillError(FAILURE_DEVICE_FAULT, "misbound or malformed raw feedback receipts")
         now = self._clock()
         times = [r.monotonic_at for r in readings.values()]
-        if any(r.device_id != self._device or not r.is_trustworthy or r.unit != self._units[r.channel_id] or type(r.sequence) is not int or r.sequence < 0 for r in readings.values()) or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 < v <= now for v in times):
-            raise SkillError(FAILURE_DEVICE_FAULT, "untrustworthy raw feedback receipts")
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in times):
+            raise SkillError(FAILURE_DEVICE_FAULT, "invalid raw feedback receipt stamps")
+        if any(not r.is_trustworthy for r in readings.values()):
+            raise _ReceptionDip(FAILURE_DEVICE_FAULT, "untrustworthy raw feedback receipts")
+        if any(not 0 < v <= now for v in times):
+            raise _ReceptionDip(FAILURE_DEVICE_FAULT, "raw feedback receipt is outside the node receipt clock")
         first, last = min(times), max(times)
         if now - first > self._profile.max_feedback_age_s or last - first > self._profile.max_coherence_s:
-            raise SkillError(FAILURE_DEVICE_FAULT, "stale or incoherent raw feedback cohort")
+            raise _ReceptionDip(FAILURE_DEVICE_FAULT, "stale or incoherent raw feedback cohort")
         values = {cid: r.value for cid, r in readings.items()}
         try:
             joint_deg = finite_vector(tuple(values[cid] for cid in self._joints), self._model.dof)
@@ -300,13 +341,19 @@ class SettledObservationSource:
         if self._prior_sources and (any(not isinstance(s, SourceStamp) for s in self._prior_sources) or tuple(s.stream for s in self._prior_sources) != ("color", "depth")):
             raise ValueError("typed prior color/depth provenance required")
 
-    def _consistent(self, first: FeedbackSnapshot, sample: FeedbackSnapshot) -> None:
+    def check_feedback(self, first: FeedbackSnapshot, sample: FeedbackSnapshot) -> None:
+        """Shared qualified stillness check for single and paired acquisition."""
         if (first.device_id, first.model_digest, first.joint_ids, first.ctrl_mode, first.node_session_id, first.declaration_digest) != (sample.device_id, sample.model_digest, sample.joint_ids, sample.ctrl_mode, sample.node_session_id, sample.declaration_digest):
             raise SkillError(FAILURE_CHECK_FAILED, "raw feedback model/channel/mode identity changed")
         if not sample.enabled or not sample.arrived or sample.arm_status != 0 or sample.communication_errors or self._blocked():
             raise SkillError(FAILURE_CHECK_FAILED, "motion/pending action or unhealthy feedback blocks capture")
-        now = self._clock()
-        if sample.last_receipt_s > now or now - sample.first_receipt_s > self._profile.max_feedback_age_s or sample.last_receipt_s - sample.first_receipt_s > self._profile.max_coherence_s:
+        # Age is owned by the admission that read the cohort, and only there: it is the
+        # one judge that holds the read clock.  Every check reachable from this point --
+        # an event-loop hop, a depth decode in a worker thread, a contended GIL -- is
+        # consumer latency, so re-judging age against a later clock refuses a cohort the
+        # declared bound has just accepted.  What stays here is receipt-relative: the
+        # cohort's own span.
+        if sample.last_receipt_s - sample.first_receipt_s > self._profile.max_coherence_s:
             raise SkillError(FAILURE_CHECK_FAILED, "stale or incoherent settled feedback sample")
         if max(abs(a - b) for a, b in zip(first.joints_rad, sample.joints_rad)) + first.joint_uncertainty_rad + sample.joint_uncertainty_rad > self._profile.max_joint_drift_rad:
             raise SkillError(FAILURE_CHECK_FAILED, "measured raw-joint stillness/drift bound exceeded")
@@ -326,24 +373,35 @@ class SettledObservationSource:
         samples = []
         while len(samples) < self._profile.min_samples or samples[-1].first_receipt_s - samples[0].last_receipt_s < self._profile.span_s:
             sample = await self._feedback.sample()
-            self._consistent(samples[0] if samples else sample, sample)
+            self.check_feedback(samples[0] if samples else sample, sample)
             if samples and (sample.first_receipt_s <= samples[-1].last_receipt_s or sample.source_id == samples[-1].source_id):
                 raise SkillError(FAILURE_CHECK_FAILED, "repeated/non-increasing raw feedback is not a new settled sample")
             samples.append(sample)
             if len(samples) >= 32:
                 raise SkillError(FAILURE_CHECK_FAILED, "settled sample budget exceeded")
-            await self._sleep(max(self._profile.poll_s, self._profile.exposure_uncertainty_s + self._profile.receipt_uncertainty_s))
-        bound = self._clock()
+            # Consecutive windows must not share a receipt: a cohort's oldest receipt
+            # trails its newest by up to the declared cycle, so waiting only one poll
+            # period (which is shorter than that cycle) re-reads channels the previous
+            # window already claimed and the windows overlap.  The wait therefore
+            # covers the declared cohort bound plus the stamp uncertainty.
+            await self._sleep(max(self._profile.poll_s, self._profile.max_coherence_s + self._profile.exposure_uncertainty_s + self._profile.receipt_uncertainty_s))
+        uncertainty = self._profile.exposure_uncertainty_s + self._profile.receipt_uncertainty_s
+        # A frame is bracketed only when one complete cohort lies entirely before its
+        # uncertain interval and another entirely after it.  A cohort's *oldest*
+        # receipt can sit a full declared cycle behind the clock that reads it (the
+        # receiver publishes one cycle's groups in sequence), so waiting only the
+        # stamp uncertainty re-reads a cohort that started before the frame was even
+        # exposed.  Both waits therefore cover the declared cohort bound as well.
+        bound = max(self._clock(), samples[-1].last_receipt_s + uncertainty)
         frame = await self._camera.capture_metric(after_monotonic=bound)
         identity = (frame.device_id, *(frame.metadata.get(k) for k in ("mount_digest", "session_id", "profile_digest")))
         if identity != self._camera_identity:
             raise SkillError(FAILURE_CHECK_FAILED, "admitted camera role/mount/session/profile changed")
         if not bound <= frame.monotonic_at <= self._clock():
             raise SkillError(FAILURE_CHECK_FAILED, "metric capture is not fresh on the node receipt clock")
-        await self._sleep(self._profile.exposure_uncertainty_s + self._profile.receipt_uncertainty_s)
+        await self._sleep(self._profile.max_coherence_s + uncertainty)
         after = await self._feedback.sample()
-        self._consistent(samples[0], after)
-        uncertainty = self._profile.exposure_uncertainty_s + self._profile.receipt_uncertainty_s
+        self.check_feedback(samples[0], after)
         if after.first_receipt_s <= samples[-1].last_receipt_s or after.first_receipt_s < frame.monotonic_at + uncertainty or samples[-1].last_receipt_s > frame.monotonic_at - uncertainty:
             raise SkillError(FAILURE_CHECK_FAILED, "fresh feedback does not bracket uncertain camera exposure/receipt")
         samples.append(after)
@@ -353,7 +411,7 @@ class SettledObservationSource:
                                           exposure_uncertainty_s=self._profile.exposure_uncertainty_s)
         except (TypeError, ValueError) as exc:
             raise SkillError(FAILURE_CHECK_FAILED, f"metric acquisition provenance refused: {exc}") from exc
-        self._consistent(samples[0], after)
+        self.check_feedback(samples[0], after)
         if self._metric_profile_digest and roi.profile.digest != self._metric_profile_digest:
             raise SkillError(FAILURE_CHECK_FAILED, "metric intrinsics changed before acquisition persistence")
         if roi.frame_id == self._prior_frame_id:

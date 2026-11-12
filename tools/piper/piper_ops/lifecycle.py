@@ -39,6 +39,8 @@ async def execute(session: Session, plan: dict[str, Any], *, torque_release: boo
     if operation == "stop":
         # Never make a protective halt depend on healthy motion telemetry.
         await session.stop()
+        # The operator asked for a released arm; the exit must not re-hold it.
+        session.leave_unheld = True
         session.success = True
         return {"ok": True, "operation": "stop", "halt_delivered": True,
                 "feedback_verified": False}
@@ -46,6 +48,9 @@ async def execute(session: Session, plan: dict[str, Any], *, torque_release: boo
         raise Refusal("unknown arm lifecycle operation")
     if operation == "disable" and not torque_release:
         raise Refusal("explicit torque-release confirmation required")
+    if operation == "disable":
+        # Torque release is the request itself; the exit must not undo it.
+        session.leave_unheld = True
     before = await session.snapshot(preflight=True)
     check_start(plan, before)
     session.bind_steps(plan["steps"])

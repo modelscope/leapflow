@@ -20,6 +20,7 @@ OPERATIONS = frozenset(
         "diagnostics",
         "solve_motion",
         "solve_raw_response",
+        "solve_bridge",
         "propose_raw",
         "update_raw",
         "track_metric",
@@ -342,6 +343,7 @@ def validate_payload(request: WorkerRequest, budgets: WorkerBudgets) -> None:
         "diagnostics": set(),
         "solve_motion": {"evidence", "options"},
         "solve_raw_response": {"evidence", "options"},
+        "solve_bridge": {"training", "holdout", "flange_T_wrist", "dependency_digest", "dependency_sources", "budget", "model_digest"},
         "propose_raw": {"fit", "current", "target", "now"},
         "update_raw": {"fit", "sample"},
         "track_metric": {"first", "second", "tracks", "config"},
@@ -363,6 +365,30 @@ def validate_payload(request: WorkerRequest, budgets: WorkerBudgets) -> None:
             raise ValueError("recursive update bound must be positive and at most 0.05")
     elif fields != expected:
         raise ValueError("unknown compute payload fields")
+    if request.operation == "solve_bridge":
+        from leapcalib.estimation.bridge import BridgeBudget, BridgePair
+        from leapcalib.geometry.se3 import Transform
+
+        for key in ("training", "holdout"):
+            pairs = request.payload[key]
+            if not isinstance(pairs, list) or len(pairs) > min(128, budgets.max_keyframes):
+                raise ValueError("bridge pair budget exceeded")
+            for pair in pairs:
+                BridgePair.from_mapping(pair)
+        if sum(len(request.payload[key]) for key in ("training", "holdout")) > min(128, budgets.max_keyframes):
+            raise ValueError("combined bridge pair budget exceeded")
+        sources = request.payload["dependency_sources"]
+        if not isinstance(sources, list) or len(sources) > 8192 or any(not isinstance(v, str) or not 0 < len(v) <= 256 for v in sources):
+            raise ValueError("bounded wrist refinement source identities required")
+        if request.payload["model_digest"] != request.model_digest:
+            raise ValueError("bridge model differs from worker envelope")
+        dependency = request.payload["dependency_digest"]
+        if not isinstance(dependency, str) or len(dependency) != 64 or any(c not in "0123456789abcdef" for c in dependency):
+            raise ValueError("exact wrist dependency digest required")
+        mount = Transform.from_mapping(request.payload["flange_T_wrist"])
+        if (mount.parent, mount.child) != ("flange", "wrist"):
+            raise ValueError("bridge dependency direction invalid")
+        BridgeBudget(**request.payload["budget"])
     if request.operation in ("track_metric", "track_scene"):
         for key in ("first", "second"):
             roi = request.payload[key]

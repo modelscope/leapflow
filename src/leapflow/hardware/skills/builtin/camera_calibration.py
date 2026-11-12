@@ -732,7 +732,12 @@ class Screws:
                 await ctx.motion.move_joints(
                     {move["channel"]: float(move["start_deg"])}, speed_pct=speed
                 )
-        fit, evidence = self._measure(plan, shots, moves)
+        # The solve is seconds of numpy over the arm clouds, and it used to run on the
+        # event loop. On the cell it blocked for ~25 s at once, which starved the node's
+        # RPC plane and its lease watchdog together: the host read the run as unreadable
+        # and the deadman halted the arm, losing a measurement that had already been
+        # captured. Nothing here needs the loop, so it waits in a worker thread.
+        fit, evidence = await asyncio.to_thread(self._measure, plan, shots, moves)
         return self._record(ctx, plan, role, fit, evidence)
 
     async def _transit(

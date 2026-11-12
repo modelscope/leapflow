@@ -885,8 +885,12 @@ class BatchStreamCoordinator:
         self._started_monotonic: float | None = None
         self._comm_loss_start: float | None = None
         self._degradation_triggered: bool = False
-        self._sensor_loss_streak: int = 0
+        # Streaks are per channel: one batch carries one sample of every channel,
+        # so a single summed counter would read one stale poll of three channels
+        # as "three consecutive degraded samples".
+        self._sensor_loss_streaks: dict[str, int] = {}
         self._sensor_loss_triggered: bool = False
+        self._failed_channel_id: str = ""
         self._last_degradation_outcome: Any = None
 
     @property
@@ -1000,27 +1004,38 @@ class BatchStreamCoordinator:
         await self._execute_degradation(policy.comm_loss_policy, reason="comm_loss")
 
     async def _track_sensor_quality(self, reading: Reading) -> None:
-        """Evaluate DegradationPolicy.sensor_loss_policy on quality streaks."""
+        """Evaluate DegradationPolicy.sensor_loss_policy on per-channel quality streaks.
+
+        A channel must be degraded in three consecutive batches -- the same rule
+        :class:`HardwareStreamSource` applies to its single channel. The latch
+        clears only once every channel reads OK again, so a healthy sibling in the
+        same batch cannot cancel a loss that is still in progress.
+        """
         policy = self._degradation_policy
+        channel_id = reading.channel_id
         if reading.quality == Quality.OK.value:
-            self._sensor_loss_streak = 0
-            if self._sensor_loss_triggered:
+            self._sensor_loss_streaks[channel_id] = 0
+            if self._sensor_loss_triggered and not any(self._sensor_loss_streaks.values()):
                 self._registry.clear_degradation(
                     self._context.device_id, recovery="healthy_batch_sensor_read"
                 )
-            self._sensor_loss_triggered = False
+                self._sensor_loss_triggered = False
             return
-        self._sensor_loss_streak += 1
+        streak = self._sensor_loss_streaks.get(channel_id, 0) + 1
+        self._sensor_loss_streaks[channel_id] = streak
         if policy is None or self._sensor_loss_triggered:
             return
-        if self._sensor_loss_streak < 3:
+        if streak < 3:
             return
         self._sensor_loss_triggered = True
+        self._failed_channel_id = channel_id
         await self._execute_degradation(policy.sensor_loss_policy, reason="sensor_loss")
 
     async def _execute_degradation(self, action: str, *, reason: str) -> None:
         """Delegate batch-source transitions to the shared coordinator."""
-        failed_channel_id = self._channel_ids[0] if self._channel_ids else ""
+        failed_channel_id = self._failed_channel_id or (
+            self._channel_ids[0] if self._channel_ids else ""
+        )
         outcome = await self._degradation_coordinator.execute(
             action,
             reason=reason,
@@ -1031,6 +1046,8 @@ class BatchStreamCoordinator:
         if outcome.completed and outcome.action == "switch_sensor":
             self._degradation_triggered = False
             self._sensor_loss_triggered = False
+            self._sensor_loss_streaks.pop(failed_channel_id, None)
+        self._failed_channel_id = ""
 
     async def _switch_sensor(self, target_channel_id: str) -> bool:
         """Replace one failed batch input only after healthy fallback readback."""
@@ -1045,7 +1062,7 @@ class BatchStreamCoordinator:
             return False
         if reading.quality != Quality.OK.value:
             return False
-        failed = next(
+        failed = self._failed_channel_id or next(
             (channel_id for channel_id in self._channel_ids if channel_id != target_channel_id),
             "",
         )

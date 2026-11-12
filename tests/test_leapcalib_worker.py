@@ -286,6 +286,32 @@ async def test_parent_rss_refusal_reaps_and_allows_only_one_later_launch(tmp_pat
         await worker.close()
 
 
+async def test_typed_refusal_keeps_process_and_spends_no_recovery_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A computed refusal is a result, not a worker fault; uninformative pairs must not cascade."""
+    worker = worker_at(tmp_path)
+    try:
+        pid = (await worker.submit("diagnostics", {}, workcell_id="c", run_id="r", model_digest="m"))["pid"]
+        process = worker._process
+        original = CalibrationWorker._response
+
+        async def refusing(self: CalibrationWorker, reader, request, start):
+            return {"kind": "failure", "failure": {"code": "insufficient_evidence", "message": "one pair carried no usable correspondences", "retryable": False}}
+
+        monkeypatch.setattr(CalibrationWorker, "_response", refusing)
+        for run_id in ("refused-1", "refused-2", "refused-3"):
+            with pytest.raises(CalibrationFailure) as caught:
+                await worker.submit("diagnostics", {}, workcell_id="c", run_id=run_id, model_digest="m")
+            assert caught.value.code == "insufficient_evidence"
+        assert worker._process is process and process.returncode is None
+        assert worker._recovery_launches == 1
+        monkeypatch.setattr(CalibrationWorker, "_response", original)
+        assert (await worker.submit("diagnostics", {}, workcell_id="c", run_id="after", model_digest="m"))["pid"] == pid
+    finally:
+        await worker.close()
+
+
 @pytest.mark.parametrize("value", ["plain", "\"\\\n\x00\x7f", "é😀", [None, True, False, 1.25, -3]])
 def test_freeze_counts_exact_canonical_bytes_and_detaches_containers(value):
     wire = encode({"value": value}, 1024)

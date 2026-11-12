@@ -26,6 +26,8 @@ class Settings:
     grip_mm: float = 0.5
     poll_s: float = 0.1
     settled_samples: int = 3
+    posture_still_deg: float = 0.05
+    """Two samples this close mean the arm is not moving; a wider gap is a droop."""
     move_timeout_s: float = 20.0
     run_timeout_s: float = 300.0
     request_timeout_s: float = 10.0
@@ -90,7 +92,7 @@ class Settings:
                    "grip_mm", "poll_s", "settled_samples", "move_timeout_s", "run_timeout_s",
                    "request_timeout_s", "joint_margin_deg", "joint_step_deg", "init_max_deg",
                    "deviation_deg", "max_cycles", "max_dwell_s", "preflight_temp_c", "max_temp_c",
-                   "voltage_min_v", "voltage_max_v")
+                   "voltage_min_v", "voltage_max_v", "posture_still_deg")
         for name in numeric:
             if not isinstance(getattr(self, name), (int, float)):
                 raise ValueError(f"{name} must be numeric")

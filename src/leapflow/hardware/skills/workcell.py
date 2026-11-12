@@ -114,6 +114,7 @@ WORKCELL_FIELDS = frozenset(
         "calibration_acquisition",
         "calibration_reference",
         "calibration_motion",
+        "calibration_bridge",
         "skills",
         "share_frames",
         "vision",
@@ -182,6 +183,7 @@ class WorkcellSpec:
     calibration_acquisition: Mapping[str, Any] = field(default_factory=dict)
     calibration_reference: Mapping[str, Any] = field(default_factory=dict)
     calibration_motion: Mapping[str, Any] = field(default_factory=dict)
+    calibration_bridge: Mapping[str, Any] = field(default_factory=dict)
     vision: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_VISION))
     skills: tuple[str, ...] = ()
     # Whether camera frames may leave the node for the model to look at
@@ -247,6 +249,7 @@ class WorkcellSpec:
             "calibration_acquisition": dict(self.calibration_acquisition),
             "calibration_reference": dict(self.calibration_reference),
             "calibration_motion": dict(self.calibration_motion),
+            "calibration_bridge": dict(self.calibration_bridge),
             "vision": dict(self.vision),
             "share_frames": self.share_frames,
         }
@@ -306,6 +309,8 @@ class WorkcellSpec:
                 calibration_acquisition=_parse_acquisition(data.get("calibration_acquisition") or {}, roles=roles, frames=frames),
                 calibration_reference=_parse_reference(data.get("calibration_reference") or {}, acquisition=data.get("calibration_acquisition") or {}),
                 calibration_motion=_parse_motion_collection(data.get("calibration_motion") or {}),
+                calibration_bridge=_parse_bridge(data.get("calibration_bridge") or {}, roles=roles, frames=frames,
+                                                 acquisition=data.get("calibration_acquisition") or {}, target=data.get("calibration_target") or {}),
                 vision=_parse_vision(data.get("vision") or {}),
                 skills=tuple(str(item) for item in data.get("skills") or ()),
                 share_frames=_flag(data.get("share_frames", False), "share_frames"),
@@ -315,6 +320,11 @@ class WorkcellSpec:
             raise
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkcellError(f"workcell {workcell_id!r}: {exc}") from exc
+
+
+def _parse_bridge(data: Mapping[str, Any], **bindings: Any) -> dict[str, Any]:
+    from leapflow.hardware.calibration.bridge_policy import validate_declaration
+    return validate_declaration(data, **bindings)
 
 
 def _parse_acquisition(data: Mapping[str, Any], *, roles: Mapping[str, str], frames: Mapping[str, FrameDecl]) -> dict[str, Any]:

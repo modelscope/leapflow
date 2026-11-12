@@ -19,7 +19,7 @@ from leapcalib.geometry.se3 import Transform
 from leapcalib.validation.bundle import EvidenceBundle, Retention
 from leapflow.hardware.calibration.acquisition import SettledObservation
 from leapflow.hardware.calibration.physical_model import PhysicalModel
-from leapflow.hardware.calibration.pose_policy import PoseCollectionPolicy
+from leapflow.hardware.calibration.pose_policy import PoseCollectionPolicy, SweepCheck
 from leapflow.hardware.calibration.trial import _capture_rows
 from leapflow.hardware.skills.kinematics import DhChain
 from leapflow.hardware.skills.protocol import (
@@ -41,7 +41,7 @@ class WorkcellPoseCollection:
     def __init__(self, collection: Any) -> None:
         self._collection = collection
 
-    def _policy_model(self) -> tuple[PoseCollectionPolicy, PhysicalModel, tuple[str, ...]]:
+    def _policy_model(self) -> tuple[PoseCollectionPolicy, PhysicalModel, tuple[str, ...], tuple[str, ...]]:
         collection, ctx = self._collection, self._collection._ctx
         if collection._profile().camera_method != "wrist":
             raise SkillError(
@@ -67,7 +67,7 @@ class WorkcellPoseCollection:
                 digest_of(ctx.workcell.to_dict()),
                 "declared_nominal_acquisition_not_qualified",
             )
-            policy.validate_model(
+            advisories = policy.validate_model(
                 model,
                 collection._profile().settled,
                 fk_mm=ctx.limits["fk_tolerance_mm"],
@@ -84,7 +84,7 @@ class WorkcellPoseCollection:
                 FAILURE_SKILL_UNAVAILABLE,
                 f"declare verified calibration_motion inputs before acquisition: {exc}",
             ) from exc
-        return policy, model, joint_channels(arm)
+        return policy, model, joint_channels(arm), advisories
 
     async def _reference(self, policy: PoseCollectionPolicy) -> tuple[SettledObservation, str]:
         collection, registry = self._collection, self._collection._registry
@@ -129,7 +129,7 @@ class WorkcellPoseCollection:
         )
         return capture, digest_of(content)
 
-    async def _state(self, policy: PoseCollectionPolicy) -> Any:
+    async def _state(self, policy: PoseCollectionPolicy) -> tuple[Any, tuple[str, ...]]:
         collection, ctx = self._collection, self._collection._ctx
         if collection._blocked():
             raise SkillError(
@@ -157,19 +157,29 @@ class WorkcellPoseCollection:
             isinstance(reading.value, bool)
             or not isinstance(reading.value, (int, float))
             or not math.isfinite(reading.value)
-            or not 0 < reading.value <= policy.speed_pct_max
+            or reading.value <= 0
         ):
-            raise ValueError(
-                "live speed exceeds campaign cap; request a separately approved speed setup"
+            raise ValueError("a positive declared percent speed setting is required")
+        # The register names the last dispatched move, not this run's authority. Every
+        # dispatch of this campaign carries its own capped speed command in the same
+        # batch, so a stale higher register is reported instead of failing the run.
+        advisories: tuple[str, ...] = ()
+        if reading.value > policy.speed_pct_max:
+            advisories = (
+                f"live speed register reads {reading.value:g} percent, above the "
+                f"{policy.speed_pct_max:g} percent campaign cap; this run commands the "
+                "capped value in the same dispatch",
             )
-        return state
+        return state, advisories
 
     def _arguments(
         self, args: Mapping[str, Any], policy: PoseCollectionPolicy, joints: tuple[str, ...]
     ) -> tuple[list[dict[str, float]], float, float]:
         poses = args.get("poses")
         if not isinstance(poses, (list, tuple)) or not 2 <= len(poses) <= policy.max_moves:
-            raise SkillError(FAILURE_INVALID_ARGS, "two to eight bounded poses required")
+            raise SkillError(
+                FAILURE_INVALID_ARGS, f"two to {policy.max_moves} bounded poses required"
+            )
         commands = []
         for pose in poses:
             if not isinstance(pose, Mapping) or set(pose) != set(joints):
@@ -221,7 +231,7 @@ class WorkcellPoseCollection:
         before: Mapping[str, float],
         target: Mapping[str, float],
         joints: tuple[str, ...],
-    ) -> tuple[float, float]:
+    ) -> SweepCheck:
         # Bounded pure geometry is drained on cancellation, preventing orphaned
         # compute and overlap with another requesting run after lease release.
         task = asyncio.create_task(
@@ -249,23 +259,22 @@ class WorkcellPoseCollection:
     async def basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]:
         collection = self._collection
         try:
-            policy, model, joints = self._policy_model()
+            policy, model, joints, declared = self._policy_model()
             commands, dwell, duration = self._arguments(args, policy, joints)
             capture, reference_digest = await self._reference(policy)
             reference = tuple(map(math.degrees, capture.feedback[-2].joints_rad))
-            state = await self._state(policy)
+            state, live_speed = await self._state(policy)
             current = dict(state.joints)
             targets, travel, joint_l1 = [], 0.0, 0.0
+            advisories = [*declared, *live_speed]
             for command in commands:
                 target = collection._ctx.motion.check_joints(command, current)
-                distance, angle = await self._sweep(
-                    policy, model, reference, current, command, joints
-                )
-                travel, joint_l1 = travel + distance, joint_l1 + angle
+                checked = await self._sweep(policy, model, reference, current, command, joints)
+                travel, joint_l1 = travel + checked.travel_mm, joint_l1 + checked.joint_l1_deg
+                advisories.extend(checked.advisories)
                 targets.append(dict(vars(target)))
                 current = command
-            if travel > policy.max_travel_mm or joint_l1 > policy.max_joint_l1_deg:
-                raise ValueError("planned acquisition exceeds cumulative travel or joint L1 budget")
+            advisories.extend(self._budget_advisories(policy, travel, joint_l1))
             basis = dict(
                 await collection.collection_basis(
                     {"region": args["region"], "frames": 2 * len(commands)}
@@ -294,6 +303,7 @@ class WorkcellPoseCollection:
                     "duration_s": duration,
                     "travel_bound_mm": travel,
                     "joint_l1_deg": joint_l1,
+                    "advisories": list(dict.fromkeys(advisories)),
                     "auto_return": False,
                     "activation": "none",
                 },
@@ -305,6 +315,22 @@ class WorkcellPoseCollection:
         except TimeoutError as exc:
             raise SkillError(FAILURE_TIMEOUT, "pose collection planning deadline expired") from exc
 
+    @staticmethod
+    def _budget_advisories(
+        policy: PoseCollectionPolicy, travel_mm: float, joint_l1_deg: float
+    ) -> list[str]:
+        """Report a campaign that outgrew its declared size without discarding it."""
+        advisories = []
+        if travel_mm > policy.max_travel_mm:
+            advisories.append(
+                f"run travel {travel_mm:.1f} mm exceeds the declared {policy.max_travel_mm:g} mm budget"
+            )
+        if joint_l1_deg > policy.max_joint_l1_deg:
+            advisories.append(
+                f"run joint L1 {joint_l1_deg:.1f} deg exceeds the declared {policy.max_joint_l1_deg:g} deg budget"
+            )
+        return advisories
+
     async def execute(self, plan: SkillPlan) -> Mapping[str, Any]:
         try:
             return await self._execute(plan)
@@ -315,7 +341,7 @@ class WorkcellPoseCollection:
 
     async def _execute(self, plan: SkillPlan) -> Mapping[str, Any]:
         collection, ctx = self._collection, self._collection._ctx
-        policy, model, joints = self._policy_model()
+        policy, model, joints, declared = self._policy_model()
         commands, dwell, duration = self._arguments(plan.args, policy, joints)
         sealed = plan.basis.get("poses", {})
         if (
@@ -336,7 +362,7 @@ class WorkcellPoseCollection:
             or list(reference) != sealed["reference_deg"]
         ):
             raise SkillError(FAILURE_PLAN_STALE, "original campaign reference changed; no motion")
-        state = await self._state(policy)
+        state, live_speed = await self._state(policy)
         if set(state.joints) != set(joints) or any(
             abs(state.joints[j] - sealed["start_joints"][j])
             > math.degrees(collection._profile().settled.max_joint_drift_rad)
@@ -349,19 +375,14 @@ class WorkcellPoseCollection:
             plan, commands=commands, frames=2 * len(commands)
         )
         captures, travel, joint_l1 = [], 0.0, 0.0
+        advisories, endpoint_errors = [*declared, *live_speed], []
         for command in commands:
-            state = await self._state(policy)
-            distance, angle = await self._sweep(
-                policy, model, reference, state.joints, command, joints
-            )
-            if (
-                travel + distance > policy.max_travel_mm
-                or joint_l1 + angle > policy.max_joint_l1_deg
-            ):
-                raise ValueError(
-                    "measured starting state exhausts cumulative run travel/joint budget"
-                )
-            fresh = await self._state(policy)
+            state, live = await self._state(policy)
+            advisories.extend(live)
+            checked = await self._sweep(policy, model, reference, state.joints, command, joints)
+            travel, joint_l1 = travel + checked.travel_mm, joint_l1 + checked.joint_l1_deg
+            advisories.extend(checked.advisories)
+            fresh, _ = await self._state(policy)
             if any(
                 abs(fresh.joints[j] - state.joints[j])
                 > math.degrees(collection._profile().settled.max_joint_drift_rad)
@@ -373,15 +394,15 @@ class WorkcellPoseCollection:
                     FAILURE_STOPPED, "acquisition stopped before dispatch; no return motion"
                 )
             await ctx.motion.move_joints(command, speed_pct=plan.args.get("speed_pct", 10))
-            travel, joint_l1 = travel + distance, joint_l1 + angle
-            await self._state(policy)
+            _, live = await self._state(policy)
+            advisories.extend(live)
             per_pose = []
             for index in range(2):
                 if index:
                     await ctx.motion.pause(dwell)
                 observation = await recorded.capture()
                 measured = tuple(map(math.degrees, observation.feedback[-2].joints_rad))
-                await self._sweep(
+                arrived = await self._sweep(
                     policy,
                     model,
                     reference,
@@ -389,14 +410,24 @@ class WorkcellPoseCollection:
                     dict(zip(joints, measured)),
                     joints,
                 )
-                if any(
-                    abs(measured[i] - command[j])
-                    > math.degrees(collection._profile().settled.max_joint_drift_rad)
-                    for i, j in enumerate(joints)
-                ):
-                    raise ValueError("settled capture is not at the approved raw joint endpoint")
+                advisories.extend(arrived.advisories)
+                # A settled capture names its own measured joints, so a small arrival
+                # residual does not invalidate the factor; it is reported per pose
+                # instead of discarding every capture already taken.
+                residual = max(
+                    abs(measured[i] - command[j]) for i, j in enumerate(joints)
+                )
+                endpoint_errors.append(residual)
+                settled_drift = math.degrees(
+                    collection._profile().settled.max_joint_drift_rad
+                )
+                if residual > settled_drift:
+                    advisories.append(
+                        f"capture arrived {residual:.2f} deg from the commanded endpoint (declared {settled_drift:.2f} deg)"
+                    )
                 per_pose.append(recorded.last_record)
             captures.append(per_pose)
+        advisories.extend(self._budget_advisories(policy, travel, joint_l1))
         return {
             "schema": SCHEMA,
             "captures_by_pose": captures,
@@ -408,6 +439,8 @@ class WorkcellPoseCollection:
             "commands": commands,
             "travel_bound_mm": travel,
             "joint_l1_deg": joint_l1,
+            "arrival_error_deg": endpoint_errors,
+            "advisories": list(dict.fromkeys(advisories)),
             "auto_return": False,
             "activation": "none",
             "raw_exported": False,

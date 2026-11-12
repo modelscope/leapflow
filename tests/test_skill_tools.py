@@ -416,6 +416,36 @@ async def test_renewal_keeps_a_run_alive_until_stopped(tmp_path: Path, rigs: Any
     assert run["effect_uncertain"] and rig.sim.halts == 1
 
 
+async def test_a_transient_renewal_failure_does_not_end_the_lease(
+    tmp_path: Path, rigs: Any
+) -> None:
+    """One missed renewal must cost nothing while the lease still has time left.
+
+    Renewal used to end on the first failure, so a single slow or refused
+    ``control.renew`` -- exactly what a node busy running the skill produces --
+    let the lease lapse, and the deadman halted a healthy run: the arm fell to
+    standby mid-capture and the host could no longer read the status or reach the
+    node to clean up.
+    """
+    failures = {"left": 1}
+
+    def fail_one_renewal(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "control.renew" and failures["left"]:
+            failures["left"] -= 1
+            raise OSError("connection reset by peer")
+        return params
+
+    rig = rigs(tmp_path, lease_s=0.3, stall=True,
+               wrap=lambda client: _Tampering(client, on_params=fail_one_renewal))
+    started = await rig.service.hw_skill_run(**MOVE, wait=False)
+    await asyncio.sleep(1.2)  # four lease periods, one renewal refused in the first
+    (run,) = (await rig.service.hw_skill_status(run_id=started["run_id"]))["runs"]
+    assert run["status"] == "running", run
+    assert rig.sim.halts == 0
+
+    await rig.service.hw_skill_stop(run_id=started["run_id"], reason="test over")
+
+
 async def test_closing_the_service_lets_the_lease_lapse(tmp_path: Path, rigs: Any) -> None:
     rig = rigs(tmp_path, lease_s=0.2, stall=True)
     await rig.service.hw_skill_run(**MOVE, wait=False)

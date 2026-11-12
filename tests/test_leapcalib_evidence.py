@@ -201,6 +201,35 @@ async def test_repeated_cancel_and_registry_shutdown_wait_for_private_settlement
         await registry.close_all()
 
 
+async def test_persistence_admits_consumer_latency_and_refuses_a_future_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    value, clock = await captured(monkeypatch)
+    registry, _, store = registry_and_cache(tmp_path)
+    last = value.feedback[-1]
+    # One cohort's channels arrive in sequence, so its oldest receipt trails the newest
+    # by a receiver cycle; a metric ROI decoded after that read is latency, not decay.
+    oldest = last.last_receipt_s - 0.01
+    stamp = replace(last.stamp, seconds=(oldest + last.last_receipt_s) / 2, uncertainty_s=0.008)
+    aged = replace(value, feedback=(*value.feedback[:-1],
+                                    replace(last, first_receipt_s=oldest, stamp=stamp)))
+
+    class Source:
+        async def capture(self):
+            return aged
+
+    wrapper = RecordedObservationSource(Source(), store, profile=profile(), binding=binding(),
+                                        ttl_s=60, quota_bytes=MAX_RAW_BYTES, on_commit=lambda _: None, clock=clock)
+    try:
+        clock.now += 0.095  # consumer latency after the newest receipt, inside the age bound
+        assert await wrapper.capture() == aged
+        await wrapper.settle()
+        assert wrapper.last_record
+        clock.now -= 0.5  # a receipt may not claim a time ahead of the node clock
+        with pytest.raises(SkillError, match="ahead of the node clock"):
+            await wrapper.capture()
+    finally:
+        await registry.close_all()
+
+
 @pytest.mark.parametrize("component", ["../escape", "/absolute", ".", "..", ""])
 def test_private_cache_refuses_path_components(tmp_path: Path, component: str) -> None:
     cache = CacheManager(CacheLayout(tmp_path / "cache"), profile_id="test")

@@ -23,6 +23,7 @@ from leapcalib.runtime.protocol import decode_json, encode
 from leapflow.cache.manager import CacheManager
 from leapflow.hardware.calibration.acquisition import ObservationSource, SettledObservation, SettledProfile
 from leapflow.hardware.calibration.generations import _json
+from leapflow.hardware.calibration.paired import PairedObservation
 from leapflow.hardware.calibration.reference import ReferenceProfile, assess_reference
 from leapflow.hardware.skills.admission import RunAdmission
 from leapflow.hardware.skills.digest import plan_digest, run_permit_digest
@@ -341,6 +342,20 @@ class CalibrationEvidenceStore:
             run_id=run_id, trusted_keys=trusted_keys, node_id=node_id,
         )
 
+    async def verify_bridge_result(self, captures: Sequence[Mapping[str, str]], result: Mapping[str, Any], *,
+                                   workcell_id: str, plan: Mapping[str, Any], run_id: str) -> dict[str, Any]:
+        """Tracked, private method-specific replay with no activation authority."""
+        from leapflow.hardware.calibration.bridge_assessment import verify_indexed_result
+
+        if self._closing:
+            raise SkillError(FAILURE_CHECK_FAILED, "acquisition store is shutting down")
+        frozen = json.loads(_json({"captures": list(captures), "result": result, "plan": plan}))
+        return await self._validated_read(
+            lambda: verify_indexed_result(self, frozen["captures"], frozen["result"], workcell_id=workcell_id,
+                                          plan=frozen["plan"], run_id=run_id),
+            name="calibration-indexed-bridge-verification",
+        )
+
     async def _tracked_compute(self, operation: Callable[[], Awaitable[Any]]) -> Any:
         """Cancel compute once while allowing its shared-storage threads to settle."""
         task = asyncio.create_task(operation(), name="calibration-indexed-scene-replay")
@@ -398,6 +413,25 @@ class CalibrationEvidenceStore:
 
     @staticmethod
     def _validate(observation: SettledObservation, profile: SettledProfile, binding: AcquisitionBinding) -> None:
+        if isinstance(observation, PairedObservation):
+            CalibrationEvidenceStore._validate(observation.fixed, profile, binding)
+            CalibrationEvidenceStore._validate(observation.wrist, profile, binding)
+            # Reconstruct rather than trust a caller's excluded/admitted flag.
+            PairedObservation.from_mapping(observation.to_dict())
+            basis = json.loads(binding.plan_json)["basis"].get("bridge", {})
+            if (basis.get("target_id"), basis.get("stationary_epoch"), basis.get("target"), basis.get("min_pose_gap_px")) != (observation.target_id, observation.stationary_epoch, json.loads(observation.target_json), observation.min_pose_gap_px):
+                raise ValueError("paired target identity differs from approved declaration")
+            for role, view in (("fixed", observation.fixed), ("wrist", observation.wrist)):
+                camera = basis.get("cameras", {}).get(role, {})
+                if (view.roi.profile.device_id, view.roi.mount_digest, view.roi.session_id, view.roi.profile.digest,
+                    view.roi.source_profile_digest, [view.roi.x, view.roi.y, view.roi.width, view.roi.height]) != (
+                    camera.get("camera_device_id"), camera.get("mount_digest"), camera.get("camera_session_id"),
+                    camera.get("metric_profile_digest"), camera.get("source_profile_digest"), camera.get("region")):
+                    raise ValueError("paired camera differs from approved declaration")
+                for sample in observation.feedback:
+                    if (sample.model_digest, sample.declaration_digest, list(sample.joint_ids)) != (basis.get("model_digest"), basis.get("declaration_digest"), basis.get("joint_ids")):
+                        raise ValueError("paired raw feedback differs from approved model/declaration")
+            return
         if not isinstance(observation, SettledObservation) or not isinstance(profile, SettledProfile) or not isinstance(binding, AcquisitionBinding):
             raise ValueError("typed settled observation/profile/owner binding required")
         if observation.profile_digest != digest_of(vars(profile)):
@@ -437,14 +471,15 @@ class CalibrationEvidenceStore:
         cache = self._cache
         if not isinstance(cache, CacheManager):
             raise ValueError("acquisition requires the registry-bound cache manager")
-        content = {"schema": SCHEMA, "observation": observation.to_dict(),
+        schema = "leapflow.paired_acquisition.v1" if isinstance(observation, PairedObservation) else SCHEMA
+        content = {"schema": schema, "observation": observation.to_dict(),
                    "profile": vars(profile), "binding": binding.to_dict()}
         # Reuse the worker's strict finite JSON framing for bounded raw serialization.
         raw = encode(content, MAX_RAW_BYTES)[4:]
         identity = digest_of(content)
         raw_hash = hashlib.sha256(raw).hexdigest()
         expires = time.time() + ttl_s
-        summary = {"schema": SCHEMA, "evidence_digest": identity, "observation_digest": observation.digest,
+        summary = {"schema": schema, "evidence_digest": identity, "observation_digest": observation.digest,
                    "workcell_id": binding.workcell_id, "run_id": binding.run_id,
                    "node_session_id": binding.node_session_id,
                    "plan_digest": json.loads(binding.plan_json)["digest"],
@@ -454,6 +489,14 @@ class CalibrationEvidenceStore:
                    "mount_digest": observation.roi.mount_digest,
                    "source_ids": [observation.roi.frame_id, *[f.source_id for f in observation.feedback]],
                    "raw_exported": False, "syncable": False, "hardware_accuracy_certified": False}
+        if isinstance(observation, PairedObservation):
+            summary.update(target_id=observation.target_id, stationary_epoch=observation.stationary_epoch,
+                           exclusions=list(observation.exclusions),
+                           camera_profiles={role: view.roi.profile.digest for role, view in (("fixed", observation.fixed), ("wrist", observation.wrist))},
+                           camera_mounts={role: view.roi.mount_digest for role, view in (("fixed", observation.fixed), ("wrist", observation.wrist))},
+                           source_ids=[observation.fixed.roi.frame_id, observation.wrist.roi.frame_id, *[f.source_id for f in observation.feedback]],
+                           skew_ms=abs(observation.fixed.roi.stamp.seconds - observation.wrist.roi.stamp.seconds) * 1000,
+                           hardware_synchronized=False)
         with self._lock:
             connection = self._holder.connection
             self._schema(connection)
@@ -535,9 +578,10 @@ class CalibrationEvidenceStore:
             if hashlib.sha256(raw).hexdigest() != row[0]:
                 raise ValueError("raw acquisition byte digest mismatch")
             content = decode_json(raw, MAX_RAW_BYTES)
-            if set(content) != {"schema", "observation", "profile", "binding"} or digest_of(content) != identity or content.get("schema") != SCHEMA:
+            if set(content) != {"schema", "observation", "profile", "binding"} or digest_of(content) != identity or content.get("schema") not in (SCHEMA, "leapflow.paired_acquisition.v1"):
                 raise ValueError("raw acquisition content digest/schema mismatch")
-            observation = SettledObservation.from_mapping(content["observation"])
+            observation = (PairedObservation.from_mapping(content["observation"]) if content["schema"] == "leapflow.paired_acquisition.v1"
+                           else SettledObservation.from_mapping(content["observation"]))
             data = content["binding"]
             proof = data["admission"]
             admission = RunAdmission(proof["mode"], proof["action_digest"], json.dumps(proof["permit"]) if proof["permit"] is not None else "")
@@ -658,8 +702,14 @@ class RecordedObservationSource:
             raise SkillError(FAILURE_CHECK_FAILED, "acquisition persistence is already in flight")
         observation = await self._source.capture()
         now = self._clock()
-        if observation.feedback[-1].last_receipt_s > now or now - observation.feedback[-1].first_receipt_s > self._profile.max_feedback_age_s:
-            raise SkillError(FAILURE_CHECK_FAILED, "capture aged out before private persistence")
+        # The age bound belongs to the admission that read the cohort, where the read
+        # clock exists; the source's own tail -- a metric ROI decoded in a worker thread,
+        # a busy node process -- is consumer latency, not decay, so a second opinion on
+        # age here would refuse evidence whose every receipt-relative bound already held.
+        # What a caller can still verify without re-judging age is that no receipt claims
+        # to be later than this clock.
+        if observation.feedback[-1].last_receipt_s > now:
+            raise SkillError(FAILURE_CHECK_FAILED, "capture carries a receipt ahead of the node clock; refuse private persistence")
         task = self._store.start_record(observation, profile=self._profile,
                                         binding=self._binding, ttl_s=self._ttl_s,
                                         quota_bytes=self._quota, on_commit=self._on_commit)

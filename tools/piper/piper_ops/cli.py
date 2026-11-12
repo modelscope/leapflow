@@ -51,6 +51,9 @@ def parser() -> argparse.ArgumentParser:
             for axis in "xyz":
                 item.add_argument(f"--d{axis}-mm", type=float, default=0.0)
             item.add_argument("--frame", choices=("base",), required=True)
+    item = command(arm, "joints", writing=True)
+    item.add_argument("--target", required=True, type=joint_target,
+                      help="Absolute j1..j6 target in degrees, comma separated")
     item = command(arm, "cycle", writing=True)
     item.add_argument("--dz-mm", type=float, default=200.0)
     item.add_argument("--cycles", type=int, default=5)
@@ -109,6 +112,13 @@ def parser() -> argparse.ArgumentParser:
     item = command(cal, "reload", writing=True)
     item.add_argument("--workcell", required=True)
     return root
+
+
+def joint_target(text: str) -> tuple[float, ...]:
+    values = tuple(float(value) for value in text.split(","))
+    if len(values) != 6:
+        raise argparse.ArgumentTypeError("a six-value j1..j6 target is required")
+    return values
 
 
 def approved(args: argparse.Namespace, settings: Settings, operation: str) -> dict[str, Any]:
@@ -231,13 +241,17 @@ async def hardware(args: argparse.Namespace, settings: Settings, evidence: Evide
             plan = motion.preview(session.context, start, settings, operation=operation,
                                   dx=getattr(args, "dx_mm", 0.0), dy=getattr(args, "dy_mm", 0.0),
                                   dz=getattr(args, "dz_mm", 0.0), width=getattr(args, "width_mm", None),
-                                  cycles=getattr(args, "cycles", 0), dwell_s=getattr(args, "dwell_s", 0.0))
+                                  cycles=getattr(args, "cycles", 0), dwell_s=getattr(args, "dwell_s", 0.0),
+                                  target=getattr(args, "target", None))
             return preview_result(plan)
         # The selected command arguments must still describe the approved artifact.
         delta = plan["delta_base_mm"]
         for axis in "xyz":
             if hasattr(args, f"d{axis}_mm") and getattr(args, f"d{axis}_mm") != delta[axis]:
                 raise Refusal("command displacement differs from approved preview")
+        if args.group == "arm" and args.operation == "joints":
+            if list(args.target) != list(plan.get("target_joints") or ()):
+                raise Refusal("joint target differs from approved preview")
         if args.group == "arm" and args.operation == "cycle":
             if args.cycles != plan.get("cycles") or args.dwell_s != plan.get("dwell_s"):
                 raise Refusal("cycle count or dwell differs from approved preview")

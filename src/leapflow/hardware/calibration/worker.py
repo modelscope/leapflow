@@ -152,6 +152,7 @@ class CalibrationWorker:
         writer: asyncio.StreamWriter | None = None
         acquired = False
         worker_used = False
+        answered = False
         try:
             # Copy bounded plain containers before suspension. Large JSON encoding,
             # hashing and response decoding run off the hardware event loop.
@@ -181,6 +182,11 @@ class CalibrationWorker:
             response = await self._response(reader, wire_request, start)
             if response["kind"] == "failure":
                 failure = response["failure"]
+                # A typed refusal is a computed result: the server answered inside its
+                # deadline and stays healthy. Reaping on it spent the single recovery
+                # launch on legitimate per-pair refusals, so a handful of uninformative
+                # pairs turned every later request into worker_unavailable.
+                answered = True
                 raise CalibrationFailure(failure["code"], failure["message"], retryable=False)
             return response["result"]
         except asyncio.CancelledError:
@@ -188,7 +194,7 @@ class CalibrationWorker:
                 await self._settle_reap()
             raise
         except (OSError, TimeoutError, ValueError, TypeError, asyncio.IncompleteReadError, CalibrationFailure) as error:
-            if worker_used:
+            if worker_used and not answered:
                 await self._settle_reap()
             if isinstance(error, CalibrationFailure):
                 raise

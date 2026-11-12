@@ -1,18 +1,43 @@
-"""Persistent-owner connection and exact-step production approval composition."""
+"""Persistent-owner connection and exact-step production approval composition.
+
+One invariant governs how a session ends: *a session that commanded the arm may
+only undo what it did*. Concretely, an exit never leaves the arm worse than the
+run left it -- a gravity-loaded arm is either still holding a verified posture or
+the evidence says otherwise and why.
+
+That invariant exists because the only stop this arm offers is a damped emergency
+stop, and on a Piper X that stop releases holding torque. Measured on this cell:
+a calibration run settled at ``z=249.62 mm``, the session then stopped it because
+the *verification* had failed, and two minutes later the arm was at
+``z=72.556 mm`` with the gripper resting on the table -- 177 mm of uncommanded
+descent that also put the tool below the workspace floor, which then refuses
+every later plan. So a failed verdict is not a motion hazard: every write settled
+and the arm is standing still. A stop is owed only when this run cannot say what
+it did to the arm -- an effect that did not land cleanly, an unknown or halted
+run, a device fault, a cancellation (``Session._stop_owed``).
+"""
 from __future__ import annotations
 
 import asyncio
 import sys
 import time
 import uuid
-from dataclasses import replace
-from typing import Any, Coroutine, TypeVar
+from dataclasses import dataclass, replace
+from typing import Any, Coroutine, Mapping, TypeVar
 
 from leapflow.engine.recovery.failure_envelope import SideEffectState
+from leapflow.hardware.arm_status import ARM_STATUS_EMERGENCY_STOP, ARM_STATUS_NORMAL
 from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.context import HardwareContext, TransportRef
+from leapflow.hardware.drivers._piper_motion import CTRL_MODE_CAN, CTRL_MODE_TEACH, ctrl_mode_name
 from leapflow.hardware.lhp.client import SocketLhpClient
 from leapflow.hardware.lhp.permit import PermitIssuer
+from leapflow.hardware.skills.protocol import (
+    FAILURE_DEVICE_FAULT,
+    FAILURE_INTERNAL_DEFECT,
+    SIDE_EFFECT_UNKNOWN,
+    STATUS_HALTED,
+)
 from leapflow.hardware.attestation import declaration_digest
 from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
 from leapflow.hardware.risk import build_risk_classifier
@@ -92,6 +117,54 @@ async def complete_cleanup(operation: Coroutine[Any, Any, T]) -> T:
     return result
 
 
+POSTURE_HELD = "held"
+POSTURE_UNHELD = "unheld"
+POSTURE_UNVERIFIED = "unverified"
+
+STOP_FAILURE_CODES = frozenset({FAILURE_DEVICE_FAULT, FAILURE_INTERNAL_DEFECT})
+"""Failures that mean the arm, not the goal, went wrong: a stop is owed for these."""
+
+
+def outcome_requires_stop(result: Mapping[str, Any]) -> bool:
+    """Whether a finished operation's own verdict calls for a stop.
+
+    Mirrors the node's own rule (``skills.runs.needs_halt``): only a run that could
+    not finish, an unknown effect, or a device fault. A calibration that measured
+    out of tolerance is a *result* -- its writes settled and the arm is standing
+    still -- so stopping it would only release the posture it was holding.
+    """
+    if str(result.get("side_effect_state") or SIDE_EFFECT_UNKNOWN) == SIDE_EFFECT_UNKNOWN:
+        return True
+    if str(result.get("status") or "") == STATUS_HALTED:
+        return True
+    return result.get("failure_code") in STOP_FAILURE_CODES
+
+
+@dataclass(frozen=True)
+class Posture:
+    """Whether the arm holds the posture it is in, from qualified samples.
+
+    ``held`` needs all four at once: every drive enabled, CAN control selected, a
+    normal status word, and an unchanged joint vector between samples. Enable flags
+    keep reading true across an emergency stop and the status word recovers, so the
+    unchanged joint vector is the only part that cannot be reported while the arm
+    is drooping.
+    """
+
+    state: str
+    detail: str
+    joints: tuple[float, ...] = ()
+    moved_deg: float = 0.0
+    ctrl_mode: int = 0
+    enabled: bool = False
+    arm_status: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"state": self.state, "detail": self.detail, "joints": list(self.joints),
+                "moved_deg": self.moved_deg, "ctrl_mode": self.ctrl_mode,
+                "enabled": self.enabled, "arm_status": self.arm_status}
+
+
 class Session:
     """One operational run; never creates or closes the node's SDK link."""
 
@@ -104,6 +177,11 @@ class Session:
         self.tools: HardwareTools | None = None
         self.touched = False
         self.success = False
+        self.stop_required = False
+        """The operation's own verdict demands a halt (unknown effect, halted run, fault)."""
+        self.leave_unheld = False
+        """The operator asked for a released arm (``arm stop``/``arm disable``)."""
+        self._halt_delivered = False
         self.context: HardwareContext | None = None
         self.listing: dict[str, Any] = {}
         self._context_token = None
@@ -271,25 +349,111 @@ class Session:
         if result.get("ok") is not True:
             raise Refusal("stop delivery unconfirmed; use the physical emergency stop",
                           state=SideEffectState.UNKNOWN)
+        self._halt_delivered = True
+
+    async def posture(self) -> Posture:
+        """Judge from two qualified samples whether the arm holds its posture.
+
+        ``held`` needs all four at once: every drive enabled, CAN control selected, a
+        normal status word, and an unchanged joint vector between the samples. Enable
+        flags keep reading true across an emergency stop and the status word recovers
+        by itself, so the joint vector is the part a drooping arm cannot satisfy.
+        Unreadable feedback is ``unverified``: never evidence of a hold, and never a
+        reason to write.
+        """
+        try:
+            previous = await self.snapshot(requalify=True)
+            await asyncio.sleep(self.settings.poll_s)
+            later = await self.snapshot(requalify=True)
+        except Exception as error:  # noqa: BLE001 - cleanup reports, a read never raises here
+            return Posture(POSTURE_UNVERIFIED, f"{type(error).__name__}: {error}")
+        moved = max(abs(a - b) for a, b in zip(previous.joints, later.joints))
+        ctrl_mode = int(later.status.get("ctrl_mode", -1))
+        arm_status = int(later.status.get("arm_status", -1))
+        if not later.enabled:
+            problem = "not every drive reports enabled"
+        elif ctrl_mode != CTRL_MODE_CAN:
+            problem = f"it is not in CAN control ({ctrl_mode_name(ctrl_mode) or ctrl_mode})"
+        elif arm_status != ARM_STATUS_NORMAL:
+            problem = f"its status word is not normal ({arm_status})"
+        elif moved > self.settings.posture_still_deg:
+            problem = f"it is still moving ({moved:.3f} deg between samples)"
+        else:
+            problem = ""
+        return Posture(POSTURE_UNHELD if problem else POSTURE_HELD, problem or "it holds its posture",
+                       joints=tuple(later.joints), moved_deg=round(moved, 4), ctrl_mode=ctrl_mode,
+                       enabled=bool(later.enabled), arm_status=arm_status)
+
+    def _stop_owed(self, exc: BaseException | None) -> bool:
+        """Whether this run's own verdict requires a stop before the session ends.
+
+        A failure that never reached the arm -- a preflight refusal, a preview that
+        did not match, a declaration that changed -- leaves the arm exactly where the
+        last settled command did, so stopping here would only release the posture the
+        arm is holding. That is how a failed *verification* dropped this arm 177 mm.
+        """
+        if self.stop_required:
+            return True
+        if exc is None:
+            return False
+        if isinstance(exc, Refusal):
+            return exc.envelope.side_effect_state != SideEffectState.NONE
+        return True  # cancellation, a read or a defect: none of them say where the arm is
+
+    async def _settle_posture(self, exc: BaseException | None) -> bool:
+        """Leave the arm holding, or say why it is not: the end-of-session invariant.
+
+        Returns whether the arm was left verifiably holding, which is what the exit
+        needs to know before it decides a close failure still owes a physical halt.
+        """
+        own_stop = self._stop_owed(exc)
+        if own_stop:
+            await self.stop()
+        before = await self.posture()
+        self.evidence.record("posture_check", own_stop=own_stop, success=self.success, **before.to_dict())
+        if before.state == POSTURE_HELD:
+            return True
+        if before.state == POSTURE_UNVERIFIED:
+            reason = "feedback is unreadable; inspect hardware before any recovery command"
+            self.evidence.observe_effect(SideEffectState.UNKNOWN)
+        elif before.ctrl_mode == CTRL_MODE_TEACH:
+            reason = "teach mode belongs to the operator; do not re-energize automatically"
+        elif before.arm_status == ARM_STATUS_EMERGENCY_STOP and not own_stop:
+            reason = "an operator stop this session did not engage must not be reset"
+        else:
+            reason = "inspect the arm, then preview and approve a separate governed arm enable"
+        self.success = False
+        self.evidence.record("posture_unresolved", before=before.to_dict(),
+                             operational_complete=False, next_step=reason)
+        print("The arm is not holding its posture after this run; " + reason + ".", file=sys.stderr)
+        return False
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         cleanup_error: BaseException | None = None
-        halt_required = self.execute and self.touched
-        halt_attempted = halt_required and (exc is not None or not self.success)
+        commands_arm = self.execute and self.touched and not self.leave_unheld
+        settled = False
         try:
-            if halt_attempted:
-                await complete_cleanup(self.stop())
+            if commands_arm:
+                settled = await complete_cleanup(self._settle_posture(exc))
+                if not settled and exc is None:
+                    cleanup_error = Refusal("holding unconfirmed; inspect hardware before continuing")
         except (Exception, asyncio.CancelledError) as error:
             cleanup_error = error
-            print("Damped halt unconfirmed: use the physical emergency stop and inspect.", file=sys.stderr)
+            self.success = False
+            self.evidence.observe_effect(SideEffectState.UNKNOWN)
+            self._record_cleanup_event("posture_unresolved", operational_complete=False,
+                                       next_step="inspect hardware before any recovery command")
+            print("Posture settlement unconfirmed: inspect the arm before continuing.", file=sys.stderr)
         finally:
             try:
                 await self._close()
             except (Exception, asyncio.CancelledError) as error:
                 cleanup_error = cleanup_error or error
-                if halt_required and not halt_attempted:
-                    # Closing may already have disposed the original connection.
-                    # A fresh read-only client can request the production safety halt.
+                # Closing may already have disposed the original connection, and a fresh
+                # read-only client can request the production safety halt. Only an arm
+                # this exit could not confirm as holding still owes that halt: a settled
+                # arm that merely failed to close must not be dropped by it.
+                if commands_arm and not settled and not self._halt_delivered:
                     try:
                         await complete_cleanup(self._halt_with_fresh_client())
                     except (Exception, asyncio.CancelledError) as halt_error:
@@ -297,12 +461,14 @@ class Session:
                         print("Close-failure halt unconfirmed: use the physical emergency stop and inspect.",
                               file=sys.stderr)
         if cleanup_error is not None:
-            if halt_required:
+            self.success = False
+            if commands_arm and not isinstance(cleanup_error, Refusal):
                 self.evidence.observe_effect(SideEffectState.UNKNOWN)
             self._record_cleanup_error(cleanup_error)
             if exc is None:
-                raise Refusal("cleanup unconfirmed; inspect hardware before continuing",
-                              state=SideEffectState.UNKNOWN) from cleanup_error
+                failure = Refusal("cleanup unconfirmed; inspect hardware before continuing")
+                failure.envelope = self.evidence.failure_envelope(failure)
+                raise failure from cleanup_error
         if isinstance(exc, Refusal):
             exc.envelope = self.evidence.failure_envelope(exc)
 
@@ -311,11 +477,15 @@ class Session:
         async with Session(self.settings, self.evidence) as safety:
             await safety.stop()
 
-    def _record_cleanup_error(self, error: BaseException) -> None:
+    def _record_cleanup_event(self, event: str, **details: Any) -> None:
+        """An unavailable audit sink must not replace the original run failure."""
         try:
-            self.evidence.record("cleanup_failure", failure_class=type(error).__name__)
+            self.evidence.record(event, **details)
         except OSError:
             print("Cleanup evidence unavailable; preserve the run and inspect.", file=sys.stderr)
+
+    def _record_cleanup_error(self, error: BaseException) -> None:
+        self._record_cleanup_event("cleanup_failure", failure_class=type(error).__name__)
 
     async def _close(self) -> None:
         try:

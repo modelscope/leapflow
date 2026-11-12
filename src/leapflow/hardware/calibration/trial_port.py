@@ -66,6 +66,8 @@ class WorkcellTrial:
             "workcell_digest": digest_of(ctx.workcell.to_dict()),
             "node_session_id": collection._node_session,
             "worker_budgets": vars(worker.budgets),
+            "acceptance_reachability": policy.evaluation.reachability(
+                (policy.solve.translation_sigma_m,) * 3 + (policy.solve.rotation_sigma_rad,)),
             "node_id": keys[1],
             "key_ids": sorted(keys[0]),
             "commands": [],

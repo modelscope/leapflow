@@ -119,6 +119,23 @@ async def pose_owner(stationary_owner, tmp_path: Path, monkeypatch: pytest.Monke
     yield registry, cache, sensor, runtime, server, issuer, declaration, policy, transport
 
 
+@pytest.mark.parametrize("bound", ["sensing_mm", "timing_mm", "uncertainty_mm", "arrival_mm"])
+def test_understated_whole_link_inflation_is_not_a_quality_advisory(bound):
+    from leapcalib.contracts.identity import digest_of
+    from leapcalib.geometry.se3 import Transform
+    from leapflow.hardware.calibration.physical_model import PhysicalModel
+
+    chain = DhChain((DhLink(100, 0, 0, 0),))
+    model = PhysicalModel(chain, (0,), Transform.identity(), digest_of(chain.to_dict()), "dependency", "certificate")
+    geometry = SafetyGeometry((25, 25), WorkspaceBox(-1000, 1000, -1000, 1000, -1000, 1000),
+                              (), "software-geometry", 100, 100, 100, 100)
+    policy = PoseCollectionPolicy("a" * 64, MountIdentity("wrist", "flange"), geometry, (0.01,), 10, "b" * 64)
+    assert policy.validate_model(model, profile(), fk_mm=1, fk_deg=1) == ()
+    understated = replace(policy, geometry=replace(geometry, **{bound: 0}))
+    with pytest.raises(ValueError, match="whole-link uncertainty understates"):
+        understated.validate_model(model, profile(), fk_mm=1, fk_deg=1)
+
+
 def poses_args(count: int = 3):
     return {
         "region": [2, 1, 8, 8],
@@ -171,9 +188,7 @@ async def test_real_lhp_pose_acquisition_is_one_shot_leased_disjoint_and_no_retu
     assert "outcome" in replay and replay["outcome"]["status"] != "succeeded"
 
 
-@pytest.mark.parametrize(
-    "problem", ["speed", "count", "joints", "campaign", "l1", "start", "mount"]
-)
+@pytest.mark.parametrize("problem", ["speed", "count", "joints", "mount"])
 async def test_pose_envelope_refusals_before_any_write(
     pose_owner, problem: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -185,12 +200,6 @@ async def test_pose_envelope_refusals_before_any_write(
         args = poses_args(9)
     elif problem == "joints":
         args["poses"][0].pop(JOINTS[1])
-    elif problem == "campaign":
-        args["poses"][-1][JOINTS[0]] = 6
-    elif problem == "l1":
-        args["poses"] = [{**dict.fromkeys(JOINTS, 0), JOINTS[0]: v} for v in [2.5, -2.5, 2.5, -2.5]]
-    elif problem == "start":
-        transport._values["arm.speed_pct"] = 20
     elif problem == "mount":
         sensor.defect = "mount_digest"
     before = list(transport._write_log)
@@ -199,6 +208,39 @@ async def test_pose_envelope_refusals_before_any_write(
     )
     assert "outcome" in result, result
     assert result["outcome"]["status"] != "succeeded"
+    assert transport._write_log == before
+
+
+@pytest.mark.parametrize("problem", ["campaign", "l1", "stale_speed"])
+async def test_pose_envelope_misses_are_reported_not_refused(
+    pose_owner, problem: str
+) -> None:
+    """One oversized move or a stale speed register is an advisory, not a failed run."""
+    _, _, _, _, server, _, _, _, transport = pose_owner
+    args = poses_args()
+    if problem == "campaign":
+        args["poses"][-1][JOINTS[0]] = 6
+    elif problem == "l1":
+        args["poses"] = [{**dict.fromkeys(JOINTS, 0), JOINTS[0]: v} for v in [2.5, -2.5, 2.5, -2.5]]
+    else:
+        transport._values["arm.speed_pct"] = 20
+    before = list(transport._write_log)
+    result = await request(
+        server, "skill.plan", workcell=WORKCELL_ID, skill="calib.collect_poses", args=args
+    )
+    assert "plan" in result, result
+    advisories = result["plan"]["basis"]["poses"]["advisories"]
+    assert any(
+        phrase in note
+        for note in advisories
+        for phrase in (
+            "campaign joint envelope",
+            "campaign translation envelope",
+            "run travel",
+            "run joint L1",
+            "live speed register",
+        )
+    ), advisories
     assert transport._write_log == before
 
 
@@ -238,13 +280,15 @@ async def test_cancel_after_first_motion_prevents_remaining_moves(
     "field,value",
     [
         ("speed_pct_max", 11),
-        ("max_moves", 9),
-        ("max_travel_mm", 41),
-        ("campaign_joint_deg", 6),
-        ("max_duration_s", 121),
+        ("max_moves", 17),
+        ("max_travel_mm", 2001),
+        ("campaign_joint_deg", 31),
+        ("campaign_translation_mm", 501),
+        ("campaign_yaw_deg", 61),
+        ("max_duration_s", 1801),
     ],
 )
-def test_motion_policy_caps_cannot_be_widened(field, value) -> None:
+def test_motion_policy_ceiling_cannot_be_exceeded(field, value) -> None:
     geometry = SafetyGeometry(
         (1, 1), WorkspaceBox(-1000, 1000, -1000, 1000, -1000, 1000), (), "test", 1, 1, 1, 1
     )
@@ -253,6 +297,26 @@ def test_motion_policy_caps_cannot_be_widened(field, value) -> None:
     )
     with pytest.raises(ValueError):
         replace(policy, **{field: value})
+
+
+def test_motion_policy_accepts_a_declared_larger_campaign() -> None:
+    geometry = SafetyGeometry(
+        (1, 1), WorkspaceBox(-1000, 1000, -1000, 1000, -1000, 1000), (), "test", 1, 1, 1, 1
+    )
+    policy = PoseCollectionPolicy(
+        "a" * 64, MountIdentity("wrist", "flange"), geometry, (0.1,), 1, "b" * 64
+    )
+    wider = replace(
+        policy,
+        campaign_translation_mm=200,
+        campaign_yaw_deg=30,
+        campaign_joint_deg=20,
+        max_travel_mm=1200,
+        max_joint_l1_deg=90,
+        max_moves=8,
+        max_duration_s=600,
+    )
+    assert wider.to_dict()["campaign_joint_deg"] == 20
 
 
 def test_workcell_motion_policy_is_optional_and_roundtrips() -> None:

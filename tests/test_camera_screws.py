@@ -22,6 +22,7 @@ that cannot swing about the base axis.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import time
 from pathlib import Path
@@ -33,6 +34,7 @@ import pytest
 from leapflow.hardware.skills import vision as vision_module
 from leapflow.hardware.skills.builtin.camera_calibration import (
     METHOD_SCREW,
+    Screws,
     skills as camera_skills,
 )
 from leapflow.hardware.skills.frames import FrameGraph
@@ -509,6 +511,52 @@ async def test_screws_averages_several_frames_per_still(
     assert outcome.ok, outcome
     assert outcome.result["frames"] == 3 and outcome.result["captures"] == 7
     assert sim.captures == 21
+
+
+async def test_screws_solves_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The solve is seconds of numpy, and on the loop it starves the whole node.
+
+    A blocked loop also stops the node's lease watchdog from running, so the host
+    reads a live run as unreadable and the deadman halts the arm -- losing a
+    measurement whose stills had already been captured. The solve must wait in a
+    worker, so keep a heartbeat ticking across it.
+    """
+    runtime, _sim = _cell(tmp_path, monkeypatch)
+    solve = Screws._measure
+    window: dict[str, float] = {}
+
+    def slow_solve(
+        self: Screws, plan: SkillPlan, shots: Mapping[Any, Any], moves: Sequence[Any]
+    ) -> Any:
+        window["start"] = time.monotonic()
+        try:
+            time.sleep(0.4)  # stands in for the solve, on whichever thread calls it
+            return solve(self, plan, shots, moves)
+        finally:
+            window["end"] = time.monotonic()
+
+    monkeypatch.setattr(Screws, "_measure", slow_solve)
+    ticks: list[float] = []
+
+    async def heartbeat() -> None:
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.02)
+
+    beat = asyncio.create_task(heartbeat())
+    await asyncio.sleep(0.05)  # the loop is already ticking when the solve starts
+    try:
+        outcome = await _run(runtime, FAST)
+    finally:
+        beat.cancel()
+    assert outcome.ok, outcome
+    start, end = window["start"], window["end"]
+    assert any(tick < start for tick in ticks), "the heartbeat never started"
+    assert [tick for tick in ticks if start < tick < end], (
+        f"the loop served nothing during the {end - start:.1f}s solve"
+    )
 
 
 async def test_screws_accepts_a_mount_it_is_given(

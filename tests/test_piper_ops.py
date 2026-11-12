@@ -20,13 +20,16 @@ from leapflow.hardware.lhp.server import LhpNodeServer
 from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
 from leapflow.hardware.transports import lhp as lhp_transport
 from leapflow.hardware.drivers._piper_feedback import CAN_GROUPS, _FAULT_FLAGS
+from leapflow.hardware.drivers._piper_motion import CTRL_MODE_CAN, CTRL_MODE_TEACH
+from leapflow.hardware.arm_status import ARM_STATUS_EMERGENCY_STOP
 from leapflow.hardware.skills.kinematics import DhChain
 from leapflow.security.actions import ActionDescriptor
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest
 from piper_ops import calibration, cli, health, layout, lifecycle, motion, node, session as session_module
 from piper_ops.config import Settings
 from piper_ops.evidence import Evidence, Refusal, encode
-from piper_ops.session import ScopedConsent, Session, unverified_digest
+from piper_ops.session import (POSTURE_HELD, POSTURE_UNHELD, POSTURE_UNVERIFIED, Posture,
+                               ScopedConsent, Session, unverified_digest)
 from leapflow.tools.execution_context import ToolExecutionContext, current_tool_context, set_tool_context
 
 pytestmark = pytest.mark.component
@@ -262,6 +265,29 @@ def test_cycle_refuses_unsafe_requests(settings, changes, match):
         motion.preview(context(), snapshot(), settings, operation="cycle", **changes)
 
 
+def test_joint_space_return_is_stepped_and_swept(settings):
+    start = snapshot()
+    goal = (5., 70., -70., 25., -40., -100.)
+    plan = motion.preview(context(), start, settings, operation="joints", target=goal)
+    rows = [r for r in plan["steps"] if r.get("joint_space")]
+    assert rows and rows[-1]["joints"] == pytest.approx(goal)
+    assert rows[-1]["commands"] == tuple(zip(health.JOINTS, rows[-1]["joints"]))
+    previous = start.joints
+    for row in rows:
+        assert max(abs(a - b) for a, b in zip(previous, row["joints"])) <= settings.joint_step_deg
+        previous = row["joints"]
+    assert len(plan["initialization_sweep"]) >= 20, "sweep samples at most one degree apart"
+    assert plan["target_joints"] == goal
+    with pytest.raises(Refusal, match="conservative"):
+        motion.preview(context(), start, settings, operation="joints", target=(0., 80., 5., 20., -40., -100.))
+    with pytest.raises(Refusal, match="equals"):
+        motion.preview(context(), start, settings, operation="joints", target=start.joints)
+    args = cli.parser().parse_args(["arm", "joints", "--target", "5,70,-70,25,-40,-100"])
+    assert args.target == goal
+    with pytest.raises(SystemExit):
+        cli.parser().parse_args(["arm", "joints", "--target", "1,2,3"])
+
+
 def test_bind_steps_skips_dwell(settings, tmp_path):
     plan = motion.preview(context(), snapshot(), settings, operation="cycle", dz=20., cycles=2, dwell_s=1.)
     run = Session(settings, Evidence(tmp_path / "bind-cycle.json"))
@@ -431,19 +457,205 @@ async def test_requalification_deadline_is_a_hard_stop(settings, tmp_path):
     assert caught.value.envelope.side_effect_state == SideEffectState.UNKNOWN
 
 
-async def test_session_failure_halts_once_success_stays_enabled(settings, tmp_path, monkeypatch):
-    for successful in (False, True):
-        run = Session(settings, Evidence(tmp_path / f"exit-{successful}.json"), execute=True)
-        run.touched, run.success = True, successful
+def posture(state=POSTURE_HELD, **fields):
+    """One posture verdict; the arm is only ever described by two qualified samples."""
+    base = dict(detail="it holds its posture", joints=(0.,) * 6, ctrl_mode=CTRL_MODE_CAN,
+                enabled=True, arm_status=0)
+    return Posture(state, **{**base, **fields})
+
+
+async def test_session_stops_only_when_it_cannot_say_what_it_did(settings, tmp_path, monkeypatch):
+    """A failed verdict is a result; a stop is owed only for an effect this run cannot vouch for."""
+    for case, stopped in (("settled", False), ("unknown", True), ("halted", True)):
+        run = Session(settings, Evidence(tmp_path / f"exit-{case}.json"), execute=True)
+        run.touched, run.success = True, case == "settled"
+        run.stop_required = case == "halted"
         calls = []
         async def stop():
             calls.append("stop")
         async def close():
             calls.append("close")
+        async def sample():
+            return posture(POSTURE_UNHELD, detail="unqualified fixture", enabled=False)
         monkeypatch.setattr(run, "stop", stop)
         monkeypatch.setattr(run, "_close", close)
+        monkeypatch.setattr(run, "posture", sample)
+        error = Refusal("run failed", state=SideEffectState.UNKNOWN) if case == "unknown" else None
+        if error is None:
+            with pytest.raises(Refusal, match="cleanup unconfirmed"):
+                await run.__aexit__(None, None, None)
+        else:
+            await run.__aexit__(type(error), error, None)
+        assert calls == (["stop", "close"] if stopped else ["close"])
+        assert run.evidence.events[0]["event"] == "posture_check"
+        assert run.evidence.events[0]["own_stop"] is stopped
+
+
+async def test_a_settled_failure_is_never_stopped(settings, tmp_path, monkeypatch):
+    """Every write settled and the arm stands still: a stop here is what dropped it 177 mm."""
+    run = Session(settings, Evidence(tmp_path / "settled-failure.json"), execute=True)
+    run.touched = True
+    calls = []
+    async def stop():
+        calls.append("stop")
+    async def close():
+        calls.append("close")
+    async def sample():
+        return posture()
+    monkeypatch.setattr(run, "stop", stop)
+    monkeypatch.setattr(run, "_close", close)
+    monkeypatch.setattr(run, "posture", sample)
+    await run.__aexit__(None, None, None)
+    assert calls == ["close"]
+    assert [row["event"] for row in run.evidence.events] == ["posture_check"]
+
+
+async def test_a_released_arm_is_not_re_energized_without_separate_approval(settings, tmp_path, monkeypatch):
+    """An uncertain stop never manufactures authority to restart a gravity-loaded arm."""
+    run = Session(settings, Evidence(tmp_path / "arrest.json"), execute=True)
+    run.touched = True
+    states = [posture(POSTURE_UNHELD, detail="not every drive reports enabled", enabled=False,
+                      moved_deg=1.5), posture()]
+    calls, writes = [], []
+    async def stop():
+        calls.append("stop")
+    async def close():
+        calls.append("close")
+    async def sample():
+        return states.pop(0)
+    async def configure(**params):
+        writes.append(params)
+        return {"ok": True, "side_effect_state": "committed"}
+    run.tools = SimpleNamespace(hw_configure=configure)
+    run.consent = SimpleNamespace(expected=(), fail_safe=False)
+    monkeypatch.setattr(run, "stop", stop)
+    monkeypatch.setattr(run, "_close", close)
+    monkeypatch.setattr(run, "posture", sample)
+    error = Refusal("dispatch outcome unknown", state=SideEffectState.UNKNOWN)
+    await run.__aexit__(Refusal, error, None)
+    assert calls == ["stop", "close"]
+    assert writes == []
+    assert run.consent.expected == ()
+    assert run.consent.fail_safe is False
+    assert [row["event"] for row in run.evidence.events] == ["posture_check", "posture_unresolved"]
+    assert run.evidence.events[-1]["operational_complete"] is False
+    assert error.envelope.side_effect_state == SideEffectState.UNKNOWN
+
+
+async def test_unreadable_holding_is_unsuccessful_unknown_and_never_enables(settings, tmp_path, monkeypatch):
+    run = Session(settings, Evidence(tmp_path / "unreadable-holding.json"), execute=True)
+    run.touched, run.success = True, True
+    writes = []
+
+    async def configure(**params):
+        writes.append(params)
+
+    async def sample():
+        return posture(POSTURE_UNVERIFIED, detail="feedback timed out")
+
+    run.tools = SimpleNamespace(hw_configure=configure)
+    monkeypatch.setattr(run, "_close", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(run, "posture", sample)
+    with pytest.raises(Refusal, match="cleanup unconfirmed") as error:
         await run.__aexit__(None, None, None)
-        assert calls == (["close"] if successful else ["stop", "close"])
+    assert not run.success and not writes
+    assert error.value.envelope.side_effect_state == SideEffectState.UNKNOWN
+    unresolved = next(row for row in run.evidence.events if row["event"] == "posture_unresolved")
+    assert unresolved["operational_complete"] is False
+
+
+@pytest.mark.parametrize("original_failure", [False, True])
+async def test_posture_reader_exception_keeps_failure_and_marks_unsuccessful(
+        settings, tmp_path, monkeypatch, original_failure):
+    run = Session(settings, Evidence(tmp_path / "posture-error.json"), execute=True)
+    run.touched = run.success = True
+    writes = []
+
+    async def sample():
+        raise OSError("feedback unavailable")
+
+    monkeypatch.setattr(run, "posture", sample)
+    monkeypatch.setattr(run, "_close", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(run, "stop", lambda: asyncio.sleep(0))
+    run.tools = SimpleNamespace(hw_configure=lambda **params: writes.append(params))
+    original = Refusal("original failure", state=SideEffectState.UNKNOWN) if original_failure else None
+    if original is None:
+        with pytest.raises(Refusal, match="cleanup unconfirmed") as failure:
+            await run.__aexit__(None, None, None)
+        assert failure.value.envelope.side_effect_state == SideEffectState.UNKNOWN
+    else:
+        await run.__aexit__(Refusal, original, None)
+        assert str(original) == "original failure"
+        assert original.envelope.side_effect_state == SideEffectState.UNKNOWN
+    assert run.success is False and not writes
+    assert any(row["event"] == "posture_unresolved" and not row["operational_complete"]
+               for row in run.evidence.events)
+
+
+async def test_teach_mode_is_left_in_the_operators_hands(settings, tmp_path, monkeypatch):
+    """An arm an operator is posturing by hand is not re-energized by a session exit."""
+    run = Session(settings, Evidence(tmp_path / "teach.json"), execute=True)
+    run.touched, run.success = True, True
+    writes = []
+    async def configure(**params):
+        writes.append(params)
+        return {"ok": True}
+    async def sample():
+        return posture(POSTURE_UNHELD, detail="it is not in CAN control (teach)",
+                       ctrl_mode=CTRL_MODE_TEACH, enabled=False)
+    run.tools = SimpleNamespace(hw_configure=configure)
+    run.consent = SimpleNamespace(expected=(), fail_safe=False)
+    monkeypatch.setattr(run, "_close", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(run, "posture", sample)
+    with pytest.raises(Refusal, match="cleanup unconfirmed"):
+        await run.__aexit__(None, None, None)
+    assert writes == []
+    assert run.success is False
+    unresolved = next(row for row in run.evidence.events if row["event"] == "posture_unresolved")
+    assert unresolved["operational_complete"] is False
+    assert "operator" in unresolved["next_step"]
+
+
+async def test_a_latch_this_session_did_not_engage_is_never_reset(settings, tmp_path, monkeypatch):
+    run = Session(settings, Evidence(tmp_path / "foreign-latch.json"), execute=True)
+    run.touched, run.success = True, True
+    writes = []
+    async def configure(**params):
+        writes.append(params)
+        return {"ok": True}
+    async def sample():
+        return posture(POSTURE_UNHELD, detail="its status word is not normal (1)",
+                       arm_status=ARM_STATUS_EMERGENCY_STOP)
+    run.tools = SimpleNamespace(hw_configure=configure)
+    run.consent = SimpleNamespace(expected=(), fail_safe=False)
+    monkeypatch.setattr(run, "_close", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(run, "posture", sample)
+    with pytest.raises(Refusal, match="cleanup unconfirmed"):
+        await run.__aexit__(None, None, None)
+    assert writes == []
+    unresolved = next(row for row in run.evidence.events if row["event"] == "posture_unresolved")
+    assert "did not engage" in unresolved["next_step"]
+
+
+async def test_an_operator_release_is_not_re_held_at_exit(settings, tmp_path, monkeypatch):
+    """`arm stop` asks for a released arm; the exit must not undo the request."""
+    run = Session(settings, Evidence(tmp_path / "release.json"), execute=True)
+    run.context = context()
+    async def estop(**kwargs):
+        return {"ok": True}
+    run.tools = SimpleNamespace(hw_estop=estop)
+    await lifecycle.execute(run, await lifecycle.preview(run, "stop"))
+    run.touched = True
+    assert run.leave_unheld is True
+    calls = []
+    async def close():
+        calls.append("close")
+    async def sample():
+        raise AssertionError("a released arm is not judged or re-held")
+    monkeypatch.setattr(run, "_close", close)
+    monkeypatch.setattr(run, "posture", sample)
+    await run.__aexit__(None, None, None)
+    assert calls == ["close"]
 
 
 async def test_cleanup_does_not_replace_original_failure(settings, tmp_path, monkeypatch):
@@ -458,6 +670,38 @@ async def test_cleanup_does_not_replace_original_failure(settings, tmp_path, mon
     error = Refusal("original", state=SideEffectState.UNKNOWN)
     await run.__aexit__(Refusal, error, None)
     assert str(error) == "original"
+
+
+@pytest.mark.parametrize("original_failure", [False, True])
+async def test_cleanup_audit_failure_preserves_original_and_closes(
+        settings, tmp_path, monkeypatch, original_failure):
+    run = Session(settings, Evidence(tmp_path / "audit-failure.json"), execute=True)
+    run.touched = run.success = True
+    calls = []
+
+    async def sample():
+        return posture(POSTURE_HELD)
+
+    async def close():
+        calls.append("close")
+
+    def unavailable(*args, **kwargs):
+        raise OSError("offline audit sink unavailable")
+
+    monkeypatch.setattr(run, "posture", sample)
+    monkeypatch.setattr(run, "_close", close)
+    monkeypatch.setattr(run, "stop", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(run.evidence, "record", unavailable)
+    original = Refusal("original failure", state=SideEffectState.UNKNOWN) if original_failure else None
+    if original is None:
+        with pytest.raises(Refusal, match="cleanup unconfirmed") as failure:
+            await run.__aexit__(None, None, None)
+        assert failure.value.envelope.side_effect_state == SideEffectState.UNKNOWN
+    else:
+        await run.__aexit__(Refusal, original, None)
+        assert str(original) == "original failure"
+        assert original.envelope.side_effect_state == SideEffectState.UNKNOWN
+    assert calls == ["close"] and not run.success
 
 
 async def test_exact_request_consent_is_consumed(settings, tmp_path):
@@ -889,11 +1133,13 @@ async def test_real_governed_transport_failure_preserves_effect_and_halts(govern
             await run.command("speed", (("arm.speed_pct", 10.),), configure=True)
     command = next(row for row in run.evidence.events if row["event"] == "speed")
     assert command["result"]["side_effect_state"] == fixture.effect
-    # A refused write stays NONE in its own result; the delivered safety halt is a run effect.
-    expected = "committed" if fixture.effect == "none" else fixture.effect
-    assert failure.value.envelope.side_effect_state == SideEffectState(expected)
+    # A write that never landed leaves the arm standing: no stop is owed, and the exit
+    # verifies the posture instead of releasing it. Every other verdict halts.
+    stopped = fixture.effect != "none"
+    assert failure.value.envelope.side_effect_state.value == fixture.effect
     assert fixture.transport.write_attempts("arm.speed_pct") == 1
-    assert sum(method == "halt" for method, _ in fixture.requests) == 1
+    assert sum(method == "halt" for method, _ in fixture.requests) == int(stopped)
+    assert next(row for row in run.evidence.events if row["event"] == "posture_check")["own_stop"] is stopped
 
 
 @pytest.mark.parametrize("summary,report_write_fails", [(False, False), (True, False), (True, True)])
@@ -946,12 +1192,22 @@ def test_cli_mode_loss_after_committed_writes_never_reports_none(
     assert "ctrl_mode=0" in failure["message"]
     expected = (("arm.speed_pct", configured.speed_pct), ("arm.enable", 1),
                 *tuple(zip(health.JOINTS, plan["origin_joints"])))
+    # A lost mode does not authorize an unpreviewed enable at session exit.
     assert fixture.transport.write_log == expected
-    assert fixture.transport.halt_calls == 1
+    assert fixture.transport.halt_calls == 0
     events = [json.loads(line) for line in report_path.with_suffix(".events.ndjson").read_text().splitlines()]
     assert [row["result"]["side_effect_state"] for row in events
             if row["event"] in ("speed", "enable", "initialize")] == ["committed"] * 3
-    assert events[-1]["event"] == "damped_stop" and events[-1]["result"]["ok"] is True
+    names = [row["event"] for row in events]
+    assert "damped_stop" not in names
+    assert names.index("posture_check") < names.index("posture_unresolved")
+    check = next(row for row in events if row["event"] == "posture_check")
+    assert check["own_stop"] is False and check["state"] == "unheld"
+    assert check["ctrl_mode"] == 0
+    unresolved = next(row for row in events if row["event"] == "posture_unresolved")
+    assert unresolved["operational_complete"] is False
+    assert "approve a separate" in unresolved["next_step"]
+    assert "not holding its posture" in output.err
     assert preview_path.with_suffix(".claimed").exists()
     saved = json.loads(report_path.read_text())
     if report_write_fails:
@@ -999,7 +1255,8 @@ async def test_uncertain_dispatch_is_not_erased_by_successful_halt(governed_node
     report = evidence.failure(Refusal("run cancelled"))
     assert report["failure"]["side_effect_state"] == SideEffectState.UNKNOWN
     assert fixture.transport.halt_calls == 1 and fixture.transport.write_log == ()
-    assert evidence.events[-1]["event"] == "damped_stop"
+    check = next(row for row in evidence.events if row["event"] == "posture_check")
+    assert check["own_stop"] is True and check["state"] == "held"
 
 
 async def test_real_governed_batch_binds_every_ordered_target(governed_node, tmp_path):

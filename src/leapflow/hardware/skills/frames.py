@@ -173,9 +173,14 @@ def _provenance_problem(procedure: str, record: Any) -> str:
     calibration skill -- an import or an edit -- and describes a camera that may
     no longer be there.
     """
+    parameters = record.parameters or {}
+    if parameters.get("method") == "stationary_board_bridge.v1" or parameters.get("bridge_evidence") is not None:
+        from leapflow.hardware.calibration.bridge_assessment import shadow_problem
+
+        reason = shadow_problem(parameters.get("bridge_evidence"))
+        return reason or "stationary bridge is a conditional shadow candidate; separate validated promotion is required"
     if HANDEYE_PROCEDURE not in procedure:
         return ""
-    parameters = record.parameters or {}
     if parameters.get("target_mount") is not None:
         return ""
     return _screw_evidence_problem(parameters.get("screw_evidence"))

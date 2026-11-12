@@ -67,6 +67,17 @@ def compute(request: WorkerRequest, budgets: WorkerBudgets) -> dict[str, Any]:
                 )
             }
         return {"tracking": track_metric(first, second, tracks=payload["tracks"], config=config)}
+    if request.operation == "solve_bridge":
+        from leapcalib.estimation.bridge import BridgeBudget, BridgePair, solve_bridge
+        from leapcalib.geometry.se3 import Transform
+
+        payload = request.payload
+        return {"bridge": solve_bridge([BridgePair.from_mapping(p) for p in payload["training"]],
+                                       [BridgePair.from_mapping(p) for p in payload["holdout"]],
+                                       flange_T_wrist=Transform.from_mapping(payload["flange_T_wrist"]),
+                                       dependency_digest=payload["dependency_digest"],
+                                       dependency_sources=payload["dependency_sources"],
+                                       budget=BridgeBudget(**payload["budget"]))}
     from leapcalib.validation.bundle import EvidenceBundle
     from leapcalib.contracts.estimates import EstimateBundle
     from leapcalib.contracts.raw_task import RawTaskState, RawTaskTransition

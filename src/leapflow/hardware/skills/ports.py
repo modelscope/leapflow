@@ -224,6 +224,19 @@ class ScenePort(Protocol):
 
 
 @runtime_checkable
+class PairedObservationPort(Protocol):
+    """Read-only paired acquisition with lossless owner-local evidence."""
+    async def capture(self) -> Any: ...
+
+
+@runtime_checkable
+class BridgeCalibrationPort(Protocol):
+    """Approved stationary acquisition and conditional shadow evaluation; no motion."""
+    async def basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+    async def execute(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
 class VisionPort(Protocol):
     """Node-local camera measurements a calibration may take.
 
@@ -409,6 +422,9 @@ class SkillContext(Protocol):
 
     @property
     def calibration(self) -> CalibrationPort: ...
+
+    @property
+    def bridge(self) -> BridgeCalibrationPort: ...
 
     @property
     def policies(self) -> PolicyPort: ...

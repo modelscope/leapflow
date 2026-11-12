@@ -75,7 +75,7 @@ def pose_batches(model: PhysicalModel, policy: PoseCollectionPolicy, acquisition
     dwell = 0.3 + 2 * sum(getattr(acquisition.settled, name) for name in (
         "receipt_uncertainty_s", "exposure_uncertainty_s", "feedback_uncertainty_s"))
     per_move = move_timeout_s + 2 * acquisition.settled.timeout_s + dwell
-    count = min(3, policy.max_moves, acquisition.max_frames // 2,
+    count = min(policy.max_moves, acquisition.max_frames // 2,
                 math.floor((min(policy.max_duration_s, run_timeout_s) - 10) / per_move))
     if count < 2:
         raise ValueError("two poses cannot fit the declared run deadline")
@@ -93,10 +93,12 @@ def pose_batches(model: PhysicalModel, policy: PoseCollectionPolicy, acquisition
         if len(group) < 2:
             break
         travel = joint_l1 = 0.0
+        notes: list[str] = []
         for after in group:
-            moved, rotated = policy.sweep(model, reference, before, after)
-            travel += moved
-            joint_l1 += rotated
+            checked = policy.sweep(model, reference, before, after)
+            travel += checked.travel_mm
+            joint_l1 += checked.joint_l1_deg
+            notes.extend(checked.advisories)
             before = after
         if travel > policy.max_travel_mm or joint_l1 > policy.max_joint_l1_deg:
             raise ValueError("proposed batch exceeds run travel budget")
@@ -104,6 +106,7 @@ def pose_batches(model: PhysicalModel, policy: PoseCollectionPolicy, acquisition
                                  "speed_pct": policy.speed_pct_max},
                         "duration_budget_s": len(group) * per_move + 10,
                         "nominal_travel_mm": travel, "joint_l1_deg": joint_l1,
+                        "advisories": sorted(set(notes)),
                         "requires_fresh_node_preview_and_explicit_approval": True})
     if not batches:
         raise ValueError("no bounded two-pose batch survives safety checks")
@@ -216,6 +219,7 @@ def prepare(probe: dict[str, Any], inputs: dict[str, Any]) -> dict[str, Any]:
     policy = model = None
     batches: list[dict[str, Any]] = []
     terms = None
+    policy_advisories: list[str] = []
     if not absent:
         chain = DhChain.from_mapping(arm.kinematics.dh)
         model = PhysicalModel(chain, (0.0,) * chain.dof, Transform.from_mapping(inputs["tool_transform"]),
@@ -225,7 +229,7 @@ def prepare(probe: dict[str, Any], inputs: dict[str, Any]) -> dict[str, Any]:
             inputs["endpoint_rate_bound_mm_s"], inputs["rate_provenance_digest"],
             speed_pct_max=inputs.get("speed_pct_max", 1))
         limits = cell["limits"]
-        policy.validate_model(model, settled, fk_mm=limits["fk_tolerance_mm"], fk_deg=limits["fk_tolerance_deg"])
+        policy_advisories = list(policy.validate_model(model, settled, fk_mm=limits["fk_tolerance_mm"], fk_deg=limits["fk_tolerance_deg"]))
         if arm.safety and arm.safety.max_velocity_rad_s > 0 and any(r > arm.safety.max_velocity_rad_s for r in policy.joint_rate_bounds_rad_s):
             raise ValueError("rate bounds exceed live device safety")
         terms = inflation_requirements(model, policy.geometry, settled, list(policy.joint_rate_bounds_rad_s),
@@ -244,7 +248,7 @@ def prepare(probe: dict[str, Any], inputs: dict[str, Any]) -> dict[str, Any]:
             "mount": mount.to_dict(), "collect_args": {"region": region, "frames": 1}, "trial_args": trial,
             "stage_b_overlay": {"calibration_motion": policy.to_dict()} if policy else None,
             "pose_batches": batches, "inflation_requirements": terms, "unresolved": missing,
-            "readiness_blockers": readiness, "trial_stamp_bound_s": stamp_bound,
+            "readiness_blockers": readiness, "policy_advisories": policy_advisories, "trial_stamp_bound_s": stamp_bound,
             "trial_stamp_gate_s": solve.max_stamp_uncertainty_s,
             "deferred_inputs_template": {**dict.fromkeys(motion_names),
                 **dict.fromkeys(("mount_confirmation", "uncertainty_evidence", "whole_link_geometry_evidence",
