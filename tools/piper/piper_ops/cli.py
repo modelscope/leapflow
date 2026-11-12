@@ -64,6 +64,10 @@ def parser() -> argparse.ArgumentParser:
     width = item.add_mutually_exclusive_group(required=True)
     width.add_argument("--max", action="store_true")
     width.add_argument("--width-mm", type=float)
+    item = command(grip, "grasp", writing=True)
+    item.add_argument("--width-mm", type=float, required=True,
+                      help="Closing target; jaws stopping short on an object settle as a grasp")
+    item.add_argument("--force-n", type=float, required=True, help="Grip force bound for the close")
     item = command(grip, "qualify", writing=True)
     item.add_argument("--workcell", default="piper_cell")
     item.add_argument("--widths", default="10,40,68")
@@ -174,6 +178,7 @@ async def hardware(args: argparse.Namespace, settings: Settings, evidence: Evide
     executing = getattr(args, "execute", False)
     operation = ("grasp_cycle" if args.group == "grasp" else
                  "gripper_qualify" if args.group == "gripper" and args.operation == "qualify" else
+                 "grasp" if args.group == "gripper" and args.operation == "grasp" else
                  {"verify": "verify", "gripper": "gripper"}.get(args.group, args.operation))
     plan = approved(args, settings, operation) if executing else None
     if plan is not None and operation in ("grasp_cycle", "gripper_qualify"):
@@ -242,7 +247,7 @@ async def hardware(args: argparse.Namespace, settings: Settings, evidence: Evide
                                   dx=getattr(args, "dx_mm", 0.0), dy=getattr(args, "dy_mm", 0.0),
                                   dz=getattr(args, "dz_mm", 0.0), width=getattr(args, "width_mm", None),
                                   cycles=getattr(args, "cycles", 0), dwell_s=getattr(args, "dwell_s", 0.0),
-                                  target=getattr(args, "target", None))
+                                  target=getattr(args, "target", None), force=getattr(args, "force_n", None))
             return preview_result(plan)
         # The selected command arguments must still describe the approved artifact.
         delta = plan["delta_base_mm"]
@@ -257,6 +262,8 @@ async def hardware(args: argparse.Namespace, settings: Settings, evidence: Evide
                 raise Refusal("cycle count or dwell differs from approved preview")
         if args.group == "gripper" and args.width_mm is not None and args.width_mm != plan["steps"][-1]["grip"]:
             raise Refusal("gripper width differs from approved preview")
+        if getattr(args, "force_n", None) != plan.get("force_n"):
+            raise Refusal("grip force differs from approved preview")
         final = await motion.execute_plan(session, plan)
     return await verify_after_exit(settings, evidence, plan, final)
 
@@ -269,7 +276,7 @@ async def halt_after_exit(settings: Settings, evidence: Evidence) -> None:
 
 async def verify_after_exit(settings: Settings, evidence: Evidence,
                             plan: dict[str, Any], final: motion.Snapshot) -> dict[str, Any]:
-    """Read back after client close; any failure inherits the completed run's halt duty."""
+    """Read back after client close; a failure halts only under the ``stop`` policy."""
     try:
         async with Session(settings, evidence) as readback:
             state = await readback.snapshot(ready=True)
@@ -277,6 +284,13 @@ async def verify_after_exit(settings: Settings, evidence: Evidence,
                                "pose": asdict(final.pose), "gripper_mm": final.gripper_mm}}, state)
             evidence.record("after_client_exit", snapshot=state.to_dict())
     except BaseException:
+        if settings.failure_policy != "stop":
+            try:
+                evidence.record("stop_withheld", failure_policy=settings.failure_policy,
+                                detail="post-exit readback failed; the arm keeps its last posture")
+            except OSError:
+                pass
+            raise
         try:
             await complete_cleanup(halt_after_exit(settings, evidence))
         except (Exception, asyncio.CancelledError) as error:

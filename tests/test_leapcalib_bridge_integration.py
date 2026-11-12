@@ -173,7 +173,8 @@ async def test_real_bridge_shadow_indexed_replay_and_no_motion(bridge_owner):
             await registry.calibration_evidence.verify_bridge_result(report["captures"], bad, workcell_id=WORKCELL_ID, plan=planned["plan"], run_id=run.run_id)
     for field, value in (("physical_activation", "active"), ("absolute_base_accuracy_established", True),
                          ("independent_reference_accuracy", {"rms_m": 0}), ("joint_wrist_fit", True),
-                         ("schema", "forged"), ("verdict", "qualified"), ("reachability", {})):
+                         ("schema", "forged"), ("verdict", "qualified"), ("reachability", {}),
+                         ("acceptance_basis", "governed_tolerance_adjustment")):
         bad = copy.deepcopy(shadow)
         bad["evaluation"][field] = value
         assert shadow_problem(bad)

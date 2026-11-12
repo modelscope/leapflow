@@ -15,6 +15,12 @@ every later plan. So a failed verdict is not a motion hazard: every write settle
 and the arm is standing still. A stop is owed only when this run cannot say what
 it did to the arm -- an effect that did not land cleanly, an unknown or halted
 run, a device fault, a cancellation (``Session._stop_owed``).
+
+Even an owed stop is sent only under ``Settings.failure_policy == "stop"``. The
+default ``hold`` policy never stops automatically: the controller keeps its last
+commanded target (every waypoint is at most one bounded segment away), the exit
+waits for the arm to come to rest and reports the withheld stop, and only the
+operator decides on a stop. A released arm is less controllable than a held one.
 """
 from __future__ import annotations
 
@@ -384,6 +390,11 @@ class Session:
                        joints=tuple(later.joints), moved_deg=round(moved, 4), ctrl_mode=ctrl_mode,
                        enabled=bool(later.enabled), arm_status=arm_status)
 
+    @property
+    def auto_stop(self) -> bool:
+        """Whether an owed stop is sent automatically (``failure_policy == "stop"``)."""
+        return self.settings.failure_policy == "stop"
+
     def _stop_owed(self, exc: BaseException | None) -> bool:
         """Whether this run's own verdict requires a stop before the session ends.
 
@@ -406,14 +417,26 @@ class Session:
         Returns whether the arm was left verifiably holding, which is what the exit
         needs to know before it decides a close failure still owes a physical halt.
         """
-        own_stop = self._stop_owed(exc)
+        owed = self._stop_owed(exc)
+        own_stop = owed and self.auto_stop
         if own_stop:
             await self.stop()
+        elif owed:
+            self.evidence.record("stop_withheld", failure_policy=self.settings.failure_policy,
+                                 detail="the run failed; holding the last commanded posture instead "
+                                        "of an automatic damped stop")
         before = await self.posture()
+        if not own_stop:
+            # A run that sent no stop leaves a powered arm: residual motion of the
+            # last segment or a sample jitter is waited out, never written to.
+            before = await self._await_rest(before)
         self.evidence.record("posture_check", own_stop=own_stop, success=self.success, **before.to_dict())
         if before.state == POSTURE_HELD:
             return True
-        if before.state == POSTURE_UNVERIFIED:
+        if not own_stop and before.state == POSTURE_UNHELD and self._only_moving(before):
+            reason = ("the arm did not come to rest and no automatic stop was sent; "
+                      "watch it and use the physical emergency stop if it does not settle")
+        elif before.state == POSTURE_UNVERIFIED:
             reason = "feedback is unreadable; inspect hardware before any recovery command"
             self.evidence.observe_effect(SideEffectState.UNKNOWN)
         elif before.ctrl_mode == CTRL_MODE_TEACH:
@@ -427,6 +450,20 @@ class Session:
                              operational_complete=False, next_step=reason)
         print("The arm is not holding its posture after this run; " + reason + ".", file=sys.stderr)
         return False
+
+    def _only_moving(self, posture: Posture) -> bool:
+        """Healthy, enabled and in CAN control, merely not yet at rest."""
+        return (posture.enabled and posture.ctrl_mode == CTRL_MODE_CAN
+                and posture.arm_status == ARM_STATUS_NORMAL
+                and posture.moved_deg > self.settings.posture_still_deg)
+
+    async def _await_rest(self, posture: Posture) -> Posture:
+        """Let the last bounded segment finish before judging; reads only, never writes."""
+        deadline = time.monotonic() + self.settings.move_timeout_s
+        while posture.state == POSTURE_UNHELD and self._only_moving(posture) and time.monotonic() < deadline:
+            await asyncio.sleep(self.settings.poll_s)
+            posture = await self.posture()
+        return posture
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         cleanup_error: BaseException | None = None
@@ -453,7 +490,7 @@ class Session:
                 # read-only client can request the production safety halt. Only an arm
                 # this exit could not confirm as holding still owes that halt: a settled
                 # arm that merely failed to close must not be dropped by it.
-                if commands_arm and not settled and not self._halt_delivered:
+                if commands_arm and not settled and not self._halt_delivered and self.auto_stop:
                     try:
                         await complete_cleanup(self._halt_with_fresh_client())
                     except (Exception, asyncio.CancelledError) as halt_error:

@@ -466,6 +466,7 @@ def posture(state=POSTURE_HELD, **fields):
 
 async def test_session_stops_only_when_it_cannot_say_what_it_did(settings, tmp_path, monkeypatch):
     """A failed verdict is a result; a stop is owed only for an effect this run cannot vouch for."""
+    settings = replace(settings, failure_policy="stop")
     for case, stopped in (("settled", False), ("unknown", True), ("halted", True)):
         run = Session(settings, Evidence(tmp_path / f"exit-{case}.json"), execute=True)
         run.touched, run.success = True, case == "settled"
@@ -491,6 +492,117 @@ async def test_session_stops_only_when_it_cannot_say_what_it_did(settings, tmp_p
         assert run.evidence.events[0]["own_stop"] is stopped
 
 
+@pytest.mark.parametrize("case", ["unknown", "halted", "cancelled"])
+async def test_hold_policy_never_stops_automatically(settings, tmp_path, monkeypatch, case):
+    """Default policy: an owed stop is withheld and recorded; the arm keeps its posture."""
+    assert settings.failure_policy == "hold"
+    run = Session(settings, Evidence(tmp_path / f"hold-{case}.json"), execute=True)
+    run.touched = True
+    run.stop_required = case == "halted"
+    calls = []
+    async def stop():
+        calls.append("stop")
+    async def close():
+        calls.append("close")
+    async def sample():
+        return posture()
+    monkeypatch.setattr(run, "stop", stop)
+    monkeypatch.setattr(run, "_close", close)
+    monkeypatch.setattr(run, "posture", sample)
+    error = {"unknown": Refusal("arrival deadline expired", state=SideEffectState.UNKNOWN),
+             "cancelled": asyncio.CancelledError(), "halted": None}[case]
+    await run.__aexit__(type(error) if error else None, error, None)
+    assert calls == ["close"]
+    names = [row["event"] for row in run.evidence.events]
+    assert names == ["stop_withheld", "posture_check"]
+    assert run.evidence.events[1]["own_stop"] is False and run.evidence.events[1]["state"] == "held"
+
+
+async def test_hold_policy_waits_for_the_last_segment_to_settle(settings, tmp_path, monkeypatch):
+    """A still-moving healthy arm is waited out by reads, never written to or stopped."""
+    run = Session(replace(settings, poll_s=.001), Evidence(tmp_path / "rest.json"), execute=True)
+    run.touched = True
+    states = [posture(POSTURE_UNHELD, detail="it is still moving", moved_deg=.4),
+              posture(POSTURE_UNHELD, detail="it is still moving", moved_deg=.1), posture()]
+    calls = []
+    async def stop():
+        calls.append("stop")
+    async def sample():
+        return states.pop(0)
+    monkeypatch.setattr(run, "stop", stop)
+    monkeypatch.setattr(run, "_close", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(run, "posture", sample)
+    error = Refusal("observed joint deviation", state=SideEffectState.UNKNOWN)
+    await run.__aexit__(Refusal, error, None)
+    assert calls == [] and states == []
+    check = next(row for row in run.evidence.events if row["event"] == "posture_check")
+    assert check["state"] == "held"
+
+
+async def test_hold_policy_close_failure_does_not_halt(settings, tmp_path, monkeypatch):
+    run = Session(settings, Evidence(tmp_path / "hold-close.json"), execute=True)
+    run.touched = True
+    calls = []
+    async def sample():
+        return posture(POSTURE_UNVERIFIED, detail="feedback timed out")
+    async def failed_close():
+        raise OSError("close failed")
+    async def halt():
+        calls.append("halt")
+    monkeypatch.setattr(run, "posture", sample)
+    monkeypatch.setattr(run, "_close", failed_close)
+    monkeypatch.setattr(run, "_halt_with_fresh_client", halt)
+    with pytest.raises(Refusal, match="cleanup unconfirmed"):
+        await run.__aexit__(None, None, None)
+    assert calls == []
+
+
+def test_grasp_preview_binds_force_before_stroke(settings):
+    start = snapshot()
+    plan = motion.preview(context(), start, settings, operation="grasp", width=40., force=2.5)
+    row = plan["steps"][-1]
+    assert row["commands"] == (("gripper.effort", 2.5), ("gripper.position", 40.))
+    assert row["stall_settles"] is True and row["grip"] == 40. and plan["force_n"] == 2.5
+    for width, force, message in ((70., 2., "narrower"), (40., 0., "grip force"),
+                                  (40., 4., "grip force"), (40., None, "explicit")):
+        with pytest.raises(Refusal, match=message):
+            motion.preview(context(), start, settings, operation="grasp", width=width, force=force)
+
+
+async def test_grasp_settles_on_a_stalled_jaw_and_reports_blocked(settings, tmp_path):
+    """Jaws that stop short on an object settle as a grasp instead of timing out."""
+    widths = iter([50., 45.] + [41.2] * 500)
+    seq = [1]
+    async def sample(**kwargs):
+        seq[0] += 1
+        return replace(snapshot(seq=seq[0]), gripper_mm=next(widths))
+    evidence = Evidence(tmp_path / "stall.json")
+    session = SimpleNamespace(snapshot=sample, evidence=evidence,
+                              settings=replace(settings, poll_s=.001, grasp_settle_s=.002))
+    before = snapshot()
+    row = motion.step("grasp", (), joints=before.joints, pose=before.pose, grip=30.)
+    row["stall_settles"] = True
+    result = await motion.wait_arrived(session, row, before,
+                                       {"joint": .5, "position": 2., "orientation": 1., "gripper": .5})
+    assert result.gripper_mm == 41.2
+    settled = next(e for e in evidence.events if e["event"] == "grasp.settled")
+    assert settled["blocked"] is True and settled["grasp_target_mm"] == 30.
+
+
+async def test_plain_gripper_move_still_requires_the_target(settings, tmp_path):
+    async def sample(**kwargs):
+        sample.seq += 1
+        return replace(snapshot(seq=sample.seq), gripper_mm=41.2)
+    sample.seq = 1
+    session = SimpleNamespace(snapshot=sample, evidence=Evidence(tmp_path / "no-stall.json"),
+                              settings=replace(settings, poll_s=.001, move_timeout_s=.05))
+    before = snapshot()
+    with pytest.raises(Refusal, match="arrival deadline"):
+        await motion.wait_arrived(session, motion.step("gripper", (), joints=before.joints,
+                                  pose=before.pose, grip=30.), before,
+                                  {"joint": .5, "position": 2., "orientation": 1., "gripper": .5})
+
+
 async def test_a_settled_failure_is_never_stopped(settings, tmp_path, monkeypatch):
     """Every write settled and the arm stands still: a stop here is what dropped it 177 mm."""
     run = Session(settings, Evidence(tmp_path / "settled-failure.json"), execute=True)
@@ -512,7 +624,7 @@ async def test_a_settled_failure_is_never_stopped(settings, tmp_path, monkeypatc
 
 async def test_a_released_arm_is_not_re_energized_without_separate_approval(settings, tmp_path, monkeypatch):
     """An uncertain stop never manufactures authority to restart a gravity-loaded arm."""
-    run = Session(settings, Evidence(tmp_path / "arrest.json"), execute=True)
+    run = Session(replace(settings, failure_policy="stop"), Evidence(tmp_path / "arrest.json"), execute=True)
     run.touched = True
     states = [posture(POSTURE_UNHELD, detail="not every drive reports enabled", enabled=False,
                       moved_deg=1.5), posture()]
@@ -776,7 +888,7 @@ async def test_enter_cleanup_preserves_original(settings, tmp_path, monkeypatch)
 
 
 async def test_repeated_cancel_finishes_halt_before_close(settings, tmp_path):
-    run = Session(settings, Evidence(tmp_path / "cancel.json"), execute=True)
+    run = Session(replace(settings, failure_policy="stop"), Evidence(tmp_path / "cancel.json"), execute=True)
     run.touched = True
     entered, release = asyncio.Event(), asyncio.Event()
     calls = []
@@ -810,6 +922,7 @@ async def test_repeated_cancel_finishes_halt_before_close(settings, tmp_path):
 
 @pytest.mark.parametrize("failure_at", ["connect", "read", "drift"])
 async def test_post_exit_failure_attempts_halt(settings, tmp_path, monkeypatch, failure_at):
+    settings = replace(settings, failure_policy="stop")
     calls = []
     final = snapshot()
     async def open_boundary(self):
@@ -1011,6 +1124,7 @@ def test_manual_intervals_have_typed_refusal(value):
 
 @pytest.mark.parametrize("failed_resource", ["registry", "client"])
 async def test_successful_run_close_failure_inherits_halt_duty(settings, tmp_path, monkeypatch, failed_resource):
+    settings = replace(settings, failure_policy="stop")
     run = Session(settings, Evidence(tmp_path / "close-failure.json"), execute=True)
     run.touched = run.success = True
     calls = []
@@ -1125,7 +1239,7 @@ async def test_operational_session_uses_real_governor_and_single_use_node_permit
 @pytest.mark.parametrize("governed_node", ["none", "partial", "unknown", "committed"], indirect=True)
 async def test_real_governed_transport_failure_preserves_effect_and_halts(governed_node, tmp_path):
     fixture = governed_node
-    run = Session(fixture.settings, Evidence(tmp_path / "effect.json"), execute=True,
+    run = Session(replace(fixture.settings, failure_policy="stop"), Evidence(tmp_path / "effect.json"), execute=True,
                   digest=unverified_digest(fixture.declaration), approval_note="offline exact consent")
     with pytest.raises(Refusal) as failure:
         async with run:
@@ -1239,7 +1353,7 @@ async def test_uncertain_dispatch_is_not_erased_by_successful_halt(governed_node
         await asyncio.Future()  # External device never acknowledges this attempted dispatch.
 
     monkeypatch.setattr(fixture.transport, "write", write)
-    run = Session(fixture.settings, evidence, execute=True,
+    run = Session(replace(fixture.settings, failure_policy="stop"), evidence, execute=True,
                   digest=unverified_digest(fixture.declaration), approval_note="offline exact consent")
 
     async def execute():

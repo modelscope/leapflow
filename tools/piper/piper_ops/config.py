@@ -29,6 +29,15 @@ class Settings:
     posture_still_deg: float = 0.05
     """Two samples this close mean the arm is not moving; a wider gap is a droop."""
     move_timeout_s: float = 20.0
+    failure_policy: str = "hold"
+    """``hold``: a failed run keeps the last settled posture and never sends an automatic
+    damped stop (on a Piper X that stop releases holding torque, so the arm drops);
+    ``stop``: the legacy automatic stop whenever the run cannot vouch for its effect.
+    An operator ``arm stop``/``arm disable`` is unaffected by either policy."""
+    grasp_settle_s: float = 1.0
+    """A grasp close is settled once the jaw reading stays unmoved this long."""
+    grasp_max_force_n: float = 3.0
+    """Upper bound on the grip force a grasp close may request."""
     run_timeout_s: float = 300.0
     request_timeout_s: float = 10.0
     joint_margin_deg: float = 1.0
@@ -92,13 +101,17 @@ class Settings:
                    "grip_mm", "poll_s", "settled_samples", "move_timeout_s", "run_timeout_s",
                    "request_timeout_s", "joint_margin_deg", "joint_step_deg", "init_max_deg",
                    "deviation_deg", "max_cycles", "max_dwell_s", "preflight_temp_c", "max_temp_c",
-                   "voltage_min_v", "voltage_max_v", "posture_still_deg")
+                   "voltage_min_v", "voltage_max_v", "posture_still_deg", "grasp_settle_s",
+                   "grasp_max_force_n")
         for name in numeric:
             if not isinstance(getattr(self, name), (int, float)):
                 raise ValueError(f"{name} must be numeric")
-        for name in ("endpoint", "node_id", "device_id", "gripper_max_evidence", "node_host"):
+        for name in ("endpoint", "node_id", "device_id", "gripper_max_evidence", "node_host",
+                     "failure_policy"):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"{name} must be a string")
+        if self.failure_policy not in ("hold", "stop"):
+            raise ValueError("failure_policy must be 'hold' or 'stop'")
         for name in ("token_file", "issuer_key", "node_devices", "root", "node_python", "node_leap",
                      "node_workspace"):
             if not isinstance(getattr(self, name), Path):

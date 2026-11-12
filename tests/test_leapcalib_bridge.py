@@ -89,6 +89,39 @@ def test_quality_rejection_retains_candidate_and_systematic_floors():
     assert not diagnostic["reachable"] and diagnostic["available_residual_m_rad"][0] == pytest.approx(-0.001)
 
 
+ADJUSTMENT = {"approval_id": "operator-approved-25mm", "rationale": "hardware lever-arm floor",
+              "study_ceiling_m_rad": [0.003, math.radians(2)]}
+
+
+def test_widening_requires_named_governed_adjustment_within_hard_bound():
+    with pytest.raises(ValueError, match="study ceilings"):
+        budget(max_error_m_rad=(0.025, math.radians(2)))
+    for bad in ({**ADJUSTMENT, "approval_id": " "}, {**ADJUSTMENT, "study_ceiling_m_rad": [0.025, math.radians(2)]},
+                {k: v for k, v in ADJUSTMENT.items() if k != "rationale"}):
+        with pytest.raises(ValueError, match="tolerance adjustment"):
+            budget(max_error_m_rad=(0.025, math.radians(2)), tolerance_adjustment=bad)
+    with pytest.raises(ValueError, match="study ceilings"):
+        budget(max_error_m_rad=(0.06, math.radians(2)), tolerance_adjustment=ADJUSTMENT)
+    adjusted = budget(max_error_m_rad=(0.025, math.radians(2)), tolerance_adjustment=ADJUSTMENT)
+    assert adjusted.acceptance_basis == "governed_tolerance_adjustment"
+    assert adjusted.stationarity_cap_m_rad == pytest.approx((0.003, math.radians(2)))
+    assert BridgeBudget(**adjusted.to_dict()) == adjusted
+    assert "tolerance_adjustment" not in budget().to_dict() and budget().acceptance_basis == "study_ceiling"
+
+
+def test_adjusted_pass_is_labelled_and_never_widens_stationarity():
+    pairs = [pair(i)[0] for i in range(6)]
+    terms = {k: (0.002, 0.001) for k in budget().terms}
+    kwargs = {"flange_T_wrist": pair()[1], "dependency_digest": "a" * 64, "dependency_sources": []}
+    study = solve_bridge(pairs[:3], pairs[3:], budget=budget(terms=terms, confidence_multiplier=1), **kwargs)
+    assert study["verdict"] == "rejected" and study["acceptance_basis"] == "study_ceiling"
+    adjusted_budget = budget(terms=terms, confidence_multiplier=1, max_error_m_rad=(0.025, math.radians(2)), tolerance_adjustment=ADJUSTMENT)
+    adjusted = solve_bridge(pairs[:3], pairs[3:], budget=adjusted_budget, **kwargs)
+    assert adjusted["verdict"] == "numerical_pass" and adjusted["acceptance_basis"] == "governed_tolerance_adjustment"
+    assert any("governed tolerance adjustment" in a for a in adjusted["advisories"])
+    assert adjusted["stationary_board"]["limits_m_rad"] == pytest.approx(study["stationary_board"]["limits_m_rad"])
+
+
 @pytest.mark.parametrize("rotation", [False, True])
 def test_stationary_epoch_change_cannot_cancel_through_both_views(rotation):
     pairs = [pair(i)[0] for i in range(6)]

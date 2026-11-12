@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from leapcalib.contracts.identity import digest_of
@@ -17,6 +18,26 @@ from leapcalib.geometry.se3 import Transform
 METHOD = "stationary_board_bridge.v1"
 SCOPE = "conditional_fixed_camera_cross_view"
 BUDGET_TERMS = frozenset({"robot_fk", "wrist_mount", "board_scale_flatness", "intrinsics", "pnp_depth", "timing", "repeatability"})
+# The study ceiling binds unless an approved tolerance adjustment names itself;
+# even then the cap stays inside a hard governed bound.
+STUDY_CEILING_M_RAD = (0.003, math.radians(2))
+GOVERNED_CEILING_M_RAD = (0.05, math.radians(5))
+ADJUSTMENT_FIELDS = frozenset({"approval_id", "rationale", "study_ceiling_m_rad"})
+
+
+def _adjustment(value: Any) -> Mapping[str, Any] | None:
+    """Validate an explicit, approved widening record; None keeps the study ceiling."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != ADJUSTMENT_FIELDS:
+        raise ValueError("tolerance adjustment requires approval_id, rationale and the study ceiling it widens")
+    if any(not isinstance(value[k], str) or not 0 < len(value[k].strip()) <= 512 for k in ("approval_id", "rationale")):
+        raise ValueError("tolerance adjustment approval and rationale must be bounded non-empty text")
+    study = finite_vector(value["study_ceiling_m_rad"], 2)
+    if any(not math.isclose(a, b, rel_tol=0, abs_tol=1e-12) for a, b in zip(study, STUDY_CEILING_M_RAD)):
+        raise ValueError("tolerance adjustment must name the unchanged study ceiling it widens")
+    return MappingProxyType({"approval_id": value["approval_id"], "rationale": value["rationale"],
+                             "study_ceiling_m_rad": tuple(study)})
 
 
 @dataclass(frozen=True)
@@ -33,6 +54,7 @@ class BridgeBudget:
     min_training: int
     min_holdout: int
     separation_s: float
+    tolerance_adjustment: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.terms, Mapping) or set(self.terms) != BUDGET_TERMS:
@@ -46,7 +68,9 @@ class BridgeBudget:
         from types import MappingProxyType
         object.__setattr__(self, "terms", MappingProxyType(normalized))
         object.__setattr__(self, "max_error_m_rad", finite_vector(self.max_error_m_rad, 2))
-        if not all(0 < v <= cap for v, cap in zip(self.max_error_m_rad, (0.003, math.radians(2)))):
+        object.__setattr__(self, "tolerance_adjustment", _adjustment(self.tolerance_adjustment))
+        ceiling = STUDY_CEILING_M_RAD if self.tolerance_adjustment is None else GOVERNED_CEILING_M_RAD
+        if not all(0 < v <= cap for v, cap in zip(self.max_error_m_rad, ceiling)):
             raise ValueError("bridge policy cannot silently widen the existing study ceilings")
         if type(self.confidence_multiplier) not in (int, float) or not math.isfinite(self.confidence_multiplier) or not 1 <= self.confidence_multiplier <= 10:
             raise ValueError("conservative confidence multiplier required")
@@ -59,9 +83,25 @@ class BridgeBudget:
     def uncertainty(self) -> tuple[float, float]:
         return tuple(sum(v[i] for v in self.terms.values()) for i in range(2))
 
+    @property
+    def acceptance_basis(self) -> str:
+        return "study_ceiling" if self.tolerance_adjustment is None else "governed_tolerance_adjustment"
+
+    @property
+    def stationarity_cap_m_rad(self) -> tuple[float, float]:
+        """A tolerance adjustment widens acceptance only, never the moved-board gate."""
+        return tuple(min(v, cap) for v, cap in zip(self.max_error_m_rad, STUDY_CEILING_M_RAD))
+
     def to_dict(self) -> dict[str, Any]:
-        return {**vars(self), "terms": {k: list(v) for k, v in self.terms.items()},
+        data = {**vars(self), "terms": {k: list(v) for k, v in self.terms.items()},
                 "max_error_m_rad": list(self.max_error_m_rad)}
+        # Omitted when absent so study-ceiling budgets keep their historical digests.
+        if self.tolerance_adjustment is None:
+            data.pop("tolerance_adjustment")
+        else:
+            data["tolerance_adjustment"] = {**self.tolerance_adjustment,
+                                            "study_ceiling_m_rad": list(self.tolerance_adjustment["study_ceiling_m_rad"])}
+        return data
 
     def reachability(self) -> dict[str, Any]:
         floors = [self.confidence_multiplier * u for u in self.uncertainty]
@@ -167,7 +207,7 @@ def stationary_board_check(pairs: Sequence[BridgePair], budget: BridgeBudget) ->
     residuals = [[anchor.distance_m(p.fixed_T_board), anchor.angle_to_rad(p.fixed_T_board)] for p in pairs]
     # Common systematic board-scale/mount/FK terms cannot excuse movement of the
     # fixed view. Allow only the separately declared view noise/repeatability.
-    limits = [budget.max_error_m_rad[i] + 2 * budget.confidence_multiplier *
+    limits = [budget.stationarity_cap_m_rad[i] + 2 * budget.confidence_multiplier *
               sum(budget.terms[key][i] for key in ("intrinsics", "pnp_depth", "repeatability")) for i in range(2)]
     if any(value > cap for row in residuals for value, cap in zip(row, limits)):
         raise ValueError("stationary board/fixed view changed; inspect and declare a new target epoch")
@@ -201,7 +241,7 @@ def solve_bridge(training: Sequence[BridgePair], holdout: Sequence[BridgePair], 
               "reachability": budget.reachability(), "training": [p.evidence_digest for p in training],
               "holdout": [p.evidence_digest for p in holdout], "physical_activation": "shadow_only",
               "independent_reference_accuracy": None, "absolute_base_accuracy_established": False,
-              "joint_wrist_fit": False, "exclusions": []}
+              "joint_wrist_fit": False, "exclusions": [], "acceptance_basis": budget.acceptance_basis}
     if len(training) < budget.min_training:
         return {**result, "verdict": "insufficient_evidence", "candidate": None}
     stationarity = stationary_board_check([*training, *holdout], budget)
@@ -216,6 +256,9 @@ def solve_bridge(training: Sequence[BridgePair], holdout: Sequence[BridgePair], 
     uncertainty = tuple(sum(value[i] for value in terms.values()) for i in range(2))
     margins = [[cap - e - budget.confidence_multiplier * u for cap, e, u in zip(budget.max_error_m_rad, row, uncertainty)] for row in withheld]
     verdict = "insufficient_evidence" if len(holdout) < budget.min_holdout else "numerical_pass" if all(min(row) >= 0 for row in margins) else "rejected"
+    advisories = [] if verdict == "numerical_pass" else ["candidate retained; scoped acceptance not established"]
+    if budget.tolerance_adjustment is not None:
+        advisories.append("evaluated against a governed tolerance adjustment, not the study ceiling")
     return {**result, "stationary_board": stationarity,
             "observability": {"solve_mode": "fixed_only_with_validated_wrist", "conditional_pose_dof": 6,
                               "joint_wrist_rank_established": False, "absolute_base_rank_established": False},
@@ -224,4 +267,4 @@ def solve_bridge(training: Sequence[BridgePair], holdout: Sequence[BridgePair], 
             "uncertainty_m_rad": list(uncertainty), "effective_uncertainty_terms": terms,
             "uncertainty_basis": "declared_correlated_bounds_plus_training_repeatability; conditional_not_metrology",
             "quality_margins_m_rad": margins,
-            "verdict": verdict, "advisories": [] if verdict == "numerical_pass" else ["candidate retained; scoped acceptance not established"]}
+            "verdict": verdict, "advisories": advisories}

@@ -99,7 +99,7 @@ def shadow_problem(record: Mapping[str, Any]) -> str:
             return "stationary bridge wrist dependency/evaluation mismatch"
         base_fields = {"schema", "method_id", "scope", "dependency_digest", "budget", "reachability", "training", "holdout",
                        "physical_activation", "independent_reference_accuracy", "absolute_base_accuracy_established",
-                       "joint_wrist_fit", "exclusions", "verdict", "candidate"}
+                       "joint_wrist_fit", "exclusions", "verdict", "candidate", "acceptance_basis"}
         fit_fields = {"stationary_board", "observability", "candidate_digest", "training_residual_m_rad",
                       "withheld_cross_view_m_rad", "uncertainty_m_rad", "effective_uncertainty_terms", "uncertainty_basis",
                       "quality_margins_m_rad", "advisories"} if result["candidate"] is not None else set()
@@ -113,6 +113,8 @@ def shadow_problem(record: Mapping[str, Any]) -> str:
         budget = BridgeBudget(**result["budget"])
         if not _same(result["reachability"], budget.reachability()):
             return "stationary bridge frozen budget/reachability mismatch"
+        if result["acceptance_basis"] != budget.acceptance_basis:
+            return "stationary bridge acceptance basis disagrees with its frozen budget"
         if result["verdict"] not in ("insufficient_evidence", "rejected", "numerical_pass"):
             return "unknown stationary bridge verdict"
         if result["candidate"] is None and result["verdict"] != "insufficient_evidence":

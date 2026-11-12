@@ -177,7 +177,7 @@ def _joint_path(context: HardwareContext, chain: DhChain, origin: tuple[float, .
 def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, operation: str,
             dx: float = 0.0, dy: float = 0.0, dz: float = 0.0,
             width: float | None = None, cycles: int = 0, dwell_s: float = 0.0,
-            target: tuple[float, ...] | None = None) -> dict[str, Any]:
+            target: tuple[float, ...] | None = None, force: float | None = None) -> dict[str, Any]:
     """A complete immutable-by-hash request, including return and safety configuration."""
     settings.validate()
     dx, dy, dz = number(dx), number(dy), number(dz)
@@ -202,7 +202,7 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
         if any(not low <= q <= high for q, (low, high) in zip(origin_q, safe)):
             raise Refusal("starting posture is outside conservative planning limits")
     maximum = None
-    if operation in ("verify", "gripper"):
+    if operation in ("verify", "gripper", "grasp"):
         maximum = opening_max(context, settings)
         if not 0 <= start.gripper_mm <= maximum:
             raise Refusal("starting opening conflicts with fitted usable range")
@@ -271,6 +271,21 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
         if not 0 <= opening <= maximum:
             raise Refusal("requested opening exceeds fitted maximum")
         rows.append(step("gripper", (("gripper.position", opening),), joints=seed, pose=origin_pose, grip=opening))
+    elif operation == "grasp":
+        # A close that may stop short on an object: the force is bound first so the
+        # stroke frame carries it, and arrival accepts a stalled jaw (see wait_arrived).
+        if width is None or force is None:
+            raise Refusal("grasp needs an explicit closing width and grip force")
+        opening, force = number(width), number(force)
+        if not 0 <= opening < start.gripper_mm:
+            raise Refusal("grasp closes from the current opening; the target must be narrower")
+        low, high = bounds(context, "gripper.effort")
+        if not low < force <= min(high, settings.grasp_max_force_n):
+            raise Refusal(f"grip force must be within ({low}, {min(high, settings.grasp_max_force_n)}] N")
+        row = step("grasp", (("gripper.effort", force), ("gripper.position", opening)),
+                   joints=seed, pose=origin_pose, grip=opening)
+        row["stall_settles"] = True
+        rows.append(row)
     elif operation != "initialize":
         raise Refusal("unknown motion operation")
     # Bind effective arrival tolerances to the same preview as every numeric target.
@@ -284,6 +299,7 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
             "origin_joints": origin_q, "origin_pose": asdict(origin_pose), "gripper_max_mm": maximum,
             "delta_base_mm": {"x": dx, "y": dy, "z": dz}, "cycles": cycles, "dwell_s": dwell_s,
             "target_joints": None if target is None else tuple(number(q) for q in target),
+            "force_n": None if force is None else number(force),
             "finish": "enabled",
             "arrival": arrival, "initialization_sweep": swept, "steps": rows,
             "clearance": "Operator must confirm unobstructed swept volume, empty jaws and accessible physical emergency stop"}
@@ -325,6 +341,10 @@ async def wait_arrived(session: Session, row: dict[str, Any], before: Snapshot,
     last = before.receipts
     target = Pose.from_mapping(row["pose"]) if row.get("pose") else None
     q = row.get("joints")
+    # A grasp settles when the jaw reading stays within tolerance of an anchor for
+    # grasp_settle_s: fingers closed on an object stop short of the target.
+    anchor: float | None = None
+    anchored_at = 0.0
     while time.monotonic() < deadline:
         current = await session.snapshot(ready=True, requalify=True)
         fresh = all(a > b for a, b in zip(current.receipts, last))
@@ -359,13 +379,26 @@ async def wait_arrived(session: Session, row: dict[str, Any], before: Snapshot,
             arrived &= target.distance_mm(current.pose) <= arrival["position"]
             arrived &= target.rotation_to_deg(current.pose) <= arrival["orientation"]
         if row.get("grip") is not None:
-            arrived &= abs(current.gripper_mm - row["grip"]) <= arrival["gripper"]
+            within = abs(current.gripper_mm - row["grip"]) <= arrival["gripper"]
+            if row.get("stall_settles") and not within:
+                now = time.monotonic()
+                if anchor is None or abs(current.gripper_mm - anchor) > arrival["gripper"]:
+                    anchor, anchored_at = current.gripper_mm, now
+                within = now - anchored_at >= settings.grasp_settle_s
+            arrived &= within
         stable = stable + 1 if arrived else 0
         if stable >= settings.settled_samples:
-            session.evidence.record(row["label"] + ".settled", snapshot=current.to_dict(), fresh_samples=stable)
+            details: dict[str, Any] = {}
+            if row.get("stall_settles"):
+                blocked = abs(current.gripper_mm - row["grip"]) > arrival["gripper"]
+                details = {"grasp_width_mm": current.gripper_mm, "grasp_target_mm": row["grip"],
+                           "blocked": blocked}
+            session.evidence.record(row["label"] + ".settled", snapshot=current.to_dict(),
+                                    fresh_samples=stable, **details)
             return current
         await asyncio.sleep(settings.poll_s)
-    raise Refusal("arrival deadline expired; halt and inspect, do not replay", state=SideEffectState.UNKNOWN)
+    raise Refusal("arrival deadline expired; inspect, do not replay (the arm keeps its last "
+                  "commanded target unless the stop policy is selected)", state=SideEffectState.UNKNOWN)
 
 
 async def execute_plan(session: Session, plan: dict[str, Any]) -> Snapshot:
