@@ -413,7 +413,7 @@ def test_render_board_status_warns_when_web_server_is_stale() -> None:
         "templates": ["generic"], "default": "generic", "watches": [], "findings": [],
         "server": {"build": {"pid": 4242, "commit": "abc123"}, "stale": True},
     })
-    assert any("4242" in line and "restart" in line.lower() for line in stale.lines)
+    assert any("4242" in line and "leap board stop" in line for line in stale.lines)
 
     fresh = _CaptureConsole()
     render_command_payload(fresh, {

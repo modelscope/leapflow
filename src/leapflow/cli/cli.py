@@ -279,7 +279,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # leap board (LeapBoard monitoring dashboard)
     dashboard_parser = subparsers.add_parser("board", help="Open the LeapBoard session analysis board")
-    dashboard_parser.add_argument("template", nargs="?", default="", help="Template lens to render (default: generic)")
+    dashboard_parser.add_argument(
+        "template", nargs="?", default="",
+        help="Template lens to render (default: generic), or 'stop' / 'status' to manage board servers",
+    )
+    dashboard_parser.add_argument(
+        "--all", action="store_true",
+        help="With 'stop': stop every LeapBoard server of this user, not only this profile's",
+    )
     dashboard_parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     dashboard_parser.add_argument("--token", default="", help=argparse.SUPPRESS)
     dashboard_parser.add_argument("--port", type=int, default=0, help="Override the dashboard port")

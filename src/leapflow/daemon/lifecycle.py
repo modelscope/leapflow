@@ -467,6 +467,15 @@ def _process_alive(pid: int) -> bool:
             kernel32.CloseHandle(handle)
 
 
+def process_alive(pid: int) -> bool:
+    """Zombie- and Windows-aware liveness probe for any process this user can see.
+
+    Public so other detached-process owners (the dashboard server launcher) share
+    one probe instead of re-learning that ``os.kill(pid, 0)`` reports zombies alive.
+    """
+    return _process_alive(pid)
+
+
 def _sock_healthy(runtime_dir: Path) -> bool:
     """Quick health check by connecting to the daemon transport."""
     from leapflow.daemon._transport import get_transport

@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import re
+import signal
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -126,11 +127,13 @@ class DashboardServer:
         bind: str = "127.0.0.1",
         port: int = 8765,
         templates: Optional[TemplateLibrary] = None,
+        owner: str = "",
     ) -> None:
         self._client = client
         self._token = token
         self._bind = bind
         self._port = port
+        self._owner = owner
         self._hub = ViewHub()
         # A Board generation must never combine old Python with files changed underneath it.
         # Templates and static assets are frozen in this process; a changed source tree gets
@@ -328,6 +331,8 @@ class DashboardServer:
             "build": self._build_info.to_dict(),
             "revision": self._revision,
             "stale": stale,
+            # Lets `leap board stop` attribute this process to its profile.
+            "owner": self._owner,
         }
 
     async def _handle_action(self, request: Any) -> Any:
@@ -780,7 +785,10 @@ async def run_server(settings: Any, *, token: str, bind: str, port: int) -> int:
         except Exception:
             override_dir = None
     templates = TemplateLibrary(override_dir=override_dir)
-    server = DashboardServer(client=client, token=token, bind=bind, port=port, templates=templates)
+    server = DashboardServer(
+        client=client, token=token, bind=bind, port=port, templates=templates,
+        owner=launcher.server_owner(settings),
+    )
     launcher.write_state(settings, {
         "port": port,
         "bind": bind,
@@ -789,13 +797,25 @@ async def run_server(settings: Any, *, token: str, bind: str, port: int) -> int:
         "revision": server._revision,
         "url": launcher.build_url(bind, port, token),
     })
+    # `leap board stop` and stale-server retirement send SIGTERM; cancelling the
+    # serve task turns it into a normal shutdown that releases preview owners.
+    _cancel_on_sigterm(asyncio.current_task())
     try:
         await server.serve()
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
-        launcher.clear_state(settings)
+        launcher.clear_state(settings, pid=os.getpid())
     return 0
+
+
+def _cancel_on_sigterm(task: Optional[asyncio.Task[Any]]) -> None:
+    if task is None:
+        return
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
+    except (NotImplementedError, RuntimeError, ValueError):
+        logger.debug("dashboard: SIGTERM handler unavailable on this platform")
 
 
 __all__ = ["DashboardServer", "run_server", "STATIC_DIR"]

@@ -282,7 +282,7 @@ def test_retire_stale_server_skips_kill_when_pid_unverified(
     settings = _settings(tmp_path)
     launcher.write_state(settings, {"port": 8765, "bind": "127.0.0.1", "token": "t", "pid": 4242})
     monkeypatch.setattr(launcher, "is_port_open", lambda *a, **k: True)
-    monkeypatch.setattr(launcher, "_pid_is_dashboard_server", lambda pid: False)
+    monkeypatch.setattr(launcher, "_pid_is_dashboard_server", lambda state: False)
     killed: list[int] = []
     monkeypatch.setattr(launcher.os, "kill", lambda pid, sig: killed.append(pid))
     launcher._retire_stale_server(settings)
@@ -296,11 +296,12 @@ def test_retire_stale_server_signals_verified_dashboard_pid(
     # A positively identified dashboard pid is signaled exactly once to free the port.
     settings = _settings(tmp_path)
     launcher.write_state(settings, {"port": 8765, "bind": "127.0.0.1", "token": "t", "pid": 4242})
-    opens = iter([True, False])  # open for the guard, closed right after the signal
-    monkeypatch.setattr(launcher, "is_port_open", lambda *a, **k: next(opens, False))
-    monkeypatch.setattr(launcher, "_pid_is_dashboard_server", lambda pid: True)
+    monkeypatch.setattr(launcher, "_pid_is_dashboard_server", lambda state: True)
     killed: list[int] = []
-    monkeypatch.setattr(launcher.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(
+        launcher.instances, "stop_process",
+        lambda pid, *, port=0: killed.append(pid) or launcher.instances.StopResult(pid, port, True, "stopped"),
+    )
     launcher._retire_stale_server(settings)
     assert killed == [4242]
     assert launcher.load_state(settings) is None

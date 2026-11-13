@@ -681,6 +681,15 @@ def test_grasp_preview_binds_force_before_stroke(settings):
             motion.preview(context(), start, settings, operation="grasp", width=width, force=force)
 
 
+def test_full_opening_settles_at_the_end_stop(settings):
+    """A release to the fitted maximum ends at the mechanical stop, not on its nominal value."""
+    start = snapshot()
+    full = motion.preview(context(), start, settings, operation="gripper")["steps"][-1]
+    assert full["stall_settles"] is True and full["grip"] > start.gripper_mm
+    explicit = motion.preview(context(), start, settings, operation="gripper", width=30.)["steps"][-1]
+    assert explicit["stall_settles"] is False
+
+
 async def test_grasp_settles_on_a_stalled_jaw_and_reports_blocked(settings, tmp_path):
     """Jaws that stop short on an object settle as a grasp instead of timing out."""
     widths = iter([50., 45.] + [41.2] * 500)

@@ -354,7 +354,12 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
         opening = maximum if width is None else number(width)
         if not 0 <= opening <= maximum:
             raise Refusal("requested opening exceeds fitted maximum")
-        rows.append(step("gripper", (("gripper.position", opening),), joints=seed, pose=origin_pose, grip=opening))
+        row = step("gripper", (("gripper.position", opening),), joints=seed, pose=origin_pose, grip=opening)
+        # Opening fully drives the jaw into its mechanical end stop, whose reading varies
+        # by a few tenths of a millimetre around the fitted maximum; the jaw coming to
+        # rest is the arrival signal, and the evidence records the width it reached.
+        row["stall_settles"] = width is None and opening > start.gripper_mm
+        rows.append(row)
     elif operation == "grasp":
         # A close that may stop short on an object: the force is bound first so the
         # stroke frame carries it, and arrival accepts a stalled jaw (see wait_arrived).

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
-from leapflow.daemon.lifecycle import DaemonSignal
+from leapflow.dashboard import instances
 from leapflow.dashboard.revision import board_revision
 
 logger = logging.getLogger(__name__)
@@ -89,12 +89,33 @@ def write_state(settings: Any, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state), encoding="utf-8")
 
 
-def clear_state(settings: Any) -> None:
-    """Best-effort removal of dashboard discovery state."""
+def clear_state(settings: Any, *, pid: Optional[int] = None) -> None:
+    """Best-effort removal of dashboard discovery state.
+
+    With ``pid`` the state is removed only while it still names that process: a
+    server shutting down must not erase the state its successor already published.
+    """
+    if pid is not None:
+        state = load_state(settings)
+        if state is not None and int(state.get("pid") or 0) != pid:
+            return
     try:
         state_path(settings).unlink(missing_ok=True)
     except OSError:
         logger.debug("dashboard: failed to clear discovery state", exc_info=True)
+
+
+def server_owner(settings: Any) -> str:
+    """Identity a board server reports so ``leap board stop`` can attribute it.
+
+    The resolved discovery-state path: unique per profile *and* per data dir, which a
+    profile name alone is not (tests and sandboxes run the default profile elsewhere).
+    """
+    path = state_path(settings)
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
 
 
 def _host_for_bind(bind: str) -> str:
@@ -322,50 +343,73 @@ def _terminate_child(proc: subprocess.Popen) -> None:
         logger.debug("dashboard: failed to stop an unready server pid=%s", proc.pid, exc_info=True)
 
 
-def _pid_is_dashboard_server(pid: int) -> bool:
-    """Best-effort confirm ``pid`` is our dashboard server before signaling it.
+def _pid_is_dashboard_server(state: dict[str, Any]) -> bool:
+    """Confirm the pid recorded in ``state`` is our dashboard server before signaling it.
 
-    Guards against PID reuse: a recorded pid may since belong to an unrelated
-    process. Verification uses psutil when available; without it we cannot prove
-    identity portably, so we return False and let the caller fall back to a free
-    port rather than risk terminating an innocent process.
+    Guards against PID reuse: a recorded pid may since belong to an unrelated process.
+    Either proof suffices -- the server answering with that pid on the recorded token,
+    or the process carrying the board server's argv. This used to require ``psutil``,
+    which minimal installs lack; without it nothing was ever verified, so every stale
+    server was abandoned on its port and its replacement took the next one.
     """
-    try:
-        import psutil  # optional dependency; absent in minimal installs
-    except ImportError:
+    pid = int(state.get("pid") or 0)
+    if pid <= 0:
         return False
-    try:
-        cmdline = " ".join(psutil.Process(pid).cmdline())
-    except (psutil.Error, OSError):
-        return False
-    return "leapflow" in cmdline and "board" in cmdline and "--serve" in cmdline
+    return instances.server_answers_as(state) or instances.pid_is_board_server(pid)
 
 
 def _retire_stale_server(settings: Any) -> None:
     """Best-effort retire a stale dashboard server recorded in discovery state.
 
     Called only after ``server_running`` rejected the state (dead server or a
-    token the server no longer accepts). Signals the recorded pid *only when it
-    is verifiably our dashboard server* (guarding against PID reuse); otherwise
-    it leaves the process alone and lets ``ensure_server`` pick a free port.
-    Always drops the stale state file.
+    token the server no longer accepts) or found it stale. Stops the recorded pid
+    *only when it is verifiably our dashboard server* (guarding against PID reuse);
+    otherwise it leaves the process alone and lets ``ensure_server`` pick a free
+    port. Always drops the stale state file.
     """
     state = load_state(settings)
     if not state:
         return
     port = int(state.get("port") or 0)
-    bind = str(state.get("bind") or getattr(settings, "dashboard_bind", "127.0.0.1"))
     pid = int(state.get("pid") or 0)
-    if port and pid > 0 and is_port_open(bind, port) and _pid_is_dashboard_server(pid):
-        try:
-            os.kill(pid, DaemonSignal.SIGTERM.value)
-        except OSError:
-            logger.debug("dashboard: stale server pid=%s not signalable", pid, exc_info=True)
-        else:
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline and is_port_open(bind, port):
-                time.sleep(0.1)
+    if pid > 0 and _pid_is_dashboard_server(state):
+        result = instances.stop_process(pid, port=port)
+        if not result.stopped:
+            logger.warning("dashboard: could not retire stale server pid=%s: %s", pid, result.detail)
     clear_state(settings)
+
+
+def stop_servers(
+    settings: Any, *, everything: bool = False,
+) -> tuple[list[instances.StopResult], list[instances.BoardServerProcess]]:
+    """Stop this profile's board servers -- the recorded one and any it lost track of.
+
+    Returns ``(results, left_running)``. A server is this profile's when it reports
+    this profile's owner, or is the recorded pid and reports no other owner. Servers
+    of other profiles, and ones that cannot be attributed (built before the owner
+    field, or not answering), are left running and returned so the caller can name
+    them; ``everything`` stops every board server of the current user instead.
+    """
+    owner = server_owner(settings)
+    state = load_state(settings) or {}
+    recorded = int(state.get("pid") or 0)
+    results: list[instances.StopResult] = []
+    left: list[instances.BoardServerProcess] = []
+    seen: set[int] = set()
+    for server in instances.discover_board_servers():
+        seen.add(server.pid)
+        ours = server.owner == owner or (server.pid == recorded and not server.owner)
+        if everything or ours:
+            results.append(instances.stop_process(server.pid, port=server.port))
+        else:
+            left.append(server)
+    # Where processes cannot be listed (Windows without psutil) the recorded server
+    # is still stoppable on the strength of its own token-authenticated answer.
+    if recorded > 0 and recorded not in seen and instances.server_answers_as(state):
+        results.append(instances.stop_process(recorded, port=int(state.get("port") or 0)))
+    if not recorded or all(r.stopped for r in results if r.pid == recorded):
+        clear_state(settings)
+    return results, left
 
 
 def ensure_server(settings: Any, *, wait_s: float = 8.0) -> dict[str, Any]:
@@ -472,6 +516,8 @@ __all__ = [
     "load_state",
     "write_state",
     "clear_state",
+    "server_owner",
+    "stop_servers",
     "build_url",
     "build_view_url",
     "is_port_open",

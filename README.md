@@ -414,6 +414,7 @@ Drop a YAML manifest in `~/.leapflow/profiles/<profile>/gateway/manifests/`, imp
 | `leap skills list\|show\|export\|import` | Skill library |
 | `leap evolve` | Run the learning boundary |
 | `leap board` | LeapBoard dashboard |
+| `leap board status\|stop [--all]` | List / stop LeapBoard web servers (incl. orphans) |
 | `leap hw list\|serve\|verify\|estop\|…` | Hardware / LHP node |
 | `leap daemon start\|stop\|restart\|status` | Manage leapd |
 | `leap config list\|set\|show` | Configuration |

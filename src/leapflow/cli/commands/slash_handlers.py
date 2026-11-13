@@ -3942,8 +3942,8 @@ def _render_board_server_health(console: "LeapConsole", server: Any) -> None:
     if stale:
         console.warning(
             f"LeapBoard web server (pid={build.get('pid')}) predates the current source "
-            "tree — restart it to pick up recent changes: run /board again after killing "
-            f"pid {build.get('pid')}, or 'leap board --serve' manually."
+            "tree — run /board to replace it with a fresh server, or 'leap board stop' "
+            "to stop it."
         )
     else:
         console.system(f"LeapBoard web server (pid={build.get('pid')}) is up to date.")
