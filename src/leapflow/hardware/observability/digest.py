@@ -235,6 +235,7 @@ def _events(registry: Any) -> tuple[dict[str, Any], ...]:
                 "kind": kind,
                 "device_id": device_id,
                 "channel_id": channel_id,
+                "quantity": str(getattr(event, "quantity", "")),
                 "detail": str(getattr(event, "detail", "")),
                 "value": getattr(event, "value", None),
                 "unit": str(getattr(event, "unit", "")),
@@ -266,6 +267,9 @@ _NOTABLE_KINDS = frozenset(
         # A degradation policy fired while actions are disabled: worth a warning,
         # but nothing was stopped, so it must not page anyone like an alert.
         "degradation_suppressed",
+        # A limit the device's firmware enforces itself was crossed: worth seeing,
+        # never worth paging (see ``leapflow.hardware.advisory``).
+        "advisory_exceeded",
     }
 )
 

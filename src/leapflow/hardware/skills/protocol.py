@@ -178,7 +178,9 @@ class SkillSpec:
 
     ``requires`` tokens: ``role:<name>`` (``arm``, ``camera.wrist``...); ``calib:<frame>`` where
     ``<frame>`` is a workcell frame name (``tcp``, ``camera``) or ``workspace``;
-    and ``model:<name>`` for a model the workcell binds under ``models``.
+    and ``model:<name>`` for a model the workcell binds under ``models``. A name in
+    braces (``calib:{camera}``) is the value of that skill argument, so a skill can
+    serve whichever role its caller picks.
 
     ``leased`` marks a READ skill that still runs as a leased run holding the
     workcell's devices (a recording) instead of answering from ``plan``: it is
@@ -394,7 +396,12 @@ class LocatedObject:
     pixels, or a single ``point`` -- a surface point with no extent, which
     ``center`` then is. ``source`` says who grounded it: the workcell's locator
     model (``locator``), or S2 pointing into a shared frame (``lift``) -- which
-    is how a relocation knows whether the label can find it again.
+    is how a relocation knows whether the label can find it again. ``camera``
+    is the camera role it was seen with, which a relocation measures it with again.
+    ``table_offset_mm`` is how far the table around it sat from the calibrated
+    plane in that camera's view (``None`` when not measured): its height is taken
+    against the table the camera saw, so a shared z offset between the camera and
+    arm chains cannot shrink or grow the object.
     """
 
     object_id: str
@@ -409,6 +416,8 @@ class LocatedObject:
     points: int = 0
     geometry: str = "mask"
     source: str = SOURCE_LOCATOR
+    camera: str = "camera"
+    table_offset_mm: float | None = None
 
     @property
     def top_z(self) -> float:
@@ -434,6 +443,10 @@ class LocatedObject:
             "points": self.points,
             "geometry": self.geometry,
             "source": self.source,
+            "camera": self.camera,
+            "table_offset_mm": (
+                None if self.table_offset_mm is None else round(self.table_offset_mm, 1)
+            ),
         }
 
     @classmethod
@@ -456,6 +469,10 @@ class LocatedObject:
             points=int(data.get("points") or 0),
             geometry=str(data.get("geometry") or "mask"),
             source=str(data.get("source") or SOURCE_LOCATOR),
+            camera=str(data.get("camera") or "camera"),
+            table_offset_mm=(
+                None if data.get("table_offset_mm") is None else float(data["table_offset_mm"])
+            ),
         )
 
 

@@ -24,10 +24,10 @@ from leapflow.hardware.lhp.client import DirectLhpClient
 from leapflow.hardware.lhp.params import optional_bool
 from leapflow.hardware.lhp.protocol import LhpProtocolError
 from leapflow.hardware.lhp.server import WRITE_MODE_TRUSTED_V1, LhpNodeServer
-from leapflow.hardware.skill_results import ATTACHMENTS_FIELD, share_frame
+from leapflow.hardware.skill_results import ATTACHMENTS_FIELD, share_frame, workcell_view
 from leapflow.hardware.skill_tools import SkillService
 from leapflow.hardware.skills.builtin.scene import skills as scene_skills
-from leapflow.hardware.skills.frames import FrameGraph
+from leapflow.hardware.skills.frames import FrameGraph, bind_requirements, unmet_requirements
 from leapflow.hardware.skills.geometry import Pose, Transform
 from leapflow.hardware.skills.perception import (
     PerceptionSettings,
@@ -38,6 +38,7 @@ from leapflow.hardware.skills.protocol import (
     COORDS_PER_MILLE,
     COORDS_PIXEL,
     COORDS_UNIT,
+    FAILURE_CALIBRATION_MISSING,
     FAILURE_INVALID_ARGS,
     FAILURE_SKILL_UNAVAILABLE,
     FAILURE_TARGET_NOT_FOUND,
@@ -60,6 +61,7 @@ from tests._harness.skill_stubs import (
     TABLE_Z,
     WORKCELL_ID,
     SimBox,
+    SimRgbdCamera,
     SkillNodeRegistry,
     perception_registry,
     write_workcell,
@@ -89,9 +91,10 @@ def _scene(
     *,
     clock: _Clock | None = None,
     evidence: dict[str, Any] | None = None,
+    spec: WorkcellSpec | None = None,
     **perception: float,
 ) -> WorkcellScene:
-    spec = WorkcellSpec.from_mapping(SHARED_YAML)
+    spec = spec or WorkcellSpec.from_mapping(SHARED_YAML)
     sink = {} if evidence is None else evidence
     return WorkcellScene(
         registry=registry,
@@ -565,3 +568,91 @@ async def test_operations_preview_uses_only_the_confirmed_saved_capture(fault, t
     assert calls[0].kwargs["args"]["capture_id"] == saved["snapshot"]["capture_id"]
     assert result["preview"]["operator_confirmation"]["snapshot_hash"] == saved["snapshot_hash"]
     assert result["plan_hash"] == motion.digest_plan(result["preview"])
+
+
+# ── Camera choice ────────────────────────────────────────────────────────────
+
+WRIST_ID = "wrist_cam"
+# The workcell camera's hand-eye record is never written; the wrist camera's is.
+WRIST_YAML: dict[str, Any] = {
+    **SHARED_YAML,
+    "roles": {**SHARED_YAML["roles"], "camera.wrist": WRIST_ID},
+    "frames": {
+        **SHARED_YAML["frames"],
+        "camera": {"parent": "base", "procedure": "global.handeye"},
+        "camera.wrist": {"parent": "base", "procedure": "camera.handeye"},
+    },
+}
+
+
+def _wrist_cell(tmp_path: Path) -> SkillNodeRegistry:
+    registry = _calibrated(tmp_path, CUP)
+    registry.devices[WRIST_ID] = SimRgbdCamera([CUP])
+    return registry
+
+
+async def test_the_listing_names_the_cameras_each_skill_can_serve(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path, _wrist_cell(tmp_path), WRIST_YAML)
+    (cell,) = runtime.list()["workcells"]
+    skills = {skill["skill_id"]: skill for skill in cell["skills"]}
+    assert skills["perceive.snapshot"]["bindings"] == {"camera": ["camera", "camera.wrist"]}
+    assert skills["perceive.locate"]["available"]
+    assert skills["perceive.locate"]["bindings"] == {"camera": ["camera.wrist"]}
+    assert skills["perceive.lift"]["available"] and skills["grasp.propose"]["available"]
+    card = workcell_view(NODE_ID, cell)["skills"]
+    assert next(s for s in card if s["skill_id"] == "perceive.locate")["bindings"] == {
+        "camera": ["camera.wrist"]
+    }
+
+
+async def test_a_skill_is_refused_for_the_camera_it_cannot_serve(tmp_path: Path) -> None:
+    registry = _wrist_cell(tmp_path)
+    registry.devices[WRIST_ID] = registry.devices[CAMERA_ID]  # the sim locator reads this one
+    runtime = _runtime(tmp_path, registry, WRIST_YAML)
+    refused = await _read(runtime, "perceive.locate", {"queries": ["cup"]})
+    assert refused.failure_code == FAILURE_SKILL_UNAVAILABLE
+    assert "camera is not calibrated" in refused.message
+    found = await _read(runtime, "perceive.locate", {"queries": ["cup"], "camera": "camera.wrist"})
+    assert found.ok and found.result["objects"][0]["camera"] == "camera.wrist"
+
+
+async def test_an_uncalibrated_camera_shows_the_scene_but_cannot_be_lifted(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path, _wrist_cell(tmp_path), WRIST_YAML)
+    shot = await _read(runtime, "perceive.snapshot", {})
+    assert shot.ok and shot.result["camera"] == "camera" and shot.result["liftable"] is False
+    assert "not liftable" in shot.message
+    refused = await _read(
+        runtime,
+        "perceive.lift",
+        {"frame": shot.result["frame"], "targets": [{"label": "cup", "box": _cup_box()}]},
+    )
+    assert refused.failure_code == FAILURE_CALIBRATION_MISSING
+    assert "take a snapshot with camera camera.wrist instead" in refused.message
+
+
+async def test_a_wrist_frame_lifts_and_is_measured_again_with_the_wrist(tmp_path: Path) -> None:
+    registry = _wrist_cell(tmp_path)
+    scene = _scene(registry, spec=WorkcellSpec.from_mapping(WRIST_YAML))
+    shot = await scene.snapshot("camera.wrist")
+    assert shot["liftable"] is True
+    target = PixelTarget("cup", box=tuple(_cup_box()))
+    (lifted,), _ = await scene.lift(shot["frame"], [target], coords=COORDS_PIXEL)
+    assert lifted.camera == "camera.wrist"
+    assert LocatedObject.from_mapping(lifted.to_dict()).camera == "camera.wrist"
+    wrist, workcell = registry.devices[WRIST_ID], registry.devices[CAMERA_ID]
+    before = (wrist.captures, workcell.captures)
+    again = await scene.relocate(lifted)
+    assert again.camera == "camera.wrist"
+    assert (wrist.captures, workcell.captures) == (before[0] + 1, before[1])
+
+
+def test_requirements_bind_to_the_arguments_a_caller_passed() -> None:
+    requires = ("role:{camera}", "calib:{camera}", "calib:workspace")
+    assert bind_requirements(requires, {"camera": "camera.wrist"}) == (
+        "role:camera.wrist", "calib:camera.wrist", "calib:workspace",
+    )
+    spec = WorkcellSpec.from_mapping(WRIST_YAML)
+    unbound = unmet_requirements(bind_requirements(requires, {}), spec, FrameGraph(spec, {}, None, {}))
+    assert any("{camera}" in reason for reason in unbound)  # never silently met

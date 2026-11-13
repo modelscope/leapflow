@@ -259,7 +259,13 @@ class WorkspaceBox:
         """Describe the first axis *point* leaves the box on, or None when inside."""
         for value, (low, high, axis) in zip(point, self._bounds()):
             if value < low + margin or value > high - margin:
-                return f"{axis}={value:.1f} mm is outside [{low:.1f}, {high:.1f}]"
+                # One decimal reads best, but must not round a near miss onto the bound.
+                near = low if value < low + margin else high
+                digits = 1 if round(value, 1) != round(near, 1) else 3
+                return (
+                    f"{axis}={value:.{digits}f} mm is outside "
+                    f"[{low:.{digits}f}, {high:.{digits}f}]"
+                )
         return None
 
     def contains(self, point: Sequence[float], *, margin: float = 0.0) -> bool:

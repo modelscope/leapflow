@@ -43,6 +43,7 @@ from leapflow.hardware.skills.perception import (
     PerceptionSettings,
     WorkcellScene,
     lift_detection,
+    reproject,
 )
 from leapflow.hardware.skills.scene_memory import SceneCapture, SceneMemory
 from leapflow.hardware.skills.ports import GraspPlanner
@@ -357,6 +358,74 @@ async def test_a_box_grounding_lifts_to_the_same_footprint(tmp_path: Path) -> No
     assert cup.center[:2] == pytest.approx(CUP.center, abs=3.0)
     assert (cup.length, cup.width, cup.height) == pytest.approx((60.0, 30.0, 50.0), abs=4.0)
     assert LocatedObject.from_mapping(cup.to_dict()).geometry == "box"
+
+
+@pytest.mark.parametrize("shift", [-12.0, 9.0])
+async def test_height_is_read_against_the_table_the_view_sees(
+    tmp_path: Path, shift: float
+) -> None:
+    """A z offset shared by the camera chain cancels: the height is the object's
+    own top minus its own table, and the object stands on the table the arm touched."""
+    registry = _calibrated(tmp_path, CUP)
+    frame = await registry.devices[CAMERA_ID].capture_rgbd()
+    touched = Plane.horizontal(TABLE_Z + shift)
+    capture = SceneCapture(frame, Transform.from_pose(Pose(**CAMERA_POSE)), touched)
+    box = reproject(_object(center=(*CUP.center, TABLE_Z + 25.0)), capture)
+    cup = lift_detection(box, capture, PerceptionSettings())
+    assert cup.table_offset_mm == pytest.approx(-shift, abs=1.0)
+    assert cup.height == pytest.approx(CUP.height, abs=4.0)
+    assert cup.bottom_z == pytest.approx(TABLE_Z + shift, abs=1e-6)
+    restored = LocatedObject.from_mapping(cup.to_dict()).table_offset_mm
+    assert restored == pytest.approx(cup.table_offset_mm, abs=0.05)
+
+
+@pytest.mark.parametrize("pad", [0.0, 6.0, 12.0])
+async def test_a_tilted_view_lifts_the_same_footprint_however_loose_the_box(
+    tmp_path: Path, pad: float
+) -> None:
+    """A hand-eye a few degrees off tilts the table the view sees against the one
+    the arm touched. Read as a pure offset, the far side of the ring stands over
+    the height floor and joins the object, so the centre moves with how loosely
+    the box was drawn; read as the plane the view sees, it does not."""
+    registry = _calibrated(tmp_path, CUP)
+    frame = await registry.devices[CAMERA_ID].capture_rgbd()
+    tilt = math.radians(5.0)
+    normal = (math.sin(tilt), 0.0, math.cos(tilt))
+    anchor = (*CUP.center, TABLE_Z)
+    touched = Plane(normal, sum(n * p for n, p in zip(normal, anchor)))
+    capture = SceneCapture(frame, Transform.from_pose(Pose(**CAMERA_POSE)), touched)
+    tight = reproject(_object(center=(*CUP.center, TABLE_Z + 25.0)), capture).box
+    assert tight is not None
+    x0, y0, x1, y1 = tight
+    loose = Detection(
+        "cup", 0.9,
+        box=(max(0.0, x0 - pad), max(0.0, y0 - pad),
+             min(float(frame.width), x1 + pad), min(float(frame.height), y1 + pad)),
+    )
+    cup = lift_detection(loose, capture, PerceptionSettings())
+    assert cup.center[:2] == pytest.approx(CUP.center, abs=3.0)
+    assert (cup.length, cup.width, cup.height) == pytest.approx((60.0, 30.0, 50.0), abs=4.0)
+    assert cup.table_offset_mm == pytest.approx(0.0, abs=1.0)
+
+
+async def test_a_turned_object_is_remeasured_through_its_silhouette(tmp_path: Path) -> None:
+    """Remeasuring lifts the silhouette the approved box casts, not that
+    silhouette's pixel box: a turned box's corners admit table that drags the
+    footprint, so the same object would seem to move without moving."""
+    turned = SimBox("bar", center=(300.0, 20.0), length=70.0, width=24.0, height=30.0, yaw_deg=45.0)
+    registry = _calibrated(tmp_path, turned)
+    frame = await registry.devices[CAMERA_ID].capture_rgbd()
+    capture = SceneCapture(frame, Transform.from_pose(Pose(**CAMERA_POSE)), _TABLE)
+    first = lift_detection(reproject(_object(
+        center=(*turned.center, TABLE_Z + 15.0), length=70.0, width=24.0, height=30.0,
+        yaw_deg=45.0), capture), capture, PerceptionSettings())
+    again = reproject(first, capture)
+    assert again.mask is not None and again.box is not None
+    x0, y0, x1, y1 = again.box
+    assert again.mask.area < 0.8 * (x1 - x0) * (y1 - y0)
+    second = lift_detection(again, capture, PerceptionSettings())
+    assert second.center[:2] == pytest.approx(first.center[:2], abs=1.5)
+    assert (second.length, second.width) == pytest.approx((first.length, first.width), abs=3.0)
 
 
 async def test_a_point_grounding_is_one_surface_point_with_no_extent(tmp_path: Path) -> None:

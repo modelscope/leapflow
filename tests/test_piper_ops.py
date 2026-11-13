@@ -184,8 +184,74 @@ async def test_fail_closed_feedback(settings, fault):
         motor["voltage_v"] = 20
     elif fault == "receipt":
         state.telemetry["receive"] = {}
+    gated = replace(settings, thermal_gate=True, voltage_gate=True, advisory_fault_gate=True)
     with pytest.raises(Refusal):
+        await health.read_snapshot(registry(state), gated, ready=True)
+
+
+@pytest.mark.parametrize("fault,gate,key", [
+    ("thermal", "thermal_gate", "motor 1 thermal"),
+    ("voltage", "voltage_gate", "motor 1 supply"),
+    ("motor_overheating", "advisory_fault_gate", "motor 1 flags"),
+    ("voltage_too_low", "advisory_fault_gate", "motor 1 flags"),
+])
+async def test_firmware_duplicate_gates_default_to_advisories(settings, fault, gate, key):
+    """The drivers protect themselves; by default a breach is reported, not refused."""
+    state = snapshot()
+    motor = state.telemetry["motors"][0]
+    if fault == "thermal":
+        motor["motor_temperature_c"] = 60
+    elif fault == "voltage":
+        motor["voltage_v"] = 20
+    else:
+        motor["faults"][fault] = True
+    current = await health.read_snapshot(registry(state), settings, ready=True, preflight=True)
+    assert [note.split(":")[0] for note in current.advisories] == [key]
+    with pytest.raises(Refusal):
+        await health.read_snapshot(registry(state), replace(settings, **{gate: True}), ready=True)
+
+
+@pytest.mark.parametrize("flag", ["driver_overcurrent", "driver_error_status", "collision_status",
+                                  "stall_status"])
+async def test_hard_faults_always_refuse(settings, flag):
+    state = snapshot()
+    state.telemetry["motors"][2]["faults"][flag] = True
+    with pytest.raises(Refusal, match=flag):
         await health.read_snapshot(registry(state), settings, ready=True)
+
+
+async def test_advisory_evidence_is_recorded_on_change_only(settings, tmp_path):
+    hot = snapshot()
+    hot.telemetry["motors"][1]["driver_temperature_c"] = 61.
+    run = Session(settings, Evidence(tmp_path / "advisory.json"))
+    run.registry = registry(hot)
+    for _ in range(3):
+        await run.snapshot(ready=True)
+    hot.telemetry["motors"][1]["driver_temperature_c"] = 62.
+    run.registry = registry(hot)
+    await run.snapshot(ready=True)
+    run.registry = registry(snapshot())
+    await run.snapshot(ready=True)
+    events = [e["event"] for e in run.evidence.events if e["event"].startswith("advisory")]
+    assert events == ["advisory", "advisory_cleared"]
+
+
+async def test_a_hot_arm_may_release_torque_but_not_energize(settings, tmp_path):
+    """Holding a pose heats the drives; an enabled thermal gate must not block the way to cool."""
+    settings = replace(settings, thermal_gate=True, voltage_gate=True)
+    hot = snapshot()
+    hot.telemetry["motors"][3]["driver_temperature_c"] = settings.preflight_temp_c + 3
+    run = Session(settings, Evidence(tmp_path / "hot.json"))
+    run.context, run.registry = context(), registry(hot)
+    with pytest.raises(Refusal, match=r"motor 4 motor/driver 26/48 C, limit 45 C.*arm disable"):
+        await lifecycle.preview(run, "enable")
+    plan = await lifecycle.preview(run, "disable", torque_release=True)
+    assert plan["steps"][0]["commands"] == (("arm.enable", 0),)
+    # Faults and supply voltage still gate a release.
+    hot.telemetry["motors"][3]["voltage_v"] = 20
+    run.registry = registry(hot)
+    with pytest.raises(Refusal, match="electrical safety gate"):
+        await lifecycle.preview(run, "disable", torque_release=True)
 
 
 def test_initialization_and_manual_intersection(settings):

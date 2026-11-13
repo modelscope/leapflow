@@ -10,6 +10,13 @@ behalf: S2 reads the candidates and names the ones it wants in a
 workcell that shares frames (and a host that consents) answers
 ``perceive.snapshot`` with an image, and ``perceive.lift`` turns the points or
 boxes S2 names in it into objects like any other.
+
+Every observing skill takes a ``camera`` role (the workcell camera by default,
+or e.g. ``camera.wrist``), and its requirements are bound to that argument: a
+listing reports which cameras each skill can serve right now (``bindings``).
+Looking needs only the camera; placing what is seen in the arm base frame needs
+its hand-eye mount and the table, so an uncalibrated camera can still show S2
+the scene, and ``perceive.lift`` explains which camera to look with instead.
 """
 
 from __future__ import annotations
@@ -37,23 +44,31 @@ from leapflow.hardware.skills.protocol import (
     SkillSpec,
 )
 
-_CAMERA_REQUIRES = (
-    f"{REQUIRE_ROLE}camera",
-    f"{REQUIRE_CALIBRATION}camera",
-    f"{REQUIRE_CALIBRATION}workspace",
-)
+_WORKSPACE = f"{REQUIRE_CALIBRATION}workspace"
+_SHARE = f"{REQUIRE_SHARE}{SHARE_FRAMES}"
+# Bound to the skill's ``camera`` argument (``frames.bind_requirements``).
+_CAMERA_REQUIRES = (f"{REQUIRE_ROLE}{{camera}}", f"{REQUIRE_CALIBRATION}{{camera}}", _WORKSPACE)
 _PERCEPTION_REQUIRES = (*_CAMERA_REQUIRES, f"{REQUIRE_MODEL}locator")
-_SHARED_REQUIRES = (*_CAMERA_REQUIRES, f"{REQUIRE_SHARE}{SHARE_FRAMES}")
-# No locator here: the object may be one S2 lifted out of a shared frame, and
-# bounding the planner on the locator made every lifted object ungraspable on a
-# workcell that runs no model service. Grounding is perceive.locate's gate.
+_SNAPSHOT_REQUIRES = (f"{REQUIRE_ROLE}{{camera}}", _SHARE)
+# The frame names its camera; lifting checks that camera's mount when it runs.
+_LIFT_REQUIRES = (_WORKSPACE, _SHARE)
+# No camera or locator here: the object already carries the camera it was seen
+# with, and may be one S2 lifted out of a shared frame -- bounding the planner on
+# the locator made every lifted object ungraspable on a workcell that runs no
+# model service. A planner that looks again reports its own camera problem.
 _GRASP_REQUIRES = (
     f"{REQUIRE_ROLE}arm",
     f"{REQUIRE_ROLE}gripper",
     f"{REQUIRE_CALIBRATION}tcp",
-    *_CAMERA_REQUIRES,
+    _WORKSPACE,
 )
 _COORD = {"type": "number", "minimum": 0}
+_CAMERA_ARG = {
+    "type": "string",
+    "pattern": "^camera(\\.[a-z0-9_]+)*$",
+    "default": "camera",
+    "description": "Camera role to look with, e.g. camera.wrist; see this skill's bindings.",
+}
 
 
 def _fmt(point: Any) -> str:
@@ -65,9 +80,9 @@ class Locate:
 
     spec = SkillSpec(
         skill_id="perceive.locate",
-        version="2.0.0",
+        version="2.1.0",
         card=(
-            "Look at the table with the workcell camera and report every detection of "
+            "Look at the table with a workcell camera and report every detection of "
             "the queried descriptions (e.g. ['red cup', 'plate']): id, label, score, "
             "centre (mm, arm base frame), size, yaw, how many depth points support "
             "it, and its geometry (mask or box; a point has no size), plus what the "
@@ -90,6 +105,7 @@ class Locate:
                     "maximum": 1,
                     "description": "Lowest detection score reported; the workcell's when omitted.",
                 },
+                "camera": _CAMERA_ARG,
             },
             "required": ["queries"],
         },
@@ -101,11 +117,13 @@ class Locate:
         return SkillPlan(
             skill_id=self.spec.skill_id,
             args=args,
-            summary=f"Locate {', '.join(args['queries'])} on the table",
+            summary=f"Locate {', '.join(args['queries'])} on the table with {args['camera']}",
         )
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
-        found = await ctx.scene.locate(plan.args["queries"], min_score=plan.args.get("min_score"))
+        found = await ctx.scene.locate(
+            plan.args["queries"], min_score=plan.args.get("min_score"), camera=plan.args["camera"]
+        )
         held = ctx.scene.held
         table = ctx.frames.table
         listed = "; ".join(
@@ -127,27 +145,35 @@ class Snapshot:
 
     spec = SkillSpec(
         skill_id="perceive.snapshot",
-        version="1.0.0",
+        version="1.1.0",
         card=(
-            "Capture one frame from the workcell camera and return it as an image you "
-            "can see, with its frame id and size in pixels. Point into it with "
-            "perceive.lift to turn what you see into objects in the arm base frame. "
-            "Only the newest few frames are kept, and they expire after a short while."
+            "Capture one frame from a workcell camera and return it as an image you "
+            "can see, with its frame id, size in pixels, and whether it is liftable. "
+            "Point into a liftable frame with perceive.lift to turn what you see into "
+            "objects in the arm base frame; a camera without a hand-eye calibration "
+            "still shows the scene but cannot be lifted from. Only the newest few "
+            "frames are kept, and they expire after a short while."
         ),
-        args_schema={"type": "object", "properties": {}},
+        args_schema={"type": "object", "properties": {"camera": _CAMERA_ARG}},
         effect=EFFECT_READ,
-        requires=_SHARED_REQUIRES,
+        requires=_SNAPSHOT_REQUIRES,
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
-        return SkillPlan(skill_id=self.spec.skill_id, args=args, summary="Share a camera frame")
+        return SkillPlan(
+            skill_id=self.spec.skill_id, args=args, summary=f"Share a {args['camera']} frame"
+        )
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
-        shot = dict(await ctx.scene.snapshot())
+        shot = dict(await ctx.scene.snapshot(plan.args["camera"]))
+        unlifted = "" if shot.get("liftable") else "; not liftable (camera not calibrated)"
         return SkillOutcome.succeeded(
             shot,
             side_effect_state=SIDE_EFFECT_NONE,
-            message=f"Frame {shot['frame']} ({shot['width']}x{shot['height']} pixels)",
+            message=(
+                f"Frame {shot['frame']} from {shot['camera']} "
+                f"({shot['width']}x{shot['height']} pixels){unlifted}"
+            ),
         )
 
 
@@ -156,7 +182,7 @@ class Lift:
 
     spec = SkillSpec(
         skill_id="perceive.lift",
-        version="1.0.0",
+        version="1.1.0",
         card=(
             "Turn what you point at in a perceive.snapshot frame into objects, without "
             "moving. Each target has a label and either a point [u, v] on the object's "
@@ -201,7 +227,7 @@ class Lift:
             "required": ["frame", "targets"],
         },
         effect=EFFECT_READ,
-        requires=_SHARED_REQUIRES,
+        requires=_LIFT_REQUIRES,
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
@@ -255,7 +281,7 @@ class GraspPropose:
 
     spec = SkillSpec(
         skill_id="grasp.propose",
-        version="1.0.0",
+        version="1.1.0",
         card=(
             "Propose grasps for one object id from perceive.locate, without moving: "
             "each grasp has an id, the TCP poses pregrasp / grasp / retreat (mm, deg, "

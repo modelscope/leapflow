@@ -20,12 +20,29 @@ from leapflow.hardware.skills.protocol import GraspCandidate, HeldObject, Locate
 
 @dataclass(frozen=True)
 class SceneCapture:
-    """One aligned RGB-D frame with the camera mount and table it was taken against."""
+    """One aligned RGB-D frame with the camera mount and table it was taken against.
+
+    A frame shared only to be looked at may come from a camera with no calibrated
+    mount, or before the table is known: it is not ``liftable`` then, and nothing
+    in it can be placed in the arm base frame.
+    """
 
     frame: RgbdFrame
-    camera_to_base: Transform
-    table: Plane
+    camera_to_base: Transform | None
+    table: Plane | None
     capture_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    camera: str = "camera"
+
+    @property
+    def liftable(self) -> bool:
+        return self.camera_to_base is not None and self.table is not None
+
+    def placement(self) -> tuple[Transform, Plane]:
+        """The mount and the table; raises ``ValueError`` when the frame is not liftable."""
+        if self.camera_to_base is None or self.table is None:
+            missing = "camera mount" if self.camera_to_base is None else "table"
+            raise ValueError(f"the {self.camera} frame was taken without a calibrated {missing}")
+        return self.camera_to_base, self.table
 
 
 class SceneMemory:

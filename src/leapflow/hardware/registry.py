@@ -106,6 +106,8 @@ class HardwareSettings:
     fleet_nodes: str = ""
     # JSON array (or already parsed sequence in tests) of reflex alert rules.
     hardware_alert_policies: Any = ""
+    # JSON array of monitor-only advisory limits (see ``leapflow.hardware.advisory``).
+    hardware_advisory_limits: Any = ""
     # Profile-owned append-only audit destination for HardwareTools.
     audit_log_path: str = ""
     # Profile-owned record of which declarations an operator has reviewed, and
@@ -146,6 +148,7 @@ class HardwareSettings:
             return cls(
                 enabled=bool(getattr(settings, "hardware_enabled", True)),
                 hardware_alert_policies=getattr(settings, "hardware_alert_policies", ""),
+                hardware_advisory_limits=getattr(settings, "hardware_advisory_limits", ""),
             )
         return cls(
             enabled=bool(getattr(settings, "hardware_enabled", True)),
@@ -189,6 +192,7 @@ class HardwareSettings:
             ),
             fleet_nodes=str(getattr(settings, "hardware_fleet_nodes", "") or ""),
             hardware_alert_policies=getattr(settings, "hardware_alert_policies", ""),
+            hardware_advisory_limits=getattr(settings, "hardware_advisory_limits", ""),
             audit_log_path=(
                 str(profile_layout.hardware.audit_log_path) if profile_layout is not None else ""
             ),

@@ -4,12 +4,19 @@
 ``FrameGraph`` snapshots every frame a workcell declares (and its workspace
 box and table plane) from the ``CalibrationStore``; ``unmet_requirements``
 explains why a skill's ``requires`` tokens do not hold in one snapshot.
+
+A token may name one of the skill's arguments in braces (``calib:{camera}``):
+``bind_requirements`` resolves it against the arguments a caller passed, and
+``requirement_bindings`` reports, for a listing, which values of it the
+workcell can meet -- so one skill serves whichever camera is ready.
 """
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
+import re
 from typing import Any, Iterable, Mapping, Sequence
 
 from leapflow.hardware.skills.geometry import Plane, Pose, Transform, WorkspaceBox
@@ -337,4 +344,79 @@ def _calib_skill(frame: str) -> str:
     return "handeye" if frame.split(".", 1)[0] == "camera" else frame
 
 
-__all__ = ["FrameGraph", "unmet_requirements"]
+_ARGUMENT = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
+
+
+def requirement_arguments(requires: Iterable[str]) -> tuple[str, ...]:
+    """The argument names *requires* binds, in first-seen order."""
+    names: dict[str, None] = {}
+    for token in requires:
+        names.update((name, None) for name in _ARGUMENT.findall(token))
+    return tuple(names)
+
+
+def bind_requirements(requires: Iterable[str], args: Mapping[str, Any]) -> tuple[str, ...]:
+    """*requires* with each ``{argument}`` replaced by its value in validated *args*.
+
+    An argument the caller left out and the schema gives no default for stays
+    unbound, so the token names nothing the workcell has and is reported unmet.
+    """
+    return tuple(
+        _ARGUMENT.sub(lambda m: str(args.get(m.group(1), m.group(0))), token) for token in requires
+    )
+
+
+def requirement_bindings(
+    requires: Sequence[str],
+    args_schema: Mapping[str, Any],
+    spec: WorkcellSpec,
+    frames: FrameGraph,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Why no binding of *requires* holds (empty when one does), and the values that do.
+
+    A bound argument's candidates are the workcell roles its schema ``pattern``
+    accepts, or its default when it declares no pattern. Without bound arguments
+    this is ``unmet_requirements`` with no bindings.
+    """
+    names = requirement_arguments(requires)
+    if not names:
+        return unmet_requirements(requires, spec, frames), {}
+    properties = args_schema.get("properties") or {}
+    choices = [_candidates(properties.get(name) or {}, spec) for name in names]
+    met: dict[str, list[str]] = {name: [] for name in names}
+    refusals: list[str] = []
+    combos = list(itertools.product(*choices))
+    for combo in combos:
+        binding = dict(zip(names, combo))
+        reasons = unmet_requirements(bind_requirements(requires, binding), spec, frames)
+        if not reasons:
+            for name, value in binding.items():
+                if value not in met[name]:
+                    met[name].append(value)
+        elif len(combos) == 1:
+            refusals.extend(reasons)
+        else:
+            label = ", ".join(f"{name}={value}" for name, value in binding.items())
+            refusals.append(f"{label}: {'; '.join(reasons)}")
+    if not combos:
+        refusals = [f"workcell {spec.workcell_id!r} binds no role {name} accepts" for name in names]
+    if any(met.values()):
+        return [], {name: values for name, values in met.items() if values}
+    return refusals, {}
+
+
+def _candidates(schema: Mapping[str, Any], spec: WorkcellSpec) -> list[str]:
+    pattern = schema.get("pattern")
+    if isinstance(pattern, str):
+        return sorted(role for role in spec.roles if re.fullmatch(pattern, role))
+    default = schema.get("default")
+    return [str(default)] if default is not None else []
+
+
+__all__ = [
+    "FrameGraph",
+    "bind_requirements",
+    "requirement_arguments",
+    "requirement_bindings",
+    "unmet_requirements",
+]

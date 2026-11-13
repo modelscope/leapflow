@@ -40,8 +40,8 @@ class _SceneSensing:
     def __init__(self, scene: Callable[[], WorkcellScene]) -> None:
         self._scene = scene
 
-    async def capture(self) -> SceneCapture:
-        return await self._scene().capture()
+    async def capture(self, role: str = "camera") -> SceneCapture:
+        return await self._scene().capture(role)
 
     async def model(self, name: str, task: str) -> ModelService:
         return await self._scene().model(name, task)

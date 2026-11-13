@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from leapflow.hardware.skills.geometry import Pose, mat_vec, wrap_axis_deg
+from leapflow.hardware.skills.geometry import Pose, mat_vec, tool_cone_deg, wrap_axis_deg
 from leapflow.hardware.skills.ports import PATH_DEFAULT, PATH_LINEAR, SkillContext
 from leapflow.hardware.skills.protocol import (
     EFFECT_ACTUATE,
@@ -200,6 +200,33 @@ def _invalid(index: int, message: str) -> SkillError:
 
 def _fmt(pose: Pose) -> str:
     return f"({pose.x:.0f}, {pose.y:.0f}, {pose.z:.0f}) mm"
+
+
+def _listed(step: Mapping[str, Any]) -> str:
+    """A step as the approver reads it: what it does, and what guards it."""
+    expect = step["expect"]
+    if not expect:
+        return str(step["text"])
+    reaction = "halt" if step["on_fail"] == ON_FAIL_STOP else "hold"
+    return f"{step['text']} [expect {expect}, else {reaction}]"
+
+
+def _envelope(start: Pose, targets: list[Pose]) -> dict[str, float]:
+    """The space the program sweeps, so one approval sees how far it goes."""
+    poses = [start, *targets]
+    return {
+        "z_min_mm": round(min(pose.z for pose in poses), 1),
+        "z_max_mm": round(max(pose.z for pose in poses), 1),
+        "tilt_max_deg": round(max(tool_cone_deg(pose) for pose in targets), 1) if targets else 0.0,
+    }
+
+
+def _envelope_text(envelope: Mapping[str, float], speed: float | None) -> str:
+    text = (
+        f"Tool z spans {envelope['z_min_mm']:.0f}-{envelope['z_max_mm']:.0f} mm; "
+        f"it tilts at most {envelope['tilt_max_deg']:.0f} deg from straight down"
+    )
+    return text + ("." if speed is None else f"; speed capped at {speed:.0f}%.")
 
 
 # ── Plan ─────────────────────────────────────────────────────────────────────
@@ -674,8 +701,9 @@ class MotionSequence:
         held = _current_hold(ctx, state)
         planner = _Planner(ctx, state)
         resolved = [planner.resolve(i, step) for i, step in enumerate(steps, 1)]
-        listed = "; ".join(f"{i}) {step['text']}" for i, step in enumerate(resolved, 1))
+        listed = "; ".join(f"{i}) {_listed(step)}" for i, step in enumerate(resolved, 1))
         speed = args.get("speed_pct")
+        envelope = _envelope(state.tcp, planner.targets)
         reach = planner.reach.to_dict()
         checked = (
             "Reach checked with the arm's kinematics."
@@ -685,7 +713,10 @@ class MotionSequence:
         return SkillPlan(
             skill_id=self.spec.skill_id,
             args=args,
-            summary=f"Run {len(resolved)} step(s) from {_fmt(state.tcp)}: {listed}. {checked}",
+            summary=(
+                f"Run {len(resolved)} step(s) from {_fmt(state.tcp)}: {listed}. "
+                f"{_envelope_text(envelope, speed)} {checked}"
+            ),
             targets=tuple(planner.targets),
             limits={} if speed is None else {"speed_pct": float(speed)},
             basis={
@@ -694,6 +725,7 @@ class MotionSequence:
                 "objects": {oid: obj.to_dict() for oid, obj in planner.objects.items()},
                 "grasps": {gid: grasp.to_dict() for gid, grasp in planner.grasps.items()},
                 "steps": resolved,
+                "envelope": envelope,
                 "reach": reach,
             },
         )

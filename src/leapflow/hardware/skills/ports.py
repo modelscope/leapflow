@@ -195,13 +195,14 @@ class ScenePort(Protocol):
     """
 
     async def locate(
-        self, queries: Sequence[str], *, min_score: float | None = None
+        self, queries: Sequence[str], *, min_score: float | None = None, camera: str = "camera"
     ) -> tuple[LocatedObject, ...]:
-        """Every detection of *queries* in a fresh frame, each under a new id."""
+        """Every detection of *queries* in a fresh frame of *camera*, each under a new id."""
         ...
 
-    async def snapshot(self) -> Mapping[str, Any]:
-        """A fresh frame, remembered as ``frame`` and shared downscaled as ``image``."""
+    async def snapshot(self, camera: str = "camera") -> Mapping[str, Any]:
+        """A fresh frame of *camera*, remembered as ``frame`` and shared downscaled as
+        ``image``; ``liftable`` says whether ``lift`` can place what is pointed at in it."""
         ...
 
     async def lift(

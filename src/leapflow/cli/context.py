@@ -812,13 +812,17 @@ class Context:
 
         cap_registry = ModelCapabilityRegistry()
         base_caps = cap_registry.resolve(settings.llm_model)
+        # The static table lags new multimodal releases; the operator's word wins.
+        vision = {"true": True, "false": False}.get(
+            getattr(settings, "llm_supports_vision", "auto"), base_caps.supports_vision
+        )
         cap_registry.register(
             settings.llm_model,
             ModelCapabilities(
                 context_length=self._effective_llm_context_length(settings),
                 max_output_tokens=base_caps.max_output_tokens,
                 supports_tools=settings.native_tool_calling_enabled,
-                supports_vision=base_caps.supports_vision,
+                supports_vision=vision,
                 supports_thinking=base_caps.supports_thinking,
                 supports_streaming_tools=base_caps.supports_streaming_tools,
                 tokens_per_image=base_caps.tokens_per_image,

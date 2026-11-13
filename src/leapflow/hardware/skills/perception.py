@@ -72,6 +72,7 @@ from leapflow.hardware.skills.protocol import (
     SkillError,
 )
 from leapflow.hardware.skills.scene_memory import SceneCapture, SceneMemory
+from leapflow.hardware.skills.table_view import base_points, convex_mask, mask_box, table_plane
 from leapflow.hardware.skills.workcell import ROLE_CAMERA, WorkcellSpec
 from leapflow.hardware.transport import TransportError
 
@@ -94,6 +95,10 @@ class PerceptionSettings:
     ``locate`` callers may raise it per call. ``point_radius_px`` is the
     half-width of the window a point's depth is the median of. ``snapshot_*``
     and ``max_frames`` shape the frames ``snapshot`` shares and remembers.
+    ``table_ring_px`` is the band around a box whose depth is the table it
+    stands on; a ring reading more than ``max_table_offset_mm`` off the
+    calibrated plane is not trusted as that table, and a ring plane tilted more
+    than ``max_table_tilt_deg`` from it is read as a pure offset instead.
     """
 
     max_points: float = 3000.0
@@ -110,6 +115,9 @@ class PerceptionSettings:
     snapshot_max_side: float = 640.0
     snapshot_quality: float = 75.0
     max_frames: float = 2.0
+    table_ring_px: float = 16.0
+    max_table_offset_mm: float = 30.0
+    max_table_tilt_deg: float = 10.0
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, float]) -> "PerceptionSettings":
@@ -221,21 +229,11 @@ def _lift_pixels(
     table: Plane,
     settings: PerceptionSettings,
 ) -> list[Vec3]:
-    depth = frame.depth_units()
-    scale = frame.depth_scale_m * 1000.0
-    intrinsics = frame.intrinsics
-    width = frame.width
-    points: list[Vec3] = []
-    for u, v in pixels:
-        raw = depth[v * width + u]
-        if not raw:
-            continue
-        z = raw * scale
-        if not settings.min_depth_mm <= z <= settings.max_depth_mm:
-            continue
-        point = camera_to_base.apply(intrinsics.deproject(u, v, z))
-        if table.above(point) >= settings.min_height_mm:
-            points.append(point)
+    points = [
+        point
+        for point in base_points(pixels, frame, camera_to_base, settings)
+        if table.above(point) >= settings.min_height_mm
+    ]
     return reject_outliers(points, table, settings.outlier_k)
 
 
@@ -247,7 +245,7 @@ def lift_detection(
     Raises ``ValueError`` when its geometry does not fit the frame, and
     ``LookupError`` (saying why) when too little depth supports it.
     """
-    frame, mount, table = capture.frame, capture.camera_to_base, capture.table
+    frame, (mount, table) = capture.frame, capture.placement()
     if detection.geometry == GEOMETRY_POINT:
         lifted = lift_point(detection.point or (), frame, mount, settings)
         if lifted is None:
@@ -265,22 +263,35 @@ def lift_detection(
             observed_at=frame.observed_at,
             points=support,
             geometry=GEOMETRY_POINT,
+            camera=capture.camera,
         )
+    box = mask_box(detection.mask) if detection.geometry == GEOMETRY_MASK else detection.box
+    viewed = table_plane(box, frame, mount, table, settings)  # type: ignore[arg-type]
+    seen = table if viewed is None else viewed
     if detection.geometry == GEOMETRY_MASK:
-        points = lift_mask(detection.mask, frame, mount, table, settings)  # type: ignore[arg-type]
+        points = lift_mask(detection.mask, frame, mount, seen, settings)  # type: ignore[arg-type]
     else:
-        points = lift_box(detection.box, frame, mount, table, settings)  # type: ignore[arg-type]
+        points = lift_box(detection.box, frame, mount, seen, settings)  # type: ignore[arg-type]
     if len(points) < settings.min_points:
         raise LookupError(f"{len(points)} depth points")
     located = describe(
         points,
-        table,
+        seen,
         label=detection.label,
         score=detection.score,
         observed_at=frame.observed_at,
         top_quantile=settings.top_quantile,
     )
-    return replace(located, geometry=detection.geometry)
+    # Measured against the table this view saw, placed on the one the arm touched.
+    x, y, _ = located.center
+    offset = None if viewed is None else viewed.height(x, y) - table.height(x, y)
+    return replace(
+        located,
+        center=(x, y, table.height(x, y) + located.height / 2.0),
+        geometry=detection.geometry,
+        camera=capture.camera,
+        table_offset_mm=offset,
+    )
 
 
 def reject_outliers(points: Sequence[Vec3], table: Plane, k: float) -> list[Vec3]:
@@ -383,11 +394,13 @@ def target_detection(
 
 def reproject(obj: LocatedObject, capture: SceneCapture) -> Detection:
     """Where *obj* would appear in *capture* if it has not moved: its point, or the
-    pixel box its oriented box spans (clipped to the frame).
+    silhouette its oriented box casts (clipped to the frame) with that
+    silhouette's pixel box. The silhouette, not the box, is what is lifted again:
+    a turned object's box takes in table enough to drag the footprint.
 
     Raises ``ValueError`` when it projects behind the camera or out of the frame.
     """
-    to_camera = capture.camera_to_base.inverse()
+    to_camera = capture.placement()[0].inverse()
     frame = capture.frame
     if obj.geometry == GEOMETRY_POINT:
         u, v = frame.intrinsics.project(to_camera.apply(obj.center))
@@ -409,7 +422,8 @@ def reproject(obj: LocatedObject, capture: SceneCapture) -> Detection:
     y1 = min(float(frame.height), max(v for _, v in pixels))
     if x1 <= x0 or y1 <= y0:
         raise ValueError("it projects outside the frame")
-    return Detection(obj.label, obj.score, box=(x0, y0, x1, y1))
+    mask = convex_mask(pixels, frame.width, frame.height)
+    return Detection(obj.label, obj.score, box=(x0, y0, x1, y1), mask=mask)
 
 
 # ── Scene ────────────────────────────────────────────────────────────────────
@@ -442,14 +456,16 @@ class WorkcellScene:
         return dict(self._frames.versions)
 
     async def locate(
-        self, queries: Sequence[str], *, min_score: float | None = None
+        self, queries: Sequence[str], *, min_score: float | None = None,
+        camera: str = ROLE_CAMERA,
     ) -> tuple[LocatedObject, ...]:
         floor = self._settings.min_score if min_score is None else float(min_score)
-        found = await self._detect(queries, floor)
+        found = await self._detect(queries, floor, camera)
         return self._memory.remember(found, self._basis)
 
-    async def snapshot(self) -> dict[str, Any]:
-        capture = await self.capture()
+    async def snapshot(self, camera: str = ROLE_CAMERA) -> dict[str, Any]:
+        """Share one frame of *camera*; it need not be calibrated to be looked at."""
+        capture = await self._observe(camera, placed=False)
         frame = capture.frame
         frame_id = self._memory.remember_frame(
             capture, self._basis, keep=int(self._settings.max_frames)
@@ -460,11 +476,16 @@ class WorkcellScene:
         )
         self._note(
             "snapshot",
-            {"frame": frame_id, "sequence": frame.sequence, "width": width, "height": height},
+            {
+                "frame": frame_id, "camera": camera, "sequence": frame.sequence,
+                "width": width, "height": height, "liftable": capture.liftable,
+            },
         )
         return {
             "frame": frame_id,
             "capture_id": capture.capture_id,
+            "camera": camera,
+            "liftable": capture.liftable,
             "width": width,
             "height": height,
             "observed_at": frame.observed_at,
@@ -484,6 +505,8 @@ class WorkcellScene:
                 f"newest {int(self._settings.max_frames)} are kept, and a recalibration "
                 "forgets them); take a new snapshot",
             )
+        if not capture.liftable:
+            raise SkillError(FAILURE_CALIBRATION_MISSING, self._unplaced(frame_id, capture))
         shown = snapshot_size(capture.frame, self._settings.snapshot_max_side)
         lifted: list[LocatedObject] = []
         dropped: list[Mapping[str, str]] = []
@@ -522,6 +545,25 @@ class WorkcellScene:
             "forgotten on a new locate or a recalibration); locate again"
         )
 
+    def _unplaced(self, frame_id: str, capture: SceneCapture) -> str:
+        """Why nothing in *capture* can be lifted, and which cameras could be used instead."""
+        camera = capture.camera
+        if capture.camera_to_base is not None:
+            return (
+                f"{frame_id} cannot be lifted: the table is not calibrated; run calib.workspace "
+                "with table_z or table_points"
+            )
+        why = self._frames.stale.get(camera) or "it is not calibrated"
+        ready = [
+            role for role in sorted(self._spec.roles)
+            if role.split(".", 1)[0] == ROLE_CAMERA and self._frames.transform(role) is not None
+        ]
+        hint = (
+            f"take a snapshot with camera {' or '.join(ready)} instead" if ready
+            else f"run calib.handeye for {camera}"
+        )
+        return f"{frame_id} cannot be lifted: {camera} has no usable hand-eye mount ({why}); {hint}"
+
     async def relocate(self, obj: LocatedObject) -> LocatedObject:
         """Measure only *obj* where its approved geometry projects in a fresh frame.
 
@@ -532,7 +574,7 @@ class WorkcellScene:
         return await self._remeasure(obj)
 
     async def _remeasure(self, obj: LocatedObject) -> LocatedObject:
-        capture = await self.capture()
+        capture = await self.capture(obj.camera)
         try:
             seen = lift_detection(reproject(obj, capture), capture, self._settings)
         except (LookupError, ValueError) as exc:
@@ -542,7 +584,7 @@ class WorkcellScene:
                 f"{obj.object_id} ({obj.label}) cannot be measured again ({exc}); "
                 f"{observe_again} and make a new plan",
             ) from exc
-        moved = replace(seen, object_id=obj.object_id, source=obj.source)
+        moved = replace(seen, object_id=obj.object_id, source=obj.source, geometry=obj.geometry)
         self._memory.update(moved, self._basis)
         return moved
 
@@ -559,8 +601,8 @@ class WorkcellScene:
     # ── GraspSensing ──
 
     async def capture(self, role: str = ROLE_CAMERA) -> SceneCapture:
-        frame, camera_to_base, table = await self._observe(role)
-        return SceneCapture(frame, camera_to_base, table)
+        """A fresh liftable frame of camera *role*; refuses an uncalibrated mount or table."""
+        return await self._observe(role)
 
     async def model(self, name: str, task: str) -> ModelService:
         """The workcell's *name* model, verified now to serve *task*."""
@@ -586,8 +628,10 @@ class WorkcellScene:
 
     # ── Internals ──
 
-    async def _detect(self, queries: Sequence[str], min_score: float) -> list[LocatedObject]:
-        capture = await self.capture()
+    async def _detect(
+        self, queries: Sequence[str], min_score: float, camera: str = ROLE_CAMERA
+    ) -> list[LocatedObject]:
+        capture = await self.capture(camera)
         frame = capture.frame
         result, model = await self._ground(frame, queries)
         kept: list[LocatedObject] = []
@@ -618,7 +662,8 @@ class WorkcellScene:
         )
         return kept
 
-    async def _observe(self, role: str = ROLE_CAMERA) -> tuple[RgbdFrame, Transform, Plane]:
+    async def _observe(self, role: str = ROLE_CAMERA, *, placed: bool = True) -> SceneCapture:
+        """One frame of camera *role*; *placed* also demands its mount and the table."""
         if role.split(".", 1)[0] != ROLE_CAMERA:
             raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"{role!r} is not a camera role")
         camera = self._spec.role(role)
@@ -627,19 +672,19 @@ class WorkcellScene:
                 FAILURE_SKILL_UNAVAILABLE, f"workcell {self._spec.workcell_id!r} binds no {role}"
             )
         mount = self._frames.transform(role)
-        if mount is None:
-            raise SkillError(
-                FAILURE_CALIBRATION_MISSING, "the camera is not calibrated (run calib.handeye)"
-            )
         table = self._frames.table
-        if table is None:
+        if placed and mount is None:
+            raise SkillError(
+                FAILURE_CALIBRATION_MISSING, f"the {role} is not calibrated (run calib.handeye)"
+            )
+        if placed and table is None:
             raise SkillError(
                 FAILURE_CALIBRATION_MISSING,
                 "the workspace was calibrated without the table; run calib.workspace with "
                 "table_z or table_points",
             )
         flange = None
-        if self._frames.parent(role) == "flange":
+        if mount is not None and self._frames.parent(role) == "flange":
             flange = (await self._motion.state()).flange
             mount = Transform.from_pose(flange).compose(mount)
         try:
@@ -658,8 +703,9 @@ class WorkcellScene:
             if (flange.distance_mm(after) > limits["capture_drift_mm"]
                     or flange.rotation_to_deg(after) > limits["capture_drift_deg"]):
                 raise SkillError(FAILURE_CALIBRATION_STALE, "the wrist moved during camera capture")
-        self._check_intrinsics(frame.intrinsics, role=role)
-        return frame, mount, table
+        if mount is not None:
+            self._check_intrinsics(frame.intrinsics, role=role)
+        return SceneCapture(frame, mount, table, camera=role)
 
     def _check_intrinsics(self, live: CameraIntrinsics, *, role: str = ROLE_CAMERA) -> None:
         recorded = self._frames.parameters(role).get("intrinsics")

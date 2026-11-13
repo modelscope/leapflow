@@ -7,6 +7,10 @@ from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 
+GATE_SWITCHES = ("thermal_gate", "voltage_gate", "advisory_fault_gate")
+"""Boolean opt-ins; every other boolean in a configuration is a mistyped number."""
+
+
 @dataclass(frozen=True)
 class Settings:
     """Conservative commissioning limits, independently configurable."""
@@ -54,6 +58,15 @@ class Settings:
     max_temp_c: float = 50.0
     voltage_min_v: float = 21.6
     voltage_max_v: float = 26.0
+    thermal_gate: bool = False
+    """Refuse motion at ``preflight_temp_c``/``max_temp_c``. Off by default: the drivers
+    carry their own thermal protection, so a breach is recorded as an advisory instead."""
+    voltage_gate: bool = False
+    """Refuse motion outside ``voltage_min_v``..``voltage_max_v``; off by default for the
+    same reason (firmware under-voltage protection), recorded as an advisory."""
+    advisory_fault_gate: bool = False
+    """Refuse on firmware-advisory flags (overheating, low voltage). Hard faults —
+    driver error, over-current, collision, stall — always refuse."""
     gripper_max_mm: float | None = None
     gripper_max_evidence: str = ""
     gripper_spec_max_mm: float | None = None
@@ -93,6 +106,10 @@ class Settings:
         """Fail closed on malformed budgets, ranges or maximum-opening evidence."""
         for field in fields(self):
             value = getattr(self, field.name)
+            if field.name in GATE_SWITCHES:
+                if not isinstance(value, bool):
+                    raise ValueError(f"{field.name} must be boolean")
+                continue
             if isinstance(value, bool):
                 raise ValueError(f"{field.name} cannot be boolean")
             if isinstance(value, (float, int)) and (not math.isfinite(value) or value <= 0):

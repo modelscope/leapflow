@@ -58,6 +58,20 @@ def _expand_path(value: str) -> Path:
     return Path(value.replace("~", str(Path.home()))).expanduser()
 
 
+_TRI_STATE = {"auto": "auto", "": "auto", "true": "true", "1": "true", "yes": "true",
+              "on": "true", "false": "false", "0": "false", "no": "false", "off": "false"}
+
+
+def _tri_state(name: str) -> str:
+    """An ``auto`` / ``true`` / ``false`` environment value; anything else is ``auto``."""
+    raw = os.getenv(name, "auto").strip().lower()
+    value = _TRI_STATE.get(raw)
+    if value is None:
+        logger.warning("%s=%r is not auto, true or false; using auto", name, raw)
+        return "auto"
+    return value
+
+
 # Directory creation is owned by PathLayout/ProfileLayout.
 def ensure_data_dir(data_dir: Path, *, profile: str = "default") -> None:
     """Create the LeapFlow data directory using the canonical layout."""
@@ -291,6 +305,10 @@ class Settings:
     # JSON array of event-to-action rules evaluated by hardware stream sources.
     # Empty keeps reflex actions disabled until an operator declares them.
     hardware_alert_policies: str = ""
+    # JSON array of monitor-only limits for conditions a device's firmware already
+    # enforces (drive temperature, supply voltage, advisory fault flags). Breaches
+    # are reported to the board with backoff and never gate a command.
+    hardware_advisory_limits: str = ""
     # Node-local skills (S1.5). Comma-separated fnmatch patterns of enabled skill
     # ids; empty enables every discovered skill. The speed cap bounds every
     # skill plan; the duration cap bounds one skill execution end to end.
@@ -746,6 +764,9 @@ class Settings:
     llm_context_length: int = (
         DEFAULT_LLM_CONTEXT_LENGTH  # Primary provider's runtime context budget
     )
+    # Whether the primary model accepts images: "auto" trusts the static model
+    # table, "true"/"false" override it for a model the table does not know.
+    llm_supports_vision: str = "auto"
     llm_credential_cooldown_s: float = 60.0  # Per-key rate-limit cooldown
 
     # ── Benchmark Qualification ──
@@ -1525,6 +1546,7 @@ def _build_settings_from_env(
     # LEAPFLOW_FLEET_NODES fallback is applied later, in fleet_config.
     hardware_fleet_nodes = os.getenv("LEAPFLOW_HARDWARE_FLEET_NODES", "").strip()
     hardware_alert_policies = os.getenv("LEAPFLOW_HARDWARE_ALERT_POLICIES", "").strip()
+    hardware_advisory_limits = os.getenv("LEAPFLOW_HARDWARE_ADVISORY_LIMITS", "").strip()
     hardware_calibration_worker_enabled = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
     hardware_calibration_worker_budgets = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_BUDGETS", "{}").strip() or "{}"
     hardware_skills_enabled = os.getenv("LEAPFLOW_HARDWARE_SKILLS_ENABLED", "").strip()
@@ -1646,6 +1668,7 @@ def _build_settings_from_env(
     llm_context_length = int(
         os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", str(DEFAULT_LLM_CONTEXT_LENGTH))
     )
+    llm_supports_vision = _tri_state("LEAPFLOW_LLM_SUPPORTS_VISION")
     llm_credential_cooldown_s = float(os.getenv("LEAPFLOW_LLM_CREDENTIAL_COOLDOWN_S", "60.0"))
 
     # Benchmark Qualification
@@ -2072,6 +2095,7 @@ def _build_settings_from_env(
         hardware_preview_idle_timeout_s=hardware_preview_idle_timeout_s,
         hardware_fleet_nodes=hardware_fleet_nodes,
         hardware_alert_policies=hardware_alert_policies,
+        hardware_advisory_limits=hardware_advisory_limits,
         hardware_calibration_worker_enabled=hardware_calibration_worker_enabled,
         hardware_calibration_worker_budgets=hardware_calibration_worker_budgets,
         hardware_skills_enabled=hardware_skills_enabled,
@@ -2142,6 +2166,7 @@ def _build_settings_from_env(
         llm_aux_api_key=llm_aux_api_key,
         llm_aux_base_url=llm_aux_base_url,
         llm_context_length=llm_context_length,
+        llm_supports_vision=llm_supports_vision,
         llm_credential_cooldown_s=llm_credential_cooldown_s,
         # Benchmark Qualification
         benchmark_commands=benchmark_commands,

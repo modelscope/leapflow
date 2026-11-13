@@ -7,6 +7,8 @@ Aggregates health signals from multiple sources:
 - HardwareRegistry: device probe results
 - FrameHub stats in a camera's probe: stale / recovered / frame-loss transitions,
   published on the registry's signal path as ordinary ``HardwareEvent`` kinds
+- Advisory limits (``hardware.advisory_limits``): monitor-only breaches of what the
+  device firmware already enforces, published with exponential backoff
 - FleetManager: node heartbeat status
 
 Executes DegradationPolicy actions based on aggregated health:
@@ -34,6 +36,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from leapflow.hardware.advisory import AdvisoryWatch, load_advisory_limits
 from leapflow.hardware.degradation import (
     DegradationCoordinator,
     degradation_actions_enabled,
@@ -118,6 +121,15 @@ def _is_power_of_two(count: int) -> bool:
     return count > 0 and count & (count - 1) == 0
 
 
+def _advisory_watch(registry: Any) -> AdvisoryWatch | None:
+    """Build the advisory watch from the registry's settings; None when nothing is watched."""
+    limits = load_advisory_limits(getattr(registry, "settings", None))
+    if not limits:
+        return None
+    logger.info("HealthMonitor: watching %d advisory limit(s)", len(limits))
+    return AdvisoryWatch(registry, limits)
+
+
 # ---------------------------------------------------------------------------
 # HardwareHealthMonitor
 # ---------------------------------------------------------------------------
@@ -152,6 +164,7 @@ class HardwareHealthMonitor:
         self._records: dict[str, DeviceHealthRecord] = {}
         self._halts: dict[str, _HaltEpisode] = {}
         self._frames = FrameHealthTracker()
+        self._advisories = _advisory_watch(registry)
         from leapflow.hardware.calibration.lifecycle import LifecycleReceiver
         self._calibration_lifecycle = LifecycleReceiver(registry)
         self._poll_task: asyncio.Task[None] | None = None
@@ -583,6 +596,9 @@ class HardwareHealthMonitor:
             if self._fleet_manager is not None:
                 await self._poll_fleet_nodes()
 
+            if self._advisories is not None:
+                await self._observe_advisories()
+
             try:
                 await asyncio.wait_for(self._stopped.wait(), timeout=self._poll_interval)
                 break  # stopped
@@ -626,6 +642,19 @@ class HardwareHealthMonitor:
         metadata = getattr(status, "metadata", None)
         stats = metadata.get("frame_hub") if isinstance(metadata, Mapping) else None
         events = self._frames.observe(device_id, stats)
+        self._publish(events, "frame")
+
+    async def _observe_advisories(self) -> None:
+        """Publish advisory-limit transitions; the watch itself paces repeats."""
+        assert self._advisories is not None
+        try:
+            events = await self._advisories.poll()
+        except Exception:  # noqa: BLE001 — telemetry must not break monitoring
+            logger.warning("HealthMonitor: advisory poll failed", exc_info=True)
+            return
+        self._publish(events, "advisory")
+
+    def _publish(self, events: Any, what: str) -> None:
         publish = getattr(self._registry, "publish_event", None)
         for event in events:
             logger.info("HealthMonitor: %s", event.to_detail())
@@ -634,7 +663,7 @@ class HardwareHealthMonitor:
             try:
                 publish(event)
             except Exception:  # noqa: BLE001 — telemetry must not break monitoring
-                logger.warning("HealthMonitor: frame event publish failed", exc_info=True)
+                logger.warning("HealthMonitor: %s event publish failed", what, exc_info=True)
 
     async def _poll_fleet_nodes(self) -> None:
         """Check fleet node health and update device records accordingly.

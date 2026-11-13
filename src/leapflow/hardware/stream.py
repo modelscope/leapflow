@@ -116,6 +116,10 @@ _EVENT_CLASS_MAP: dict[str, str] = {
     # A withheld supervisory action is a warning for a person, never a trigger:
     # classing it REFLEX would hand the alert policy the stop just withheld.
     DEGRADATION_SUPPRESSED: HardwareEventClass.RECORD,
+    # Advisory limits watch what the device's own firmware already enforces; a
+    # breach informs a person and must never drive a reflex (see ``advisory``).
+    "advisory_exceeded": HardwareEventClass.RECORD,
+    "advisory_cleared": HardwareEventClass.RECORD,
 }
 
 
@@ -188,6 +192,10 @@ class EventKind:
     CALIBRATION_DRIFT = "calibration_drift"
     DEGRADATION_SUPPRESSED = DEGRADATION_SUPPRESSED
     """A degradation policy triggered while actions are disabled; reported only."""
+    ADVISORY_EXCEEDED = "advisory_exceeded"
+    """A monitor-only limit the device protects itself against was breached."""
+    ADVISORY_CLEARED = "advisory_cleared"
+    """A breached advisory limit returned inside its hysteresis band."""
 
 
 @dataclass(frozen=True)

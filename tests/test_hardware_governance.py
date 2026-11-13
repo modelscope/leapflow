@@ -1868,6 +1868,7 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.preview_idle_timeout_s",
         "hardware.fleet_nodes",
         "hardware.alert_policies",
+        "hardware.advisory_limits",
         "hardware.skills_enabled",
         "hardware.skills_speed_pct_max",
         "hardware.skills_max_duration_s",

@@ -201,6 +201,9 @@ def workcell_view(node_id: str, cell: Mapping[str, Any]) -> dict[str, Any]:
         card["available"] = bool(skill.get("available"))
         if not card["available"]:
             card["reason"] = skill.get("reason")
+        if skill.get("bindings"):
+            # The argument values this workcell can serve, e.g. which camera is ready.
+            card["bindings"] = skill.get("bindings")
         skills.append(card)
     return {
         "workcell": f"{node_id}/{cell.get('workcell') or ''}",

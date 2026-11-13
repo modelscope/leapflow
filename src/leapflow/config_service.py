@@ -161,6 +161,12 @@ _FIELD_DESCRIPTIONS = {
         "hw_estop rules halt directly while other actions use approval. Stream sources "
         "bind these rules at startup, so a change needs a daemon restart."
     ),
+    "hardware.advisory_limits": (
+        "JSON array of monitor-only limits ({device_id, channel_id, field, min/max or flag, "
+        "unit, label, hysteresis, report_after_s, report_max_s}) for conditions the device "
+        "firmware already protects. Breaches appear on LeapBoard with exponential backoff "
+        "and never gate a command. Read at startup, so a change needs a daemon restart."
+    ),
     "hardware.host_interval_s": (
         "Seconds between samples of fast host channels (cpu, memory, network); disk, "
         "battery and thermal channels sample less often. 0 uses the 5s default. Read "
@@ -370,6 +376,10 @@ _FIELD_DESCRIPTIONS = {
     "llm.base_url": "OpenAI-compatible endpoint for the primary LLM provider.",
     "llm.model": "Primary LLM model used by chat, planning, and tool reasoning.",
     "llm.context_length": "Runtime context budget in tokens shown in the TUI status bar.",
+    "llm.supports_vision": (
+        "Whether the primary model reads images: auto uses the built-in model table, "
+        "true or false overrides it (for a multimodal model the table does not know yet)."
+    ),
     "llm.max_retries": "Retry attempts for transient LLM provider failures.",
     "vlm.api_key": "VLM API key stored in the local secret vault.",
     "runtime.mock_host": "Use the in-process mock host when native OS control is unavailable.",
@@ -1034,6 +1044,7 @@ def _examples_for_key(key: str) -> tuple[str, ...]:
     examples = {
         "llm.model": ("leap config set llm.model qwen3.7-plus",),
         "llm.context_length": ("leap config set llm.context_length 1000000",),
+        "llm.supports_vision": ("leap config set llm.supports_vision true",),
         "runtime.mock_host": ("leap config set runtime.mock_host true",),
         "runtime.log_level": ("leap config set runtime.log_level DEBUG",),
         "memory.working_max_tokens": ("leap config set memory.working_max_tokens 0",),

@@ -46,7 +46,9 @@ TOP_DOWN = "top_down"
 class GraspSensing(Protocol):
     """What a planner may consult per call: a fresh RGB-D view and a bound model."""
 
-    async def capture(self) -> SceneCapture: ...
+    async def capture(self, role: str = "camera") -> SceneCapture:
+        """A fresh liftable view from camera *role* (an object's ``camera``)."""
+        ...
 
     async def model(self, name: str, task: str) -> ModelService:
         """The workcell's *name* model, verified to serve *task*; raises ``SkillError``."""
@@ -56,7 +58,7 @@ class GraspSensing(Protocol):
 class AdmissionSensing:
     """The sensing a planner is built with at admission: nothing can be observed."""
 
-    async def capture(self) -> SceneCapture:
+    async def capture(self, role: str = "camera") -> SceneCapture:
         raise SkillError(FAILURE_SKILL_UNAVAILABLE, "no scene is observable at admission")
 
     async def model(self, name: str, task: str) -> ModelService:

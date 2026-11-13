@@ -193,6 +193,7 @@ class Session:
         self._context_token = None
         self.consent: ScopedConsent | None = None
         self._approved_steps: list[tuple[str, tuple[tuple[str, Any], ...], bool]] = []
+        self._advisories: frozenset[str] = frozenset()
 
     def bind_steps(self, steps: list[dict[str, Any]]) -> None:
         """Bind the complete preview once; execution cannot invent a subsequent step."""
@@ -269,21 +270,22 @@ class Session:
         return context
 
     async def snapshot(self, *, ready: bool = False, preflight: bool = False,
-                       requalify: bool = False) -> Snapshot:
+                       requalify: bool = False, releasing: bool = False) -> Snapshot:
         """Read one qualified snapshot; ``requalify`` re-samples only a receive gap.
 
         A stale CAN sample describes the reception, not the arm, so an observation may
         read again inside the configured request budget while the servo keeps following
         its waypoint; a reception that never requalifies stops the run instead of
-        spinning. Every other refusal — fault, thermal, enable, mode — still aborts at
-        once, and without ``requalify`` the sample fails closed exactly as before.
+        spinning. Every other refusal — fault, enable, mode, an enabled thermal or
+        voltage gate — still aborts at once, and without ``requalify`` the sample fails
+        closed exactly as before.
         """
         assert self.registry is not None
         deadline, stale = time.monotonic() + self.settings.request_timeout_s, 0
         while True:
             try:
-                current = await read_snapshot(self.registry, self.settings,
-                                             ready=ready, preflight=preflight)
+                current = await read_snapshot(self.registry, self.settings, ready=ready,
+                                             preflight=preflight, releasing=releasing)
             except StaleFeedback as exc:
                 if not requalify:
                     raise
@@ -297,15 +299,32 @@ class Session:
                 continue
             if stale:
                 self.evidence.record("feedback_requalified", stale_samples=stale)
+            self._note_advisories(current)
             return current
 
-    async def command(self, label: str, commands: tuple[tuple[str, Any], ...], *, configure: bool = False) -> None:
+    def _note_advisories(self, current: Snapshot) -> None:
+        """Record disabled-gate breaches when the set of breached gates changes.
+
+        Keyed on ``<motor> <gate>`` rather than the full text, so a temperature that
+        keeps creeping is one record, not one per sample.
+        """
+        active = frozenset(note.split(":", 1)[0] for note in current.advisories)
+        if active == self._advisories:
+            return
+        if active:
+            self.evidence.record("advisory", active=sorted(active), detail=list(current.advisories))
+        else:
+            self.evidence.record("advisory_cleared", cleared=sorted(self._advisories))
+        self._advisories = active
+
+    async def command(self, label: str, commands: tuple[tuple[str, Any], ...], *, configure: bool = False,
+                      releasing: bool = False) -> None:
         """Send once through HardwareTools; a failed/uncertain result is never replayed."""
         assert self.tools and self.client and self.consent
         current = self._declaration(await self.client.request("list"))
         if self.execute and (unverified_digest(current) != self.digest or not current.provenance.is_verified):
             raise Refusal("declaration changed during execution")
-        await self.snapshot(ready=not configure, preflight=True, requalify=True)
+        await self.snapshot(ready=not configure, preflight=True, requalify=True, releasing=releasing)
         if self.execute:
             if not self._approved_steps or self._approved_steps[0] != (label, commands, configure):
                 raise Refusal("command differs from the complete approved preview")

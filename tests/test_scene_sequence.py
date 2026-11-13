@@ -182,6 +182,14 @@ async def test_a_composed_pick_resolves_grasp_handles_and_records_the_hold(
     assert set(plan.basis["objects"]) == {"o1"} and set(plan.basis["grasps"]) == {"g1"}
     assert _sim(runtime).batches == []  # planning never moves
 
+    # One approval covers the whole program, so it shows each guard and the swept space.
+    assert "[expect held, else halt]" in plan.summary
+    envelope = plan.basis["envelope"]
+    assert envelope["z_min_mm"] == pytest.approx(grasp.z, abs=0.1)
+    assert envelope["z_max_mm"] >= pregrasp.z
+    assert envelope["tilt_max_deg"] == pytest.approx(0.0, abs=0.5)
+    assert f"Tool z spans {envelope['z_min_mm']:.0f}-" in plan.summary
+
     outcome = await _execute(runtime, plan)
     assert outcome.status == STATUS_SUCCEEDED, outcome
     assert outcome.side_effect_state == SIDE_EFFECT_COMMITTED

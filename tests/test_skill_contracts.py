@@ -298,6 +298,8 @@ def test_workspace_box_reports_the_violating_axis() -> None:
     box = WorkspaceBox.from_mapping({"x": [0, 10], "y": [0, 10], "z": [0, 10]})
     assert box.contains((5, 5, 5))
     assert "z=11.0" in (box.violation((5, 5, 11)) or "")
+    # A near miss keeps enough digits to show which side of the bound it is on.
+    assert box.violation((5, 5, -0.04)) == "z=-0.040 mm is outside [0.000, 10.000]"
     with pytest.raises(ValueError):
         WorkspaceBox(0, 0, 0, 1, 0, 1)
 

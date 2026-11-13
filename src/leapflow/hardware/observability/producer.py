@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Sequence
 
+from leapflow.hardware.advisory import active_advisories
 from leapflow.hardware.observability.digest import ALERT_KINDS, build_digest
 from leapflow.monitor.types import Evidence, Finding, ProducerContext, Severity
 
@@ -107,6 +108,11 @@ def _assess(digest: Any) -> tuple[Severity, str]:
     if shortfall:
         names = ", ".join(sorted(str(row.get("channel_id", "")) for row in shortfall)[:3])
         return Severity.NOTABLE, f"Sampling behind declared rate: {names}"
+
+    advisories = active_advisories(digest.events)
+    if advisories:
+        names = ", ".join(sorted(advisories)[:3])
+        return Severity.NOTABLE, f"Device advisory (firmware-protected, reported only): {names}"
 
     return Severity.INFO, f"{len(digest.devices)} device(s) within declared envelopes"
 

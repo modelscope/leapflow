@@ -234,3 +234,40 @@ def test_daemon_serve_applies_daemon_log_level(monkeypatch, tmp_path) -> None:
     settings = Settings()
     assert asyncio.run(daemon_module._serve(settings, mock_host=True)) == 0
     assert applied == [settings]
+
+
+def test_llm_supports_vision_overrides_the_model_table(monkeypatch, tmp_path) -> None:
+    """llm.supports_vision flows YAML -> env -> Settings -> model capabilities, so a
+    multimodal model the static table misses can still be shown images."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from conftest import make_settings
+    from leapflow.cli.context import Context
+    from leapflow.config import _build_settings_from_env
+    from leapflow.config_service import _build_field_specs
+
+    layout = build_layout(tmp_path / "leap-home")
+    profile_layout = layout.ensure(profile_id="default")
+    profile_layout.llm_config_path.write_text(
+        "llm:\n  model: deepseek-flash\n  supports_vision: true\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("LEAPFLOW_LLM_SUPPORTS_VISION", raising=False)
+    bundle = load_config_bundle(layout, profile_layout, tmp_path)
+    assert bundle.env["LEAPFLOW_LLM_SUPPORTS_VISION"] == "true"
+    assert _build_field_specs()["llm.supports_vision"].setting_name == "llm_supports_vision"
+
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "home"))
+    for raw, expected in (("true", "true"), ("OFF", "false"), ("maybe", "auto")):
+        monkeypatch.setenv("LEAPFLOW_LLM_SUPPORTS_VISION", raw)
+        assert _build_settings_from_env().llm_supports_vision == expected
+
+    owner = SimpleNamespace(llm_chain=None)
+    owner._effective_llm_context_length = lambda s: Context._effective_llm_context_length(
+        owner, s
+    )
+    base = replace(make_settings(str(tmp_path)), llm_model="deepseek-flash")
+    for value, vision in (("auto", False), ("true", True), ("false", False)):
+        settings = replace(base, llm_supports_vision=value)
+        registry = Context._build_model_capability_registry(owner, settings)
+        assert registry.resolve("deepseek-flash").supports_vision is vision

@@ -66,7 +66,9 @@ from leapflow.hardware.skills.episodes import (
     EpisodeTap,
     label_episode,
 )
-from leapflow.hardware.skills.frames import FrameGraph, unmet_requirements
+from leapflow.hardware.skills.frames import (
+    FrameGraph, bind_requirements, requirement_bindings, unmet_requirements,
+)
 from leapflow.hardware.skills.grasp import (
     AdmissionSensing,
     GraspSensing,
@@ -250,10 +252,13 @@ class SkillRuntime:
             skills = []
             for skill_id in self._offered(spec):
                 skill_spec = self._skills[skill_id].spec
-                reasons = unmet_requirements(skill_spec.requires, spec, frames)
-                skills.append(
-                    {**skill_spec.to_dict(), "available": not reasons, "reason": "; ".join(reasons)}
+                reasons, bindings = requirement_bindings(
+                    skill_spec.requires, skill_spec.args_schema, spec, frames
                 )
+                skills.append({
+                    **skill_spec.to_dict(), "available": not reasons,
+                    "reason": "; ".join(reasons), "bindings": bindings,
+                })
             cells.append(
                 {
                     **spec.to_dict(),
@@ -291,7 +296,8 @@ class SkillRuntime:
             spec, skill = self._resolve(workcell, skill_id)
             arguments = validate_args(skill.spec.args_schema, args)
             frames = self._frames(spec)
-            reasons = unmet_requirements(skill.spec.requires, spec, frames)
+            requires = bind_requirements(skill.spec.requires, arguments)
+            reasons = unmet_requirements(requires, spec, frames)
             if f"{REQUIRE_SHARE}{SHARE_FRAMES}" in skill.spec.requires and not share_frames:
                 reasons.append(
                     "the host has not consented to receive camera frames (its operator sets "

@@ -91,9 +91,10 @@ class ModelGraspPlanner:
         self, obj: LocatedObject, *, table: Plane, current: Pose
     ) -> tuple[GraspCandidate, ...]:
         s = self._settings
-        capture = await self._sensing.capture()
+        capture = await self._sensing.capture(obj.camera)
+        mount, _table = capture.placement()
         service = await self._sensing.model(self._model, TASK_GRASP_PROPOSAL)
-        request = await self._request(obj, capture.frame, capture.camera_to_base)
+        request = await self._request(obj, capture.frame, mount)
         try:
             result = await propose_grasps(service, request)
         except (TransportError, TypeError) as exc:
@@ -108,7 +109,7 @@ class ModelGraspPlanner:
             in_camera = Transform.from_pose(Pose(*proposal.pose))
             found.append(
                 GraspCandidate(
-                    grasp=capture.camera_to_base.compose(in_camera).to_pose(),
+                    grasp=mount.compose(in_camera).to_pose(),
                     width_mm=proposal.width_mm,
                     open_mm=min(self._max_width, proposal.width_mm + s.open_margin_mm),
                     approach_mm=proposal.approach_mm or s.approach_mm,

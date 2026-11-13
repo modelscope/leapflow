@@ -25,6 +25,9 @@ JOINTS = tuple(f"joint.j{i}.position" for i in range(1, 7))
 POSE = tuple(f"ee.{axis}" for axis in ("x", "y", "z", "rx", "ry", "rz"))
 CHANNELS = ("arm.status", "arm.telemetry", "arm.enabled", "gripper.position", *JOINTS, *POSE)
 CAN_ERROR_STATS = ("restarts", "bus_error", "error_warning", "error_passive", "bus_off")
+ADVISORY_FLAGS = frozenset({"motor_overheating", "driver_overheating", "voltage_too_low"})
+"""Firmware flags the drivers already act on; refusing on them is an opt-in."""
+HARD_FAULT_FLAGS = tuple(key for key in _FAULT_FLAGS if key not in ADVISORY_FLAGS)
 
 
 def _link_sample(interface: str, timeout: float) -> dict[str, Any]:
@@ -140,6 +143,8 @@ class Snapshot:
     enabled: bool
     status: dict[str, Any]
     telemetry: dict[str, Any]
+    advisories: tuple[str, ...] = ()
+    """Breaches of disabled gates, ``"<motor> <gate>: <detail>"``: reported, never refused."""
 
     @property
     def receipts(self) -> tuple[int, ...]:
@@ -149,8 +154,53 @@ class Snapshot:
         return asdict(self)
 
 
+def _optional(value: Any) -> float | None:
+    return None if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) \
+        else float(value)
+
+
+def _motor_advisories(motor: dict[str, Any], settings: Settings, *, preflight: bool,
+                      releasing: bool) -> list[str]:
+    """Apply the enabled firmware-duplicate gates; return the disabled ones' breaches."""
+    index, faults, notes = motor["motor"], motor["faults"], []
+    flagged = sorted(key for key in ADVISORY_FLAGS if faults[key])
+    if flagged:
+        if settings.advisory_fault_gate:
+            raise Refusal(f"motor {index} reports {', '.join(flagged)}; no motion")
+        notes.append(f"motor {index} flags: {','.join(flagged)}")
+    voltage = _optional(motor.get("voltage_v"))
+    if settings.voltage_gate and voltage is None:
+        raise Refusal("missing/nonfinite numeric feedback")
+    if voltage is not None and not settings.voltage_min_v <= voltage <= settings.voltage_max_v:
+        if settings.voltage_gate:
+            raise Refusal(f"motor electrical safety gate refused: motor {index} supply "
+                          f"{voltage:.1f} V outside [{settings.voltage_min_v:g}, {settings.voltage_max_v:g}] V")
+        notes.append(f"motor {index} supply: {voltage:.1f} V outside "
+                     f"[{settings.voltage_min_v:g}, {settings.voltage_max_v:g}] V")
+    limit = settings.preflight_temp_c if preflight else settings.max_temp_c
+    temperatures = [_optional(motor.get(k)) for k in ("motor_temperature_c", "driver_temperature_c")]
+    if settings.thermal_gate and None in temperatures:
+        raise Refusal("missing/nonfinite numeric feedback")
+    known = [t for t in temperatures if t is not None]
+    if known and max(known) >= limit:
+        rendered = "/".join("?" if t is None else f"{t:.0f}" for t in temperatures)
+        if settings.thermal_gate and not releasing:
+            raise Refusal(f"motor thermal safety gate refused: motor {index} motor/driver {rendered} C, "
+                          f"limit {limit:g} C; `arm disable` releases torque so the arm can cool")
+        notes.append(f"motor {index} thermal: motor/driver {rendered} C at or above {limit:g} C")
+    return notes
+
+
 async def read_snapshot(registry: HardwareRegistry, settings: Settings, *, ready: bool = False,
-                        preflight: bool = False) -> Snapshot:
+                        preflight: bool = False, releasing: bool = False) -> Snapshot:
+    """Read and qualify one controller sample.
+
+    Hard faults always refuse. Thermal, supply-voltage and the firmware-advisory flags
+    duplicate protection the drivers already enforce, so they refuse only when their
+    gate is enabled; otherwise a breach is returned in ``Snapshot.advisories``.
+    ``releasing`` marks a torque release: it can only shed heat, so an enabled thermal
+    gate must not block it — otherwise a hot arm holding a pose could never be let cool.
+    """
     batch = await registry.read_batch(settings.device_id, CHANNELS)
     readings = {r.channel_id: r for r in batch.readings}
     if len(batch.readings) != len(CHANNELS) or set(readings) != set(CHANNELS) or any(
@@ -191,20 +241,17 @@ async def read_snapshot(registry: HardwareRegistry, settings: Settings, *, ready
                               for m in motors) or {
         m.get("motor") for m in motors} != set(range(1, 7)):
         raise Refusal("missing or duplicate motor records")
-    flags = []
+    flags, advisories = [], []
     for motor in motors:
         enabled, faults = motor.get("enabled"), motor.get("faults")
         if not isinstance(enabled, bool) or not isinstance(faults, dict) or any(
             type(faults.get(key)) is not bool for key in _FAULT_FLAGS
         ):
             raise Refusal("unknown motor enable or fault fields")
-        if any(faults[key] for key in _FAULT_FLAGS):
-            raise Refusal(f"motor {motor['motor']} reports a fault; no motion")
-        voltage = number(motor.get("voltage_v"))
-        limit = settings.preflight_temp_c if preflight else settings.max_temp_c
-        temperatures = [number(motor.get(k)) for k in ("motor_temperature_c", "driver_temperature_c")]
-        if not settings.voltage_min_v <= voltage <= settings.voltage_max_v or max(temperatures) >= limit:
-            raise Refusal("motor thermal/electrical safety gate refused")
+        hard = [key for key in HARD_FAULT_FLAGS if faults[key]]
+        if hard:
+            raise Refusal(f"motor {motor['motor']} reports a fault ({', '.join(hard)}); no motion")
+        advisories.extend(_motor_advisories(motor, settings, preflight=preflight, releasing=releasing))
         flags.append(enabled)
     enabled = value["arm.enabled"]
     if type(enabled) is not bool or enabled != all(flags):
@@ -216,4 +263,4 @@ async def read_snapshot(registry: HardwareRegistry, settings: Settings, *, ready
                       f"ctrl_mode={status.get('ctrl_mode')} motors={flags}")
     return Snapshot(tuple(number(value[c]) for c in JOINTS),
                     Pose(*(number(value[c]) for c in POSE)), number(value["gripper.position"]),
-                    enabled, status, telemetry)
+                    enabled, status, telemetry, tuple(advisories))
