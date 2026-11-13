@@ -179,3 +179,56 @@ async def test_health_monitor_offline_halt_is_withheld_when_actions_disabled() -
     assert registry.halts == []
     assert [event.kind for event in registry.events] == [DEGRADATION_SUPPRESSED]
     assert emitted == ["hw.health.device.halt_suppressed"]
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_retries_an_offline_halt_but_backs_off_its_log(caplog) -> None:
+    """Every probe re-halts an offline device; only the log may thin out.
+
+    Logged per attempt, an unreachable bench wrote thousands of identical tracebacks
+    and buried every other line of the daemon log.
+    """
+    import logging
+
+    from leapflow.hardware.health_monitor import DeviceHealthRecord, HardwareHealthMonitor
+
+    registry = _Registry(enabled=True)
+    reachable = {"arm": False}
+    transports: list[str] = []
+
+    async def transport(device_id: str) -> Any:
+        transports.append(device_id)
+        if not reachable[device_id]:
+            raise OSError("link down")
+        return None
+
+    registry.transport = transport  # type: ignore[attr-defined]
+    monitor = HardwareHealthMonitor(registry)
+    record = DeviceHealthRecord(device_id="arm", consecutive_probe_failures=5)
+    monitor._records["arm"] = record
+
+    def _lines(level: int, text: str) -> list[logging.LogRecord]:
+        return [r for r in caplog.records if r.levelno == level and text in r.getMessage()]
+
+    with caplog.at_level(logging.DEBUG, logger="leapflow.hardware.health_monitor"):
+        for _ in range(9):
+            await monitor._evaluate_health("arm")
+        reachable["arm"] = True
+        await monitor._evaluate_health("arm")
+
+    assert len(transports) == 10, "the halt cadence must not back off"
+    assert registry.halts == ["arm"]
+    failed = _lines(logging.ERROR, "halt failed")
+    assert [r.getMessage().split("failure ")[1].split(";")[0] for r in failed] == ["1", "2", "4", "8"]
+    assert [bool(r.exc_info) for r in failed] == [True, False, False, False]
+    assert len(_lines(logging.WARNING, "halting device")) == 1
+    assert len(_lines(logging.INFO, "after 9 failed attempt(s)")) == 1
+
+    # Leaving the offline state ends the episode; the next one is announced again.
+    caplog.clear()
+    record.consecutive_probe_failures = 0
+    await monitor._evaluate_health("arm")
+    record.consecutive_probe_failures = 5
+    with caplog.at_level(logging.DEBUG, logger="leapflow.hardware.health_monitor"):
+        await monitor._evaluate_health("arm")
+    assert len(_lines(logging.WARNING, "halting device")) == 1

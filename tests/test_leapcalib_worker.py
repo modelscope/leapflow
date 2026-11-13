@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import uuid
 import stat
 import struct
@@ -200,6 +202,56 @@ async def test_disabled_worker_never_launches(tmp_path: Path) -> None:
     with pytest.raises(CalibrationFailure, match="disabled"):
         await worker.submit("diagnostics", {}, workcell_id="c", run_id="r", model_digest="m")
     assert worker._process is None
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False  # PermissionError: the pid was reused by another user's process.
+    return True
+
+
+def _eventually(condition, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.05)
+    return condition()
+
+
+def test_worker_exits_when_its_owner_dies_without_reaping_it(tmp_path: Path) -> None:
+    # An owner that never closes its worker -- a test that forgot to, an owner killed
+    # outright -- must not leave an orphan holding memory and a socket for good.
+    socket_path = tmp_path.resolve().parent / ("lc-" + uuid.uuid4().hex[:8]) / "s"
+    owner_code = (
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-m', 'leapcalib.cli', 'serve', '--socket', sys.argv[1]],\n"
+        "                         stdout=subprocess.DEVNULL)\n"
+        "print(child.pid, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    owner = subprocess.Popen(
+        [sys.executable, "-c", owner_code, str(socket_path)], stdout=subprocess.PIPE, text=True
+    )
+    worker_pid = None
+    try:
+        assert owner.stdout is not None
+        worker_pid = int(owner.stdout.readline())
+        assert _eventually(socket_path.exists, 10), "worker never bound its socket"
+        owner.kill()
+        owner.wait(5)
+        assert _eventually(lambda: not _alive(worker_pid), 10), "orphaned worker kept serving"
+        assert not socket_path.exists()
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(5)
+        if worker_pid is not None and _alive(worker_pid):
+            os.kill(worker_pid, signal.SIGKILL)
+        if owner.stdout is not None:
+            owner.stdout.close()
 
 
 async def test_cancel_queued_job_leaves_active_process_usable(tmp_path: Path) -> None:

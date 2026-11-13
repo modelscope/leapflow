@@ -649,46 +649,17 @@ class PathLayout:
         return profile_layout
 
     def workspace_config_path(self, workspace_root: Path) -> Path:
-        return workspace_root / ".leapflow" / "config.yaml"
+        """Return the opt-in workspace config override path.
 
-    def workspace_manifest_path(self, workspace_root: Path) -> Path:
-        return workspace_root / ".leapflow" / "workspace.yaml"
-
-    def write_workspace_manifest(self, workspace_root: Path) -> Path | None:
-        """Write the workspace-local manifest; return its path, or ``None`` if skipped.
-
-        Skipped when the workspace's ``.leapflow`` directory *is* the LeapFlow
-        home (i.e. the workspace root is the home's parent, typically ``$HOME``).
-        Writing there would drop a workspace marker into the global home
-        alongside ``config/``, ``profiles/`` and ``secrets/`` — the two
-        directories collapse onto one path and the layout stops being readable.
-        The profile-side manifest (addressed by ``workspace_id``) is written
-        unconditionally by the caller, so nothing is lost by skipping this copy.
+        Nothing creates this directory on its own: a ``.leapflow`` tree appears
+        in a user's project only once they deliberately scope a setting to the
+        workspace (``leap config set --scope workspace``). Writing a marker
+        manifest on every command used to litter every directory LeapFlow ran
+        in, and nothing ever read it back -- the workspace id is derived from
+        the canonical path, and the path-to-id record lives in the profile's
+        cache, so no reader was lost with it.
         """
-        workspace_root = workspace_root.expanduser().resolve()
-        path = self.workspace_manifest_path(workspace_root)
-        if path.parent.resolve() == self.root.resolve():
-            return None
-        workspace_id = workspace_id_for_path(workspace_root)
-        now = datetime.now(timezone.utc).isoformat()
-        existing: dict[str, Any] = {}
-        if path.exists():
-            try:
-                loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-                if isinstance(loaded, dict):
-                    existing = loaded
-            except (OSError, yaml.YAMLError, ValueError):
-                existing = {}
-        payload = {
-            "version": 1,
-            "workspace_id": workspace_id,
-            "canonical_path": str(workspace_root),
-            "display_name": workspace_root.name,
-            "first_seen_at": existing.get("first_seen_at") or now,
-            "last_seen_at": now,
-        }
-        _write_yaml(path, payload)
-        return path
+        return workspace_root / ".leapflow" / "config.yaml"
 
     def describe_path(self, path: Path) -> ManagedPathDescriptor:
         """Return semantic metadata for a path under this layout."""

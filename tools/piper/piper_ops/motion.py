@@ -6,20 +6,91 @@ import hashlib
 import json
 import math
 import time
-from dataclasses import asdict
-from typing import Any
+from dataclasses import asdict, dataclass, replace
+from typing import Any, Mapping
 
 from leapflow.engine.recovery.failure_envelope import SideEffectState
 from leapflow.hardware.context import HardwareContext
 from leapflow.hardware.skills.adapt.ik import solve_ik
 from leapflow.hardware.skills.adapt.spec import IkSettings
-from leapflow.hardware.skills.geometry import Pose, Transform
+from leapflow.hardware.skills.geometry import Pose, Transform, WorkspaceBox
 from leapflow.hardware.skills.kinematics import DhChain
 
 from .config import Settings
 from .evidence import Refusal, json_default
 from .health import JOINTS, POSE, Snapshot, number
 from .session import Session, unverified_digest
+
+# Operations whose waypoints are held to the calibrated workspace. Initialization and
+# the bring-up verification stay near the zero posture, which lies outside any table
+# workspace, and they must remain available before the cell is calibrated at all.
+GUARDED = ("move", "cycle", "joints")
+
+
+@dataclass(frozen=True)
+class WorkspaceGuard:
+    """The workcell's calibrated tool box, applied to every predicted flange waypoint.
+
+    The declared ``ee.*`` envelope bounds the flange only (-300..900 mm in z on the
+    Piper), so on its own it lets a translation drive the fingertips into the table.
+    The calibrated ``workspace.safe_box`` bounds the TCP and is what the skill runtime
+    enforces; this applies the same box here. A waypoint may not lie further outside
+    the box than the start already does on any axis, so a posture that sagged below
+    the floor can still be moved back up, never further down.
+    """
+
+    box: WorkspaceBox
+    flange_tcp: Transform
+    start_excess: tuple[float, ...] = (0.0, 0.0, 0.0)
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "WorkspaceGuard | None":
+        """None when the workcell has no calibrated workspace to apply."""
+        if data.get("workspace") is None:
+            return None
+        return cls(WorkspaceBox.from_mapping(data["workspace"]),
+                   Transform.from_pose(Pose.from_mapping(data["flange_tcp"])))
+
+    def tcp(self, flange: Pose) -> Pose:
+        return Transform.from_pose(flange).compose(self.flange_tcp).to_pose()
+
+    def excess(self, flange: Pose) -> tuple[float, ...]:
+        """How far the TCP lies outside the box on each axis (0 inside)."""
+        bounds = self.box.to_dict()
+        point = self.tcp(flange).position
+        return tuple(max(bounds[axis][0] - v, v - bounds[axis][1], 0.0)
+                     for axis, v in zip("xyz", point))
+
+    def departing(self, flange: Pose) -> "WorkspaceGuard":
+        return replace(self, start_excess=self.excess(flange))
+
+    def check(self, flange: Pose) -> None:
+        bounds = self.box.to_dict()
+        for index, (axis, now, allowed) in enumerate(zip("xyz", self.excess(flange), self.start_excess)):
+            if now > allowed + 1e-6:
+                low, high = bounds[axis]
+                raise Refusal(f"waypoint leaves the calibrated workspace: TCP {axis}="
+                              f"{self.tcp(flange).position[index]:.1f} mm is outside [{low:.1f}, {high:.1f}]")
+
+
+def check_workspace(plan: Mapping[str, Any], workspace: Mapping[str, Any]) -> None:
+    """Re-check an approved plan's waypoints against the workspace as calibrated now.
+
+    A workspace re-measured between preview and execution applies to the run; a
+    plan previewed against a looser (or no) workspace does not outlive it.
+    """
+    approved = plan.get("workspace_guard") or {}
+    if approved.get("workcell") not in (None, workspace.get("workcell")):
+        raise Refusal("workcell differs from the approved preview")
+    guard = WorkspaceGuard.from_mapping(workspace)
+    if guard is None:
+        if approved.get("workspace") is not None:
+            raise Refusal("the calibrated workspace disappeared since preview; inspect calibration")
+        return
+    guard = guard.departing(Pose.from_mapping(plan["origin_pose"]))
+    for row in [*plan["steps"], *plan.get("initialization_sweep", ())]:
+        if row.get("pose"):
+            guard.check(Pose.from_mapping(row["pose"]))
 
 
 def digest_plan(plan: dict[str, Any]) -> str:
@@ -103,15 +174,18 @@ def step(label: str, commands: tuple[tuple[str, Any], ...], *, configure: bool =
             "joints": joints, "pose": asdict(pose) if pose else None, "grip": grip}
 
 
-def _pose_check(context: HardwareContext, pose: Pose) -> None:
+def _pose_check(context: HardwareContext, pose: Pose, guard: WorkspaceGuard | None = None) -> None:
     for cid, value in zip(POSE, pose.as_tuple()):
         low, high = bounds(context, cid)
         if not low <= value <= high:
             raise Refusal(f"waypoint outside declared workspace: {cid}")
+    if guard is not None:
+        guard.check(pose)
 
 
 def _segment(context: HardwareContext, chain: DhChain, origin: Pose, destination: Pose,
-             seed: tuple[float, ...], settings: Settings, label: str) -> tuple[list[dict[str, Any]], tuple[float, ...]]:
+             seed: tuple[float, ...], settings: Settings, label: str,
+             guard: WorkspaceGuard | None = None) -> tuple[list[dict[str, Any]], tuple[float, ...]]:
     delta = tuple(b - a for a, b in zip(origin.position, destination.position))
     count = max(1, math.ceil(origin.distance_mm(destination) / settings.waypoint_mm))
     safe = limits(context, settings)
@@ -121,7 +195,7 @@ def _segment(context: HardwareContext, chain: DhChain, origin: Pose, destination
     previous = origin
     for index in range(1, count + 1):
         target = origin.translated(*(d * index / count for d in delta))
-        _pose_check(context, target)
+        _pose_check(context, target, guard)
         # Solve midpoint and endpoint in order: never seed a return from an unrelated posture.
         midpoint = previous.translated(*(d / count / 2 for d in delta))
         try:
@@ -142,7 +216,8 @@ def _segment(context: HardwareContext, chain: DhChain, origin: Pose, destination
 
 
 def _joint_path(context: HardwareContext, chain: DhChain, origin: tuple[float, ...], goal: tuple[float, ...],
-                settings: Settings) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                settings: Settings, guard: WorkspaceGuard | None = None
+                ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Linear joint interpolation to an absolute target, bounded per step and swept.
 
     Every step stays within the joint step budget and the declared per-channel jump,
@@ -158,7 +233,7 @@ def _joint_path(context: HardwareContext, chain: DhChain, origin: tuple[float, .
     for i in range(1, samples + 1):
         q = tuple(a + (b - a) * i / samples for a, b in zip(origin, goal))
         pose = chain.forward(q)
-        _pose_check(context, pose)
+        _pose_check(context, pose, guard)
         swept.append({"joints": q, "pose": asdict(pose)})
     rows, previous = [], origin
     for index in range(1, count + 1):
@@ -177,8 +252,13 @@ def _joint_path(context: HardwareContext, chain: DhChain, origin: tuple[float, .
 def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, operation: str,
             dx: float = 0.0, dy: float = 0.0, dz: float = 0.0,
             width: float | None = None, cycles: int = 0, dwell_s: float = 0.0,
-            target: tuple[float, ...] | None = None, force: float | None = None) -> dict[str, Any]:
-    """A complete immutable-by-hash request, including return and safety configuration."""
+            target: tuple[float, ...] | None = None, force: float | None = None,
+            workspace: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """A complete immutable-by-hash request, including return and safety configuration.
+
+    ``workspace`` is the workcell's calibration read (``calibration.workspace_guard``);
+    for the GUARDED operations its TCP box bounds every predicted waypoint.
+    """
     settings.validate()
     dx, dy, dz = number(dx), number(dy), number(dz)
     safe = limits(context, settings)
@@ -186,6 +266,10 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
     rows = [step("speed", (("arm.speed_pct", settings.speed_pct),), configure=True)]
     origin_q, origin_pose = start.joints, start.pose
     swept = []
+    guarded = workspace if operation in GUARDED else None
+    guard = WorkspaceGuard.from_mapping(guarded) if guarded is not None else None
+    if guard is not None:
+        guard = guard.departing(origin_pose)
     if operation in ("initialize", "verify"):
         origin_q = initialization(context, start, settings)
         origin_pose = chain.forward(origin_q)
@@ -231,7 +315,7 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
             raise Refusal("move needs a nonzero displacement")
         rows.append(step("linear_path", (("arm.pose_path", "linear"),), configure=True))
         path, seed = _segment(context, chain, origin_pose, origin_pose.translated(dx, dy, dz),
-                              seed, settings, "move")
+                              seed, settings, "move", guard)
         rows.extend(path)
     elif operation == "cycle":
         # A vertical round trip repeated under one approval; every leg is segmented and
@@ -246,9 +330,9 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
         lifted = origin_pose.translated(dz=dz)
         joint_tolerance = tolerance(context, JOINTS, settings.joint_deg)
         for index in range(1, cycles + 1):
-            path, seed = _segment(context, chain, origin_pose, lifted, seed, settings, f"cycle{index}.up")
+            path, seed = _segment(context, chain, origin_pose, lifted, seed, settings, f"cycle{index}.up", guard)
             rows.extend(path)
-            path, seed = _segment(context, chain, lifted, origin_pose, seed, settings, f"cycle{index}.down")
+            path, seed = _segment(context, chain, lifted, origin_pose, seed, settings, f"cycle{index}.down", guard)
             rows.extend(path)
             if max(abs(a - b) for a, b in zip(seed, origin_q)) > joint_tolerance:
                 raise Refusal("cycle return IK does not recover the origin joint branch")
@@ -264,7 +348,7 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
         goal = tuple(number(q) for q in target)
         if any(not low <= q <= high for q, (low, high) in zip(goal, safe)):
             raise Refusal("joint target is outside the conservative intervals")
-        path, swept = _joint_path(context, chain, origin_q, goal, settings)
+        path, swept = _joint_path(context, chain, origin_q, goal, settings, guard)
         rows.extend(path)
     elif operation == "gripper":
         opening = maximum if width is None else number(width)
@@ -300,6 +384,7 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
             "delta_base_mm": {"x": dx, "y": dy, "z": dz}, "cycles": cycles, "dwell_s": dwell_s,
             "target_joints": None if target is None else tuple(number(q) for q in target),
             "force_n": None if force is None else number(force),
+            "workspace_guard": None if guarded is None else dict(guarded),
             "finish": "enabled",
             "arrival": arrival, "initialization_sweep": swept, "steps": rows,
             "clearance": "Operator must confirm unobstructed swept volume, empty jaws and accessible physical emergency stop"}

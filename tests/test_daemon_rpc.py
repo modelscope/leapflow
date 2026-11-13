@@ -1571,6 +1571,95 @@ async def test_daemon_shutdown_stops_server_when_caller_hung_up_before_reply() -
     assert stopped.is_set()
 
 
+class _CountingGoneWriter:
+    """A socket whose peer hung up: writes are buffered, the flush finds the reset."""
+
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        raise ConnectionResetError("Connection lost")
+
+    def close(self) -> None:
+        pass
+
+    async def wait_closed(self) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+@pytest.mark.asyncio
+async def test_a_viewer_closing_a_finished_preview_ends_the_connection_quietly(caplog) -> None:
+    """Closing a preview tab is routine, not a request failure.
+
+    The completion notice used to be written outside the stream's disconnect handling,
+    so each closed tab logged a request failure, wrote that failure to the same dead
+    socket, and surfaced as an unhandled exception in the connection callback.
+    """
+    import logging
+
+    class PreviewService(_FakeService):
+        async def hardware_preview_stream(self, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        runtime_dir = Path(root) / "runtime"
+        server = UnixRpcServer(
+            PreviewService(),
+            sock_path=get_transport().readiness_path(runtime_dir),
+            runtime_dir=runtime_dir,
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(b'{"jsonrpc": "2.0", "id": "p1", "method": "hardware.preview.stream", "params": {}}\n')
+        reader.feed_eof()
+        writer = _CountingGoneWriter()
+        with caplog.at_level(logging.DEBUG, logger="leapflow.daemon.server"):
+            await server._handle_client(reader, writer)  # type: ignore[arg-type]
+
+    assert len(writer.writes) == 1, "nothing may be written after the peer is known to be gone"
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert server.active_connections == 0
+
+
+@pytest.mark.asyncio
+async def test_a_handler_connection_error_is_still_reported_to_the_caller() -> None:
+    """Only the caller's own socket going away is quiet; a device link reset is a failure."""
+    import json
+
+    class LinkResetService(_FakeService):
+        async def status(self) -> dict[str, Any]:
+            raise ConnectionResetError("device link reset")
+
+    class Writer:
+        def __init__(self) -> None:
+            self.lines: list[dict[str, Any]] = []
+
+        def write(self, data: bytes) -> None:
+            self.lines.append(json.loads(data))
+
+        async def drain(self) -> None:
+            return None
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        runtime_dir = Path(root) / "runtime"
+        server = UnixRpcServer(
+            LinkResetService(),
+            sock_path=get_transport().readiness_path(runtime_dir),
+            runtime_dir=runtime_dir,
+        )
+        writer = Writer()
+        await server._handle_line(
+            b'{"jsonrpc": "2.0", "id": "s1", "method": "daemon.status", "params": {}}\n',
+            writer,  # type: ignore[arg-type]
+        )
+
+    assert writer.lines and writer.lines[-1]["id"] == "s1"
+    assert "device link reset" in str(writer.lines[-1]["error"])
+
+
 @pytest.mark.asyncio
 async def test_runtime_service_status_reports_host_backend() -> None:
     from conftest import make_settings

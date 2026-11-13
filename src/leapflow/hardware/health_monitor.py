@@ -100,6 +100,24 @@ class DeviceHealthRecord:
         }
 
 
+@dataclass
+class _HaltEpisode:
+    """Halt attempts on one device since it last left the offline state.
+
+    An offline device is re-halted on every probe while degradation actions are
+    enabled -- the stop must land the moment the link returns -- so the attempts are
+    deliberate, but logging each one buried the log under thousands of identical
+    tracebacks. Only the log cadence follows this record; the halt cadence does not.
+    """
+
+    attempts: int = 0
+    failures: int = 0
+
+
+def _is_power_of_two(count: int) -> bool:
+    return count > 0 and count & (count - 1) == 0
+
+
 # ---------------------------------------------------------------------------
 # HardwareHealthMonitor
 # ---------------------------------------------------------------------------
@@ -132,6 +150,7 @@ class HardwareHealthMonitor:
 
         # Per-device health tracking.
         self._records: dict[str, DeviceHealthRecord] = {}
+        self._halts: dict[str, _HaltEpisode] = {}
         self._frames = FrameHealthTracker()
         from leapflow.hardware.calibration.lifecycle import LifecycleReceiver
         self._calibration_lifecycle = LifecycleReceiver(registry)
@@ -244,6 +263,8 @@ class HardwareHealthMonitor:
         prev_status = record.status
         new_status = self._compute_health_status(record)
         record.status = new_status
+        if new_status != _HEALTH_OFFLINE:
+            self._halts.pop(device_id, None)
 
         # If status worsened, check degradation policy.
         if new_status in (_HEALTH_DEGRADED, _HEALTH_CRITICAL) and prev_status == _HEALTH_OK:
@@ -318,7 +339,10 @@ class HardwareHealthMonitor:
                 {"device_id": device_id, "reason": reason},
             )
             return
-        logger.warning(
+        episode = self._halts.setdefault(device_id, _HaltEpisode())
+        episode.attempts += 1
+        logger.log(
+            logging.WARNING if episode.attempts == 1 else logging.DEBUG,
             "HealthMonitor: halting device %s (reason: %s)",
             device_id,
             reason,
@@ -329,12 +353,25 @@ class HardwareHealthMonitor:
             await self._registry.transport(device_id)
             await self._registry.halt(device_id)
         except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "HealthMonitor: halt failed for %s: %s",
+            episode.failures += 1
+            # Logged at doubling attempt counts, the traceback once: the retry keeps
+            # its cadence, the log only says it is still failing.
+            logger.log(
+                logging.ERROR if _is_power_of_two(episode.failures) else logging.DEBUG,
+                "HealthMonitor: halt failed for %s (failure %d; logged at doubling counts): %s",
                 device_id,
+                episode.failures,
                 exc,
-                exc_info=True,
+                exc_info=episode.failures == 1,
             )
+        else:
+            if episode.failures:
+                logger.info(
+                    "HealthMonitor: halt reached %s after %d failed attempt(s)",
+                    device_id,
+                    episode.failures,
+                )
+                episode.failures = 0
         self._emit_event(
             "device.halted",
             {

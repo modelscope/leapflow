@@ -82,6 +82,9 @@ class HardwareSettings:
     raw_retention_days: float = 7.0
     history_retention_days: float = 90.0
     raw_segment_mb: float = 32.0
+    # Minimum spacing between cache-index refreshes of an open raw segment; 0 refreshes
+    # on every write. New and rolled segments are always indexed immediately.
+    raw_index_refresh_s: float = 60.0
     reading_store_sensitive: bool = True
     readings_dir: str = ""
     instrument_db_path: str = ""
@@ -179,6 +182,8 @@ class HardwareSettings:
                 getattr(settings, "hardware_history_retention_days", 90.0) or 90.0
             ),
             raw_segment_mb=float(getattr(settings, "hardware_raw_segment_mb", 32.0) or 32.0),
+            # Not ``or 60.0``: zero is a valid setting (refresh on every write).
+            raw_index_refresh_s=float(getattr(settings, "hardware_raw_index_refresh_s", 60.0)),
             reading_store_sensitive=bool(
                 getattr(settings, "hardware_reading_store_sensitive", True)
             ),
@@ -1254,6 +1259,7 @@ class HardwareRegistry:
                 downsample_interval_s=self._settings.downsample_interval_s,
                 history_ttl_s=self._settings.history_retention_days * 24 * 3600.0,
                 raw_segment_bytes=int(self._settings.raw_segment_mb * 1024 * 1024),
+                raw_index_refresh_s=self._settings.raw_index_refresh_s,
             )
         return self._reading_store
 

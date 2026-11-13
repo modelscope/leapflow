@@ -12,6 +12,7 @@ from leapflow.hardware.calibration_qualification import admit_package
 from leapflow.hardware.fleet import FleetNode, FleetTopology
 from leapflow.hardware.lhp.client import SocketLhpClient
 from leapflow.hardware.lhp.permit import PermitIssuer, request_digest
+from leapflow.hardware.skills.geometry import Pose, Transform
 from leapflow.security.actions import ActionDescriptor, ActionEffect, ActionKind
 from leapflow.hardware.skill_tools import SkillService
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest, SessionAwareGate
@@ -125,6 +126,28 @@ async def service(session: Session, approved: dict[str, Any] | None = None,
         yield client
     finally:
         await complete_cleanup(client.close())
+
+
+async def workspace_guard(session: Session, workcell: str) -> dict[str, Any]:
+    """Read the workcell's calibrated TCP box and flange->TCP offset with arm.state; no motion.
+
+    The offset is recovered from one coherent state read (TCP = flange * offset), so the
+    box is checked in the same TCP the skill runtime enforces it in. ``workspace`` is
+    None when the workcell has no current workspace calibration.
+    """
+    async with service(session) as client:
+        result = await client.hw_skill_run(workcell=f"{session.settings.node_id}/{workcell}",
+                                           skill="arm.state", args={}, dry_run=True,
+                                           timeout_s=session.settings.run_timeout_s)
+    if result.get("ok") is not True or result.get("side_effect_state") != "none":
+        raise Refusal("arm.state did not answer; the calibrated workspace cannot be checked")
+    state = result["result"]
+    flange = Transform.from_pose(Pose.from_mapping(state["flange"]))
+    offset = flange.inverse().compose(Transform.from_pose(Pose.from_mapping(state["tcp"]))).to_pose()
+    guard = {"workcell": workcell, "workspace": state.get("workspace"),
+             "tcp_calibrated": state.get("tcp_calibrated") is True, "flange_tcp": offset.to_dict()}
+    session.evidence.record("workspace_guard", guard=guard)
+    return guard
 
 
 async def run(session: Session, *, workcell: str = "", skill: str = "", args: dict[str, Any] | None = None,

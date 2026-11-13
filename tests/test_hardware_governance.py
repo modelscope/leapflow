@@ -1852,6 +1852,7 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.raw_retention_days",
         "hardware.history_retention_days",
         "hardware.raw_segment_mb",
+        "hardware.raw_index_refresh_s",
         "hardware.reading_store_sensitive",
         "hardware.providers",
         "hardware.host_interval_s",

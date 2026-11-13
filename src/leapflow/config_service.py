@@ -278,7 +278,8 @@ _FIELD_DESCRIPTIONS = {
     ),
     "hardware.raw_retention_days": (
         "How long raw sample files are kept. They are session-scoped, sensitive, and "
-        "never synced. Read when sampling starts, so a change needs a daemon restart."
+        "never synced. Expired files are deleted by the sampling process, at most hourly. "
+        "Read when sampling starts, so a change needs a daemon restart."
     ),
     "hardware.history_retention_days": (
         "How long downsampled history windows are kept in instrument.duckdb. Longer than "
@@ -291,6 +292,13 @@ _FIELD_DESCRIPTIONS = {
         "segment is written once, so its indexed size and TTL are accurate and old data "
         "can expire without touching the file being appended to. Read when sampling "
         "starts, so a change needs a daemon restart."
+    ),
+    "hardware.raw_index_refresh_s": (
+        "Minimum seconds between cache-index refreshes of a raw sample segment that is "
+        "still being written. New and rolled segments are indexed immediately; this only "
+        "bounds how stale an open segment's recorded size and TTL may be. 0 refreshes on "
+        "every write, which is costly on many channels. Read when sampling starts, so a "
+        "change needs a daemon restart."
     ),
     "hardware.reading_store_sensitive": (
         "Register the durable instrument.duckdb history tier as sensitive and "

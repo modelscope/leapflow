@@ -223,13 +223,40 @@ async def serve(
             path.unlink()
 
 
+_OWNER_POLL_S = 0.5
+
+
+async def _stop_when_orphaned(stop: asyncio.Event, owner_pid: int) -> None:
+    """Stop serving once the owner that launched this process is gone.
+
+    The worker is owner-bound, but an owner that dies without reaping it (SIGKILL, a
+    crash, a caller that never closed it) sends no signal here, and an orphan holds
+    its memory and socket indefinitely. POSIX re-parents an orphan, so a parent id
+    that no longer matches the one seen at startup means the owner has exited.
+    """
+    while os.getppid() == owner_pid:
+        try:
+            await asyncio.wait_for(stop.wait(), _OWNER_POLL_S)
+            return
+        except TimeoutError:
+            continue
+    stop.set()
+
+
 def main(socket_path: str, budgets: WorkerBudgets = WorkerBudgets()) -> int:
+    owner_pid = os.getppid()
+
     async def run() -> None:
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for name in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(name, stop.set)
-        await serve(socket_path, budgets=budgets, stop=stop)
+        watcher = asyncio.create_task(_stop_when_orphaned(stop, owner_pid))
+        try:
+            await serve(socket_path, budgets=budgets, stop=stop)
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
 
     # This entry point owns a dedicated compute process. Make the endpoint
     # private at bind time, before the parent can observe it; chmod after the

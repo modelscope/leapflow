@@ -51,14 +51,17 @@ def parser() -> argparse.ArgumentParser:
             for axis in "xyz":
                 item.add_argument(f"--d{axis}-mm", type=float, default=0.0)
             item.add_argument("--frame", choices=("base",), required=True)
+            item.add_argument("--workcell", default="piper_cell", help="Calibrated workspace to stay inside")
     item = command(arm, "joints", writing=True)
     item.add_argument("--target", required=True, type=joint_target,
                       help="Absolute j1..j6 target in degrees, comma separated")
+    item.add_argument("--workcell", default="piper_cell", help="Calibrated workspace to stay inside")
     item = command(arm, "cycle", writing=True)
     item.add_argument("--dz-mm", type=float, default=200.0)
     item.add_argument("--cycles", type=int, default=5)
     item.add_argument("--dwell-s", type=float, default=5.0)
     item.add_argument("--frame", choices=("base",), required=True)
+    item.add_argument("--workcell", default="piper_cell", help="Calibrated workspace to stay inside")
     grip = groups.add_parser("gripper").add_subparsers(dest="operation", required=True)
     item = command(grip, "open", writing=True)
     width = item.add_mutually_exclusive_group(required=True)
@@ -243,11 +246,14 @@ async def hardware(args: argparse.Namespace, settings: Settings, evidence: Evide
                                  torque_release=getattr(args, "torque_release_confirmed", False)))
         if not executing:
             start = await session.snapshot(preflight=True)
+            workspace = (await calibration.workspace_guard(session, args.workcell)
+                         if operation in motion.GUARDED else None)
             plan = motion.preview(session.context, start, settings, operation=operation,
                                   dx=getattr(args, "dx_mm", 0.0), dy=getattr(args, "dy_mm", 0.0),
                                   dz=getattr(args, "dz_mm", 0.0), width=getattr(args, "width_mm", None),
                                   cycles=getattr(args, "cycles", 0), dwell_s=getattr(args, "dwell_s", 0.0),
-                                  target=getattr(args, "target", None), force=getattr(args, "force_n", None))
+                                  target=getattr(args, "target", None), force=getattr(args, "force_n", None),
+                                  workspace=workspace)
             return preview_result(plan)
         # The selected command arguments must still describe the approved artifact.
         delta = plan["delta_base_mm"]
@@ -264,6 +270,8 @@ async def hardware(args: argparse.Namespace, settings: Settings, evidence: Evide
             raise Refusal("gripper width differs from approved preview")
         if getattr(args, "force_n", None) != plan.get("force_n"):
             raise Refusal("grip force differs from approved preview")
+        if operation in motion.GUARDED:
+            motion.check_workspace(plan, await calibration.workspace_guard(session, args.workcell))
         final = await motion.execute_plan(session, plan)
     return await verify_after_exit(settings, evidence, plan, final)
 

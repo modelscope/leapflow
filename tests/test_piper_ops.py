@@ -295,6 +295,118 @@ def test_bind_steps_skips_dwell(settings, tmp_path):
     assert len(run._approved_steps) == len([r for r in plan["steps"] if r.get("dwell_s") is None])
 
 
+FLANGE_TCP = {"x": 0., "y": 0., "z": 126.5, "rx": 0., "ry": 0., "rz": 0.}
+
+
+def workspace(z=(-1000., 2000.), x=(-1000., 1000.), y=(-1000., 1000.), workcell="piper_cell"):
+    """A ``calibration.workspace_guard`` reading with the declared 126.5 mm TCP."""
+    return {"workcell": workcell, "workspace": {"x": list(x), "y": list(y), "z": list(z)},
+            "tcp_calibrated": False, "flange_tcp": dict(FLANGE_TCP)}
+
+
+def tcp_z(pose):
+    return motion.WorkspaceGuard.from_mapping(workspace()).tcp(pose).z
+
+
+def test_move_is_held_above_the_calibrated_floor(settings):
+    start = snapshot()
+    floor = tcp_z(start.pose) - 5.
+    guard = workspace(z=(floor, 2000.))
+    with pytest.raises(Refusal, match="calibrated workspace: TCP z="):
+        motion.preview(context(), start, settings, operation="move", dz=-10., workspace=guard)
+    plan = motion.preview(context(), start, settings, operation="move", dz=-4., workspace=guard)
+    assert plan["workspace_guard"] == guard
+    assert motion.preview(context(), start, settings, operation="move", dz=10., workspace=guard)
+    # the declared flange envelope alone would have admitted the descent
+    assert motion.preview(context(), start, settings, operation="move", dz=-10.)["workspace_guard"] is None
+    unbounded = motion.preview(context(), start, settings, operation="move", dz=-10.,
+                               workspace={**guard, "workspace": None})
+    assert unbounded["workspace_guard"]["workspace"] is None
+
+
+def test_a_start_below_the_floor_may_rise_but_not_sink(settings):
+    start = snapshot()
+    guard = workspace(z=(tcp_z(start.pose) + 5., 2000.))
+    assert motion.preview(context(), start, settings, operation="move", dz=10., workspace=guard)
+    assert motion.preview(context(), start, settings, operation="move", dx=5., workspace=guard)
+    with pytest.raises(Refusal, match="calibrated workspace"):
+        motion.preview(context(), start, settings, operation="move", dz=-1., workspace=guard)
+
+
+def test_cycle_and_joint_sweep_are_held_to_the_workspace(settings):
+    start = snapshot()
+    z = tcp_z(start.pose)
+    with pytest.raises(Refusal, match="calibrated workspace"):
+        motion.preview(context(), start, settings, operation="cycle", dz=50., cycles=1,
+                       workspace=workspace(z=(z - 1., z + 20.)))
+    tcp = motion.WorkspaceGuard.from_mapping(workspace()).tcp(start.pose)
+    tight = workspace(x=(tcp.x - .5, tcp.x + .5), y=(tcp.y - .5, tcp.y + .5), z=(z - .5, z + .5))
+    with pytest.raises(Refusal, match="calibrated workspace"):
+        motion.preview(context(), start, settings, operation="joints",
+                       target=(5., 70., -70., 25., -40., -100.), workspace=tight)
+
+
+@pytest.mark.parametrize("operation", ["initialize", "verify"])
+def test_bring_up_operations_ignore_the_workspace(settings, operation):
+    start = snapshot()
+    guard = workspace(z=(tcp_z(start.pose) + 500., 2000.))
+    plan = motion.preview(context(), start, replace(settings, init_max_deg=90.), operation=operation,
+                          dy=50., dz=100., workspace=guard)
+    assert plan["workspace_guard"] is None
+
+
+def test_execution_rechecks_the_workspace_as_calibrated_now(settings):
+    start = snapshot()
+    floor = tcp_z(start.pose) - 20.
+    plan = motion.preview(context(), start, settings, operation="move", dz=-10.,
+                          workspace=workspace(z=(floor, 2000.)))
+    plan = json.loads(json.dumps(plan, default=motion.json_default))
+    motion.check_workspace(plan, workspace(z=(floor, 2000.)))
+    with pytest.raises(Refusal, match="calibrated workspace"):
+        motion.check_workspace(plan, workspace(z=(floor + 15., 2000.)))
+    with pytest.raises(Refusal, match="disappeared"):
+        motion.check_workspace(plan, {**workspace(), "workspace": None})
+    with pytest.raises(Refusal, match="workcell"):
+        motion.check_workspace(plan, workspace(z=(floor, 2000.), workcell="other_cell"))
+    # a plan previewed before any calibration is still held to one that appeared since
+    open_plan = motion.preview(context(), start, settings, operation="move", dz=-10.,
+                               workspace={**workspace(), "workspace": None})
+    motion.check_workspace(open_plan, {**workspace(), "workspace": None})
+    with pytest.raises(Refusal, match="calibrated workspace"):
+        motion.check_workspace(open_plan, workspace(z=(floor + 15., 2000.)))
+
+
+async def test_workspace_guard_reads_box_and_tcp_offset(settings, tmp_path, monkeypatch):
+    flange = {"x": 190.771, "y": 199.908, "z": 189.772, "rx": 180., "ry": 0., "rz": 90.}
+    tcp = motion.WorkspaceGuard.from_mapping(workspace()).tcp(motion.Pose.from_mapping(flange)).to_dict()
+    box = {"x": [110., 420.], "y": [-170., 220.], "z": [11.6899, 330.]}
+    requests = []
+    answer = {"ok": True, "side_effect_state": "none",
+              "result": {"flange": flange, "tcp": tcp, "workspace": box, "tcp_calibrated": False}}
+
+    class Client:
+        async def hw_skill_run(self, **request):
+            requests.append(request)
+            return answer
+
+    @asynccontextmanager
+    async def service(session, approved=None, *, share_frames=False):
+        yield Client()
+
+    monkeypatch.setattr(calibration, "service", service)
+    run = _CalibrationSession(settings, Evidence(tmp_path / "guard.json"))
+    guard = await calibration.workspace_guard(run, "piper_cell")
+    assert requests[-1]["skill"] == "arm.state" and requests[-1]["dry_run"] is True
+    assert guard["workspace"] == box and guard["workcell"] == "piper_cell"
+    assert motion.Pose.from_mapping(guard["flange_tcp"]).distance_mm(motion.Pose.from_mapping(FLANGE_TCP)) < 1e-3
+    answer["ok"] = False
+    with pytest.raises(Refusal, match="arm.state"):
+        await calibration.workspace_guard(run, "piper_cell")
+    for command in (["arm", "move", "--dz-mm", "5", "--frame", "base"], ["arm", "cycle", "--frame", "base"],
+                    ["arm", "joints", "--target", "0,0,0,0,0,0"]):
+        assert cli.parser().parse_args(command).workcell == "piper_cell"
+
+
 def test_evidence_never_overwrites(tmp_path):
     path = tmp_path / "run.json"
     first = Evidence(path)

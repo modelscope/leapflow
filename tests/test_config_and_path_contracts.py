@@ -250,18 +250,43 @@ def test_profile_owns_its_state_and_never_the_workspace(layout, tmp_path) -> Non
         )
 
 
-def test_workspace_footprint_is_limited_to_declared_files(layout, tmp_path) -> None:
-    """Workspace-local files are limited to config + manifest, in .leapflow/."""
+def test_workspace_footprint_is_limited_to_the_opt_in_config(layout, tmp_path) -> None:
+    """Only the opt-in config override may live in the workspace.
+
+    A marker manifest used to be written on every command; nothing ever read it
+    back and it littered every directory LeapFlow ran in, so the only remaining
+    workspace-local file is the one the user explicitly creates with
+    ``leap config set --scope workspace``.
+    """
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
     config_path = pathlib.Path(layout.workspace_config_path(workspace)).resolve()
-    manifest_path = pathlib.Path(layout.workspace_manifest_path(workspace)).resolve()
 
-    for path in (config_path, manifest_path):
-        assert path.is_relative_to(workspace.resolve())
-        assert path.parent.name == ".leapflow", f"{path} must live in .leapflow/"
-    assert {config_path.name, manifest_path.name} == {"config.yaml", "workspace.yaml"}
+    assert config_path.is_relative_to(workspace.resolve())
+    assert config_path.parent.name == ".leapflow", f"{config_path} must live in .leapflow/"
+    assert config_path.name == "config.yaml"
+    assert not config_path.parent.exists(), "resolving the path must not create .leapflow/"
+
+
+def test_config_load_leaves_the_workspace_untouched(monkeypatch, tmp_path) -> None:
+    """End-to-end: loading settings must write only inside the profile."""
+    from leapflow.config import load_config
+    from leapflow.layout import workspace_id_for_path
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "leap-home"))
+    monkeypatch.setenv("LEAPFLOW_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("LEAPFLOW_PROFILE", "default")
+
+    settings = load_config()
+
+    assert not (workspace / ".leapflow").exists()
+    cache_manifest = settings.profile_layout.cache.workspace_manifest_path(
+        workspace_id_for_path(workspace)
+    )
+    assert cache_manifest.exists()
 
 
 def test_profiles_are_mutually_isolated(layout) -> None:

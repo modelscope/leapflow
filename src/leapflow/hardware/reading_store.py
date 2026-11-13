@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Iterable, Protocol, Sequence, runtime_checkable
 
 from leapflow.hardware.context import as_numeric
+from leapflow.hardware.raw_segment_index import DEFAULT_RAW_INDEX_REFRESH_S, RawSegmentIndex
 from leapflow.hardware.transport import Reading
 from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
 
@@ -258,6 +259,7 @@ class ReadingStore:
         downsample_interval_s: float = DEFAULT_DOWNSAMPLE_INTERVAL_S,
         history_ttl_s: float = DEFAULT_HISTORY_TTL_S,
         raw_segment_bytes: int = DEFAULT_RAW_SEGMENT_BYTES,
+        raw_index_refresh_s: float = DEFAULT_RAW_INDEX_REFRESH_S,
         window_policy: AdaptiveWindowPolicy | None = None,
     ) -> None:
         self._raw_dir = raw_dir
@@ -271,15 +273,12 @@ class ReadingStore:
             self._holder = LocalConnectionHolder(self._db_path)
             self._owns_holder = True
         self._cache = cache_manager
-        self._workspace_id = workspace_id
-        self._session_id = session_id
         # When True (the default and the safe posture) the durable history database is
         # registered as sensitive and non-syncable, so a profile backup treats it like
         # the raw tier. An operator who knows a bench produces no sensitive series can
         # opt out via ``hardware.reading_store_sensitive`` to let it sync normally.
         self._reading_store_sensitive = bool(reading_store_sensitive)
         self._db_registered = False
-        self._raw_ttl_s = raw_ttl_s
         self._downsample_interval_s = max(1.0, downsample_interval_s)
         # The window length is asked of a policy, not read from the constant, so an
         # excursion can tighten it and steady state can relax it. The default policy
@@ -289,6 +288,14 @@ class ReadingStore:
         )
         self._history_ttl_s = max(0.0, history_ttl_s)
         self._raw_segment_bytes = max(1, int(raw_segment_bytes))
+        self._raw_index = RawSegmentIndex(
+            cache_manager,
+            category=READINGS_CATEGORY,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            ttl_s=raw_ttl_s,
+            refresh_s=raw_index_refresh_s,
+        )
         self._pending: dict[tuple[str, str], list[Reading]] = {}
         self._dropped: dict[tuple[str, str], int] = {}
         self._window_start: dict[tuple[str, str], float] = {}
@@ -370,21 +377,30 @@ class ReadingStore:
         Blocking: appends files and opens DuckDB. Safe to call from a worker thread
         because it touches no buffer the sampling loop also touches.
         """
-        if not batches:
-            return 0
+        return self._write(batches, force_index=False)
+
+    def flush(self, *, force: bool = False, now: float | None = None) -> int:
+        """Drain and write in one call, for teardown and for callers off the hot path.
+
+        A forced flush also brings every segment's index entry up to date, so the size
+        and TTL recorded at teardown are those of the last sample written.
+        """
+        return self._write(self.drain(force=force, now=now), force_index=force)
+
+    def _write(self, batches: Sequence[ReadingBatch], *, force_index: bool) -> int:
         windows: list[ReadingWindow] = []
         for batch in batches:
             self._append_raw(batch.readings)
             window = summarize_window(batch.readings, dropped=batch.dropped)
             if window is not None:
                 windows.append(window)
+        self._raw_index.index_due(force=force_index)
+        self._raw_index.sweep_expired()
+        if not windows:
+            return 0
         written = self._write_windows(windows)
         self._windows_written += written
         return written
-
-    def flush(self, *, force: bool = False, now: float | None = None) -> int:
-        """Drain and write in one call, for teardown and for callers off the hot path."""
-        return self.write_batches(self.drain(force=force, now=now))
 
     def _current_interval(self, moment: float) -> float:
         """Ask the policy for the window length right now, clamped to a sane floor.
@@ -408,11 +424,11 @@ class ReadingStore:
         experiment goes wrong somebody needs to read them with ordinary tools, and a
         partially written line is recoverable where a truncated binary record is not.
 
-        The segment is re-indexed after every append, and rolled once it passes its
-        byte cap. Both are required by how ``CacheManager`` accounts for an artifact:
-        it records the size it finds at registration, so a file registered once and
-        appended to forever is counted at the few kilobytes it started as, and its TTL
-        runs from the first sample rather than the last.
+        The segment is marked for re-indexing after every append, and rolled once it
+        passes its byte cap. Both are required by how ``CacheManager`` accounts for an
+        artifact: it records the size it finds at registration, so a file registered
+        once and appended to forever is counted at the few kilobytes it started as, and
+        its TTL runs from the first sample rather than the last.
         """
         if self._raw_dir is None:
             return
@@ -428,7 +444,7 @@ class ReadingStore:
             logger.warning("Could not append hardware readings to %s: %s", path, exc)
             return
         self._raw_writes += len(readings)
-        self._index_raw_file(path)
+        self._raw_index.mark_appended(path)
         self._roll_if_full(key, path)
 
     def _segment_path(self, key: tuple[str, str]) -> Path:
@@ -459,8 +475,8 @@ class ReadingStore:
     def _roll_if_full(self, key: tuple[str, str], path: Path) -> None:
         """Start a new segment once this one passes its cap.
 
-        The finished segment keeps the registration it already has, which is now its
-        final and correct size.
+        The finished segment is indexed once more at the end of this write, which then
+        records its final and correct size.
         """
         try:
             if path.stat().st_size < self._raw_segment_bytes:
@@ -468,33 +484,8 @@ class ReadingStore:
         except OSError:
             return
         self._segments[key] = self._segments.get(key, 0) + 1
+        self._raw_index.mark_rolled(path)
         logger.debug("hardware readings: rolled %s at its size cap", path.name)
-
-    def _index_raw_file(self, path: Path) -> None:
-        """Index the file as sensitive, non-syncable, TTL-bounded session data.
-
-        Re-registered on every append rather than once per file. The index is keyed by
-        path, so this refreshes the recorded size and restarts the TTL from the most
-        recent sample -- which is what "keep for seven days" has to mean for a file
-        that is still being written to.
-        """
-        if self._cache is None:
-            return
-        try:
-            self._cache.register(
-                path=path,
-                scope="session",
-                category=READINGS_CATEGORY,
-                source=str(path.name),
-                workspace_id=self._workspace_id,
-                session_id=self._session_id,
-                expires_at=time.time() + self._raw_ttl_s,
-                sensitive=True,
-                syncable=False,
-                owner_component="hardware",
-            )
-        except Exception as exc:  # noqa: BLE001 - indexing must not break sampling
-            logger.warning("Could not index hardware reading file %s: %s", path, exc)
 
     # ── Downsampled tier ──
 

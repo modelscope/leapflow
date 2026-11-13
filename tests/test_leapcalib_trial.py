@@ -162,6 +162,7 @@ async def test_trial_real_worker_disjoint_evaluation_no_activation(tmp_path: Pat
         assert verifier._seen_nonces == nonces
         assert "color_bgr8" not in json.dumps(report) and "depth_m_f32le" not in json.dumps(report)
     finally:
+        await worker.close()
         await registry.close_all()
 
 
@@ -198,6 +199,7 @@ async def test_tracking_exclusion_never_promotes_withheld_to_training(tmp_path: 
         assert report["tracking_refusals"][0]["split"] == "training"
         assert report["evaluation"]["verdict"] == "insufficient_evidence"
     finally:
+        await worker.close()
         await registry.close_all()
 
 

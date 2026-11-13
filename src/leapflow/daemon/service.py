@@ -1754,7 +1754,6 @@ class RuntimeLeapService:
             "user_config_path": str(layout.user_config_path),
             "mcp_servers_path": str(layout.mcp_servers_path),
             "workspace_config_path": str(layout.workspace_config_path(workspace_root)),
-            "workspace_manifest_path": str(layout.workspace_manifest_path(workspace_root)),
             "config_sources": list(getattr(settings, "config_sources", ())),
             "config_warnings": list(getattr(settings, "config_warnings", ())),
             "watched_config_paths": [str(p) for p in getattr(settings, "watched_config_paths", ())],

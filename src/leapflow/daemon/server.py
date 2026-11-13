@@ -44,6 +44,18 @@ them, so a routed request cannot leak a pending approval when its caller disconn
 """
 
 
+class _ClientDisconnected(ConnectionResetError):
+    """The caller hung up before a reply could be written to its socket.
+
+    Raised only by ``_write_json``, so a hang-up is told apart from a connection error
+    the *handler* hit on its own (a device link reset, say), which is a real request
+    failure the caller must hear about. A ``ConnectionResetError`` so the stream loop's
+    existing disconnect handling still applies. Routine -- a board closing a preview
+    tab -- so it ends the connection quietly instead of logging a request failure and
+    then writing that failure to the same dead socket.
+    """
+
+
 def _stream_heartbeat_interval() -> float:
     raw = os.getenv("LEAPFLOW_DAEMON_STREAM_HEARTBEAT", str(_DEFAULT_STREAM_HEARTBEAT_S)).strip()
     try:
@@ -164,6 +176,10 @@ class UnixRpcServer:
                 if not raw:
                     break
                 await self._handle_line(raw, writer)
+        except (ConnectionResetError, BrokenPipeError) as exc:
+            # ``_handle_line`` reports every handler failure itself, so what reaches
+            # here is the caller's socket going away, on read or on reply.
+            logger.debug("daemon: client disconnected (%s: %s)", type(exc).__name__, exc)
         finally:
             self._active_connections -= 1
             self._connections.pop(task, None)
@@ -192,6 +208,8 @@ class UnixRpcServer:
                 str(exc),
             )
             await _write_json(writer, response.to_json())
+        except _ClientDisconnected:
+            raise
         except Exception as exc:
             logger.exception("daemon: request failed method=%s", request.method)
             response = RpcResponse.fail(
@@ -535,8 +553,11 @@ async def _watch_idle_shutdown(
 
 
 async def _write_json(writer: asyncio.StreamWriter, text: str) -> None:
-    writer.write(text.encode("utf-8") + b"\n")
-    await writer.drain()
+    try:
+        writer.write(text.encode("utf-8") + b"\n")
+        await writer.drain()
+    except (ConnectionResetError, BrokenPipeError) as exc:
+        raise _ClientDisconnected(str(exc) or type(exc).__name__) from exc
 
 
 async def _close_writer(writer: asyncio.StreamWriter) -> None:

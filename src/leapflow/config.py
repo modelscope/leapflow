@@ -240,6 +240,11 @@ class Settings:
     # finished one is a write-once artifact -- its recorded size and TTL are correct,
     # and old data can be dropped without discarding the file being written to.
     hardware_raw_segment_mb: float = 32.0
+    # Minimum spacing between cache-index refreshes of a raw segment still being
+    # written. Each refresh is a DuckDB open/update/close on the shared cache index, so
+    # refreshing on every append kept cores busy on a multi-channel arm. New and rolled
+    # segments are indexed immediately; 0 refreshes on every write.
+    hardware_raw_index_refresh_s: float = 60.0
     # Whether the durable ``instrument.duckdb`` history tier is registered as sensitive
     # and non-syncable, so a profile backup excludes physical series that may carry a
     # trade secret or sample information. On by default; opt out only for a bench known
@@ -948,7 +953,6 @@ def load_config() -> Settings:
     profile_layout = layout.ensure(profile_id=profile)
     workspace_id = workspace_id_for_path(workspace_root)
     try:
-        layout.write_workspace_manifest(workspace_root)
         profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
     except OSError:
         logger.debug("Workspace manifest write skipped", exc_info=True)
@@ -1010,7 +1014,6 @@ def _build_settings_from_env(
     profile_manifest = profile_manifest or profile_layout.load_manifest()
     workspace_id = workspace_id_for_path(workspace_root)
     try:
-        layout.write_workspace_manifest(workspace_root)
         profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
     except OSError:
         logger.debug("Workspace manifest write skipped", exc_info=True)
@@ -1488,6 +1491,9 @@ def _build_settings_from_env(
         os.getenv("LEAPFLOW_HARDWARE_HISTORY_RETENTION_DAYS", "90")
     )
     hardware_raw_segment_mb = float(os.getenv("LEAPFLOW_HARDWARE_RAW_SEGMENT_MB", "32"))
+    hardware_raw_index_refresh_s = max(
+        0.0, float(os.getenv("LEAPFLOW_HARDWARE_RAW_INDEX_REFRESH_S", "60") or 60.0)
+    )
     hardware_reading_store_sensitive = os.getenv(
         "LEAPFLOW_HARDWARE_READING_STORE_SENSITIVE", "1"
     ).strip().lower() in ("1", "true", "yes")
@@ -2051,6 +2057,7 @@ def _build_settings_from_env(
         hardware_raw_retention_days=hardware_raw_retention_days,
         hardware_history_retention_days=hardware_history_retention_days,
         hardware_raw_segment_mb=hardware_raw_segment_mb,
+        hardware_raw_index_refresh_s=hardware_raw_index_refresh_s,
         hardware_reading_store_sensitive=hardware_reading_store_sensitive,
         hardware_host_interval_s=hardware_host_interval_s,
         hardware_host_include=hardware_host_include,

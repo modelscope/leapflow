@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import stat
 import threading
@@ -16,6 +17,61 @@ from typing import Any, Iterable
 import duckdb
 
 from leapflow.layout import CacheLayout
+
+logger = logging.getLogger(__name__)
+
+# Per-process state keyed by index file, shared by every CacheManager instance on it.
+# Callers such as the web cache build a manager per call, so per-instance state would
+# neither serialize their writes nor spare them the schema DDL on every construction.
+_REGISTRY_LOCK = threading.Lock()
+_PATH_LOCKS: dict[str, threading.RLock] = {}
+_SCHEMA_READY: set[tuple[str, int]] = set()
+
+# Secondary indexes created by earlier releases and dropped on open. On a table of a
+# few thousand rows a scan costs well under a millisecond, while an ART index turns
+# every update of its columns into a delete plus insert that leaves a dead row group
+# behind at each checkpoint -- the index grew to hundreds of megabytes that way.
+_LEGACY_INDEXES = ("idx_cache_expiry", "idx_cache_scope")
+
+# Column order of ``cache_entry``; ``_entry_params`` produces values in this order.
+_COLUMNS = (
+    "id",
+    "profile_id",
+    "workspace_id",
+    "session_id",
+    "scope",
+    "category",
+    "source",
+    "path",
+    "content_hash",
+    "size_bytes",
+    "created_at",
+    "last_accessed_at",
+    "expires_at",
+    "sensitive",
+    "syncable",
+    "owner_component",
+    "metadata_json",
+)
+# Columns refreshed when an already-indexed entry is registered again. ``id`` is the
+# key and ``created_at`` is when the artifact first appeared, so neither is rewritten.
+_REFRESH_COLUMNS = tuple(column for column in _COLUMNS if column not in ("id", "created_at"))
+_INSERT_SQL = f"INSERT INTO cache_entry VALUES ({', '.join('?' * len(_COLUMNS))})"
+_UPDATE_SQL = (
+    "UPDATE cache_entry SET "
+    + ", ".join(f"{column} = ?" for column in _REFRESH_COLUMNS)
+    + " WHERE id = ?"
+)
+
+
+def _path_lock(index_path: Path) -> threading.RLock:
+    key = str(index_path)
+    with _REGISTRY_LOCK:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
 
 
 class CacheScope(str, Enum):
@@ -55,7 +111,7 @@ class CacheManager:
     def __init__(self, layout: CacheLayout, *, profile_id: str) -> None:
         self._layout = layout
         self._profile_id = profile_id
-        self._connect_lock = threading.Lock()
+        self._connect_lock = _path_lock(layout.index_path)
         self._layout.ensure()
         self._init_schema()
 
@@ -120,7 +176,7 @@ class CacheManager:
         owner_component: str = "cache",
         metadata: dict[str, Any] | None = None,
     ) -> CacheEntry:
-        entry = self._build_entry(
+        entry = self.build_entry(
             path=path,
             scope=scope,
             category=category,
@@ -138,17 +194,35 @@ class CacheManager:
         return entry
 
     def register_many(self, entries: Iterable[CacheEntry]) -> tuple[CacheEntry, ...]:
-        """Register multiple cache entries using one DuckDB connection."""
+        """Register multiple cache entries using one DuckDB connection.
+
+        Known entries are updated in place and only unknown ones are inserted. An
+        upsert (``INSERT OR REPLACE``) is a delete plus an insert in DuckDB, and since
+        each short-lived connection checkpoints on close, every re-registration left a
+        dead row group in the file: a few thousand entries grew the index to 700 MB and
+        each subsequent open/close cost over a CPU-second. Held under the per-file lock
+        so two threads cannot both find an id missing and both insert it; another
+        process cannot interleave because DuckDB locks the file for the connection.
+        """
         items = tuple(entries)
         if not items:
             return ()
-        with self._connect() as con:
-            con.executemany(
-                """
-                INSERT OR REPLACE INTO cache_entry VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [_entry_params(entry) for entry in items],
-            )
+        # Last registration of an id wins, as it did under the previous upsert.
+        latest = {entry.entry_id: entry for entry in items}
+        with self._connect_lock, self._connect() as con:
+            existing = {
+                str(row[0])
+                for row in con.execute(
+                    "SELECT id FROM cache_entry WHERE list_contains(?, id)",
+                    [list(latest)],
+                ).fetchall()
+            }
+            updates = [_refresh_params(e) for e in latest.values() if e.entry_id in existing]
+            inserts = [_entry_params(e) for e in latest.values() if e.entry_id not in existing]
+            if updates:
+                con.executemany(_UPDATE_SQL, updates)
+            if inserts:
+                con.executemany(_INSERT_SQL, inserts)
         return items
 
     def register_directory(
@@ -176,7 +250,7 @@ class CacheManager:
                 continue
             if suffix_filter and path.suffix.lower() not in suffix_filter:
                 continue
-            entries.append(self._build_entry(
+            entries.append(self.build_entry(
                 path=path,
                 scope=scope,
                 category=category,
@@ -235,21 +309,50 @@ class CacheManager:
                 [time.time(), entry_id],
             )
 
-    def cleanup_expired(self, *, now: float | None = None) -> int:
-        cutoff = now or time.time()
-        removed = 0
-        with self._connect() as con:
-            rows = con.execute(
-                "SELECT id, path FROM cache_entry WHERE expires_at IS NOT NULL AND expires_at <= ?",
-                [cutoff],
-            ).fetchall()
-            for entry_id, raw_path in rows:
+    def cleanup_expired(
+        self,
+        *,
+        now: float | None = None,
+        category: str | None = None,
+        keep: Iterable[Path] = (),
+        min_idle_s: float = 0.0,
+    ) -> int:
+        """Delete expired entries and their managed files; return how many were removed.
+
+        ``category`` limits the sweep to one owner's artifacts. ``keep`` spares paths the
+        owner is still writing, whose recorded expiry can trail the file by a refresh
+        interval. ``min_idle_s`` spares any file written to more recently than that,
+        whoever is writing it: the index is shared across processes, so a row can be
+        stale for a file another process has just appended to, and only the file itself
+        knows. A file that cannot be deleted keeps its row, so the next sweep retries it
+        instead of leaving an unindexed file nobody will ever expire.
+        """
+        cutoff = time.time() if now is None else now
+        kept = {str(Path(path).expanduser().resolve()) for path in keep}
+        idle_cutoff = cutoff - min_idle_s if min_idle_s > 0 else None
+        sql = "SELECT id, path FROM cache_entry WHERE expires_at IS NOT NULL AND expires_at <= ?"
+        params: list[Any] = [cutoff]
+        if category is not None:
+            sql += " AND category = ?"
+            params.append(category)
+        with self._connect_lock, self._connect() as con:
+            removed: list[str] = []
+            for entry_id, raw_path in con.execute(sql, params).fetchall():
+                if str(raw_path) in kept:
+                    continue
                 path = Path(str(raw_path))
                 if self._is_managed_path(path):
-                    path.unlink(missing_ok=True)
-                con.execute("DELETE FROM cache_entry WHERE id = ?", [entry_id])
-                removed += 1
-        return removed
+                    if idle_cutoff is not None and _modified_after(path, idle_cutoff):
+                        continue
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logger.warning("Could not delete expired cache file %s: %s", path, exc)
+                        continue
+                removed.append(str(entry_id))
+            if removed:
+                con.executemany("DELETE FROM cache_entry WHERE id = ?", [(entry_id,) for entry_id in removed])
+        return len(removed)
 
     def list_entries(
         self,
@@ -279,7 +382,23 @@ class CacheManager:
         return [_entry_from_row(row) for row in rows]
 
     def _init_schema(self) -> None:
-        self._layout.index_path.parent.mkdir(parents=True, exist_ok=True)
+        """Create the table and drop legacy indexes, once per index file per process.
+
+        Keyed by inode as well as path, so a file that was deleted or replaced (for
+        example by an offline compaction) is initialized again rather than assumed.
+        """
+        index_path = self._layout.index_path
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect_lock:
+            key = _schema_key(index_path)
+            if key is not None and key in _SCHEMA_READY:
+                return
+            self._create_schema()
+            key = _schema_key(index_path)
+            if key is not None:
+                _SCHEMA_READY.add(key)
+
+    def _create_schema(self) -> None:
         with self._connect() as con:
             con.execute(
                 """
@@ -304,10 +423,10 @@ class CacheManager:
                 )
                 """
             )
-            con.execute("CREATE INDEX IF NOT EXISTS idx_cache_scope ON cache_entry(profile_id, scope)")
-            con.execute("CREATE INDEX IF NOT EXISTS idx_cache_expiry ON cache_entry(expires_at)")
+            for index_name in _LEGACY_INDEXES:
+                con.execute(f"DROP INDEX IF EXISTS {index_name}")
 
-    def _build_entry(
+    def build_entry(
         self,
         *,
         path: Path,
@@ -323,6 +442,11 @@ class CacheManager:
         owner_component: str = "cache",
         metadata: dict[str, Any] | None = None,
     ) -> CacheEntry:
+        """Describe ``path`` as an entry without writing it, for ``register_many``.
+
+        Lets a caller that indexes several files at once pay for one connection rather
+        than one per file.
+        """
         scope_value = scope.value if isinstance(scope, CacheScope) else str(scope)
         resolved = path.expanduser().resolve()
         size = resolved.stat().st_size if resolved.exists() and resolved.is_file() else 0
@@ -349,7 +473,15 @@ class CacheManager:
         )
 
     def _connect(self):
-        """Create a DuckDB connection, serialized to protect against concurrent writes."""
+        """Create a DuckDB connection, serialized to protect against concurrent writes.
+
+        Deliberately one short-lived connection per operation, an intended exception to
+        the ``ConnectionHolder`` rule in ``leapflow.storage.connection``: the index is
+        shared by every LeapFlow process on the profile (daemon, CLI, doctor, node), and
+        DuckDB holds an exclusive file lock for as long as a read-write connection is
+        open, so a long-lived connection in one process would lock the others out. The
+        cost of that choice is bounded by keeping writes infrequent and in place.
+        """
         with self._connect_lock:
             return duckdb.connect(str(self._layout.index_path))
 
@@ -359,6 +491,20 @@ class CacheManager:
             return True
         except ValueError:
             return False
+
+
+def _modified_after(path: Path, moment: float) -> bool:
+    try:
+        return path.stat().st_mtime > moment
+    except OSError:
+        return False
+
+
+def _schema_key(index_path: Path) -> tuple[str, int] | None:
+    try:
+        return (str(index_path), index_path.stat().st_ino)
+    except OSError:
+        return None
 
 
 def _entry_id(path: Path) -> str:
@@ -385,6 +531,11 @@ def _entry_params(entry: CacheEntry) -> list[Any]:
         entry.owner_component,
         json.dumps(entry.metadata, ensure_ascii=False),
     ]
+
+
+def _refresh_params(entry: CacheEntry) -> list[Any]:
+    values = dict(zip(_COLUMNS, _entry_params(entry)))
+    return [values[column] for column in _REFRESH_COLUMNS] + [entry.entry_id]
 
 
 def _entry_from_row(row: tuple[Any, ...]) -> CacheEntry:
