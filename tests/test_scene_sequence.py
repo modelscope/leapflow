@@ -27,6 +27,7 @@ from leapflow.hardware.skills.builtin.motion import skills as motion_skills
 from leapflow.hardware.skills.builtin.scene import skills as scene_skills
 from leapflow.hardware.skills.builtin.sequence import skills as sequence_skills
 from leapflow.hardware.skills.geometry import Pose, Transform
+from leapflow.hardware.skills.kinematics import DhChain
 from leapflow.hardware.skills.protocol import (
     FAILURE_GUARD_FAILED,
     FAILURE_INVALID_ARGS,
@@ -34,6 +35,7 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_PLAN_STALE,
     FAILURE_SKILL_UNAVAILABLE,
     FAILURE_TARGET_NOT_FOUND,
+    FAILURE_UNREACHABLE,
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_PARTIAL,
@@ -58,6 +60,7 @@ from tests._harness.skill_stubs import (
     SimRgbdCamera,
     SkillNodeRegistry,
     perception_registry,
+    piper_context,
     write_workcell,
 )
 
@@ -278,6 +281,58 @@ async def test_plan_refuses_what_it_cannot_resolve_or_reach(
     refused = await _refusal(runtime, steps)
     assert refused.failure_code == code and needle in refused.message, refused
     assert _sim(runtime).batches == []
+
+
+# ── Reach before approval ────────────────────────────────────────────────────
+
+# A real Piper X posture: tool pointing down over the table, wrist pitch j4 at
+# 67.5 deg. A vertical lift raises j4 toward its 89 deg limit, so the arm runs
+# out of wrist long before the workspace box ends -- the program that halted on
+# the real cell after the grasp, with the object in the jaws.
+OVER_TABLE_JOINTS = (18.361, 107.691, -80.454, 67.516, 0.0, -34.512)
+
+
+def _kinematic_cell(tmp_path: Path) -> SkillRuntime:
+    chain = DhChain.from_mapping(piper_context().kinematics.dh)
+    arm = SimArmTransport(joints=OVER_TABLE_JOINTS, forward=chain.forward)
+    return _cell(tmp_path, arm=arm)
+
+
+def _lift(dz: float) -> list[dict[str, Any]]:
+    return [
+        {"op": "move_linear", "relative": {"dx": 0, "dy": 0, "dz": 40, "frame": "base"}},
+        {"op": "move_linear", "relative": {"dx": 0, "dy": 0, "dz": dz, "frame": "base"}},
+        {"op": "move_linear", "relative": {"dx": 0, "dy": 0, "dz": -dz, "frame": "base"}},
+    ]
+
+
+async def test_a_lift_past_the_wrist_limit_is_refused_with_how_far_the_arm_gets(
+    tmp_path: Path,
+) -> None:
+    runtime = _kinematic_cell(tmp_path)
+    refused = await _refusal(runtime, _lift(200.0))
+
+    assert refused.failure_code == FAILURE_UNREACHABLE, refused
+    assert refused.message.startswith("step 2: the arm reaches only")
+    reach = refused.result["reach"]
+    assert reach["requested_mm"] == 200.0 and 60.0 < reach["reachable_mm"] < 200.0
+    assert reach["joint"] == "joint.j4.position" and reach["cause"] == "joint_limit"
+    assert reach["farthest"]["z"] < _sim(runtime).flange.z - TOOL_LENGTH_MM + 40.0 + 200.0
+    assert _sim(runtime).batches == []
+
+    # Rewritten to the reported reach, the same program plans -- and says it was checked.
+    plan = await _plan(runtime, _lift(math.floor(reach["reachable_mm"]) - 1.0))
+    assert plan.basis["reach"] == {"verified": True, "detail": ""}
+    assert plan.summary.endswith("Reach checked with the arm's kinematics.")
+
+
+async def test_reach_is_reported_unverified_when_the_kinematics_cannot_predict(
+    tmp_path: Path,
+) -> None:
+    runtime = _cell(tmp_path)  # the sim's joints do not produce its flange pose
+    plan = await _plan(runtime, _lift(60.0))
+    assert plan.basis["reach"]["verified"] is False
+    assert "Reach not verified: the arm's kinematics.dh puts the flange" in plan.summary
 
 
 # ── Freshness at execute ─────────────────────────────────────────────────────

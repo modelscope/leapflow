@@ -74,7 +74,8 @@ def effective_limits(
         "speed_pct": speed, "speed_pct_max": cap,
         **{name: float(spec.limits[name]) for name in (
             "move_timeout_s", "fk_tolerance_mm", "fk_tolerance_deg", "joint_path_step_deg",
-            "max_steps", "max_wait_s",
+            "max_steps", "max_wait_s", "reach_step_mm", "reach_joint_step_deg",
+            "reach_joint_margin_deg",
         )},
         "max_duration_s": duration,
     }

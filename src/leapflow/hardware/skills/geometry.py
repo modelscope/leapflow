@@ -487,6 +487,12 @@ def rotation_vector(r: Mat3) -> Vec3:
     return (axis[0] * angle, axis[1] * angle, axis[2] * angle)
 
 
+def interpolate_rotation(a: Mat3, b: Mat3, fraction: float) -> Mat3:
+    """The rotation *fraction* of the way from *a* to *b* along the shortest arc."""
+    turn = rotation_vector(mat_mul(transpose(a), b))
+    return mat_mul(a, _exp_so3(tuple(v * fraction for v in turn)))
+
+
 def _symmetric_eigen(matrix: Sequence[Sequence[float]]) -> tuple[list[float], list[list[float]]]:
     """Eigenvalues and eigenvectors (columns) of a small symmetric matrix (cyclic Jacobi)."""
     n = len(matrix)
@@ -1101,6 +1107,7 @@ __all__ = [
     "dot",
     "fit_plane",
     "footprint",
+    "interpolate_rotation",
     "least_squares",
     "mat_mul",
     "mat_vec",

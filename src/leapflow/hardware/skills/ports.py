@@ -109,6 +109,25 @@ class FrameView(Protocol):
 
 
 @runtime_checkable
+class ReachCheck(Protocol):
+    """Follows a program's pose targets with the arm's kinematics at plan time.
+
+    ``move`` raises ``SkillError`` (``unreachable``) naming how far along the
+    move the arm gets. An arm whose kinematics cannot predict reach yields a
+    check that is not ``verified`` and passes every move.
+    """
+
+    @property
+    def verified(self) -> bool: ...
+
+    def to_dict(self) -> dict[str, Any]: ...
+
+    def move(self, target: Pose, *, linear: bool, label: str) -> None: ...
+
+    def joints_moved(self, joints: Mapping[str, float], tcp: Pose) -> None: ...
+
+
+@runtime_checkable
 class MotionFacade(Protocol):
     """Governed discrete motion. Every call goes through the node write gate."""
 
@@ -132,6 +151,10 @@ class MotionFacade(Protocol):
         self, state: ArmState, targets: Sequence[Pose]
     ) -> tuple[Mapping[str, Any], ...]:
         """Bounded IK waypoints whose actual joint-space paths pass workspace checks."""
+        ...
+
+    def reach_tracker(self, state: ArmState) -> ReachCheck:
+        """Plan-time IK that follows pose targets from *state* inside the joint limits."""
         ...
 
     @property
@@ -488,6 +511,7 @@ __all__ = [
     "MetricReadinessPort",
     "NodeSkill",
     "PolicyPort",
+    "ReachCheck",
     "ScenePort",
     "SkillContext",
     "VisionPort",

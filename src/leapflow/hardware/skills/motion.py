@@ -39,6 +39,14 @@ width); this module owns *how*, in one place:
   it releases the devices.
 - **Record.** Every batch that reached a transport is reported to the run's
   ``EpisodeTap``, so the recorded actions are exactly what was commanded.
+- **Reach.** ``reach_tracker`` hands a planner the declared kinematics and
+  joint bounds; the IK walk itself lives in ``reach``.
+
+**Why this file exceeds 800 lines**: every check above guards the same write
+path and shares its state (frames, limits, gate, deadline, in-flight batches);
+splitting them would hand that state across modules and let one command be
+checked against a different snapshot than the one it is sent with. Pure
+computations (``grasp_path``, ``reach``) already live outside.
 """
 
 from __future__ import annotations
@@ -86,6 +94,7 @@ from leapflow.hardware.skills.protocol import (
     MotionResult,
     SkillError,
 )
+from leapflow.hardware.skills.reach import ReachSettings, ReachTracker, joint_bounds
 from leapflow.hardware.skills.tuning import DEFAULT_LIMITS
 from leapflow.hardware.skills.workcell import (
     ARM_STATUS_CHANNEL,
@@ -401,7 +410,7 @@ class GovernedMotion:
         if self._dh_chain is None:
             raise SkillError(
                 FAILURE_SKILL_UNAVAILABLE,
-                "move_joints needs the arm's kinematics.dh to check where the tool goes",
+                "the arm declares no kinematics.dh, so where the tool goes cannot be predicted",
             )
         return self._dh_chain
 
@@ -510,6 +519,23 @@ class GovernedMotion:
         """
         return sum(
             float(self._arm.channel(name).envelope.tolerance or 0.0) for name in self._joints
+        )
+
+    def reach_tracker(self, state: ArmState) -> ReachTracker:
+        """Plan-time IK from *state*; unverified when the declared FK cannot predict."""
+        try:
+            self.check_kinematics(state)
+        except SkillError as error:
+            return ReachTracker.unverified(state.tcp, error.message)
+        settings = ReachSettings.from_limits(self._limits)
+        return ReachTracker(
+            tcp=state.tcp,
+            chain=self._chain(),
+            names=self._joints,
+            joints=state.joints,
+            bounds=joint_bounds(self._arm, self._joints, settings.margin_deg),
+            flange_tcp=self._flange_tcp,
+            settings=settings,
         )
 
     def check_cartesian_path(self, state: ArmState, targets: Sequence[Pose]) -> tuple[Mapping[str, Any], ...]:

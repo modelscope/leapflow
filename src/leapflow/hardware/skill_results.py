@@ -73,8 +73,10 @@ _NEXT_STEPS: dict[str, str] = {
         "server on the node is running, then plan again."
     ),
     FAILURE_UNREACHABLE: (
-        "The target is outside what the arm can safely reach. Tell the user the workcell's "
-        "reachable range (hw_skill_list) or choose another target."
+        "The target is outside what the arm can safely reach. When result.reach names how far "
+        "the arm gets, tell the user that distance and the limiting joint and offer its "
+        "farthest target instead; otherwise tell the user the workcell's reachable range "
+        "(hw_skill_list) or choose another target."
     ),
     FAILURE_PLAN_STALE: "Plan again with hw_skill_run; the new plan needs a new approval.",
     FAILURE_GUARD_FAILED: (

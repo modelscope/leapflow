@@ -21,6 +21,12 @@ DEFAULT_LIMITS: Mapping[str, float] = {
     "fk_tolerance_mm": 5.0,
     "fk_tolerance_deg": 2.0,
     "joint_path_step_deg": 2.0,
+    # Plan-time reach (``skills.reach``): IK sample spacing along a linear move,
+    # the largest joint change between samples before the line is taken to
+    # switch arm configuration, and the margin kept inside every joint limit.
+    "reach_step_mm": 10.0,
+    "reach_joint_step_deg": 10.0,
+    "reach_joint_margin_deg": 1.0,
     "max_steps": 16.0,  # steps one motion.sequence may carry
     "max_wait_s": 10.0,  # longest single ``wait`` step
 }

@@ -188,6 +188,9 @@ async def test_sequence_plan_is_sealed_digested_and_cached(tmp_path: Path) -> No
         "max_duration_s": 120.0,
         "max_steps": 16.0,
         "max_wait_s": 10.0,
+        "reach_step_mm": 10.0,
+        "reach_joint_step_deg": 10.0,
+        "reach_joint_margin_deg": 1.0,
     }
     assert set(plan.basis["calibration"]) == {"tcp", "workspace"}
     assert plan.digest == plan_digest(plan)

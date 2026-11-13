@@ -12,6 +12,10 @@ model must never be trusted with:
   the workspace, the tool cone and the arm's envelopes before approval. The
   workspace box is convex, so a straight segment between two checked targets
   stays inside it. The approved targets are exactly the targets that run.
+- **Reach.** The program is followed with the arm's declared kinematics from
+  the joints it reports: a target the arm cannot reach inside its joint
+  limits -- along the whole line, for a linear move -- is refused before
+  approval with how far the arm gets, instead of halting the program midway.
 - **Freshness.** ``execute`` refuses (``plan_stale``, nothing moved) when the
   tool left its planned start, the held object changed, or a referenced object
   drifted beyond the workcell's declared ``freshness`` tolerances.
@@ -163,7 +167,9 @@ _CARD = (
     "released (the jaws opened freely), reached (the TCP is at the last target), or "
     "no_contact (the move arrived and the jaws were not pushed); on_fail stop halts "
     "the arm, hold leaves it in place. Plan uses the arm's declared FK to sample every "
-    "joint path and refuses any tool target outside the workspace; execute repeats that check "
+    "joint path and refuses any tool target outside the workspace, and solves every move "
+    "with IK inside the joint limits: an unreachable one is refused with the farthest "
+    "reachable target, so rewrite the program to it; execute repeats the workspace check "
     "from fresh joint state and refuses when the tool or a referenced object moved."
 )
 
@@ -209,6 +215,7 @@ class _Planner:
         self._joints = frozenset(state.joints)
         self._joint_state: dict[str, float] | None = dict(state.joints)
         self._kinematics_checked = False
+        self.reach = ctx.motion.reach_tracker(state)
         self.objects: dict[str, LocatedObject] = {}
         self.grasps: dict[str, GraspCandidate] = {}
         self.targets: list[Pose] = []
@@ -258,6 +265,7 @@ class _Planner:
             target, entry["object"], entry["grasp"] = self._referenced(index, step)
             text = f"to {step['ref']} at {_fmt(target)}"
         self._ctx.motion.check_target(target)
+        self.reach.move(target, linear=self._linear(path), label=f"step {index}")
         self._previous = target
         self._joint_state = None
         self.targets.append(target)
@@ -290,6 +298,12 @@ class _Planner:
                 index, f"path {named!r} is not declared by this arm (declared: {available})"
             )
         return str(named)
+
+    def _linear(self, path: str) -> bool:
+        """Whether *path* rides a straight line, the arm's first declared path for default."""
+        if path == PATH_DEFAULT:
+            path = next(iter(self._ctx.motion.paths), PATH_DEFAULT)
+        return path == PATH_LINEAR
 
     def _orientation(self, index: int, data: Mapping[str, Any]) -> tuple[float, float, float]:
         previous = self._previous
@@ -361,6 +375,7 @@ class _Planner:
             self._joint_state = dict(joints)
         else:
             self._joint_state.update(joints)
+        self.reach.joints_moved(joints, target)
         self._previous = target
         self.targets.append(target)
         return {
@@ -661,10 +676,16 @@ class MotionSequence:
         resolved = [planner.resolve(i, step) for i, step in enumerate(steps, 1)]
         listed = "; ".join(f"{i}) {step['text']}" for i, step in enumerate(resolved, 1))
         speed = args.get("speed_pct")
+        reach = planner.reach.to_dict()
+        checked = (
+            "Reach checked with the arm's kinematics."
+            if reach["verified"]
+            else f"Reach not verified: {reach['detail'].rstrip('.')}."
+        )
         return SkillPlan(
             skill_id=self.spec.skill_id,
             args=args,
-            summary=f"Run {len(resolved)} step(s) from {_fmt(state.tcp)}: {listed}",
+            summary=f"Run {len(resolved)} step(s) from {_fmt(state.tcp)}: {listed}. {checked}",
             targets=tuple(planner.targets),
             limits={} if speed is None else {"speed_pct": float(speed)},
             basis={
@@ -673,6 +694,7 @@ class MotionSequence:
                 "objects": {oid: obj.to_dict() for oid, obj in planner.objects.items()},
                 "grasps": {gid: grasp.to_dict() for gid, grasp in planner.grasps.items()},
                 "steps": resolved,
+                "reach": reach,
             },
         )
 
