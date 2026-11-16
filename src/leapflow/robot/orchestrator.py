@@ -105,20 +105,11 @@ class MultiDeviceOrchestrator:
     - ``hardware_tools``: :class:`~leapflow.hardware.tools.HardwareTools`
       for approval-gated batch writes (optional).  When provided, every
       device write flows through the approval chain.
-    - ``capability_index``: :class:`~leapflow.hardware.capability_router.CapabilityIndex`
-      for affordance-based device routing (optional).
     """
 
-    def __init__(
-        self,
-        registry: Any,
-        *,
-        hardware_tools: Any = None,
-        capability_index: Any = None,
-    ) -> None:
+    def __init__(self, registry: Any, *, hardware_tools: Any = None) -> None:
         self._registry = registry
         self._hardware_tools = hardware_tools
-        self._capability_index = capability_index
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -254,17 +245,6 @@ class MultiDeviceOrchestrator:
             did, status = item
             halt_map[did] = status
         return halt_map
-
-    def resolve_by_affordance(self, affordance: str) -> tuple[str, ...]:
-        """Return device_ids that can perform the given affordance.
-
-        Uses ``capability_index`` to find candidate devices for multi-device
-        task planning (e.g. "which arms can grasp?").
-        """
-        if self._capability_index is None:
-            return ()
-        entries = self._capability_index.resolve(affordance)
-        return tuple(entry.device_id for entry in entries)
 
     # ── Internal execution modes ──────────────────────────────────
 

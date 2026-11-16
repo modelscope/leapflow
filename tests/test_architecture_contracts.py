@@ -220,6 +220,10 @@ def test_hardware_transports_are_not_named_after_one_device() -> None:
     LeapFlow Hardware Protocol onto the transport contract, and holds no device
     knowledge -- the device identity, endpoint and node id all arrive in the
     ``TransportRef.config`` the registry admitted.
+
+    ``model_service.py`` qualifies as a contract binding: it carries the task-typed
+    model-serving contract over HTTP for any server that speaks it, and the URL,
+    task, and pinned model identity all come from the declaration.
     """
     allowed = {
         "__init__.py",
@@ -230,10 +234,10 @@ def test_hardware_transports_are_not_named_after_one_device() -> None:
         "host.py",
         "media.py",
         "lhp.py",
+        "model_service.py",
         "robot_arm.py",
         "robot_channels.py",
         "ros2.py",
-        "vla_inference.py",
     }
     present = {p.name for p in (HARDWARE_DIR / "transports").glob("*.py")}
     unexpected = present - allowed
@@ -383,7 +387,11 @@ def test_domain_types_are_frozen(module_name: str, type_name: str) -> None:
 
 def test_frozen_domain_type_rejects_mutation_at_runtime() -> None:
     """The frozen flag must actually block writes (not just be declared)."""
-    from leapflow.engine.recovery.failure_envelope import FailureEnvelope, FailureSource, Recoverability
+    from leapflow.engine.recovery.failure_envelope import (
+        FailureEnvelope,
+        FailureSource,
+        Recoverability,
+    )
 
     envelope = FailureEnvelope.create(
         source=FailureSource.TOOL,
@@ -706,8 +714,8 @@ def test_only_watched_rpcs_get_an_approval_route() -> None:
     The lifecycle is what makes membership safe: every routed request registers, denies on
     exit, and unregisters, so a pending approval cannot outlive the caller that raised it.
     """
-    from leapflow.daemon.server import _APPROVAL_ROUTED_METHODS
     from leapflow.daemon.protocol import METHOD_REGISTRY
+    from leapflow.daemon.server import _APPROVAL_ROUTED_METHODS
 
     assert "command.execute" in _APPROVAL_ROUTED_METHODS, (
         "slash commands are the original approval surface and must keep their route"

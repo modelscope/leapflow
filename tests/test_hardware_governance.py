@@ -38,11 +38,11 @@ from leapflow.hardware.context import (
     Interlock,
     TransportRef,
 )
-from leapflow.hardware.transport import SIDE_EFFECT_NONE
-from leapflow.hardware.transports.mcp import set_mcp_client_provider
 from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
 from leapflow.hardware.risk import build_risk_classifier
 from leapflow.hardware.tools import HardwareTools, build_hardware_tools
+from leapflow.hardware.transport import SIDE_EFFECT_NONE
+from leapflow.hardware.transports.mcp import set_mcp_client_provider
 from leapflow.security.actions import ActionDescriptor, ActionKind
 from leapflow.security.approval import ApprovalDecision, SessionAwareGate
 from leapflow.security.grants import ApprovalScope, grant_key
@@ -1842,6 +1842,9 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.require_describe",
         "hardware.envelope_grant",
         "hardware.trust_skip_enabled",
+        "hardware.degradation_actions_enabled",
+        "hardware.sensor_loss_debounce_s",
+        "hardware.write_verification_follow_s",
         "hardware.stream_enabled",
         "hardware.stream_ring_capacity",
         "hardware.persist_readings",
@@ -1849,6 +1852,7 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.raw_retention_days",
         "hardware.history_retention_days",
         "hardware.raw_segment_mb",
+        "hardware.raw_index_refresh_s",
         "hardware.reading_store_sensitive",
         "hardware.providers",
         "hardware.host_interval_s",
@@ -1857,12 +1861,26 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.rediscover_interval_s",
         "hardware.media_screens",
         "hardware.media_microphones",
+        "hardware.media_exclude_usb",
         "hardware.preview_max_fps",
         "hardware.preview_max_width",
         "hardware.preview_quality",
         "hardware.preview_idle_timeout_s",
         "hardware.fleet_nodes",
         "hardware.alert_policies",
+        "hardware.advisory_limits",
+        "hardware.skills_enabled",
+        "hardware.skills_speed_pct_max",
+        "hardware.skills_max_duration_s",
+        "hardware.skills_plan_ttl_s",
+        "hardware.skills_halt_timeout_s",
+        "hardware.skills_stop_grace_s",
+        "hardware.skills_dispatch_settle_s",
+        "hardware.skills_episode_fps",
+        "hardware.skills_episode_min_free_mb",
+        "hardware.share_frames",
+        "hardware.calibration_worker_enabled",
+        "hardware.calibration_worker_budgets",
     }
     for key in keys:
         view = service.describe(key)
@@ -1883,6 +1901,65 @@ def test_explicitly_disabled_hardware_leaves_the_classifier_untouched() -> None:
     registry = build_registry(_Settings())
     assert registry is None
     assert isinstance(build_risk_classifier(registry), DefaultRiskClassifier)
+
+
+def test_a_confirmed_declaration_reports_when_it_was_confirmed(tmp_path) -> None:
+    """A re-attested device reports the review time, not ``0.0``.
+
+    The confirmation record and the context speak different dialects for one
+    fact -- an ISO-8601 stamp on disk, Unix seconds in provenance -- and a reader
+    that understood only numbers turned every real stamp into 0.0.  ``hw
+    describe`` then told an operator that a device re-attested minutes earlier
+    carried no timestamp, which is exactly the field that answers "have I
+    already reviewed this declaration?".
+    """
+    import yaml
+
+    from leapflow.hardware.attestation import declaration_digest, store_verification
+    from leapflow.hardware.providers.yaml_provider import YamlContextProvider
+
+    devices = tmp_path / "devices"
+    devices.mkdir()
+    (devices / "bench.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "hc_version": HC_VERSION,
+                "device_id": "bench",
+                "halt_supported": True,
+                "transport": {"kind": "mock", "config": {"values": {"level": 1.0}}},
+                "channels": [
+                    {
+                        "channel_id": "level",
+                        "direction": "readwrite",
+                        "quantity": "ratio.level",
+                        "unit": "percent",
+                        "effect": "actuate",
+                        "envelope": {"declared": True, "min_value": 0.0, "max_value": 50.0},
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    reviewed = YamlContextProvider({"devices_dir": devices}).discover()[0]
+    verified_path = tmp_path / "verified.json"
+    entry = store_verification(
+        verified_path,
+        "bench",
+        verifier="jason",
+        digest=declaration_digest(reviewed),
+    )
+
+    stamped = YamlContextProvider(
+        {"devices_dir": devices, "verified_path": str(verified_path)}
+    ).discover()[0]
+
+    assert stamped.provenance.verified_by == "jason"
+    assert stamped.provenance.verified_at > 0
+    # Reported in the same dialect the record is written in, so the operator can
+    # compare what describe prints with what verified.json stores.
+    assert stamped.provenance.to_dict()["verified_at"] == entry["verified_at"]
 
 
 @pytest.mark.asyncio
@@ -1930,7 +2007,18 @@ async def test_enabled_profile_drives_the_whole_chain_from_declarations(tmp_path
         ),
         encoding="utf-8",
     )
-    (tmp_path / "verified.json").write_text(yaml.safe_dump({"rig": "jason"}), encoding="utf-8")
+    # The confirmation is bound to the declaration an operator reviewed, so it
+    # is recorded the way the real command records it -- not as a bare name.
+    from leapflow.hardware.attestation import declaration_digest, store_verification
+    from leapflow.hardware.providers.yaml_provider import YamlContextProvider
+
+    reviewed = YamlContextProvider({"devices_dir": devices}).discover()[0]
+    store_verification(
+        tmp_path / "verified.json",
+        "rig",
+        verifier="jason",
+        digest=declaration_digest(reviewed),
+    )
 
     class _Settings:
         hardware_enabled = True

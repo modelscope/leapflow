@@ -254,7 +254,7 @@ _COMPOUND_KEYS: frozenset[str] = frozenset({
     "api_key", "base_url", "max_retries", "context_length",
     "max_tokens", "timeout_s", "idle_ttl_s", "max_live_sessions",
     "track_enabled", "hard_limit_ratio", "warning_ratio",
-    "result_budget", "tool_budget",
+    "result_budget", "tool_budget", "supports_vision",
 })
 
 

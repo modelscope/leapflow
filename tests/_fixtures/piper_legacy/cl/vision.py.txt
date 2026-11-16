@@ -1,0 +1,490 @@
+"""Vision through the framework's own camera path, with a per-run table plane.
+
+Only the differential measurements decide the grasp, because the depth frame's
+absolute z is not the robot's z:
+
+* **height** -- a lattice of depth probes over the object, the highest cluster
+  fitted as a plane, minus the table plane fitted around the object, evaluated at
+  one (x, y).  A constant offset and a tilt both cancel in that difference.
+* **footprint** -- the mask projected onto the object's *top* plane (robot table z
+  plus height), not onto the table, so the shape is neither sheared nor offset.
+* **yaw** -- the minimum-area rectangle of that projection.
+
+The detector stays the simple one the cell was built around: a white table and a
+black arm mean the object is what is saturated and lands in the work zone.  Its
+job is to bound the object, not to classify it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import math
+import statistics
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import cv2
+import numpy as np
+from PIL import Image
+
+from . import config
+
+ROI_DEFAULT = [140.0, 420.0, -50.0, 210.0]
+MERGE_MM = 100.0
+TOKEN_FILE = config.ROOT.parent / "jetson" / ".lhp-token"
+
+
+class VisionError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+def fit_plane(points: list[tuple[float, float, float]]) -> dict | None:
+    """Least-squares ``z = a x + b y + c`` and its RMS residual.
+
+    The depth frame carries a constant bias *and* a small tilt (the measured
+    table drops ~15 mm over 130 mm of y), so an absolute depth z is meaningless
+    while a plane-minus-plane difference cancels both.  Height is measured that
+    way: fit the table ring, fit the object's top, subtract at one (x, y).
+    """
+    if len(points) < 3:
+        return None
+    matrix = np.array([[p[0], p[1], 1.0] for p in points], dtype=float)
+    values = np.array([p[2] for p in points], dtype=float)
+    solution, *_ = np.linalg.lstsq(matrix, values, rcond=None)
+    predicted = matrix @ solution
+    residual = float(np.sqrt(np.mean((values - predicted) ** 2)))
+    return {"a": float(solution[0]), "b": float(solution[1]), "c": float(solution[2]),
+            "residual_mm": round(residual, 2), "n": len(points)}
+
+
+def plane_at(plane: dict | None, x: float, y: float) -> float | None:
+    if not plane:
+        return None
+    return plane["a"] * x + plane["b"] * y + plane["c"]
+
+
+@dataclass(frozen=True)
+class Frame:
+    id: str
+    image: np.ndarray
+    observed_at: float
+    width: int
+    height: int
+
+    @property
+    def age_s(self) -> float:
+        return round(time.monotonic() - self.observed_at, 3)
+
+
+class RobotEye:
+    def __init__(self, cfg: config.Cfg, token_file: Path | None = None):
+        self.cfg = cfg
+        self.token_file = token_file or TOKEN_FILE
+        self.endpoint = f"tcp://{cfg.lhp.host}:{cfg.lhp.port}"
+        record = config.handeye()
+        self.intrinsics = record["intrinsics"]
+        self.mount = np.asarray(record["camera_in_base"]["matrix"], dtype=float)
+        self.roi = cfg.get_path("vision.roi_mm", ROI_DEFAULT)
+        self._last: Frame | None = None
+        self._plane_cache: tuple[float, np.ndarray] | None = None
+        self._projection_z = float(cfg.get_path("geometry.declared_table_z_mm", -15.5))
+        self._plane_z = self._projection_z
+        self._top_z = self._projection_z
+
+    # -- transport ---------------------------------------------------------
+    def _request(self, skill: str, args: dict, timeout: float = 20.0) -> dict:
+        from leapflow.hardware.lhp.client import SocketLhpClient
+
+        token = self.token_file.read_text(encoding="utf-8").strip()
+
+        async def run() -> dict:
+            client = SocketLhpClient(self.endpoint, token=token)
+            await client.connect()
+            try:
+                return await asyncio.wait_for(
+                    client.request("skill.plan", {"workcell": self.cfg.lhp.workcell, "skill": skill,
+                                                  "args": args, "share_frames": True}),
+                    timeout=timeout)
+            finally:
+                await client.close()
+
+        return asyncio.run(run())
+
+    def _outcome(self, skill: str, args: dict, timeout: float = 20.0) -> dict:
+        reply = self._request(skill, args, timeout)
+        outcome = reply.get("outcome")
+        if outcome is None:
+            raise VisionError("no_outcome", f"{skill}: {str(reply)[:200]}")
+        if outcome.get("status") != "succeeded":
+            raise VisionError(outcome.get("failure_code") or "failed",
+                              str(outcome.get("message") or outcome.get("status"))[:240])
+        return outcome
+
+    # -- capture -----------------------------------------------------------
+    def snapshot(self, reuse_s: float | None = None) -> Frame:
+        limit = self.cfg.get_path("vision.reuse_frame_s", 1.2) if reuse_s is None else reuse_s
+        if self._last is not None and self._last.age_s <= limit:
+            return self._last
+        outcome = self._outcome(self.cfg.lhp.snapshot_skill, {}, timeout=15.0)
+        result = outcome["result"]
+        raw = base64.b64decode(result["image"]["data"])
+        image = np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"), dtype=np.uint8)
+        frame = Frame(id=str(result.get("frame") or f"t{time.time():.3f}"), image=image,
+                      observed_at=time.monotonic(), width=image.shape[1], height=image.shape[0])
+        self._last = frame
+        return frame
+
+    def lift(self, frame_id: str, targets: list[dict], timeout: float = 20.0) -> dict:
+        result = self._outcome(self.cfg.lhp.lift_skill,
+                               {"frame": frame_id, "targets": targets, "coords": "pixel"},
+                               timeout=timeout)["result"]
+        if result.get("dropped"):
+            raise VisionError("dropped", f"the locator fell behind on frame {frame_id}")
+        return result
+
+    def lift_points(self, frame: Frame, points: list[tuple[str, float, float]]) -> dict[str, dict]:
+        """Depth for labelled pixels; the locator caps one request at eight targets."""
+        limit = int(self.cfg.get_path("vision.max_targets", 8))
+        out: dict[str, dict] = {}
+        for start in range(0, len(points), limit):
+            batch = points[start:start + limit]
+            targets = [{"label": label, "point": [int(round(u)), int(round(v))]}
+                       for label, u, v in batch]
+            result = self.lift(frame.id, targets)
+            for obj in result.get("objects") or []:
+                out[str(obj.get("label"))] = obj
+        return out
+
+    # -- camera geometry ---------------------------------------------------
+    def base_map(self, z_plane: float, frame: Frame | None = None) -> np.ndarray:
+        """Base-frame XYZ for every pixel on the horizontal plane ``z_plane``."""
+        source = frame or self._last
+        if source is None:
+            raise VisionError("no_frame", "snapshot() first")
+        if self._plane_cache and abs(self._plane_cache[0] - z_plane) < 1e-6:
+            return self._plane_cache[1]
+        u, v = np.meshgrid(np.arange(source.width, dtype=float),
+                           np.arange(source.height, dtype=float))
+        fx, fy, ppx, ppy = (self.intrinsics["fx"], self.intrinsics["fy"],
+                            self.intrinsics["ppx"], self.intrinsics["ppy"])
+        rays = np.stack([(u - ppx) / fx, (v - ppy) / fy, np.ones_like(u)], axis=-1)
+        rotation, origin = self.mount[:3, :3], self.mount[:3, 3]
+        rays = rays @ rotation.T
+        scale = (z_plane - origin[2]) / rays[..., 2]
+        points = origin + rays * scale[..., None]
+        self._plane_cache = (z_plane, points)
+        return points
+
+    def base_at(self, u: float, v: float, z_plane: float) -> tuple[float, float, float]:
+        points = self.base_map(z_plane)
+        row = int(min(max(round(v), 0), points.shape[0] - 1))
+        col = int(min(max(round(u), 0), points.shape[1] - 1))
+        return (float(points[row, col, 0]), float(points[row, col, 1]), float(points[row, col, 2]))
+
+    def plane_z(self) -> float:
+        """The base-frame plane XY is projected onto: the robot's table, not depth's."""
+        return self._projection_z
+
+    def pixel_of(self, x: float, y: float, z: float) -> tuple[float, float]:
+        rotation, origin = self.mount[:3, :3], self.mount[:3, 3]
+        camera = rotation.T @ (np.array([x, y, z], dtype=float) - origin)
+        return (float(self.intrinsics["fx"] * camera[0] / camera[2] + self.intrinsics["ppx"]),
+                float(self.intrinsics["fy"] * camera[1] / camera[2] + self.intrinsics["ppy"]))
+
+    # -- detection ---------------------------------------------------------
+    def segment(self, frame: Frame, z_plane: float) -> tuple[np.ndarray, dict]:
+        rgb = frame.image.astype(np.float32)
+        high, low = rgb.max(axis=2), rgb.min(axis=2)
+        saturation = (high - low) / np.maximum(high, 1.0)
+        mask = (high > self.cfg.get_path("vision.min_value", 40)) & (
+            saturation > self.cfg.get_path("vision.min_saturation", 95) / 255.0)
+        base = self.base_map(z_plane, frame)
+        x0, x1, y0, y1 = self.roi
+        mask &= (base[..., 0] > x0) & (base[..., 0] < x1) & (base[..., 1] > y0) & (base[..., 1] < y1)
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            mask.astype(np.uint8), connectivity=8)
+        min_area = int(self.cfg.get_path("vision.min_area_px", 400))
+        blobs = [index for index in range(1, count)
+                 if stats[index, cv2.CC_STAT_AREA] >= min_area]
+        if not blobs:
+            return np.zeros(frame.image.shape[:2], dtype=bool), {"pixels": 0, "parts": 0}
+        blobs.sort(key=lambda index: -int(stats[index, cv2.CC_STAT_AREA]))
+        seed = blobs[0]
+        seed_xy = base[labels == seed][:, :2].mean(axis=0)
+        keep = [seed]
+        for index in blobs[1:]:
+            centre = base[labels == index][:, :2].mean(axis=0)
+            if np.linalg.norm(centre - seed_xy) <= MERGE_MM:
+                keep.append(index)
+        mask = np.isin(labels, keep)
+        ys, xs = np.nonzero(mask)
+        stats_out = {
+            "pixels": int(mask.sum()), "parts": len(keep),
+            "pixel": (float(xs.mean()), float(ys.mean())),
+            "box_px": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())],
+            "runners_up": int(len(blobs) - len(keep)),
+        }
+        return mask, stats_out
+
+    # -- measurement -------------------------------------------------------
+    def table_plane(self, frame: Frame, cx: float, cy: float, z_hint: float) -> dict:
+        offsets = self.cfg.get_path("vision.table_offsets_mm", [])
+        points = []
+        for dx, dy in offsets:
+            u, v = self.pixel_of(cx + dx, cy + dy, z_hint)
+            if 2 <= u < frame.width - 2 and 2 <= v < frame.height - 2:
+                points.append((f"{dx:+.0f}_{dy:+.0f}", u, v))
+        if len(points) < 4:
+            raise VisionError("table_points", "fewer than four probe points land in frame")
+        found = self.lift_points(frame, points)
+        zs = [float(obj["center"][2]) for obj in found.values()]
+        if len(zs) < 4:
+            raise VisionError("table_points", f"only {len(zs)} of {len(points)} probes returned depth")
+        zs.sort()
+        median = float(np.median(zs))
+        spread = float(max(zs) - min(zs))
+        plane = fit_plane([tuple(float(c) for c in obj["center"]) for obj in found.values()])
+        return {"z": round(median, 2), "spread_mm": round(spread, 2),
+                "min": round(min(zs), 2), "max": round(max(zs), 2), "n": len(zs),
+                "plane": plane,
+                "probes": {label: [round(c, 1) for c in obj["center"]] for label, obj in found.items()},
+                "ok": spread <= self.cfg.get_path("vision.table_spread_max_mm", 4.0)}
+
+    def footprint(self, frame: Frame, mask: np.ndarray, plane_z: float) -> dict:
+        """Centre, long/short side and yaw in the base frame, from the mask itself."""
+        points = np.column_stack(np.nonzero(mask))[:, ::-1].astype(np.float32)  # (u, v)
+        if len(points) < 30:
+            raise VisionError("too_few_pixels", f"{len(points)} px")
+        rect = cv2.minAreaRect(points)
+        corners_px = cv2.boxPoints(rect)
+        corners = [self.base_at(u, v, plane_z)[:2] for u, v in corners_px]
+        best = (0.0, 0.0, 0.0)
+        for index in range(4):
+            ax, ay = corners[index]
+            bx, by = corners[(index + 1) % 4]
+            length = math.hypot(bx - ax, by - ay)
+            if length > best[0]:
+                best = (length, math.degrees(math.atan2(by - ay, bx - ax)), index)
+        long_mm, yaw_long, index = best
+        short_mm = math.hypot(corners[(index + 1) % 4][0] - corners[(index + 2) % 4][0],
+                              corners[(index + 1) % 4][1] - corners[(index + 2) % 4][1])
+        # The rectangle's own centre flips by millimetres when the mask's outline
+        # wobbles between two near-tied orientations; the point centroid does not.
+        points_mm = self.base_map(plane_z, frame)[mask][:, :2]
+        centre = [float(points_mm[:, 0].mean()), float(points_mm[:, 1].mean())]
+        rect_area_px = max(1.0, float(rect[1][0] * rect[1][1]))
+        return {
+            "centre_mm": [round(centre[0], 2), round(centre[1], 2)],
+            "long_mm": round(long_mm, 2), "short_mm": round(short_mm, 2),
+            "yaw_long_deg": round((yaw_long + 180.0) % 180.0 - 90.0, 2),
+            "corners_mm": [[round(c[0], 2), round(c[1], 2)] for c in corners],
+            "fill": round(len(points) / rect_area_px, 3),
+        }
+
+    def observe(self, z_hint: float | None = None) -> dict:
+        """One coherent look: frame, mask, measured table, footprint and height.
+
+        Three planes are in play and none of them is the depth frame's raw z.  The
+        depth readings carry a constant offset of about +47 mm plus a small tilt, so
+        an absolute z from either source is meaningless.  Therefore:
+
+        * the table plane and the object's top plane are both fitted in the depth
+          frame and subtracted at one (x, y), which cancels offset and tilt;
+        * the mask is projected onto the *object's top plane* (robot-true table z
+          plus the measured height), not onto the table, because the mask covers the
+          top face and a plane 20 mm lower would shear its shape and bias its centre.
+        """
+        frame = self.snapshot(reuse_s=0.0)
+        projection = float(self.cfg.get_path("geometry.declared_table_z_mm", -15.5)) \
+            if z_hint is None else float(z_hint)
+        self._projection_z = projection
+        mask, blob = self.segment(frame, projection)
+        if not blob.get("pixels"):
+            raise VisionError("not_found", "no saturated object inside the work zone")
+        centre0 = self._mask_centre_mm(frame, mask, projection)
+        plane = self.table_plane(frame, *centre0, projection)
+        plane["bias_mm"] = round(plane["z"] - projection, 2)
+        top = self.top_surface(frame, blob["box_px"], centre0)
+        table_at = plane_at(plane.get("plane"), *centre0)
+        if table_at is None or top is None:
+            raise VisionError("no_height", "the table or the top surface did not fit a plane")
+        height = float(top["z_at_centre"] - table_at)
+        if not 4.0 <= height <= 80.0:
+            raise VisionError("bad_height", f"object height {height:.1f} mm is not physical")
+        top_z = projection + height
+        foot = self.footprint(frame, mask, top_z)
+        quality = "ok" if top["plane"]["residual_mm"] <= 3.0 else "noisy"
+        self._plane_z = projection
+        self._top_z = top_z
+        radius = max(30.0, foot["short_mm"] / 2.0 + 12.0)
+        near = self._local_pixels(frame, mask, top_z, foot["centre_mm"], radius)
+        return {
+            "frame": frame.id, "frame_age_s": frame.age_s,
+            "mask_pixels": blob["pixels"], "mask_parts": blob["parts"],
+            "pixel": [round(v, 1) for v in blob["pixel"]], "box_px": blob["box_px"],
+            "table": plane, "footprint": foot, "top": top,
+            "height_mm": round(height, 2), "height_quality": quality,
+            "projection_z": round(projection, 2), "top_z": round(top_z, 2),
+            "local_px": near, "local_radius_mm": round(radius, 1),
+            "roi_mm": self.roi,
+        }
+
+    def observe_stable(self, looks: int = 3) -> dict:
+        """Median of several looks.
+
+        A single look at a grazing angle varies by about 2 mm in height and 5 deg in
+        yaw between frames; the mission stores this result and every later stage
+        reasons from it, so it is worth three frames.
+        """
+        runs = [self.observe() for _ in range(max(1, int(looks)))]
+        if len(runs) == 1:
+            return runs[0]
+
+        def field(run: dict, *path: str | int) -> float:
+            node: Any = run
+            for step in path:
+                node = node[step]
+            return float(node)
+
+        height = statistics.median(field(run, "height_mm") for run in runs)
+        yaw = statistics.median(field(run, "footprint", "yaw_long_deg") for run in runs)
+        x = statistics.median(field(run, "footprint", "centre_mm", 0) for run in runs)
+        y = statistics.median(field(run, "footprint", "centre_mm", 1) for run in runs)
+        long_mm = statistics.median(field(run, "footprint", "long_mm") for run in runs)
+        short_mm = statistics.median(field(run, "footprint", "short_mm") for run in runs)
+        best = dict(runs[-1])
+        foot = dict(best["footprint"])
+        foot.update({"centre_mm": [round(x, 2), round(y, 2)],
+                     "long_mm": round(long_mm, 2), "short_mm": round(short_mm, 2),
+                     "yaw_long_deg": round(yaw, 2)})
+        best["footprint"] = foot
+        best["height_mm"] = round(height, 2)
+        best["top_z"] = round(float(best["projection_z"]) + height, 2)
+        heights = [float(run["height_mm"]) for run in runs]
+        best["looks"] = len(runs)
+        best["look_spread"] = {
+            "height_mm": round(max(heights) - min(heights), 2),
+            "centre_mm": round(max(max(abs(float(run["footprint"]["centre_mm"][0]) - x),
+                                        abs(float(run["footprint"]["centre_mm"][1]) - y))
+                                     for run in runs), 2),
+            "yaw_deg": round(max(abs(float(run["footprint"]["yaw_long_deg"]) - yaw)
+                                 for run in runs), 2),
+        }
+        return best
+
+    def top_surface(self, frame: Frame, box_px: list[int], centre_xy: list[float]) -> dict | None:
+        """Depth probes on a lattice over the blob; the highest cluster is the top.
+
+        The mask rectangle is inflated by the object's front face (parallax under a
+        grazing view), so a footprint-aligned grid puts a whole row on the table and
+        a naive plane fit averages that row into the height.  A lattice inside the
+        *pixel* bounds cannot leave the object, and the top face sits far above the
+        table spread, so the top cluster is the discriminator.
+        """
+        u0, v0, u1, v1 = box_px
+        inset = float(self.cfg.get_path("vision.top_inset", 0.15))
+        steps = max(3, int(self.cfg.get_path("vision.top_grid", 4)))
+        span_u, span_v = float(u1 - u0), float(v1 - v0)
+        lattice = [(f"{i}_{j}",
+                    u0 + span_u * (inset + (1.0 - 2.0 * inset) * i / (steps - 1)),
+                    v0 + span_v * (inset + (1.0 - 2.0 * inset) * j / (steps - 1)))
+                   for i in range(steps) for j in range(steps)]
+        found = self.lift_points(frame, lattice)
+        xyz: list[tuple[float, float, float]] = []
+        pixels: list[tuple[float, float]] = []
+        for label, u, v in lattice:
+            obj = found.get(label)
+            if obj is None:
+                continue
+            xyz.append(tuple(float(c) for c in obj["center"]))
+            pixels.append((u, v))
+        if len(xyz) < 6:
+            return None
+        ceiling = max(point[2] for point in xyz)
+        band = float(self.cfg.get_path("vision.top_band_mm", 8.0))
+        inliers = [index for index, point in enumerate(xyz) if point[2] >= ceiling - band]
+        if len(inliers) < 5:
+            return None
+        plane = fit_plane([xyz[index] for index in inliers])
+        if plane is None:
+            return None
+        z_at = plane_at(plane, centre_xy[0], centre_xy[1])
+        if z_at is None:
+            return None
+        pixel = (sum(pixels[index][0] for index in inliers) / len(inliers),
+                 sum(pixels[index][1] for index in inliers) / len(inliers))
+        heights = [xyz[index][2] for index in inliers]
+        return {"z_at_centre": round(float(z_at), 2), "plane": plane,
+                "n": len(inliers), "probed": len(xyz),
+                "spread_mm": round(max(heights) - min(heights), 2),
+                "points": [[round(c, 1) for c in xyz[index]] for index in inliers],
+                "pixel": [round(pixel[0], 1), round(pixel[1], 1)]}
+
+    def presence(self, centre_xy: list[float], radius_mm: float = 45.0) -> dict:
+        """How many saturated pixels still sit where the object used to be."""
+        frame = self.snapshot(reuse_s=0.0)
+        mask, blob = self.segment(frame, self._plane_z)
+        local = self._local_pixels(frame, mask, self._top_z, centre_xy, radius_mm)
+        return {"frame": frame.id, "local_px": local, "total_px": int(blob.get("pixels", 0)),
+                "radius_mm": radius_mm, "plane_z": self._top_z}
+
+    def _local_pixels(self, frame: Frame, mask: np.ndarray, z_plane: float,
+                      centre_xy: list[float], radius_mm: float) -> int:
+        base = self.base_map(z_plane, frame)
+        inside = ((base[..., 0] - centre_xy[0]) ** 2 + (base[..., 1] - centre_xy[1]) ** 2) <= radius_mm ** 2
+        return int((mask & inside).sum())
+
+    def _mask_centre_mm(self, frame: Frame, mask: np.ndarray, z_plane: float) -> tuple[float, float]:
+        points = self.base_map(z_plane, frame)[mask]
+        return float(points[:, 0].mean()), float(points[:, 1].mean())
+
+    # -- evidence ----------------------------------------------------------
+    def annotate(self, frame: Frame, observation: dict, plane_z: float,
+                 extra: list[tuple[float, float]] | None = None) -> np.ndarray:
+        table_z = float(observation.get("projection_z") or plane_z)
+        top_z = float(observation.get("top_z") or table_z)
+        mask, _ = self.segment(frame, table_z)
+        show = frame.image.copy()
+        show[mask] = (0.45 * show[mask] + 0.55 * np.array([255.0, 40.0, 40.0])).astype(np.uint8)
+        foot = observation.get("footprint") or {}
+        corners = foot.get("corners_mm") or []
+        for index in range(len(corners)):
+            a = corners[index]
+            b = corners[(index + 1) % len(corners)]
+            pa = tuple(int(round(v)) for v in self.pixel_of(a[0], a[1], top_z))
+            pb = tuple(int(round(v)) for v in self.pixel_of(b[0], b[1], top_z))
+            cv2.line(show, pa, pb, (0, 255, 255), 2)
+        centre = foot.get("centre_mm")
+        if centre:
+            u, v = self.pixel_of(centre[0], centre[1], top_z)
+            cv2.drawMarker(show, (int(u), int(v)), (0, 255, 0), cv2.MARKER_CROSS, 26, 2)
+        top_pixel = (observation.get("top") or {}).get("pixel")
+        if top_pixel:
+            cv2.drawMarker(show, (int(top_pixel[0]), int(top_pixel[1])), (255, 0, 255),
+                           cv2.MARKER_TILTED_CROSS, 18, 2)
+        for x, y, z in (extra or []):
+            u, v = self.pixel_of(x, y, z)
+            cv2.drawMarker(show, (int(u), int(v)), (255, 0, 255), cv2.MARKER_TRIANGLE_UP, 18, 2)
+        text = (f"{observation.get('frame', '?')}  z={table_z:.1f}->{top_z:.1f}  "
+                f"h={observation.get('height_mm', 0):.1f} {observation.get('height_quality', '?')}  "
+                f"{foot.get('long_mm', 0):.0f}x{foot.get('short_mm', 0):.0f}  "
+                f"yaw={foot.get('yaw_long_deg', 0):.1f}")
+        cv2.putText(show, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        return show
+
+
+def open_eye(cfg: config.Cfg | None = None) -> Any:
+    """The eye the mounted camera calls for: ``vision.camera`` is ``side`` or ``top``."""
+    cfg = cfg or config.load_profile()
+    if cfg.get_path("vision.camera", "top") == "side":
+        from .sideeye import SideEye
+
+        return SideEye(cfg)
+    return RobotEye(cfg)

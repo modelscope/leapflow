@@ -89,6 +89,7 @@ class DaemonClient:
         enable_thinking: bool = False,
         session_id: str = "",
         workspace_root: str = "",
+        request_id: str = "",
     ) -> AsyncIterator[StreamEvent]:
         """Stream chat events from the daemon-owned AgentEngine.
 
@@ -99,6 +100,8 @@ class DaemonClient:
         ``workspace_root`` is the client process' active workspace/cwd. It is
         routed to the daemon so each TUI session gets its own project context
         instead of inheriting the shared daemon process cwd.
+        ``request_id`` names the turn so the caller can later cancel exactly it
+        (``engine_cancel(request_id)``) without touching other clients' turns.
         """
         params: dict[str, Any] = {"message": message, "enable_thinking": enable_thinking}
         if session_id:
@@ -108,6 +111,7 @@ class DaemonClient:
         request = RpcRequest(
             method="engine.chat",
             params=params,
+            **({"id": request_id} if request_id else {}),
         )
         reader, writer = await self._open()
         try:

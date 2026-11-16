@@ -14,6 +14,7 @@ information. Downsampled windows are the long-term tier a later analysis reads.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from leapflow.hardware.context import (
     Quality,
     TransportRef,
 )
+from leapflow.hardware.raw_segment_index import RawSegmentIndex
 from leapflow.hardware.reading_store import (
     READINGS_CATEGORY,
     ReadingStore,
@@ -797,6 +799,7 @@ def test_persistence_config_keys_are_discoverable() -> None:
         "hardware.persist_readings",
         "hardware.downsample_interval_s",
         "hardware.raw_retention_days",
+        "hardware.raw_index_refresh_s",
     ):
         view = service.describe(key)
         assert view.description
@@ -1434,3 +1437,289 @@ async def test_calibration_survives_close_all_and_reopens_for_reads(tmp_path: Pa
     # The holder was closed during teardown; reading reopens it rather than failing.
     assert registry.calibration_store.latest_time("dev") == 555.0
 
+
+
+# ════════════════════════════════════════════════════════════════
+# Raw-tier index cadence
+# ════════════════════════════════════════════════════════════════
+
+
+def _indexed_store(tmp_path: Path, **kwargs: Any) -> tuple[ReadingStore, CacheManager, list[int]]:
+    """A store whose cache manager counts index writes, the unit the daemon pays for.
+
+    Each ``register_many`` is one DuckDB open/update/close on the shared index.
+    Re-registering every segment on every append made that one per channel per drain,
+    which on a multi-joint arm kept several cores busy.
+    """
+    layout = build_layout(tmp_path / "data")
+    manager = CacheManager(layout.ensure(profile_id="default").cache, profile_id="default")
+    batch_sizes: list[int] = []
+    original = manager.register_many
+
+    def counted(entries: Any) -> Any:
+        items = tuple(entries)
+        # The history database registers through the same entry point; only the raw
+        # tier's cadence is under test here.
+        if _is_raw_batch(items):
+            batch_sizes.append(len(items))
+        return original(items)
+
+    manager.register_many = counted  # type: ignore[method-assign]
+    store = ReadingStore(
+        raw_dir=tmp_path / "raw",
+        db_path=tmp_path / "instrument.duckdb",
+        cache_manager=manager,
+        session_id="sess",
+        **kwargs,
+    )
+    return store, manager, batch_sizes
+
+
+def _is_raw_batch(items: tuple[Any, ...]) -> bool:
+    return any(entry.category == READINGS_CATEGORY for entry in items)
+
+
+def _drain_all(store: ReadingStore, index: int, channels: tuple[str, ...]) -> None:
+    for channel in channels:
+        store.record(_reading(float(index), sequence=index, at=3600.0 + index, channel=channel))
+    # Not ``flush(force=True)``: that is the teardown path, which refreshes everything.
+    store.write_batches(store.drain(force=True))
+
+
+def _raw_sizes(manager: CacheManager) -> dict[str, int]:
+    return {
+        entry.path.name: entry.size_bytes
+        for entry in manager.list_entries()
+        if entry.category == READINGS_CATEGORY
+    }
+
+
+def test_open_segments_are_indexed_once_per_refresh_interval(tmp_path: Path) -> None:
+    channels = ("a", "b", "c")
+    store, manager, batch_sizes = _indexed_store(tmp_path, raw_index_refresh_s=3600.0)
+
+    for index in range(1, 11):
+        _drain_all(store, index, channels)
+
+    assert batch_sizes == [len(channels)], (
+        "new segments must be indexed together in one write, and not again until the "
+        f"refresh interval has passed; got index batches {batch_sizes}"
+    )
+    assert set(_raw_sizes(manager)) == {f"dev.{channel}.0000.ndjson" for channel in channels}
+
+
+def test_open_segments_are_refreshed_after_the_interval(tmp_path: Path) -> None:
+    store, manager, batch_sizes = _indexed_store(tmp_path, raw_index_refresh_s=0.05)
+    _drain_all(store, 1, ("a",))
+    first = _raw_sizes(manager)["dev.a.0000.ndjson"]
+
+    time.sleep(0.06)
+    _drain_all(store, 2, ("a",))
+
+    assert batch_sizes == [1, 1]
+    refreshed = _raw_sizes(manager)["dev.a.0000.ndjson"]
+    assert refreshed > first
+    assert refreshed == (tmp_path / "raw" / "dev.a.0000.ndjson").stat().st_size
+
+
+def test_a_rolled_segment_is_indexed_at_its_final_size(tmp_path: Path) -> None:
+    """A finished segment is written once more, at its closing size, without waiting."""
+    store, manager, _ = _indexed_store(tmp_path, raw_index_refresh_s=3600.0, raw_segment_bytes=200)
+    for index in range(1, 12):
+        _drain_all(store, index, ("level",))
+
+    raw = tmp_path / "raw"
+    names = sorted(p.name for p in raw.glob("*.ndjson"))
+    assert len(names) > 2, f"expected the segment to roll, got {names}"
+    sizes = _raw_sizes(manager)
+    assert set(sizes) == set(names), "every segment must be indexed, including finished ones"
+    for name in names[:-1]:
+        assert sizes[name] == (raw / name).stat().st_size, f"{name} not indexed at final size"
+
+
+def test_close_brings_every_segment_index_up_to_date(tmp_path: Path) -> None:
+    channels = ("a", "b")
+    store, manager, _ = _indexed_store(tmp_path, raw_index_refresh_s=3600.0)
+    for index in range(1, 6):
+        _drain_all(store, index, channels)
+    store.record(_reading(99.0, sequence=99, at=3700.0, channel="a"))
+
+    store.close()
+
+    raw = tmp_path / "raw"
+    sizes = _raw_sizes(manager)
+    assert sizes == {p.name: p.stat().st_size for p in raw.glob("*.ndjson")}
+
+
+def test_a_failed_index_write_is_retried_on_the_next_write(tmp_path: Path) -> None:
+    store, manager, _ = _indexed_store(tmp_path, raw_index_refresh_s=3600.0)
+    working = manager.register_many
+    attempts: list[int] = []
+
+    def flaky(entries: Any) -> Any:
+        items = tuple(entries)
+        if not _is_raw_batch(items):
+            return working(items)
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("index locked")
+        return working(items)
+
+    manager.register_many = flaky  # type: ignore[method-assign]
+    _drain_all(store, 1, ("a",))
+    assert _raw_sizes(manager) == {}
+    _drain_all(store, 2, ("a",))
+
+    assert len(attempts) == 2
+    assert set(_raw_sizes(manager)) == {"dev.a.0000.ndjson"}
+
+
+# ════════════════════════════════════════════════════════════════
+# Raw-tier retention
+# ════════════════════════════════════════════════════════════════
+
+
+def _cache_backed_store(tmp_path: Path, **kwargs: Any) -> tuple[ReadingStore, CacheManager, Path]:
+    """A store whose raw tier lives under the cache root, so expiry may delete its files."""
+    profile = build_layout(tmp_path / "data").ensure(profile_id="default")
+    manager = CacheManager(profile.cache, profile_id="default")
+    raw_dir = profile.cache.session_dir("default", "sess") / "hardware_readings"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    store = ReadingStore(
+        raw_dir=raw_dir,
+        db_path=tmp_path / "instrument.duckdb",
+        cache_manager=manager,
+        session_id="sess",
+        **kwargs,
+    )
+    return store, manager, raw_dir
+
+
+def _expired_segment(
+    manager: CacheManager, raw_dir: Path, name: str, *, category: str, idle_s: float = 30 * 86400.0
+) -> Path:
+    """A segment whose index row has expired and whose last sample is ``idle_s`` old."""
+    path = raw_dir / name
+    path.write_text('{"value": 1}\n', encoding="utf-8")
+    last_sample = time.time() - idle_s
+    os.utime(path, (last_sample, last_sample))
+    manager.register(
+        path=path,
+        scope=CacheScope.SESSION,
+        category=category,
+        source=name,
+        session_id="sess",
+        expires_at=time.time() - 60.0,
+    )
+    return path
+
+
+def test_the_first_write_expires_segments_past_retention(tmp_path: Path) -> None:
+    """Nothing else expires the raw tier; before this sweep it grew for months."""
+    store, manager, raw_dir = _cache_backed_store(tmp_path)
+    stale = _expired_segment(manager, raw_dir, "old.a.0000.ndjson", category=READINGS_CATEGORY)
+    foreign = _expired_segment(manager, raw_dir, "other.json", category="calibration_evidence")
+
+    _drain_all(store, 1, ("a",))
+
+    assert not stale.exists()
+    assert foreign.exists(), "the raw tier's sweep must not expire another owner's artifacts"
+    assert set(_raw_sizes(manager)) == {"dev.a.0000.ndjson"}
+    assert (raw_dir / "dev.a.0000.ndjson").exists()
+
+
+def test_the_retention_sweep_runs_at_most_once_per_interval() -> None:
+    calls: list[set[Path]] = []
+
+    class _Cache:
+        def cleanup_expired(self, *, category: str, keep: Any, **kwargs: Any) -> int:
+            calls.append(set(keep))
+            return 0
+
+    index = RawSegmentIndex(_Cache(), category=READINGS_CATEGORY, ttl_s=60.0, sweep_interval_s=3600.0)
+    for _ in range(5):
+        index.sweep_expired()
+    assert len(calls) == 1
+
+    eager = RawSegmentIndex(_Cache(), category=READINGS_CATEGORY, ttl_s=60.0, sweep_interval_s=0.0)
+    eager.sweep_expired()
+    eager.sweep_expired()
+    assert len(calls) == 3
+
+
+def test_the_retention_sweep_spares_segments_still_being_written() -> None:
+    """An open segment's recorded expiry trails its last sample by up to a refresh."""
+    kept: list[set[Path]] = []
+
+    class _Cache:
+        def build_entry(self, **kwargs: Any) -> Any:
+            return kwargs
+
+        def register_many(self, entries: Any) -> None:
+            tuple(entries)
+
+        def cleanup_expired(self, *, category: str, keep: Any, **kwargs: Any) -> int:
+            kept.append(set(keep))
+            return 0
+
+    index = RawSegmentIndex(_Cache(), category=READINGS_CATEGORY, ttl_s=60.0)
+    indexed, pending = Path("/r/a.ndjson"), Path("/r/b.ndjson")
+    index.mark_appended(indexed)
+    index.index_due()
+    index.mark_appended(pending)
+
+    index.sweep_expired()
+
+    assert kept == [{indexed, pending}]
+
+
+def test_a_non_positive_retention_disables_the_sweep() -> None:
+    """A zero or negative TTL must never be read as "everything is already expired"."""
+
+    calls: list[int] = []
+
+    class _Cache:
+        def cleanup_expired(self, **kwargs: Any) -> int:
+            calls.append(1)
+            return 0
+
+    for ttl in (0.0, -1.0):
+        assert RawSegmentIndex(_Cache(), category=READINGS_CATEGORY, ttl_s=ttl).sweep_expired() == 0
+    assert calls == []
+
+
+def test_a_failed_retention_sweep_does_not_break_sampling(tmp_path: Path) -> None:
+    store, manager, raw_dir = _cache_backed_store(tmp_path)
+
+    def broken(**kwargs: Any) -> int:
+        raise RuntimeError("index locked")
+
+    manager.cleanup_expired = broken  # type: ignore[method-assign]
+    _drain_all(store, 1, ("a",))
+
+    assert (raw_dir / "dev.a.0000.ndjson").exists()
+    assert set(_raw_sizes(manager)) == {"dev.a.0000.ndjson"}
+
+
+def test_the_retention_sweep_spares_a_segment_another_writer_just_sampled(tmp_path: Path) -> None:
+    """The index is shared across processes; a stale row must not outvote a fresh file."""
+    store, manager, raw_dir = _cache_backed_store(tmp_path)
+    foreign_live = _expired_segment(
+        manager, raw_dir, "other.a.0000.ndjson", category=READINGS_CATEGORY, idle_s=5.0
+    )
+
+    _drain_all(store, 1, ("a",))
+
+    assert foreign_live.exists()
+    assert "other.a.0000.ndjson" in _raw_sizes(manager), "kept for the next sweep to judge"
+
+
+def test_a_non_positive_retention_is_indexed_without_an_expiry(tmp_path: Path) -> None:
+    """Recording "now" would hand the segment to any other sweep of the shared index."""
+    store, manager, _ = _cache_backed_store(tmp_path, raw_ttl_s=-1.0)
+
+    _drain_all(store, 1, ("a",))
+
+    entries = [entry for entry in manager.list_entries() if entry.category == READINGS_CATEGORY]
+    assert [entry.expires_at for entry in entries] == [None]
+    assert manager.cleanup_expired() == 0

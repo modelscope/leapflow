@@ -13,7 +13,6 @@ it, but ``SerialMotorsBus.connect()`` requires it at runtime.
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass

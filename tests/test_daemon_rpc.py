@@ -17,7 +17,7 @@ import leapflow
 from leapflow.daemon._transport import get_transport
 from leapflow.daemon.client import DaemonClient, DaemonUnavailableError, ensure_daemon_client
 from leapflow.daemon.lifecycle import DaemonInfo
-from leapflow.daemon.protocol import StreamChunk
+from leapflow.daemon.protocol import RpcRequest, StreamChunk
 from leapflow.daemon.server import UnixRpcServer
 
 
@@ -1541,6 +1541,126 @@ async def test_daemon_shutdown_rpc_triggers_server_stop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_daemon_shutdown_stops_server_when_caller_hung_up_before_reply() -> None:
+    """A restart client that timed out must not leave leapd serving with torn-down services."""
+
+    class ShutdownService(_FakeService):
+        async def shutdown(self) -> None:
+            return None
+
+    class GoneWriter:
+        def write(self, data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            raise ConnectionResetError("Connection lost")
+
+    stopped = asyncio.Event()
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        runtime_dir = Path(root) / "runtime"
+        server = UnixRpcServer(
+            ShutdownService(),
+            sock_path=get_transport().readiness_path(runtime_dir),
+            runtime_dir=runtime_dir,
+            on_shutdown=stopped.set,
+        )
+        request = RpcRequest(id="r1", method="daemon.shutdown", params={})
+        with pytest.raises(ConnectionResetError):
+            await server._dispatch(request, GoneWriter())  # type: ignore[arg-type]
+
+    assert stopped.is_set()
+
+
+class _CountingGoneWriter:
+    """A socket whose peer hung up: writes are buffered, the flush finds the reset."""
+
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        raise ConnectionResetError("Connection lost")
+
+    def close(self) -> None:
+        pass
+
+    async def wait_closed(self) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+@pytest.mark.asyncio
+async def test_a_viewer_closing_a_finished_preview_ends_the_connection_quietly(caplog) -> None:
+    """Closing a preview tab is routine, not a request failure.
+
+    The completion notice used to be written outside the stream's disconnect handling,
+    so each closed tab logged a request failure, wrote that failure to the same dead
+    socket, and surfaced as an unhandled exception in the connection callback.
+    """
+    import logging
+
+    class PreviewService(_FakeService):
+        async def hardware_preview_stream(self, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        runtime_dir = Path(root) / "runtime"
+        server = UnixRpcServer(
+            PreviewService(),
+            sock_path=get_transport().readiness_path(runtime_dir),
+            runtime_dir=runtime_dir,
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(b'{"jsonrpc": "2.0", "id": "p1", "method": "hardware.preview.stream", "params": {}}\n')
+        reader.feed_eof()
+        writer = _CountingGoneWriter()
+        with caplog.at_level(logging.DEBUG, logger="leapflow.daemon.server"):
+            await server._handle_client(reader, writer)  # type: ignore[arg-type]
+
+    assert len(writer.writes) == 1, "nothing may be written after the peer is known to be gone"
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert server.active_connections == 0
+
+
+@pytest.mark.asyncio
+async def test_a_handler_connection_error_is_still_reported_to_the_caller() -> None:
+    """Only the caller's own socket going away is quiet; a device link reset is a failure."""
+    import json
+
+    class LinkResetService(_FakeService):
+        async def status(self) -> dict[str, Any]:
+            raise ConnectionResetError("device link reset")
+
+    class Writer:
+        def __init__(self) -> None:
+            self.lines: list[dict[str, Any]] = []
+
+        def write(self, data: bytes) -> None:
+            self.lines.append(json.loads(data))
+
+        async def drain(self) -> None:
+            return None
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        runtime_dir = Path(root) / "runtime"
+        server = UnixRpcServer(
+            LinkResetService(),
+            sock_path=get_transport().readiness_path(runtime_dir),
+            runtime_dir=runtime_dir,
+        )
+        writer = Writer()
+        await server._handle_line(
+            b'{"jsonrpc": "2.0", "id": "s1", "method": "daemon.status", "params": {}}\n',
+            writer,  # type: ignore[arg-type]
+        )
+
+    assert writer.lines and writer.lines[-1]["id"] == "s1"
+    assert "device link reset" in str(writer.lines[-1]["error"])
+
+
+@pytest.mark.asyncio
 async def test_runtime_service_status_reports_host_backend() -> None:
     from conftest import make_settings
     from leapflow.daemon.service import RuntimeLeapService
@@ -2430,3 +2550,113 @@ async def test_oversized_frame_is_a_typed_actionable_error_not_a_bare_value_erro
     client = DaemonClient(Path(_short_tempdir()) / "leapd.sock")
     with pytest.raises(DaemonUnavailableError, match="larger than"):
         await client._read_payload(_OverLimitReader())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", [None, "engine.chat", "daemon.status", "hardware.read"])
+async def test_server_stop_drains_connected_clients(method: str | None) -> None:
+    """Idle sockets and suspended generators must not keep wait_closed pending."""
+    entered = asyncio.Event()
+    closed = asyncio.Event()
+
+    class Service(_FakeService):
+        async def status(self) -> dict[str, Any]:
+            try:
+                entered.set()
+                await asyncio.Event().wait()
+                return {}
+            finally:
+                closed.set()
+
+        async def hardware_read(self) -> dict[str, Any]:
+            return await self.status()
+
+        async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+            try:
+                entered.set()
+                await asyncio.Event().wait()
+                yield StreamChunk(request_id="", content="unreachable")
+            finally:
+                closed.set()
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        runtime_dir = Path(root) / "runtime"
+        server = UnixRpcServer(
+            Service(), sock_path=get_transport().readiness_path(runtime_dir),
+            runtime_dir=runtime_dir,
+        )
+        serving = asyncio.create_task(server.serve_forever())
+        client = DaemonClient(get_transport().readiness_path(runtime_dir))
+        writer = None
+        try:
+            while server._server is None:
+                await asyncio.sleep(0.01)
+            reader, writer = await client._open()
+            if method is not None:
+                params = {"message": "test"} if method == "engine.chat" else {}
+                request = RpcRequest(method=method, params=params)
+                writer.write((request.to_json() + "\n").encode())
+                await writer.drain()
+                await asyncio.wait_for(entered.wait(), timeout=1.0)
+            while server.active_connections == 0:
+                await asyncio.sleep(0)
+            await asyncio.wait_for(server.stop(), timeout=1.0)
+            assert server.active_connections == 0
+            assert method is None or closed.is_set()
+            assert not server._connections
+            assert await asyncio.wait_for(reader.read(), timeout=1.0) == b""
+            await server.stop()
+        finally:
+            if writer is not None:
+                writer.close()
+                await writer.wait_closed()
+            serving.cancel()
+            try:
+                await serving
+            except asyncio.CancelledError:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_serve_daemon_shutdown_with_an_idle_connected_client(monkeypatch) -> None:
+    """The orchestrator must drain clients before cancelling serve_forever."""
+    from types import SimpleNamespace
+
+    from leapflow.daemon import server as server_module
+    from leapflow.daemon import service as service_module
+
+    class Service(_FakeService):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__()
+
+        async def start(self) -> None:
+            pass
+
+        def start_deferred_init(self) -> None:
+            pass
+
+        async def shutdown(self) -> None:
+            pass
+
+    monkeypatch.setattr(service_module, "RuntimeLeapService", Service)
+    monkeypatch.setattr(server_module, "_daemon_idle_timeout", lambda: 0.0)
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        runtime_dir = Path(root) / "runtime"
+        readiness = get_transport().readiness_path(runtime_dir)
+        serving = asyncio.create_task(server_module.serve_daemon(SimpleNamespace(runtime_dir=runtime_dir)))
+        writer = None
+        try:
+            while not readiness.exists():
+                await asyncio.sleep(0.01)
+            client = DaemonClient(readiness)
+            reader, writer = await client._open()
+            await client.shutdown()
+            assert await asyncio.wait_for(asyncio.shield(serving), timeout=1.0) == 0
+            assert await asyncio.wait_for(reader.read(), timeout=1.0) == b""
+        finally:
+            if writer is not None:
+                writer.close()
+                await writer.wait_closed()
+            if not serving.done():
+                serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)

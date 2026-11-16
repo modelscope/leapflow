@@ -27,6 +27,52 @@ def effect_is_uncertain_on_failure(policy: str) -> bool:
     return str(policy or "") in UNCERTAIN_EFFECT_POLICIES
 
 
+def result_reports_no_effect(result: Any) -> bool:
+    """Return whether *result* is producer evidence that the call changed nothing.
+
+    ``side_effect_state: "none"`` is the producer's own verdict -- a refusal
+    before anything was sent, a dry run, an observation. An explicit
+    ``effect_uncertain`` overrides it, and anything else is not evidence.
+    """
+    if not isinstance(result, Mapping) or result.get("effect_uncertain") is True:
+        return False
+    state = result.get("side_effect_state")
+    return isinstance(state, str) and state.strip().lower() == "none"
+
+
+def result_is_observation(result: Any) -> bool:
+    """Return whether *result* says this call only observed, whatever it failed at.
+
+    A tool's declared policy covers everything it *can* do; a tool that drives
+    hardware must declare an external side effect even though many of its calls
+    only read. ``observation: true`` narrows the policy for one call, and only
+    counts beside the producer's own no-effect verdict. A failed observation
+    leaves nothing for the rest of a batch to be protected from.
+    """
+    return (
+        isinstance(result, Mapping)
+        and result.get("observation") is True
+        and result_reports_no_effect(result)
+    )
+
+
+def failed_effect_is_uncertain(result: Mapping[str, Any], policy: str) -> bool:
+    """Return whether this failed *result* may still have taken effect.
+
+    The policy says what a tool could do in general; the result says what this
+    attempt did. A producer that reports ``side_effect_state: "none"`` (a refusal
+    before anything was sent, a dry run) has settled the question, and flagging
+    it anyway tells the model to verify an effect that cannot exist. An explicit
+    ``effect_uncertain`` always flags; any other or malformed state defers to the
+    policy, mirroring ``UnifiedErrorClassifier``'s precedence of producer evidence.
+    """
+    if result.get("effect_uncertain") is True:
+        return True
+    if result_reports_no_effect(result):
+        return False
+    return effect_is_uncertain_on_failure(policy)
+
+
 def exit_code_from(result: Any) -> int | None:
     """Return a process exit code from a tool result under either key name.
 
@@ -378,7 +424,13 @@ class ToolExecutionLedger:
         arguments: Mapping[str, Any] | None,
         policy: ExecutionPolicy,
     ) -> tuple[ToolExecutionRecord, ToolExecutionRecord | None]:
-        """Reserve an execution or return the original record for duplicates."""
+        """Reserve an execution or return the original record for duplicates.
+
+        A settled original whose result reported no side effect does not
+        suppress the new call: there is no effect to duplicate, and replaying
+        its stale result would hand back an expired observation or a refusal
+        the caller may since have addressed. An in-flight original still does.
+        """
         key = build_idempotency_key(
             session_id=session_id,
             turn_id=turn_id,
@@ -386,10 +438,13 @@ class ToolExecutionLedger:
             arguments=arguments,
             policy=policy,
         )
+        superseded = False
         if policy != "read_only":
             existing = self._records.get(key) or self._get_durable(session_id, key)
             if existing is not None:
-                return existing, existing
+                if not self._settled_without_effect(existing):
+                    return existing, existing
+                superseded = True
         record = ToolExecutionRecord.create(
             session_id=session_id,
             turn_id=turn_id,
@@ -404,7 +459,17 @@ class ToolExecutionLedger:
         if policy != "read_only":
             self._inflight[key] = asyncio.get_running_loop().create_future()
         self._reserve_durable(record)
+        if superseded:
+            # The durable row keeps the key; mark it running again so a restart
+            # mid-call cannot read the superseded result as this call's.
+            self._complete_durable(record)
         return record, None
+
+    @staticmethod
+    def _settled_without_effect(record: ToolExecutionRecord) -> bool:
+        return record.status not in {"reserved", "running"} and result_reports_no_effect(
+            record.result
+        )
 
     async def wait_for_completion(
         self,

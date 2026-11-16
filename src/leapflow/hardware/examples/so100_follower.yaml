@@ -25,7 +25,6 @@ kinematics:
   workspace_bounds: [-0.5, 0.5, -0.5, 0.5, 0.0, 0.6]
 
 capabilities:
-  affordances: ["grasp", "place", "push", "pour"]
   payload_kg: 0.5
   reach_m: 0.28
   tool_slots: 1

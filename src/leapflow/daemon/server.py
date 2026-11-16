@@ -44,6 +44,18 @@ them, so a routed request cannot leak a pending approval when its caller disconn
 """
 
 
+class _ClientDisconnected(ConnectionResetError):
+    """The caller hung up before a reply could be written to its socket.
+
+    Raised only by ``_write_json``, so a hang-up is told apart from a connection error
+    the *handler* hit on its own (a device link reset, say), which is a real request
+    failure the caller must hear about. A ``ConnectionResetError`` so the stream loop's
+    existing disconnect handling still applies. Routine -- a board closing a preview
+    tab -- so it ends the connection quietly instead of logging a request failure and
+    then writing that failure to the same dead socket.
+    """
+
+
 def _stream_heartbeat_interval() -> float:
     raw = os.getenv("LEAPFLOW_DAEMON_STREAM_HEARTBEAT", str(_DEFAULT_STREAM_HEARTBEAT_S)).strip()
     try:
@@ -79,6 +91,10 @@ class UnixRpcServer:
         self._on_shutdown = on_shutdown
         self._server: asyncio.AbstractServer | None = None
         self._active_connections = 0
+        self._connections: dict[asyncio.Task[Any], asyncio.StreamWriter] = {}
+        # Strong refs for stream finalizers that outlive a cancelled connection.
+        self._stream_closers: set[asyncio.Task[Any]] = set()
+        self._stopping = False
         if hasattr(service, "set_client_count_provider"):
             service.set_client_count_provider(lambda: self._active_connections)
         if hasattr(service, "set_client_lease_provider"):
@@ -119,17 +135,29 @@ class UnixRpcServer:
         )
         write_pid_file(self._runtime_dir)
         try:
-            async with self._server:
-                await self._server.serve_forever()
+            await self._server.serve_forever()
         except asyncio.CancelledError:
             raise
         finally:
             transport.cleanup(self._runtime_dir)
 
     async def stop(self) -> None:
-        """Stop accepting clients and close the listening socket."""
+        """Close client lifetimes before waiting for the listening server to drain."""
+        self._stopping = True
         if self._server is not None:
             self._server.close()
+        # Python 3.12+ wait_closed also waits for accepted connections. Closing
+        # only the listener leaves an idle TUI subscription holding shutdown open.
+        current = asyncio.current_task()
+        tasks = []
+        for task, writer in list(self._connections.items()):
+            writer.close()
+            if task is not current:
+                task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if self._server is not None:
             await self._server.wait_closed()
         get_transport().cleanup(self._runtime_dir)
 
@@ -138,15 +166,25 @@ class UnixRpcServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self._connections[task] = writer
         self._active_connections += 1
         try:
+            if self._stopping:
+                return
             while not reader.at_eof():
                 raw = await reader.readline()
                 if not raw:
                     break
                 await self._handle_line(raw, writer)
+        except (ConnectionResetError, BrokenPipeError) as exc:
+            # ``_handle_line`` reports every handler failure itself, so what reaches
+            # here is the caller's socket going away, on read or on reply.
+            logger.debug("daemon: client disconnected (%s: %s)", type(exc).__name__, exc)
         finally:
             self._active_connections -= 1
+            self._connections.pop(task, None)
             await _close_writer(writer)
 
     async def _handle_line(self, raw: bytes, writer: asyncio.StreamWriter) -> None:
@@ -172,6 +210,8 @@ class UnixRpcServer:
                 str(exc),
             )
             await _write_json(writer, response.to_json())
+        except _ClientDisconnected:
+            raise
         except Exception as exc:
             logger.exception("daemon: request failed method=%s", request.method)
             response = RpcResponse.fail(
@@ -230,9 +270,13 @@ class UnixRpcServer:
                     except AttributeError:
                         pass
         response = RpcResponse.success(request.id, result)
-        await _write_json(writer, response.to_json())
-        if request.method == "daemon.shutdown" and self._on_shutdown is not None:
-            self._on_shutdown()
+        try:
+            await _write_json(writer, response.to_json())
+        finally:
+            # The services are already torn down; a caller that hung up before the
+            # reply must not leave the process listening without them.
+            if request.method == "daemon.shutdown" and self._on_shutdown is not None:
+                self._on_shutdown()
 
     async def _await_with_heartbeat(
         self,
@@ -251,51 +295,41 @@ class UnixRpcServer:
         """
         task = asyncio.ensure_future(coro)
         approval_get: asyncio.Task[Any] | None = None
-        while True:
-            wait_set: set[asyncio.Task[Any]] = {task}
-            if approval_queue is not None:
-                if approval_get is None or approval_get.done():
-                    approval_get = asyncio.create_task(approval_queue.get())
-                wait_set.add(approval_get)
-            done, _ = await asyncio.wait(
-                wait_set,
-                timeout=self._stream_heartbeat_s,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if approval_get is not None and approval_get in done:
-                chunk = approval_get.result()
-                approval_get = None
-                try:
+        try:
+            while True:
+                wait_set: set[asyncio.Task[Any]] = {task}
+                if approval_queue is not None:
+                    if approval_get is None or approval_get.done():
+                        approval_get = asyncio.create_task(approval_queue.get())
+                    wait_set.add(approval_get)
+                done, _ = await asyncio.wait(
+                    wait_set,
+                    timeout=self._stream_heartbeat_s,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if approval_get is not None and approval_get in done:
+                    chunk = approval_get.result()
+                    approval_get = None
                     await _write_json(writer, chunk.to_notification().to_json())
-                except (ConnectionResetError, BrokenPipeError):
-                    task.cancel()
-                    try:
-                        await task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    raise
-                continue
-            if task in done:
-                if approval_get is not None and not approval_get.done():
-                    approval_get.cancel()
-                return task.result()
-            # Send heartbeat to keep client connection alive
-            heartbeat = StreamChunk(
-                request_id=request_id,
-                content="",
-                event_type="status",
-                metadata={"heartbeat": True},
-            ).to_notification()
-            try:
+                    continue
+                if task in done:
+                    return task.result()
+                # Send heartbeat to keep client connection alive
+                heartbeat = StreamChunk(
+                    request_id=request_id,
+                    content="",
+                    event_type="status",
+                    metadata={"heartbeat": True},
+                ).to_notification()
                 await _write_json(writer, heartbeat.to_json())
-            except (ConnectionResetError, BrokenPipeError):
-                # Client disconnected; cancel the handler and re-raise
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                raise
+        finally:
+            # The request owns both children, including when shutdown cancels
+            # the connection while a handler is awaiting consent or external I/O.
+            children = [child for child in (task, approval_get) if child is not None]
+            for child in children:
+                if not child.done():
+                    child.cancel()
+            await asyncio.gather(*children, return_exceptions=True)
 
     async def _dispatch_stream(
         self,
@@ -391,10 +425,7 @@ class UnixRpcServer:
                 except (asyncio.CancelledError, Exception):
                     pass
             if stream is not None and hasattr(stream, "aclose"):
-                try:
-                    await stream.aclose()
-                except Exception:
-                    logger.debug("daemon: failed to close stream", exc_info=True)
+                await self._close_stream_in_context(stream, ctx, request.method)
             if route_token is not None:
                 from leapflow.daemon.approval_route import approval_route as _approval_route
 
@@ -410,6 +441,27 @@ class UnixRpcServer:
             await _write_json(writer, done.to_json())
             response = RpcResponse.success(request.id, {"ok": True})
             await _write_json(writer, response.to_json())
+
+    async def _close_stream_in_context(
+        self, stream: Any, ctx: contextvars.Context, method: str,
+    ) -> None:
+        """Finalize *stream* inside the Context its steps ran in.
+
+        The generator's ``finally`` resets ContextVars it set while running in
+        ``ctx`` (approval route, turn slot). Closing it from the connection task's
+        own Context makes every such ``reset`` raise "created in a different
+        Context", which aborted the cleanup that releases the session lock and
+        the turn slot: a client disconnecting mid-stream (TUI ``/cancel``) left
+        the next turn in that session waiting forever. The close is shielded so
+        a connection torn down during shutdown still finishes releasing them.
+        """
+        closer = asyncio.create_task(stream.aclose(), context=ctx)
+        self._stream_closers.add(closer)
+        closer.add_done_callback(self._stream_closers.discard)
+        try:
+            await asyncio.shield(closer)
+        except Exception:
+            logger.warning("daemon: failed to close stream method=%s", method, exc_info=True)
 
     async def _write_stream_heartbeat(
         self,
@@ -470,12 +522,14 @@ async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
             await idle_task
         except asyncio.CancelledError:
             pass
+        # serve_forever itself awaits wait_closed when cancelled on Python
+        # 3.12+, so accepted clients must be closed before cancelling that task.
+        await server.stop()
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
-        await server.stop()
         await service.shutdown()
         cleanup_runtime_dir(runtime_dir)
     return 0
@@ -519,8 +573,11 @@ async def _watch_idle_shutdown(
 
 
 async def _write_json(writer: asyncio.StreamWriter, text: str) -> None:
-    writer.write(text.encode("utf-8") + b"\n")
-    await writer.drain()
+    try:
+        writer.write(text.encode("utf-8") + b"\n")
+        await writer.drain()
+    except (ConnectionResetError, BrokenPipeError) as exc:
+        raise _ClientDisconnected(str(exc) or type(exc).__name__) from exc
 
 
 async def _close_writer(writer: asyncio.StreamWriter) -> None:

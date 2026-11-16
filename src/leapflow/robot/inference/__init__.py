@@ -3,7 +3,7 @@
 
 Provides pluggable physical AI inference strategies for test-time scaling.
 Each strategy maps observation → action through a different compute path
-(local VLA, remote PolicyServer, classical controller, etc.) and declares
+(local VLA, classical controller, etc.) and declares
 its compute profile so the system can adapt the budget to task complexity.
 """
 
@@ -18,7 +18,6 @@ from leapflow.robot.inference.strategy import (
     InferenceStrategy,
 )
 from leapflow.robot.inference.vla_local import VLALocalStrategy
-from leapflow.robot.inference.vla_remote import VLARemoteStrategy
 
 __all__ = [
     "ComputeBudget",
@@ -28,5 +27,4 @@ __all__ = [
     "InferenceStrategyRegistry",
     "PositionControlStrategy",
     "VLALocalStrategy",
-    "VLARemoteStrategy",
 ]

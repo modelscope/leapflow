@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Node-local dual-camera commissioning using the standard RealSense transport.
+
+Run only after the LHP camera owner has stopped. Raw Z16 never leaves this node.
+An explicit flat-surface ROI is required to qualify depth; preview success alone
+cannot qualify a camera, mount, hand-eye transform, or grasp.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+import yaml
+
+from leapflow.hardware.context import HardwareContext
+from leapflow.hardware.drivers.realsense import RealSenseTransport
+
+
+def depth_statistics(stack: np.ndarray, scale_m: float, roi: list[int], *, target_mm: float = 150.0,
+                     tolerance_mm: float = 15.0, p95_limit_mm: float = 1.0) -> dict:
+    """Per-pixel temporal absolute deviation, not standard deviation or pooled plane slope."""
+    if (stack.dtype != np.dtype("uint16") or stack.ndim != 3 or stack.shape[0] < 20
+            or not np.isfinite(scale_m) or scale_m <= 0):
+        raise ValueError("at least 20 Z16 frames and a positive per-device scale required")
+    u0, v0, u1, v1 = roi
+    if not 0 <= u0 < u1 <= stack.shape[2] or not 0 <= v0 < v1 <= stack.shape[1]:
+        raise ValueError("ROI outside aligned depth frame")
+    values = stack[:, v0:v1, u0:u1].astype(float) * scale_m * 1000.0
+    coverage = np.mean(values > 0, axis=(1, 2))
+    # Only pixels valid in every frame contribute; also require 60% coverage.
+    complete = np.all(values > 0, axis=0)
+    samples = values[:, complete]
+    if samples.shape[1] < 100:
+        return {"qualified": False, "reason": "fewer than 100 continuously valid pixels",
+                "complete_pixels": int(samples.shape[1]), "min_coverage": float(coverage.min())}
+    median = np.median(samples, axis=0)
+    p95 = float(np.percentile(np.abs(samples - median), 95))
+    distance = float(np.median(median))
+    # Remove a fitted plane to check that the selected ROI is actually flat.
+    vv, uu = np.nonzero(complete)
+    design = np.column_stack((uu, vv, np.ones(len(uu))))
+    residual = median - design @ np.linalg.lstsq(design, median, rcond=None)[0]
+    flat_p95 = float(np.percentile(np.abs(residual), 95))
+    checks = {"scale_consistent": abs(scale_m - 0.0001) < 1e-9,
+              "working_distance": abs(distance - target_mm) <= tolerance_mm,
+              "coverage": bool(coverage.min() >= 0.60),
+              "temporal_p95": p95 < p95_limit_mm, "flat_surface": flat_p95 < 1.0}
+    return {"qualified": all(checks.values()), "checks": checks, "frames": len(stack),
+            "roi": roi, "complete_pixels": samples.shape[1], "min_coverage": float(coverage.min()),
+            "distance_mm": distance, "temporal_p95_deviation_mm": p95,
+            "flat_residual_p95_mm": flat_p95, "depth_scale_m": scale_m}
+
+
+def qualified_depth(evidence: object) -> bool:
+    """Require metric results and distinct native color/depth source frames."""
+    try:
+        if not isinstance(evidence, dict) or evidence.get("qualified") is not True:
+            return False
+        metrics = [evidence[key] for key in ("depth_scale_m", "distance_mm", "min_coverage",
+                                            "temporal_p95_deviation_mm", "flat_residual_p95_mm")]
+        if not all(type(v) in (int, float) and math.isfinite(v) for v in metrics):
+            return False
+        scale, distance, coverage, temporal, flat = metrics
+        if not (abs(scale - .0001) < 1e-9 and 135 <= distance <= 165
+                and .6 <= coverage <= 1 and 0 <= temporal < 1 and 0 <= flat < 1):
+            return False
+        frames = evidence["source_frames"]
+        if len(frames) < 20 or evidence["frames"] != len(frames):
+            return False
+        previous = None
+        for row in frames:
+            if (not isinstance(row, dict) or not row.get("session_id") or not row.get("profile_digest")
+                    or row.get("aligned_to_color") is not True or row.get("depth_scale_m") != scale):
+                return False
+            if previous and any(row[key] != previous[key] for key in ("session_id", "profile_digest")):
+                return False
+            for stream in ("color_source", "depth_source"):
+                for key in ("frame_number", "timestamp_ms"):
+                    value = row[stream][key]
+                    if (type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                            or previous and value <= previous[stream][key]):
+                        return False
+            previous = row
+        return True
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+async def commission(args: argparse.Namespace) -> dict:
+    output = args.output
+    output.mkdir(parents=True, exist_ok=True)
+    transports = []
+    report: dict = {"cameras": {}, "depth": {"qualified": False, "reason": "flat ROI not specified"}}
+    try:
+        for filename in ("realsense_435if.yaml", "realsense_d405.yaml"):
+            context = HardwareContext.from_mapping(yaml.safe_load((args.device_dir / filename).read_text()))
+            transport = RealSenseTransport(context.transport.config)
+            transports.append(transport)
+            status = await transport.open(context)
+            if not status.connected:
+                raise RuntimeError(status.detail)
+            report["cameras"][context.device_id] = {"status": status.metadata, "previews": {}}
+        # Both pipelines stay active throughout the checks (real shared-bus test).
+        for transport in transports:
+            for channel in ("camera.color.preview", "camera.depth.preview",
+                            "camera.infrared_left.preview", "camera.infrared_right.preview"):
+                frame = await transport.read_frame(channel, max_width=640, quality=95)
+                path = output / f"{frame.device_id}_{channel.split('.')[1]}.jpg"
+                path.write_bytes(frame.data)
+                report["cameras"][frame.device_id]["previews"][channel] = {
+                    "width": frame.width, "height": frame.height, "sequence": frame.sequence,
+                    "metadata": frame.metadata, "image": str(path)}
+        if args.roi:
+            wrist = transports[1]
+            for _ in range(15):
+                await wrist.capture_rgbd()
+            frames = [await wrist.capture_rgbd() for _ in range(20)]
+            stack = np.stack([np.frombuffer(f.depth, dtype="<u2").reshape(f.height, f.width) for f in frames])
+            scales = [f.depth_scale_m for f in frames]
+            if len(set(scales)) != 1:
+                raise ValueError("depth scale changed during qualification")
+            report["depth"] = depth_statistics(stack, scales[0], args.roi)
+            report["depth"]["source_frames"] = [f.metadata for f in frames]
+            report["depth"]["qualified"] = qualified_depth(report["depth"])
+        report["dual_camera_preview_passed"] = len(report["cameras"]) == 2
+    finally:
+        for transport in reversed(transports):
+            await transport.close()
+    (output / "commission.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    return report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device-dir", type=Path,
+                        default=Path.home() / ".leapflow/profiles/default/hardware/devices")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--roi", type=int, nargs=4, metavar=("U0", "V0", "U1", "V1"))
+    args = parser.parse_args()
+    report = asyncio.run(commission(args))
+    print(json.dumps(report, indent=2))
+    return 0 if report.get("dual_camera_preview_passed") and (not args.roi or report["depth"]["qualified"]) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

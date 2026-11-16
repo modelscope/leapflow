@@ -8,10 +8,9 @@ CAS single-fire, budget, default-off, unknown kind raises ValueError.
 from __future__ import annotations
 
 import pytest
-import time
 
 from leapflow.scheduler.reentry_driver import event_matches
-from leapflow.storage.reentry_store import build_reentry_trigger, ReentryKind
+from leapflow.storage.reentry_store import build_reentry_trigger
 
 
 # ── event_matches: source domain gate ────────────────────────────────────
@@ -104,15 +103,39 @@ class TestReentryServiceHardwareEvent:
     """Test the hardware event dispatch on ReentryService."""
 
     @pytest.mark.asyncio
-    async def test_default_config_disabled(self):
-        """Hardware reentry is off by default (env var not set)."""
-        import os
+    async def test_the_flag_reaches_settings_and_gates_the_hardware_path(
+        self, tmp_path, monkeypatch
+    ):
+        """Enablement has to arrive on Settings, not merely sit in the environment.
 
-        # Without the env var set, the default is off
-        val = os.getenv("LEAPFLOW_AGENT_REENTRY_HARDWARE_ENABLED", "0")
-        enabled = val.strip().lower() in ("1", "true", "yes")
-        # This asserts the default for a clean environment
-        assert enabled is False
+        The daemon opens the hardware observer bridge only when
+        ``settings.agent_reentry_hardware_enabled`` is true, and the service also
+        requires base re-entry.  Asserting on ``os.getenv`` let an environment read
+        that never reached the Settings constructor look correct while the gate
+        stayed permanently shut: no configuration could turn hardware re-entry on.
+        """
+        from leapflow.config import load_config
+        from leapflow.scheduler.reentry_service import ReentryService
+        from leapflow.storage.reentry_store import ReentryStore
+
+        monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.delenv("LEAPFLOW_AGENT_REENTRY_ENABLED", raising=False)
+        monkeypatch.delenv("LEAPFLOW_AGENT_REENTRY_HARDWARE_ENABLED", raising=False)
+        assert load_config().agent_reentry_hardware_enabled is False
+
+        monkeypatch.setenv("LEAPFLOW_AGENT_REENTRY_HARDWARE_ENABLED", "1")
+        hardware_only = load_config()
+        assert hardware_only.agent_reentry_hardware_enabled is True
+
+        store = ReentryStore(tmp_path / "reentry.duckdb")
+        service = ReentryService(store=store, manager=object(), settings=hardware_only)
+        # Hardware re-entry is inert without base re-entry.
+        assert service._hardware_reentry_enabled() is False
+
+        monkeypatch.setenv("LEAPFLOW_AGENT_REENTRY_ENABLED", "1")
+        both = load_config()
+        service = ReentryService(store=store, manager=object(), settings=both)
+        assert service._hardware_reentry_enabled() is True
 
     @pytest.mark.asyncio
     async def test_hardware_event_trigger_matches_only_hardware_source(self):

@@ -160,7 +160,6 @@ async def test_perception_capture_screenshot(adapters: Adapters) -> None:
     the smallest qualifying window is used because the AX walk that accompanies
     the capture scales with element count.
     """
-    from leapflow.platform.protocol import RpcError
 
     windows_info = await adapters.darwin_perception.list_windows()
 

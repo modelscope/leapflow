@@ -1,0 +1,220 @@
+"""Fail-closed wrist observations; camera visibility is not a grasp certificate."""
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass
+from typing import Literal
+
+import cv2
+import numpy as np
+
+from . import config, eye
+from .bridge import ArmBridge
+
+Verdict = Literal["aligned", "misaligned", "obstructed", "occluded", "held", "empty", "unknown"]
+
+
+@dataclass(frozen=True)
+class WristFrame:
+    image: np.ndarray
+    metadata: dict
+    before: dict
+    after: dict
+
+
+@dataclass(frozen=True)
+class Verification:
+    verdict: Verdict
+    reason: str
+    evidence: dict
+
+
+def capture_wrist(arm: ArmBridge) -> WristFrame:
+    before = arm.latest(max_age_s=0.12)
+    image, metadata = eye.grab_wrist()
+    return WristFrame(image, metadata, before, arm.latest(max_age_s=0.12))
+
+
+def _context(pose: list[float], frame: WristFrame) -> tuple[eye.WristCamera, config.Cfg]:
+    cfg = config.load_profile()
+    now = time.monotonic()
+    age = now - float(frame.metadata["received_mono"])
+    duration = float(frame.metadata["capture_duration_s"])
+    if not 0 <= age <= cfg.wrist.max_frame_age_s or not 0 <= duration <= cfg.wrist.max_capture_s:
+        raise ValueError("stale or excessively delayed wrist frame")
+    if frame.metadata.get("device_id") != config.D405_DEVICE_ID:
+        raise ValueError("wrong camera frame")
+    if not frame.before["session_id"] or frame.before["session_id"] != frame.after["session_id"]:
+        raise ValueError("arm session changed during camera capture")
+    eye.require_frame_source(frame.metadata)
+    before = [frame.before[k] for k in ("x", "y", "z", "rx", "ry", "rz")]
+    after = [frame.after[k] for k in ("x", "y", "z", "rx", "ry", "rz")]
+    if not np.isfinite(np.array([before, after, pose])).all():
+        raise ValueError("nonfinite pose")
+    for measured in (before, pose):
+        if (np.linalg.norm(np.array(measured[:3]) - after[:3]) > cfg.wrist.pose_drift_mm
+                or max(abs((a-b+180) % 360-180) for a, b in zip(measured[3:], after[3:])) > cfg.wrist.pose_drift_deg):
+            raise ValueError("pose/frame correspondence drift")
+    camera = eye.WristCamera(after)
+    metadata = frame.metadata["camera_metadata"]
+    if metadata["serial_number"] != camera.record["serial_number"] or metadata["color_intrinsics"] != camera.k:
+        raise ValueError("camera serial/profile changed since calibration")
+    return camera, cfg
+
+
+def _blob(image: np.ndarray, cfg: config.Cfg) -> np.ndarray | None:
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+    mask = cv2.inRange(hsv, np.array(cfg.wrist.hsv_low), np.array(cfg.wrist.hsv_high))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    candidates = [i for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] >= cfg.wrist.min_blob_px]
+    if len(candidates) > 1:
+        raise ValueError("ambiguous wrist view: multiple blue objects")
+    return labels == candidates[0] if candidates else None
+
+
+def box_top_in_base(camera: eye.WristCamera, blob: np.ndarray, plan: dict, cfg: config.Cfg) -> np.ndarray:
+    """Metric top-face pose from independent dimensions; refuse ambiguous planar solutions."""
+    if blob[0].any() or blob[-1].any() or blob[:, 0].any() or blob[:, -1].any():
+        raise ValueError("box contour clipped")
+    contours, _ = cv2.findContours(blob.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    hull = cv2.convexHull(max(contours, key=cv2.contourArea))
+    polygon = cv2.approxPolyDP(hull, 0.02 * cv2.arcLength(hull, True), True).reshape(-1, 2)
+    if len(polygon) != 4:
+        raise ValueError("full rectangular top face not observable")
+    camera_k = camera.intrinsics_at(blob.shape[1])
+    width, height = float(plan["long_mm"]), float(plan["short_mm"])
+    if not math.isfinite(width * height) or not width >= height > 0:
+        raise ValueError("positive independent long/short dimensions required")
+    points = np.array([[-width/2, -height/2, 0], [width/2, -height/2, 0],
+                       [width/2, height/2, 0], [-width/2, height/2, 0]], dtype=float)
+    candidates = []
+    yaw = math.radians(plan["yaw_long_deg"])
+    axis = np.array([math.cos(yaw), math.sin(yaw), 0])
+    limit = math.cos(math.radians(cfg.wrist.box_tilt_deg))
+    for ordered in (polygon, polygon[::-1]):
+        for offset in range(4):
+            pixels = np.roll(ordered, offset, axis=0)
+            rays = np.array([camera_k.deproject(float(u), float(v), 1)[:2] for u, v in pixels])
+            result = cv2.solvePnPGeneric(points, rays, np.eye(3), None, flags=cv2.SOLVEPNP_IPPE)
+            if not result[0]:
+                continue
+            for rotation, translation in zip(result[1], result[2]):
+                rotation, translation = cv2.solvePnPRefineLM(points, rays, np.eye(3), None, rotation, translation)
+                matrix = cv2.Rodrigues(rotation)[0]
+                measured = points @ matrix.T + translation[:, 0]
+                if not np.isfinite(measured).all() or np.any(measured[:, 2] <= 0):
+                    continue
+                base_rotation = camera.mount[:3, :3] @ matrix
+                if base_rotation[2, 2] < limit or abs(axis @ base_rotation[:, 0]) < limit:
+                    continue
+                projected = np.array([camera_k.project(point) for point in measured])
+                rms = float(np.sqrt(np.mean(np.sum((projected - pixels)**2, axis=1))))
+                if rms <= cfg.wrist.box_pnp_rms_px:
+                    base = camera.mount @ np.r_[translation[:, 0], 1]
+                    candidates.append((rms, base[:3]))
+    if not candidates:
+        raise ValueError("top-face metric pose unavailable")
+    candidates.sort(key=lambda row: row[0])
+    best = candidates[0][1]
+    if any(np.linalg.norm(center - best) > cfg.wrist.alignment_mm for _, center in candidates):
+        raise ValueError("ambiguous top-face metric pose")
+    return best
+
+
+def _unknown(error: Exception) -> Verification:
+    return Verification("unknown", str(error), {"contact_proven": False})
+
+
+def verify_pre_grasp(arm_pose: list[float], wrist_frame: WristFrame, plan: dict) -> Verification:
+    try:
+        camera, cfg = _context(arm_pose, wrist_frame)
+        blob = _blob(wrist_frame.image, cfg)
+        if blob is None:
+            return Verification("occluded", "box not fully visible", {})
+        if blob[0].any() or blob[-1].any() or blob[:, 0].any() or blob[:, -1].any():
+            return Verification("occluded", "box contour clipped by frame edge", {})
+        foot = eye.footprint(camera, blob, plan["table_z"] + plan["height_mm"])
+        yaw_error = abs((foot["yaw_long_deg"] - plan["yaw_long_deg"] + 90) % 180 - 90)
+        if yaw_error > cfg.wrist.box_tilt_deg:
+            return Verification("obstructed", "observed box yaw contradicts planned jaw clearance", {"footprint": foot})
+        correction = np.array(foot["centre_mm"]) - plan["centre"]
+        distance = float(np.linalg.norm(correction))
+        # Size agreement refuses unrelated blue distractors or depth-plane contradictions.
+        if max(abs(foot[k] - plan[k]) for k in ("short_mm", "long_mm")) > 3.0:
+            return Verification("obstructed", "observed footprint contradicts planned box", {"footprint": foot})
+        return Verification("aligned" if distance <= cfg.wrist.alignment_mm else "misaligned",
+                            "wrist footprint compared with fresh overview plan",
+                            {"correction_mm": correction.tolist(), "offset_mm": distance, "footprint": foot})
+    except (KeyError, ValueError, TypeError, OSError, cv2.error) as error:
+        return _unknown(error)
+
+
+def _pad_pixels(camera: eye.WristCamera, frame: WristFrame, pose: list[float], cfg: config.Cfg) -> np.ndarray:
+    pads = cfg.wrist.inner_pad_tool_mm
+    if not isinstance(pads, dict) or not pads.get("evidence_ref"):
+        raise ValueError("independently calibrated inner-pad geometry unavailable")
+    gap = float(frame.after["gripper_mm"]) + float(pads["width_bias_mm"])
+    if not math.isfinite(gap) or gap <= 0:
+        raise ValueError("invalid jaw-gap feedback")
+    local = np.array([[sign * gap / 2, 0, pads["z_mm"], 1] for sign in (-1, 1)])
+    base = (eye.flange_matrix(pose) @ local.T).T[:, :3]
+    pixels = np.array([camera.pixel_of(*p, width=frame.image.shape[1]) for p in base])
+    h, w = frame.image.shape[:2]
+    if np.any(pixels[:, 0] < 3) or np.any(pixels[:, 0] >= w-3) or np.any(pixels[:, 1] < 3) or np.any(pixels[:, 1] >= h-3):
+        raise ValueError("inner pads not visible in wrist frame")
+    return pixels
+
+
+def verify_hold(arm_pose: list[float], wrist_frame: WristFrame, plan: dict) -> Verification:
+    try:
+        camera, cfg = _context(arm_pose, wrist_frame)
+        pads = _pad_pixels(camera, wrist_frame, arm_pose, cfg)
+        blob = _blob(wrist_frame.image, cfg)
+        if blob is None:
+            return Verification("unknown", "no visible box; absence is not proof of empty jaws", {})
+        closure = plan.get("closure", {})
+        gap = float(wrist_frame.after["gripper_mm"])
+        if closure.get("why") != "effort_limit" or gap <= plan["close_mm"] + cfg.grasp.hold_min_mm:
+            return Verification("empty", "closure lacks an independently corroborated object gap", {"gap_mm": gap})
+        physical_gap = gap + float(cfg.wrist.inner_pad_tool_mm["width_bias_mm"])
+        if abs(physical_gap - plan["short_mm"]) > cfg.wrist.alignment_mm:
+            raise ValueError("jaw gap contradicts independent box width")
+        # A loaded motor alone is insufficient: both measured inner pads must meet the visible box.
+        contours, _ = cv2.findContours(blob.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        points = np.concatenate(contours).reshape(-1, 2)
+        distance_px = [float(np.min(np.linalg.norm(points - pad, axis=1))) for pad in pads]
+        top = box_top_in_base(camera, blob, plan, cfg)
+        optical = camera.mount[:3, :3].T @ (top - camera.origin)
+        scale = camera.intrinsics_at(wrist_frame.image.shape[1]).fx / optical[2]
+        tolerance_px = cfg.wrist.pad_engagement_tolerance_mm * scale
+        engaged = all(distance <= tolerance_px for distance in distance_px)
+        evidence = {"pad_pixels": pads.tolist(), "pad_distances_px": distance_px,
+                    "gap_mm": gap, "contact_proven": False, "object_top_base_mm": top.tolist(),
+                    "requires_proof_lift": True, "source_sequence": wrist_frame.metadata["sequence"]}
+        return Verification("held" if engaged else "unknown", "visual pad engagement plus closure-gap evidence", evidence)
+    except (KeyError, ValueError, TypeError, OSError, cv2.error) as error:
+        return _unknown(error)
+
+
+def verify_empty(arm_pose: list[float], wrist_frame: WristFrame, plan: dict | None = None) -> Verification:
+    try:
+        camera, cfg = _context(arm_pose, wrist_frame)
+        pads = _pad_pixels(camera, wrist_frame, arm_pose, cfg)
+        blob = _blob(wrist_frame.image, cfg)
+        if blob is None:
+            # Without depth a black/occluded object could remain between the jaws.
+            return Verification("unknown", "no blue pixels; RGB absence alone cannot verify empty jaws", {})
+        if plan is None:
+            raise ValueError("independent box dimensions required to verify release")
+        top = box_top_in_base(camera, blob, plan, cfg)
+        pad_z = (eye.flange_matrix(arm_pose) @ np.array([0, 0, cfg.wrist.inner_pad_tool_mm["z_mm"], 1]))[2]
+        support_z = plan["table_z"] + plan["height_mm"]
+        clear = (abs(top[2] - support_z) <= cfg.wrist.alignment_mm
+                 and pad_z - top[2] >= cfg.qualification.proof_lift_mm)
+        return Verification("empty" if clear else "unknown", "known box on support below visible inner pads",
+                            {"pad_pixels": pads.tolist(), "object_top_base_mm": top.tolist(),
+                             "pad_z_mm": float(pad_z), "contact_proven": False})
+    except (KeyError, ValueError, TypeError, OSError, cv2.error) as error:
+        return _unknown(error)

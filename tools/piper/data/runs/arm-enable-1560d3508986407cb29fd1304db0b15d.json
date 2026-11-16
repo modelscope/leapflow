@@ -1,0 +1,28 @@
+{
+  "ok": false,
+  "failure": {
+    "envelope_id": "7276ec96fbc141df9373cdff7248c798",
+    "source": "tool",
+    "category": "hardware",
+    "failure_class": "Refusal",
+    "failure_code": "piper_operations_refused",
+    "message": "preview already consumed; inspect previous run, do not replay",
+    "recoverability": "user_fixable",
+    "side_effect_state": "none",
+    "context": {
+      "tool_name": "",
+      "arguments": [],
+      "execution_id": "",
+      "trace_id": "",
+      "turn_id": 0,
+      "session_id": "",
+      "provider": "",
+      "model": "",
+      "attempt_number": 0,
+      "elapsed_ms": 0.0
+    },
+    "timestamp": 1793007090.610005,
+    "provider_hint": null
+  },
+  "events": []
+}

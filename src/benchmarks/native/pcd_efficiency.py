@@ -87,7 +87,7 @@ class PCDEfficiencyAdapter:
                 make_channel("joint_0", quantity="angular_position", unit="rad"),
                 make_channel("gripper", quantity="position", unit="ratio"),
             ),
-            capabilities=CapabilityDeclaration(("grasp", "place", "inspect"), 1, 0.5, 0.4),
+            capabilities=CapabilityDeclaration(tool_slots=1, payload_kg=0.5, reach_m=0.4),
             safety=SafetyPolicy(max_velocity_rad_s=2.0, max_force_n=8.0),
             transport_kind="simulated",
             transport_config={"values": {"joint_0": 0.0, "gripper": 0.0}},
@@ -101,10 +101,10 @@ class PCDEfficiencyAdapter:
             return False
         device = devices[0]
         if level == PCDLevel.MINIMAL.value:
-            return not device.get("affordances") and not device.get("safety_limits")
+            return not device.get("health") and not device.get("safety_limits")
         if level == PCDLevel.TASK_RELEVANT.value:
-            return bool(device.get("affordances")) and not device.get("safety_limits")
-        return bool(device.get("affordances")) and bool(device.get("safety_limits"))
+            return bool(device.get("health")) and not device.get("safety_limits")
+        return bool(device.get("health")) and bool(device.get("safety_limits"))
 
     def _result(self, scenario: Scenario, seed: int, started: float,
                 payload: dict[str, Any], budget: int, passed: bool) -> TrialResult:

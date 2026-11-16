@@ -31,17 +31,13 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from leapflow.hardware.lhp.authority import WRITE_MODE_PERMIT_REQUIRED
 from leapflow.hardware.lhp.protocol import (
     LHP_DEFAULT_PORT,
     LHP_PROTOCOL_VERSION,
     is_valid_device_id,
 )
-from leapflow.hardware.lhp.server import (
-    LhpNodeServer,
-    WRITE_MODE_PERMIT_REQUIRED,
-    WRITE_MODE_TRUSTED_V1,
-    WRITE_MODE_OBSERVE_ONLY,
-)
+from leapflow.hardware.lhp.server import LhpNodeServer
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +64,7 @@ def _resolve_write_mode(write_mode: str) -> str:
     return wm or WRITE_MODE_PERMIT_REQUIRED
 
 
-def _load_permit_verifier(
-    key_paths: list[str], *, node_id: str
-) -> Any:
+def _load_permit_verifier(key_paths: list[str], *, node_id: str) -> Any:
     """Load a PermitVerifier from issuer public key PEM files."""
     # Combine flag paths and environment paths
     env_paths = os.environ.get(_PERMIT_KEYS_ENV, "").strip()
@@ -79,8 +73,9 @@ def _load_permit_verifier(
         all_paths.extend(p.strip() for p in env_paths.split(os.pathsep) if p.strip())
     if not all_paths:
         return None
-    from leapflow.hardware.lhp.permit import PermitVerifier, key_id_from_public, public_key_from_pem
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    from leapflow.hardware.lhp.permit import PermitVerifier, key_id_from_public, public_key_from_pem
 
     trusted: dict[str, Ed25519PublicKey] = {}
     for path_str in all_paths:
@@ -120,13 +115,28 @@ async def serve_node(
     # registry/config dependency is visible exactly where it is taken.
     from dataclasses import replace
 
+    from duckdb import Error as CacheIndexError
+
+    from leapflow.cache.manager import CacheManager
     from leapflow.config import load_config
     from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
+    from leapflow.hardware.skills.runtime import SkillRuntime, SkillRuntimeSettings
 
-    settings = HardwareSettings.from_settings(load_config())
-    registry = HardwareRegistry(
-        replace(settings, persist_readings=False, stream_enabled=False)
-    )
+    config = load_config()
+    settings = HardwareSettings.from_settings(config)
+    registry = HardwareRegistry(replace(settings, persist_readings=False, stream_enabled=False))
+    try:
+        cache = await asyncio.to_thread(
+            CacheManager,
+            config.profile_layout.cache,
+            profile_id=config.profile_manifest.profile_id,
+        )
+        registry.bind_persistence(cache_manager=cache)
+    except (OSError, ValueError, CacheIndexError):
+        logger.warning(
+            "Node evidence cache unavailable; cache-dependent diagnostics will refuse",
+            exc_info=True,
+        )
     registry.load()
     contexts = registry.contexts()
     if not contexts:
@@ -135,13 +145,25 @@ async def serve_node(
             "Declare devices (`leap hw list` shows the active profile's view) and retry.\n"
         )
 
+    from leapflow.hardware.calibration.worker import CalibrationWorker
+
+    worker = None
+    try:
+        worker = CalibrationWorker.from_settings(config)
+        registry.bind_calibration_worker(worker)
+    except (ValueError, TypeError):
+        logger.warning("Calibration worker configuration refused; existing skills remain available", exc_info=True)
     verifier = _load_permit_verifier(permit_issuer_keys or [], node_id=node_id)
+    if verifier is not None:
+        registry.bind_approval_keys(verifier.trusted_public_keys, node_id=verifier.node_id)
+    skill_runtime = SkillRuntime(registry, settings=SkillRuntimeSettings.from_settings(config))
     server = LhpNodeServer(
         registry,
         node_id=node_id,
         token=token,
         write_mode=write_mode,
         permit_verifier=verifier,
+        skill_runtime=skill_runtime,
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -164,17 +186,22 @@ async def serve_node(
             "endpoint": endpoint,
             "device_ids": [context.device_id for context in contexts],
             "device_count": len(contexts),
+            "skill_ids": list(skill_runtime.skill_ids),
+            "workcell_count": len(skill_runtime.list().get("workcells", ())),
             "token_required": bool(token),
             "write_mode": write_mode,
-            "trusted_issuers": list(
-                getattr(verifier, "trusted_key_ids", ()) or ()
-            ) if verifier is not None else [],
+            "trusted_issuers": list(getattr(verifier, "trusted_key_ids", ()) or ())
+            if verifier is not None
+            else [],
         }
         print(json.dumps(ready, ensure_ascii=False), flush=True)
         logger.info("LHP node %r serving %d device(s) at %s", node_id, len(contexts), endpoint)
         await stop.wait()
     finally:
         await server.stop()
+        await skill_runtime.close()
+        if worker is not None:
+            await worker.close()
         await registry.close_all()
     logger.info("LHP node %r stopped", node_id)
     return 0
@@ -194,9 +221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="",
         help=f"Node identity, [a-z0-9_]+ (env {_NODE_ID_ENV})",
     )
-    parser.add_argument(
-        "--host", default="127.0.0.1", help="TCP bind address (default: 127.0.0.1)"
-    )
+    parser.add_argument("--host", default="127.0.0.1", help="TCP bind address (default: 127.0.0.1)")
     parser.add_argument(
         "--port",
         type=int,

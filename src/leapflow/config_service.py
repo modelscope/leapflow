@@ -161,6 +161,12 @@ _FIELD_DESCRIPTIONS = {
         "hw_estop rules halt directly while other actions use approval. Stream sources "
         "bind these rules at startup, so a change needs a daemon restart."
     ),
+    "hardware.advisory_limits": (
+        "JSON array of monitor-only limits ({device_id, channel_id, field, min/max or flag, "
+        "unit, label, hysteresis, report_after_s, report_max_s}) for conditions the device "
+        "firmware already protects. Breaches appear on LeapBoard with exponential backoff "
+        "and never gate a command. Read at startup, so a change needs a daemon restart."
+    ),
     "hardware.host_interval_s": (
         "Seconds between samples of fast host channels (cpu, memory, network); disk, "
         "battery and thermal channels sample less often. 0 uses the 5s default. Read "
@@ -189,6 +195,12 @@ _FIELD_DESCRIPTIONS = {
     "hardware.media_microphones": (
         "Enumerate microphones alongside cameras. Only an input level is exposed, never "
         "audio. Applied at discovery, so a change needs a daemon restart."
+    ),
+    "hardware.media_exclude_usb": (
+        "Comma-separated USB identities ('vid' or 'vid:pid', hex) whose video nodes a "
+        "dedicated driver owns, e.g. '8086' for RealSense UVC endpoints. They are not "
+        "listed as generic cameras, so nothing offers a second opener of that hardware. "
+        "Linux only; applied at discovery, so a change needs a daemon restart."
     ),
     "hardware.preview_max_fps": (
         "Hard capture ceiling for page-selected economy/balanced/detail profiles. The "
@@ -234,6 +246,25 @@ _FIELD_DESCRIPTIONS = {
         "Off by default; irreversible channels always require approval regardless. "
         "Read at startup, so a change needs a daemon restart."
     ),
+    "hardware.degradation_actions_enabled": (
+        "Let a triggered degradation policy (comm/sensor loss) and the health monitor's "
+        "offline halt act on the device (halt, safe_state, switch_sensor). Off by default: "
+        "the condition is still detected, logged and shown on the board as a warning, "
+        "but nothing is sent to the device. Read at startup, so a change needs a daemon "
+        "restart."
+    ),
+    "hardware.sensor_loss_debounce_s": (
+        "Minimum seconds a sensor-loss streak must last (on top of three consecutive "
+        "degraded samples) before the sensor-loss policy triggers. Read at startup, so a "
+        "change needs a daemon restart."
+    ),
+    "hardware.write_verification_follow_s": (
+        "How long a post-write verdict may follow a value that is still travelling "
+        "toward its command before reporting 'pending'. A declared settling time says "
+        "when an observation becomes meaningful, not when a servo has arrived, so a "
+        "slow move judged by it alone looks contradicted. Read when the verification "
+        "coordinator is built, so a change needs a daemon restart."
+    ),
     "hardware.stream_enabled": (
         "Sample channels that declare a sample rate. Sampling loops start during "
         "initialization, so a change needs a daemon restart."
@@ -253,7 +284,8 @@ _FIELD_DESCRIPTIONS = {
     ),
     "hardware.raw_retention_days": (
         "How long raw sample files are kept. They are session-scoped, sensitive, and "
-        "never synced. Read when sampling starts, so a change needs a daemon restart."
+        "never synced. Expired files are deleted by the sampling process, at most hourly. "
+        "Read when sampling starts, so a change needs a daemon restart."
     ),
     "hardware.history_retention_days": (
         "How long downsampled history windows are kept in instrument.duckdb. Longer than "
@@ -267,6 +299,13 @@ _FIELD_DESCRIPTIONS = {
         "can expire without touching the file being appended to. Read when sampling "
         "starts, so a change needs a daemon restart."
     ),
+    "hardware.raw_index_refresh_s": (
+        "Minimum seconds between cache-index refreshes of a raw sample segment that is "
+        "still being written. New and rolled segments are indexed immediately; this only "
+        "bounds how stale an open segment's recorded size and TTL may be. 0 refreshes on "
+        "every write, which is costly on many channels. Read when sampling starts, so a "
+        "change needs a daemon restart."
+    ),
     "hardware.reading_store_sensitive": (
         "Register the durable instrument.duckdb history tier as sensitive and "
         "non-syncable, so a profile backup excludes physical series that may carry a "
@@ -274,11 +313,73 @@ _FIELD_DESCRIPTIONS = {
         "known to produce no sensitive data. Applied when the store is built, so a "
         "change needs a daemon restart."
     ),
+    "hardware.calibration_worker_enabled": (
+        "Enable the lazy node-owned compute-only calibration subprocess. Defaults off; "
+        "does not grant acquisition, motion, or model activation. Requires node restart."
+    ),
+    "hardware.calibration_worker_budgets": (
+        "JSON worker budgets: request_bytes (16777216), response_bytes (2097152), queued_jobs (2), "
+        "max_keyframes (128), max_tracks (2048), roi_width (640), roi_height (480), startup_s (10), "
+        "update_s (2), solve_s (30), rss_bytes (536870912). Values may tighten, never expand "
+        "these ceilings. Socket location is profile-layout-owned. Requires node restart."
+    ),
+    "hardware.skills_enabled": (
+        "Comma-separated patterns (fnmatch) of node skills a hardware node offers; empty "
+        "offers every discovered skill. Read when the node starts, so a change needs a "
+        "node restart."
+    ),
+    "hardware.skills_speed_pct_max": (
+        "Upper bound on the speed rate (percent of firmware maximum) any skill plan may "
+        "request. Read when the node starts, so a change needs a node restart."
+    ),
+    "hardware.skills_max_duration_s": (
+        "Longest one skill execution may run before the node halts it and reports a "
+        "timeout. Read when the node starts, so a change needs a node restart."
+    ),
+    "hardware.skills_plan_ttl_s": (
+        "How long a skill plan the node computed stays executable; an older plan must be "
+        "planned (and approved) again. Read when the node starts, so a change needs a node "
+        "restart."
+    ),
+    "hardware.skills_halt_timeout_s": (
+        "Longest one actuator's halt call may take when a run is stopped or fails before "
+        "the node logs it as failed. Read when the node starts, so a change needs a node "
+        "restart."
+    ),
+    "hardware.skills_stop_grace_s": (
+        "How long a stopped skill may unwind on its own before the node cancels it. Read "
+        "when the node starts, so a change needs a node restart."
+    ),
+    "hardware.skills_dispatch_settle_s": (
+        "How long the node waits for a write still inside a transport when a run ends; "
+        "past it the run reports side effect UNKNOWN and keeps its devices held until the "
+        "write resolves. Read when the node starts, so a change needs a node restart."
+    ),
+    "hardware.skills_episode_fps": (
+        "Rate at which every executed skill run is recorded (arm state, commands, one "
+        "frame per workcell camera) under the profile's hardware/episodes for offline "
+        "training; 0 disables recording. Read when the node starts, so a change needs a "
+        "node restart."
+    ),
+    "hardware.skills_episode_min_free_mb": (
+        "Free disk space below which a run is not recorded (the run itself proceeds). "
+        "Read when the node starts, so a change needs a node restart."
+    ),
+    "hardware.share_frames": (
+        "Let the model look at workcell camera frames (perceive.snapshot). Off by default; "
+        "the workcell must also declare share_frames. Each shared frame is audited and "
+        "shown to the model only for the current turns, never persisted. Read when the "
+        "skill tools are built, so a change needs a daemon restart."
+    ),
     "llm.api_key": "Primary LLM API key stored in the local secret vault.",
     "llm.aux_api_key": "Auxiliary LLM provider API key stored in the local secret vault.",
     "llm.base_url": "OpenAI-compatible endpoint for the primary LLM provider.",
     "llm.model": "Primary LLM model used by chat, planning, and tool reasoning.",
     "llm.context_length": "Runtime context budget in tokens shown in the TUI status bar.",
+    "llm.supports_vision": (
+        "Whether the primary model reads images: auto uses the built-in model table, "
+        "true or false overrides it (for a multimodal model the table does not know yet)."
+    ),
     "llm.max_retries": "Retry attempts for transient LLM provider failures.",
     "vlm.api_key": "VLM API key stored in the local secret vault.",
     "runtime.mock_host": "Use the in-process mock host when native OS control is unavailable.",
@@ -492,6 +593,7 @@ _VALUE_HINTS = {
     "hardware.providers": "comma-separated provider kinds (yaml, host, media)",
     "hardware.host_include": "comma-separated channel-id prefixes, or empty for all",
     "hardware.host_exclude": "comma-separated channel-id prefixes, or empty for none",
+    "hardware.skills_enabled": "comma-separated skill-id patterns, or empty for all",
     "recording.mode": "video|default|vision_only",
     "signal.channels": "all or comma-separated channel names",
     "signal.noise_path_fragments": "comma-separated path fragments",
@@ -942,6 +1044,7 @@ def _examples_for_key(key: str) -> tuple[str, ...]:
     examples = {
         "llm.model": ("leap config set llm.model qwen3.7-plus",),
         "llm.context_length": ("leap config set llm.context_length 1000000",),
+        "llm.supports_vision": ("leap config set llm.supports_vision true",),
         "runtime.mock_host": ("leap config set runtime.mock_host true",),
         "runtime.log_level": ("leap config set runtime.log_level DEBUG",),
         "memory.working_max_tokens": ("leap config set memory.working_max_tokens 0",),

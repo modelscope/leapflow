@@ -1,0 +1,899 @@
+"""The staged mission: survey, measure, pick, flip, place, park.
+
+Every physical stage follows the same four beats, and nothing moves between them
+that was not measured in the beat before:
+
+1. **Plan** -- measure with vision or load the defended contact model, build the
+   flange poses, and preflight them through the vendor FK on the board.
+2. **Approve** -- print the exact numbers with a token derived from them.  The
+   token is what the operator approves; if a measurement changes, the token
+   changes and the old approval no longer opens the stage.
+3. **Verify** -- re-observe the object at the approach and again at the pre-grasp;
+   the plan is committed, so a moved box aborts instead of being chased.
+4. **Move** -- one absolute target per segment through ``cl_armd``; contact,
+   effort and staleness are the board's decision at 200 Hz, and the verdict
+   records what the arm measured, not what was asked.
+
+A failed stage checkpoints the uncertain effects and stops. Recovery motion
+requires a separately validated and approved path; generic parking is forbidden.
+This staged experiment remains a single script so its approval payload and
+execution geometry are reviewed together; evidence contracts live in production.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict
+from enum import Enum
+import hashlib
+import json
+import math
+import shlex
+import logging
+import sys
+import time
+from typing import Any, Sequence
+
+from leapflow.hardware.grasp_evidence import (
+    EvidenceIdentity, GraspEvidence, GraspLimits, GraspObserver, GraspState,
+)
+
+from . import bridge as bridge_mod
+from . import config, journal, kin, plan as planner, policy_source, vision
+
+PHYSICAL = {"enable", "measure", "pick", "flip", "place", "park", "recover", "all"}
+GRASP_PLAN = config.DATA / "grasp_plan.json"
+LAST_VERDICT = config.DATA / "last_verdict.json"
+
+
+class MissionError(RuntimeError):
+    def __init__(self, code: str, message: str, detail: Any = None):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+        self.detail = detail
+
+
+class PlanOnly(Exception):
+    def __init__(self, token: str):
+        super().__init__(token)
+        self.token = token
+
+
+def approval_token(stage: str, payload: dict) -> str:
+    blob = json.dumps({"stage": stage, "payload": payload}, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()[:8]
+
+
+def _wrap180(angle: float) -> float:
+    return (angle + 180.0) % 360.0 - 180.0
+
+
+def _wrap90(angle: float) -> float:
+    return (angle + 90.0) % 180.0 - 90.0
+
+
+class Mission:
+    def __init__(self, args: argparse.Namespace, *, grasp_observer: GraspObserver | None = None):
+        self.args = args
+        self.cfg = config.load_profile()
+        self.stage = args.stage
+        self.run = journal.Run(f"{args.stage}{'-plan' if args.plan_only else ''}")
+        self.eye = vision.open_eye(self.cfg)
+        self.grasp_observer = grasp_observer or (self.eye if isinstance(self.eye, GraspObserver) else None)
+        self.arm: bridge_mod.ArmBridge | None = None
+        self.grasp: dict | None = None
+        self.plan_payload: dict = {}
+        self._checkpointed = False
+
+    # -- plumbing ----------------------------------------------------------
+    def note(self, message: str, **fields: Any) -> None:
+        print(message, flush=True)
+        self.run.log("note", message=message, **fields)
+
+    def connect(self) -> bridge_mod.ArmBridge:
+        if self.arm is None:
+            self.arm = bridge_mod.ArmBridge(self.cfg.bridge.host, self.cfg.bridge.port,
+                                            self.cfg.bridge.timeout_s).connect()
+            self.run.log("bridge", hello=self.arm.hello)
+            self.note(f"armd {self.arm.hello.get('version')} on "
+                      f"{self.cfg.bridge.host}:{self.cfg.bridge.port}, "
+                      f"{self.arm.hello.get('sampler_hz')} Hz")
+            if hasattr(self.eye, "attach_arm"):
+                self.eye.attach_arm(self.arm)
+        return self.arm
+
+    def _ik(self, poses: list[list[float]]) -> dict:
+        """Wrist preflight on the host model, seeded with the arm's live joints."""
+        reply = kin.ik(poses, self.arm.latest()["joints"])
+        self.run.log("ik", solver=reply["solver"], seed=reply["seed"], results=reply["results"])
+        return reply
+
+    def _approve(self, stage: str, payload: dict, *, auto: bool = False) -> str:
+        token = approval_token(stage, payload)
+        self.run.log("approval_payload", stage=stage, token=token, payload=payload)
+        if self.args.plan_only:
+            self._print_approval(stage, payload, token)
+            raise PlanOnly(token)
+        if not self.args.yes:
+            raise MissionError("approval", f"stage {stage} moves the arm: re-run with --yes --token {token}")
+        if (self.args.token or "") != token:
+            raise MissionError("stale_plan",
+                               f"approval token mismatch (this plan is {token}); "
+                               f"re-run with --plan-only and approve again")
+        return token
+
+    def _print_approval(self, stage: str, payload: dict, token: str) -> None:
+        print("\n" + "=" * 68)
+        print(f"APPROVAL REQUIRED: {stage}")
+        print("=" * 68)
+        for line in payload.get("lines") or []:
+            print("  " + line)
+        print("-" * 68)
+        print(f"  token: {token}")
+        print(f"  run:   {shlex.quote(sys.executable)} cl_mission.py --stage {stage} "
+              f"--yes --token {token}")
+        print("=" * 68 + "\n", flush=True)
+
+    def _ready(self) -> dict:
+        status = self.connect().check()
+        self.run.log("check", **status)
+        if not status["ok"]:
+            raise MissionError("not_ready", f"the guard refuses the arm ({status.get('reason')})",
+                               detail=status)
+        return status
+
+    def _fingerprint(self) -> dict:
+        """The arm's own numbers at a decision, so a verdict cannot be read alone."""
+        try:
+            snap = self.arm.latest() if self.arm else {}
+        except (bridge_mod.BridgeError, AttributeError):
+            return {}
+        return {key: snap.get(key) for key in ("x", "y", "z", "rz", "gripper_mm", "frame_age_s")}
+
+    def _verify(self, expect: dict, *, tol_mm: float = 8.0, tol_short: float = 6.0,
+                tol_height: float = 10.0, note: str = "") -> dict:
+        try:
+            obs = self.eye.observe()
+        except vision.VisionError as error:
+            return {"ok": False, "reason": f"{error.code}: {error.message}"}
+        foot = obs["footprint"]
+        dx = foot["centre_mm"][0] - expect["centre"][0]
+        dy = foot["centre_mm"][1] - expect["centre"][1]
+        drift = math.hypot(dx, dy)
+        short_error = abs(foot["short_mm"] - expect["short_mm"])
+        height_error = abs(obs["height_mm"] - expect["height_mm"])
+        ok = drift <= tol_mm and short_error <= tol_short and height_error <= tol_height
+        result = {"ok": ok, "note": note, "drift_mm": round(drift, 2),
+                  "dx_mm": round(dx, 2), "dy_mm": round(dy, 2),
+                  "short_mm": foot["short_mm"], "height_mm": obs["height_mm"],
+                  "short_error_mm": round(short_error, 2), "height_error_mm": round(height_error, 2),
+                  "frame": obs["frame"], "local_px": obs["local_px"],
+                  "centre_mm": foot["centre_mm"]}
+        self.run.log("verify", **result)
+        return result
+
+    def _close_loop(self, grasp: dict, z: float, rpy: Sequence[float], *, phase: str,
+                    abort_mm: float, fix_mm: float = 2.5, tries: int = 2) -> dict:
+        """Measure the box against the tool axis from where the arm is, and centre it.
+
+        The side camera sees the jaws and the box in one frame, so the drift is
+        read with the arm already over the box.  A consistent offset between
+        ``fix_mm`` and ``abort_mm`` is corrected with a level move at this height
+        (up to ``tries`` times); a larger one means the box was disturbed, and an
+        inconsistent or low-quality look is never chased.  ``grasp['centre']`` is
+        updated in place, so the descent and the place target follow the box.
+        """
+        looks = int(self.cfg.get_path("vision.loop_looks", 3))
+        spread_max = float(self.cfg.get_path("vision.loop_spread_mm", 3.0))
+        for attempt in range(tries + 1):
+            try:
+                obs = self.eye.observe_stable(looks=looks)
+            except vision.VisionError as error:
+                self._retreat(why=f"{phase}_vision")
+                raise MissionError("vision_failed", f"{phase}: {error.code}: {error.message}")
+            jaws = obs.get("jaw_midpoint_mm")
+            if (not obs.get("independent_jaws") or not obs.get("synchronized")
+                    or not obs.get("metric_qualified") or not isinstance(jaws, (list, tuple))
+                    or len(jaws) != 3 or not all(math.isfinite(v) for v in jaws)):
+                raise MissionError("jaw_alignment_unknown", "fresh independent RGB-D inner-jaw landmarks required")
+            x, y = jaws[:2]
+            bx, by = obs["footprint"]["centre_mm"]
+            drift = math.hypot(bx - x, by - y)
+            spread = float((obs.get("look_spread") or {}).get("centre_mm") or 0.0)
+            row = {"phase": phase, "attempt": attempt, "drift_mm": round(drift, 2),
+                   "dx_mm": round(bx - x, 2), "dy_mm": round(by - y, 2), "spread_mm": spread,
+                   "iou": obs.get("iou"), "occluded": obs.get("occluded"),
+                   "yaw_long_deg": obs["footprint"]["yaw_long_deg"], "frame": obs["frame"],
+                   "quality": obs["height_quality"]}
+            self.run.log("close_loop", **row)
+            try:
+                frame = self.eye.snapshot(reuse_s=5.0)
+                self.run.image(f"{phase}_{attempt}", self.eye.annotate(frame, obs, obs["table"]["z"]))
+            except vision.VisionError:
+                pass
+            self.note(f"[pick] {phase} look {attempt}: box ({bx:.1f}, {by:.1f}) vs tool "
+                      f"({x:.1f}, {y:.1f}) -> drift {drift:.1f} mm (spread {spread:.1f}, "
+                      f"iou {obs.get('iou')}, occluded {obs.get('occluded')})")
+            if obs["height_quality"] != "ok" or spread > spread_max:
+                self._retreat(why=f"{phase}_unsteady")
+                raise MissionError("vision_unsteady", f"{phase}: look not trustworthy", detail=row)
+            if drift > abort_mm:
+                self._retreat(why=f"{phase}_moved")
+                raise MissionError("box_moved", f"{phase}: box is {drift:.1f} mm off the plan", detail=row)
+            if drift < fix_mm:
+                return row
+            if attempt == tries:
+                break
+            corrected = planner.with_rz(grasp, grasp["rz"])
+            snap = self.arm.latest()
+            corrected["centre"] = [round(snap["x"] + bx - x, 2), round(snap["y"] + by - y, 2)]
+            problems = planner.validate_grasp(corrected, self.cfg)
+            if problems:
+                self._retreat(why=f"{phase}_correction_invalid")
+                raise MissionError("plan_invalid", "; ".join(problems), detail=row)
+            self.note(f"[pick] {phase}: re-centre by ({bx - x:+.1f}, {by - y:+.1f}) mm at z {z:.1f}")
+            moved = self.arm.move(*corrected["centre"], z, rpy=rpy, kind="linear", speed_pct=5.0, arrive_mm=0.8)
+            self.run.log("move", stage=f"{phase}_recentre", **moved)
+            grasp["centre"] = corrected["centre"]
+        self._retreat(why=f"{phase}_not_converged")
+        raise MissionError("not_centred", f"{phase}: still {drift:.1f} mm off after {tries} corrections")
+
+    def _pose_error(self, snap: dict, target: Sequence[float]) -> dict:
+        return {"planar_mm": round(math.hypot(snap["x"] - target[0], snap["y"] - target[1]), 2),
+                "dz_mm": round(abs(snap["z"] - target[2]), 2),
+                "tilt_deg": round(max(abs(_wrap180(snap["rx"] + 180.0)), abs(_wrap180(snap["ry"]))), 2),
+                "pose": [round(snap[k], 2) for k in ("x", "y", "z", "rx", "ry", "rz")],
+                "target": [round(float(v), 2) for v in target[:6]]}
+
+    def _retreat(self, z: float = 160.0, why: str = "") -> None:
+        """Checkpoint and controlled stop; never invent a recovery path."""
+        attempted = self.arm is not None and getattr(self.arm, "effects_attempted", False)
+        if self._checkpointed:
+            return
+        self._checkpointed = bool(attempted)
+        self.run.log("recovery_checkpoint", why=why, side_effect_state="unknown" if attempted else "none",
+                     grasp_state=GraspState.UNKNOWN.value, automatic_retreat=False)
+        if attempted:
+            try:
+                self.arm.stop()
+            except bridge_mod.BridgeError as error:
+                self.run.log("stop_unconfirmed", why=why, error=str(error))
+
+    def _identity(self, frame_ids: tuple[str, ...] = ()) -> EvidenceIdentity:
+        package_path = self.cfg.get_path("calibration.package_path")
+        if not package_path:
+            raise MissionError("calibration_unqualified", "separate geometry-bound calibration package required")
+        from pathlib import Path
+        from leapflow.hardware.calibration_qualification import admit_package
+        try:
+            package = admit_package(json.loads(Path(package_path).read_text(encoding="utf-8")),
+                                    device_id="piper", recorded_at=time.time())
+            camera = getattr(self.eye, "cam", self.eye)
+            intrinsics = getattr(camera, "intrinsics", getattr(camera, "k", None))
+            mount = getattr(camera, "mount", None)
+            if intrinsics is None or mount is None:
+                raise ValueError("active camera geometry is unavailable")
+            matrix = mount.tolist() if hasattr(mount, "tolist") else mount
+            package.require_geometry("camera_to_base", {"intrinsics": intrinsics}, matrix)
+            model = planner.load_table_model()
+            if not model:
+                raise ValueError("independently qualified tool/table model required")
+            table = planner.table_from_model(model, self.cfg)
+            package.require_geometry("fingertip_plane", {"tool_len_mm": table["tool_len_mm"],
+                                                       "contact_z_mm": table["contact_z"]})
+            package.require_geometry("table_plane", {"z_mm": float(self.cfg.geometry.declared_table_z_mm)})
+            package.require_geometry("jaw_stroke", {"encoder_to_gap_scale": 1.0, "offset_mm": 0.0})
+            digest = package.digest
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise MissionError("calibration_unqualified", str(error)) from error
+        return EvidenceIdentity(self.arm.hello.get("session_id", "") if self.arm else "",
+                                str(self.cfg.get_path("vision.scene_id", "")),
+                                digest, time.monotonic(), frame_ids)
+
+    def _grasp_limits(self) -> GraspLimits:
+        declaration = self.cfg.get_path("grasp.verification")
+        if not isinstance(declaration, dict):
+            raise MissionError("grasp_unqualified", "declare qualified grasp verification limits")
+        return GraspLimits(**declaration)
+
+    def _observe_hold(self) -> tuple[GraspState, GraspEvidence]:
+        if not isinstance(self.grasp_observer, GraspObserver):
+            raise MissionError("grasp_unavailable", "independent RGB-D object/jaw observer is not bound")
+        evidence = self.grasp_observer.observe_grasp()
+        state = evidence.state(self._identity(), now=time.monotonic(), limits=self._grasp_limits())
+        self.run.log("grasp_evidence", state=state.value, evidence=evidence.to_dict())
+        return state, evidence
+
+    def _collect_hold(self) -> tuple[GraspState, GraspEvidence]:
+        """Collect distinct observations; unknown/empty/slipped stops immediately."""
+        state, evidence = self._observe_hold()
+        for _ in range(self._grasp_limits().min_frames - 1):
+            if state != GraspState.CONTACT_CANDIDATE:
+                break
+            state, evidence = self._observe_hold()
+        return state, evidence
+
+    def _require_held(self, anchor: dict) -> GraspEvidence:
+        stored = anchor.get("grasp_evidence", {})
+        try:
+            identity = EvidenceIdentity(**stored["identity"])
+        except (KeyError, TypeError):
+            raise MissionError("stale_grasp", "stored stage has no qualified identity") from None
+        if (anchor.get("grasp_state") != GraspState.HELD_VERIFIED.value
+                or not identity.current(self._identity(), now=time.monotonic(),
+                                        max_age_s=self._grasp_limits().max_age_s)):
+            raise MissionError("stale_grasp", "grasp state expired or scene/calibration/daemon changed")
+        state, evidence = self._observe_hold()
+        if state != GraspState.HELD_VERIFIED:
+            raise MissionError("grasp_unverified", f"fresh grasp state is {state.value}")
+        return evidence
+
+    # -- stages ------------------------------------------------------------
+    def stage_doctor(self) -> dict:
+        status = self._ready()
+        snap = self.arm.latest()
+        report = {
+            "arm": {"enabled": status["enabled"], "ctrl_mode": status["ctrl_mode"],
+                    "rate_hz": status["rate_hz"], "temps": status["temps"],
+                    "faults": status["faults"], "halted": status["halted"],
+                    "pose": [round(snap[k], 2) for k in ("x", "y", "z", "rx", "ry", "rz")],
+                    "gripper_mm": round(snap["gripper_mm"], 2),
+                    "tilt_deg": round(max(abs(_wrap180(snap["rx"] + 180)), abs(_wrap180(snap["ry"]))), 2)},
+            "files": {name: path.exists() for name, path in
+                      (("profile", config.PROFILE), ("table_model", config.TABLE_MODEL),
+                       ("box_pose", config.BOX_POSE), ("grasp_plan", GRASP_PLAN))},
+            "board": self.arm.hello,
+        }
+        try:
+            obs = self.eye.observe()
+            report["vision"] = {"frame": obs["frame"], "table_z": obs["table"]["z"],
+                                "table_spread_mm": obs["table"]["spread_mm"],
+                                "centre": obs["footprint"]["centre_mm"],
+                                "size": [obs["footprint"]["long_mm"], obs["footprint"]["short_mm"],
+                                         obs["height_mm"]],
+                                "yaw_long_deg": obs["footprint"]["yaw_long_deg"],
+                                "mask_pixels": obs["mask_pixels"], "local_px": obs["local_px"]}
+            frame = self.eye.snapshot(reuse_s=5.0)
+            self.run.image("doctor", self.eye.annotate(frame, obs, obs["table"]["z"]))
+        except vision.VisionError as error:
+            report["vision"] = {"error": f"{error.code}: {error.message}"}
+        self.note(json.dumps(report, indent=2, ensure_ascii=False))
+        return {"ok": True, "reason": "doctor", **report}
+
+    def stage_survey(self) -> dict:
+        try:
+            self.connect()  # the eye blanks the arm only if it knows where the arm is
+        except bridge_mod.BridgeError as error:
+            self.note(f"[survey] arm offline ({error.code}); no occlusion mask")
+        if hasattr(self.eye, "prior"):
+            self.eye.prior = None  # a survey measures afresh; the box may have moved or fallen
+        obs = self.eye.observe_stable(looks=int(self.cfg.get_path("vision.survey_looks", 3)))
+        frame = self.eye.snapshot(reuse_s=5.0)
+        tips = []
+        if self.arm is not None and self.arm.connected:
+            snap = self.arm.latest()
+            tips.append((snap["x"], snap["y"], snap["z"]))
+        self.run.image("survey", self.eye.annotate(frame, obs, obs["table"]["z"], tips))
+        record = {"observed": obs, "at": time.time(), "qualified": False}
+        if obs.get("metric_qualified") and obs.get("identity") and self.arm:
+            try:
+                observed_identity = EvidenceIdentity(**obs["identity"])
+                record["qualified"] = observed_identity.current(self._identity(), now=time.monotonic(),
+                                                                max_age_s=self._grasp_limits().max_age_s)
+                if record["qualified"]:
+                    record["identity"] = obs["identity"]
+            except (TypeError, ValueError, MissionError):
+                pass
+        config.dump_json(config.BOX_POSE, record)
+        foot = obs["footprint"]
+        self.note(f"box at ({foot['centre_mm'][0]:.1f}, {foot['centre_mm'][1]:.1f}) mm, "
+                  f"{foot['long_mm']:.1f} x {foot['short_mm']:.1f} x {obs['height_mm']:.1f} mm, "
+                  f"long-axis yaw {foot['yaw_long_deg']:.1f} deg over {obs.get('looks', 1)} look(s) "
+                  f"(spread {obs.get('look_spread')})")
+        self.note(f"table z {obs['table']['z']:.1f} (spread {obs['table']['spread_mm']:.1f} mm), "
+                  f"{obs['mask_pixels']} px in {obs['mask_parts']} part(s), frame {obs['frame']}")
+        return {"ok": True, "reason": "surveyed", "observation": obs}
+
+    def stage_measure(self) -> dict:
+        raise MissionError("contact_excluded", "contact calibration is excluded; approve independent non-contact metrology first")
+
+    def _choose_rz(self, grasp: dict) -> tuple[dict, dict]:
+        options = grasp["rz_options"]
+        poses: list[list[float]] = []
+        index: dict[str, list[int]] = {}
+        for rz in options:
+            candidate = planner.with_rz(grasp, rz)
+            for name, pose in planner.grasp_poses(candidate).items():
+                index.setdefault(f"{rz:.2f}", []).append(len(poses))
+                poses.append(pose)
+        reply = self._ik(poses)
+        results = reply["results"]
+        per = {key: [results[i] for i in idx] for key, idx in index.items()}
+        rz, verdict = planner.choose_rz(per, options)
+        self.run.log("ik_preflight", options=options, chosen=rz, verdict=verdict, rows=per)
+        if not verdict["feasible"]:
+            raise MissionError("ik_infeasible", f"no feasible wrist yaw: {verdict.get('reason')}",
+                               detail=per)
+        if float(verdict["margin"]) < 10.0:
+            raise MissionError("wrist_margin", f"chosen yaw leaves only {verdict['margin']:.1f} deg of joint margin")
+        return planner.with_rz(grasp, rz), {"rz": rz, **verdict, "options": options}
+
+    def stage_pick(self, *, auto: bool = False) -> dict:
+        if not config.BOX_POSE.exists():
+            raise MissionError("no_box_pose", "run --stage survey first")
+        model = planner.load_table_model()
+        if not model:
+            raise MissionError("no_table_model", "independent non-contact tool/table qualification required")
+        box_record = config.load_json(config.BOX_POSE)
+        observation = box_record["observed"]
+        if not self.args.plan_only:
+            if not isinstance(self.grasp_observer, GraspObserver):
+                raise MissionError("grasp_unavailable", "qualified RGB-D and inner-jaw observer required before motion")
+            self._grasp_limits()
+            self.connect()
+            if not box_record.get("qualified") or box_record.get("identity") is None:
+                raise MissionError("stale_scene", "historical box localization has no scene/session certificate")
+            identity = EvidenceIdentity(**box_record["identity"])
+            if not identity.current(self._identity(), now=time.monotonic(),
+                                    max_age_s=self._grasp_limits().max_age_s):
+                raise MissionError("stale_scene", "re-observe the current scene before approval")
+        table = planner.table_from_model(model, self.cfg)
+        grasp = planner.grasp_plan(observation, table, self.cfg)
+        if grasp["problems"]:
+            raise MissionError("plan_invalid", "; ".join(grasp["problems"]), detail=grasp)
+        ik = {"rz": grasp["rz"], "margin": None, "options": grasp["rz_options"],
+              "note": "the arm is offline, so the wrist preflight did not run"}
+        try:
+            self._ready()
+        except (bridge_mod.BridgeError, MissionError) as error:
+            if not self.args.plan_only:
+                raise
+            reason = error.detail.get("reason") if isinstance(error.detail, dict) else None
+            self.note(f"[pick] arm not ready ({error.code}: {reason or error.message[:120]}); the "
+                      "plan and its token are still exact, but the wrist preflight is unchecked")
+        else:
+            grasp, ik = self._choose_rz(grasp)
+            grasp["problems"] = planner.validate_grasp(grasp, self.cfg)
+            if grasp["problems"]:
+                raise MissionError("plan_invalid", "; ".join(grasp["problems"]), detail=grasp)
+        if ik.get("margin") is None:
+            margin_line = f"IK preflight not run: {ik.get('note')}"
+        else:
+            margin_line = (f"IK wrist margin {ik['margin']:.1f} deg, second option "
+                           f"{[o for o in ik['options'] if o != ik['rz']]}")
+        payload = {"lines": planner.describe(grasp).splitlines() + [
+            margin_line,
+            f"vision frame {grasp['source_frame']}; closed loop over the box: re-centre 2.5-10 mm "
+            f"at approach, 2.5-6 mm at pre-grasp (max 2 each), abort beyond"],
+            "plan": planner.summary(grasp)}
+        token = self._approve("pick", payload, auto=auto)
+        self.run.log("grasp_plan", plan=grasp, ik=ik, token=token)
+        config.dump_json(GRASP_PLAN, {"plan": grasp, "ik": ik, "token": token, "at": time.time()})
+
+        self.note(f"[pick] jaws open to {grasp['open_mm']:.1f} mm")
+        opened = self.arm.open_gripper(grasp["open_mm"] + 2.0)
+        self.run.log("gripper", phase="open", **opened)
+        if opened["width_mm"] < grasp["short_mm"] + 6.0:
+            raise MissionError("jaw_stuck", f"jaw only opened to {opened['width_mm']:.1f} mm",
+                               detail=opened)
+
+        poses = planner.grasp_poses(grasp)
+        x, y = grasp["centre"]
+        snap = self.arm.latest()
+        if snap["z"] < poses["approach"][2] - 5.0:
+            # A point transit interpolates joints, not the tool: climb first so
+            # the path to the approach cannot sweep the fingers through the box.
+            self.note(f"[pick] climb to {poses['approach'][2]:.1f} mm before the transit")
+            climb = self.arm.move(snap["x"], snap["y"], poses["approach"][2],
+                                  rpy=(snap["rx"], snap["ry"], snap["rz"]), kind="linear",
+                                  speed_pct=10.0, arrive_mm=1.5, timeout_s=30.0)
+            self.run.log("move", stage="climb", **climb)
+        self.note(f"[pick] transit to approach {poses['approach'][2]:.1f} mm")
+        self.arm.transit(x, y, poses["approach"][2], rpy=poses["approach"][3:], speed_pct=10.0)
+        self._close_loop(grasp, poses["approach"][2], poses["approach"][3:], phase="approach",
+                         abort_mm=10.0)
+        x, y = grasp["centre"]
+
+        self.note(f"[pick] descend to pre-grasp {grasp['pre_z']:.1f} mm at 5%")
+        pre = self.arm.move(x, y, grasp["pre_z"], rpy=poses["pre"][3:], kind="linear",
+                            speed_pct=5.0, arrive_mm=1.5, timeout_s=20.0)
+        self.run.log("move", stage="pre", **pre)
+        if pre["why"] != "arrived" and pre["short_mm"] > 3.0:
+            self._retreat(why="pre_short")
+            raise MissionError("blocked", f"pre-grasp move ended {pre['why']} "
+                                          f"{pre['short_mm']:.1f} mm short", detail=pre)
+        self._close_loop(grasp, grasp["pre_z"], poses["pre"][3:], phase="pre-grasp", abort_mm=6.0)
+        x, y = grasp["centre"]
+        config.dump_json(GRASP_PLAN, {"plan": grasp, "ik": ik, "token": token, "at": time.time()})
+
+        self.note(f"[pick] descend to grasp {grasp['grasp_z']:.1f} mm at 3%")
+        down = self.arm.move(x, y, grasp["grasp_z"], rpy=poses["grasp"][3:], kind="linear",
+                             speed_pct=3.0, arrive_mm=0.8, stall_s=0.6)
+        self.run.log("move", stage="grasp", **down)
+        if down["why"] != "arrived":
+            self._retreat(why="grasp_blocked")
+            raise MissionError("blocked", f"descent ended {down['why']} at z {down['end'][2]:.1f}",
+                               detail=down)
+        # "arrived" is judged before the brake; the pose after it is what the
+        # jaws close on.  An earlier pick jumped 10 mm and tilted 4 deg here.
+        time.sleep(0.3)
+        landed = self._pose_error(self.arm.latest(), poses["grasp"])
+        self.run.log("grasp_pose", **landed)
+        if landed["planar_mm"] > 3.0 or landed["dz_mm"] > 3.0 or landed["tilt_deg"] > 1.5:
+            self._retreat(why="grasp_pose_jump")
+            raise MissionError("pose_jump", f"after the descent the flange is {landed['planar_mm']:.1f} mm "
+                                            f"off, dz {landed['dz_mm']:.1f}, tilt {landed['tilt_deg']:.1f} deg; "
+                                            f"not closing on that", detail=landed)
+
+        self.note(f"[pick] close to {grasp['close_mm']:.1f} mm at {self.cfg.grasp.effort_nm} Nm")
+        closed = self.arm.grip(grasp["close_mm"], float(self.cfg.grasp.effort_nm))
+        self.run.log("gripper", phase="close", **closed)
+        held = closed["width_mm"]
+        # The mask reads the short side from a grazing view, so it can come out low.
+        # What proves a hold is the close *stalling* above its target, not the width
+        # matching the measurement: a box wider than measured stalls wide, and that
+        # is a hold.  A close that reaches its target met nothing at all.
+        if closed["why"] == "timeout":
+            self._retreat(why="close_timeout")
+            raise MissionError("close_timeout", f"close ended at {held:.1f} mm", detail=closed)
+        if closed["why"] == "reached" or held <= float(self.cfg.grasp.hold_min_mm) + 1.5:
+            self.run.log("grasp_state", state=GraspState.EMPTY.value)
+            self._retreat(why="jaws_met")
+            raise MissionError("empty_grasp", f"jaws reached {held:.1f} mm and met nothing "
+                                              f"(box short {grasp['short_mm']:.1f} mm)", detail=closed)
+        if held > grasp["short_mm"] + 4.0:
+            self.note(f"[pick] held width {held:.1f} mm exceeds the measured short side "
+                      f"{grasp['short_mm']:.1f} mm; the mask read low, the close stalled on the box")
+
+        state, candidate = self._observe_hold()
+        if state != GraspState.CONTACT_CANDIDATE:
+            self._retreat(why="contact_unverified")
+            raise MissionError("contact_unverified", f"closure state is {state.value}; no proof lift")
+        proof_mm = self._grasp_limits().min_proof_lift_mm
+        self.note(f"[pick] bounded proof lift {proof_mm:.1f} mm and verify object co-motion")
+        up = self.arm.move(x, y, grasp["grasp_z"] + proof_mm, rpy=poses["grasp"][3:], kind="linear",
+                           speed_pct=5.0, arrive_mm=1.2, timeout_s=25.0)
+        after = self.arm.latest()
+        slip = abs(after["gripper_mm"] - held)
+        self.run.log("gripper", phase="lift", width_mm=after["gripper_mm"], slip_mm=round(slip, 2))
+        if slip > float(self.cfg.grasp.slip_mm):
+            self._retreat(why="slipped")
+            raise MissionError("slipped", f"jaw width moved {slip:.1f} mm while lifting", detail=up)
+        presence = self.eye.presence([x, y], 50.0)
+        self.run.log("presence", phase="picked", **presence)
+        if presence.get("fill") is not None:
+            stuck = presence["fill"] > 0.45
+        else:
+            stuck = presence["local_px"] > 0.45 * max(1, observation.get("local_px", 1))
+        state, evidence = self._collect_hold()
+        if stuck or state != GraspState.HELD_VERIFIED:
+            self._retreat(why="hold_unverified")
+            raise MissionError("hold_unverified", f"object remains on support or hold state is {state.value}")
+        anchor = config.load_json(GRASP_PLAN)
+        anchor.update(grasp_state=state.value, grasp_evidence=evidence.to_dict())
+        config.dump_json(GRASP_PLAN, anchor)
+        self.note(f"[pick] carry at {grasp['carry_z']:.0f} mm")
+        self.arm.transit(x, y, grasp["carry_z"], rpy=poses["grasp"][3:], speed_pct=10.0)
+        state, evidence = self._observe_hold()
+        if state != GraspState.HELD_VERIFIED:
+            raise MissionError("carry_unverified", f"fresh carry state is {state.value}")
+        anchor.update(grasp_state=state.value, grasp_evidence=evidence.to_dict())
+        config.dump_json(GRASP_PLAN, anchor)
+        return {"ok": True, "reason": "picked", "grasp_width_mm": held, "slip_mm": round(slip, 2),
+                "presence": presence, "plan": planner.summary(grasp)}
+
+    def stage_flip(self, *, auto: bool = False) -> dict:
+        self._ready()
+        if not GRASP_PLAN.exists():
+            raise MissionError("no_grasp_plan", "run --stage pick first")
+        anchor = config.load_json(GRASP_PLAN)
+        self._require_held(anchor)
+        stored = anchor["plan"]
+        snap = self.arm.latest()
+        held = snap["gripper_mm"]
+        if not (float(self.cfg.grasp.hold_min_mm) <= held <= float(self.cfg.grasp.jaw_max_mm)):
+            raise MissionError("nothing_held", f"jaw width {held:.1f} mm does not describe a box")
+        x, y = stored["centre"]
+        rz_now = float(stored.get("rz_place", stored["rz"]))
+        rz_new = _wrap180(rz_now + 180.0)
+        poses = [[x, y, stored["carry_z"], -180.0, 0.0, rz_now],
+                 [x, y, stored["carry_z"], -180.0, 0.0, rz_new]]
+        ik = self._ik(poses)["results"]
+        if not all(row.get("feasible") for row in ik):
+            raise MissionError("ik_infeasible", f"flip to {rz_new:.1f} is not reachable", detail=ik)
+        margin = min(min(row.get("margins_deg") or [0]) for row in ik)
+        if margin < 10.0:
+            raise MissionError("wrist_margin", f"flip leaves {margin:.1f} deg of joint margin")
+        payload = {"lines": [
+            f"carry ({x:.1f}, {y:.1f}, {stored['carry_z']:.0f}) mm, wrist {rz_now:.1f} -> {rz_new:.1f} deg",
+            f"jaw holds {held:.1f} mm; slip tolerance {self.cfg.grasp.slip_mm:.1f} mm",
+            f"IK report: {json.dumps(ik, ensure_ascii=False)}"],
+            "flip": {"x": x, "y": y, "z": stored["carry_z"], "rz_from": rz_now, "rz_to": rz_new}}
+        token = self._approve("flip", payload, auto=auto)
+        self.run.log("flip_start", token=token, width_mm=held, rz_from=rz_now, rz_to=rz_new)
+        self.arm.transit(x, y, stored["carry_z"], rpy=(-180.0, 0.0, rz_now), speed_pct=10.0)
+        turned = self.arm.move(x, y, stored["carry_z"], rpy=(-180.0, 0.0, rz_new), kind="point",
+                               speed_pct=10.0, arrive_deg=1.5, timeout_s=30.0)
+        self.run.log("flip_move", **turned)
+        after = self.arm.latest()
+        slip = abs(after["gripper_mm"] - held)
+        rz_error = abs(_wrap180(after["rz"] - rz_new))
+        ok = turned["why"] == "arrived" and slip <= float(self.cfg.grasp.slip_mm) and rz_error <= 2.0
+        if ok:
+            anchor = config.load_json(GRASP_PLAN)
+            anchor["plan"]["rz_place"] = rz_new
+            anchor["flipped_at"] = time.time()
+            config.dump_json(GRASP_PLAN, anchor)
+        else:
+            self._retreat(why="flip_failed")
+        return {"ok": ok, "reason": "flipped" if ok else "flip_failed",
+                "rz_deg": round(after["rz"], 2), "rz_error_deg": round(rz_error, 2),
+                "slip_mm": round(slip, 2), "width_mm": round(after["gripper_mm"], 2)}
+
+    def stage_place(self, *, auto: bool = False) -> dict:
+        self._ready()
+        if not GRASP_PLAN.exists():
+            raise MissionError("no_grasp_plan", "run --stage pick first")
+        anchor = config.load_json(GRASP_PLAN)
+        self._require_held(anchor)
+        grasp = anchor["plan"]
+        snap = self.arm.latest()
+        held = snap["gripper_mm"]
+        if not (float(self.cfg.grasp.hold_min_mm) <= held <= float(self.cfg.grasp.jaw_max_mm)):
+            raise MissionError("nothing_held", f"jaw width {held:.1f} mm does not describe a box")
+        place = planner.place_plan(grasp, self.cfg)
+        if place["problems"]:
+            raise MissionError("plan_invalid", "; ".join(place["problems"]), detail=place)
+        poses = planner.place_poses(place)
+        ik = self._ik([poses["approach"], poses["pre"], poses["place"]])["results"]
+        if not all(row.get("feasible") for row in ik):
+            raise MissionError("ik_infeasible", "place pose is not reachable", detail=ik)
+        payload = {"lines": [
+            f"place at ({place['x']:.1f}, {place['y']:.1f}) mm, flange z {place['place_z']:.1f} "
+            f"(box bottom {self.cfg.place.clearance_mm:.1f} mm above contact)",
+            f"tool yaw {place['rz']:.1f} deg, jaws were holding {held:.1f} mm",
+            f"path z: approach {place['approach_z']:.1f} -> pre {place['pre_z']:.1f} -> "
+            f"place {place['place_z']:.1f}; release opens to {place['open_mm']:.0f} mm"],
+            "place": place}
+        token = self._approve("place", payload, auto=auto)
+        self.run.log("place_start", token=token, plan=place, ik=ik)
+        self.arm.transit(place["x"], place["y"], place["approach_z"], rpy=poses["approach"][3:],
+                         speed_pct=10.0)
+        pre = self.arm.move(place["x"], place["y"], place["pre_z"], rpy=poses["pre"][3:],
+                            kind="linear", speed_pct=5.0, arrive_mm=1.2)
+        self.run.log("move", stage="place_pre", **pre)
+        down = self.arm.move(place["x"], place["y"], place["place_z"], rpy=poses["place"][3:],
+                             kind="linear", speed_pct=3.0, arrive_mm=0.8, stall_s=0.6)
+        self.run.log("move", stage="place_down", **down)
+        if down["why"] != "arrived":
+            self._retreat(why="place_blocked")
+            raise MissionError("blocked", f"place descent ended {down['why']}", detail=down)
+        reopened = self.arm.open_gripper(place["open_mm"])
+        anchor["grasp_state"] = GraspState.UNKNOWN.value
+        anchor.pop("grasp_evidence", None)
+        config.dump_json(GRASP_PLAN, anchor)
+        self.run.log("gripper", phase="release", **reopened)
+        time.sleep(float(place["settle_s"]))
+        self.arm.move(place["x"], place["y"], place["place_z"] + 30.0, rpy=poses["place"][3:],
+                      kind="linear", speed_pct=5.0, arrive_mm=1.5)
+        self.arm.transit(place["x"], place["y"], min(place["pre_z"] + 40.0, planner.z_ceiling(self.cfg)),
+                         rpy=poses["place"][3:], speed_pct=10.0)
+        try:
+            obs = self.eye.observe()
+            foot = obs["footprint"]
+            dx = foot["centre_mm"][0] - place["x"]
+            dy = foot["centre_mm"][1] - place["y"]
+            yaw_error = abs(_wrap90(foot["yaw_long_deg"] - (place["rz"] - 90.0)))
+            released = {"drift_mm": round(math.hypot(dx, dy), 2), "yaw_error_deg": round(yaw_error, 2),
+                        "centre_mm": foot["centre_mm"], "frame": obs["frame"]}
+            ok = released["drift_mm"] <= 15.0 and yaw_error <= 15.0
+        except vision.VisionError as error:
+            released = {"error": f"{error.code}: {error.message}"}
+            ok = False
+        self.run.log("released", ok=ok, **released)
+        return {"ok": ok, "reason": "placed" if ok else "place_unverified",
+                "held_mm": round(held, 2), "released": released, "plan": place}
+
+    def stage_park(self, *, auto: bool = False) -> dict:
+        self._ready()
+        park = self.cfg.motion.park_mm
+        payload = {"lines": [f"transit to park ({park[0]:.0f}, {park[1]:.0f}, {park[2]:.0f}) mm, "
+                             f"jaws open to {self.cfg.grasp.jaw_max_mm:.0f} mm"],
+                   "park": list(park)}
+        token = self._approve("park", payload, auto=auto)
+        self.run.log("park_start", token=token)
+        self.arm.open_gripper(float(self.cfg.grasp.jaw_max_mm))
+        moved = self.arm.transit(park[0], park[1], park[2], speed_pct=10.0)
+        self.run.log("park_move", **moved)
+        return {"ok": moved["why"] == "arrived", "reason": "parked",
+                "end": moved["end"], "short_mm": moved["short_mm"]}
+
+    def stage_vla(self, *, auto: bool = False) -> dict:
+        """V0/V1: ask a policy source for one chunk, preview it, then execute it guarded.
+
+        The rehearsal never drives a descent: it requires carry height, refuses a
+        first row that does not continue the measured joints, and sends the chunk
+        through the board's clamp.  A model that disagrees with the arm's state
+        convention stops here instead of at the table.
+        """
+        self._ready()
+        source = policy_source.make_source(self.args.source, self.cfg)
+        health = getattr(source, "health", None)
+        if health is not None:
+            health()
+        snap = self.arm.latest()
+        if snap["z"] < 120.0:
+            raise MissionError("too_low", f"a policy rehearsal runs at carry height, z is {snap['z']:.1f}")
+        frame = self.eye.snapshot(reuse_s=0.0)
+        state = list(snap["joints"]) + [snap["gripper_mm"]]
+        started = time.monotonic()
+        chunk = source.act({"rgb": frame.image, "state": state,
+                            "instruction": self.args.instruction})
+        rows = policy_source.clamp_rows(chunk.rows, chunk.kind)
+        if not rows:
+            raise MissionError("empty_chunk", "the policy source returned no rows")
+        jump = 0.0
+        if chunk.kind == "joint":
+            jump = max(abs(rows[0][i] - snap["joints"][i]) for i in range(6))
+        preview = {"source": chunk.source, "kind": chunk.kind, "rows": len(rows),
+                   "fps": chunk.fps, "first_jump_deg": round(jump, 2),
+                   "latency_s": round(time.monotonic() - started, 3),
+                   "first": [round(v, 2) for v in rows[0]], "info": source.describe()}
+        self.run.log("vla_chunk", **preview)
+        self.note(f"[vla] {chunk.source}: {len(rows)} rows at {chunk.fps:.0f} Hz, "
+                  f"first row jumps {jump:.1f} deg, {preview['latency_s']:.2f} s")
+        if chunk.kind == "joint" and jump > 8.0:
+            raise MissionError("state_mismatch", f"the model's first row is {jump:.1f} deg from the arm; "
+                                                  f"its state convention does not match this robot")
+        payload = {"lines": [f"policy source {chunk.source} ({preview['info'].get('version')}), "
+                              f"kind {chunk.kind}, {len(rows)} rows at {chunk.fps:.0f} Hz",
+                              f"rate clamp {self.cfg.vla.max_rate_deg_s:.0f} deg/s, "
+                              f"max {self.args.max_rows} rows executed",
+                              f"start {preview['first']}"],
+                   "vla": preview}
+        token = self._approve("vla", payload, auto=auto)
+        if not self.args.execute:
+            return {"ok": True, "reason": "vla_preview", "token": token, **preview}
+        sent = rows[: max(1, int(self.args.max_rows))]
+        executed = self.arm.chunk(sent, kind=chunk.kind, fps=chunk.fps,
+                                  max_rate_deg_s=float(self.cfg.vla.max_rate_deg_s))
+        self.run.log("vla_executed", **executed)
+        return {"ok": True, "reason": "vla_chunk_executed", "token": token,
+                "executed": executed, **preview}
+
+    def stage_enable(self) -> dict:
+        snap = self.connect().latest()
+        payload = {
+            "lines": [
+                "standby -> CAN handshake -> EnableArm(7, 0x02)",
+                "no ResetPiper, DisableArm, arm.enable=0, or motion target",
+                f"current mode={snap.get('ctrl_mode')} status={snap.get('arm_status')}",
+            ],
+            "enable": {"ctrl_mode": snap.get("ctrl_mode"), "arm_status": snap.get("arm_status")},
+        }
+        token = self._approve("enable", payload)
+        result = self.connect().enable()
+        self.run.log("enable", token=token, **result)
+        return {"ok": bool(result.get("enabled")), "reason": "enabled", "token": token, **result}
+
+    def stage_recover(self) -> dict:
+        self._approve("recover", {"lines": ["conditional estop resume -> standby -> CAN -> "
+                                            "EnableArm(7, 0x02); no ResetPiper",
+                                            "requires z >= 80 mm or --support if the arm is resting low"],
+                                  "recover": {"support": bool(self.args.support)}})
+        result = self.connect().recover(support=bool(self.args.support))
+        self.run.log("recover", **result)
+        return {"ok": bool(result.get("enabled")), "reason": "recovered", **result}
+
+    def stage_all(self) -> dict:
+        self.note("[all] survey")
+        self.stage_survey()
+        if self.args.remeasure or not config.TABLE_MODEL.exists():
+            self.note("[all] measure (contact model)")
+            self.stage_measure()
+        self.note("[all] pick")
+        pick = self.stage_pick(auto=True)
+        self.note("[all] flip")
+        flip = self.stage_flip(auto=True)
+        if not flip["ok"]:
+            self._retreat(why="flip")
+            return {"ok": False, "reason": "flip_failed", "pick": pick, "flip": flip}
+        self.note("[all] place")
+        place = self.stage_place(auto=True)
+        self.note("[all] park")
+        park = self.stage_park(auto=True)
+        return {"ok": bool(place["ok"] and park["ok"]), "reason": "all",
+                "pick": pick, "flip": flip, "place": place, "park": park}
+
+    # -- entry -------------------------------------------------------------
+    def run_stage(self) -> dict:
+        handlers = {
+            "doctor": self.stage_doctor, "survey": self.stage_survey,
+            "enable": self.stage_enable, "measure": self.stage_measure, "pick": self.stage_pick,
+            "flip": self.stage_flip, "place": self.stage_place,
+            "park": self.stage_park, "recover": self.stage_recover, "all": self.stage_all,
+            "vla": self.stage_vla,
+        }
+        return handlers[self.stage]()
+
+    def failure(self, error: Exception) -> dict:
+        """One typed terminal boundary, persisted by the existing run journal."""
+        from leapflow.engine.recovery.failure_envelope import (
+            FailureContext, FailureEnvelope, FailureSource, Recoverability, SideEffectState,
+        )
+        attempted = self.arm is not None and getattr(self.arm, "effects_attempted", False)
+        if attempted:
+            self._retreat(why=getattr(error, "code", "internal_defect"))
+        effect = "unknown" if attempted else getattr(error, "side_effect_state", "none")
+        envelope = FailureEnvelope.create(
+            source=FailureSource.TOOL, category="hardware_checkpoint" if attempted else "hardware_refusal",
+            failure_class=type(error).__name__, failure_code=getattr(error, "code", "internal_defect"),
+            message=getattr(error, "message", str(error)),
+            recoverability=Recoverability.USER_FIXABLE if hasattr(error, "code") else Recoverability.NON_RECOVERABLE,
+            side_effect_state=SideEffectState(effect),
+            context=FailureContext(tool_name=self.stage, execution_id=self.run.dir.name,
+                                   session_id=self.arm.hello.get("session_id", "") if self.arm else ""),
+        )
+        encoded = json.loads(json.dumps(asdict(envelope), default=lambda value: value.value if isinstance(value, Enum) else str(value)))
+        result = {"ok": False, "reason": envelope.failure_code, "message": envelope.message,
+                  "side_effect_state": effect, "envelope": encoded,
+                  "detail": getattr(error, "detail", None), "arm": self._fingerprint(),
+                  "upstream_envelope": getattr(error, "envelope", {})}
+        self.run.log("failure", **result)
+        self.run.verdict(result)
+        return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--stage", required=True,
+                        choices=("doctor", "survey", "enable", "measure", "pick", "flip", "place",
+                                 "park", "recover", "all", "vla"))
+    parser.add_argument("--yes", action="store_true", help="execute a physical stage")
+    parser.add_argument("--token", default="", help="the token printed by --plan-only")
+    parser.add_argument("--plan-only", action="store_true", help="measure, print, move nothing")
+    parser.add_argument("--support", action="store_true", help="arm is resting low; allow recovery")
+    parser.add_argument("--remeasure", action="store_true", help="all: redo the contact model")
+    parser.add_argument("--source", default="scripted", choices=("scripted", "fake", "smolvla"))
+    parser.add_argument("--instruction", default="pick up the blue box")
+    parser.add_argument("--execute", action="store_true", help="vla: send the previewed chunk")
+    parser.add_argument("--max-rows", type=int, default=15, help="vla: rows executed from the chunk")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    mission = Mission(args)
+    try:
+        verdict = mission.run_stage()
+        if not verdict.get("ok"):
+            verdict = mission.failure(MissionError(
+                verdict.get("reason", "stage_failed"),
+                "stage outcome is unverified", verdict,
+            ))
+            path = mission.run.dir / "verdict.json"
+        else:
+            path = mission.run.verdict(verdict)
+    except PlanOnly as plan:
+        mission.run.verdict({"ok": True, "reason": "plan_only", "token": plan.token})
+        return 0
+    except (MissionError, bridge_mod.BridgeError, vision.VisionError) as error:
+        result = mission.failure(error)
+        print(f"\nSTOPPED: {result['reason']}: {result['message']}", flush=True)
+        return 3
+    except Exception as error:
+        logging.exception("mission internal defect")
+        result = mission.failure(error)
+        print(f"\nSTOPPED: {result['reason']}: {result['message']}", flush=True)
+        return 5
+    finally:
+        if mission.arm is not None:
+            mission.arm.close()
+    print(f"\n{verdict.get('reason')}: ok={verdict.get('ok')}  evidence={path}", flush=True)
+    print(str(mission.run.dir))
+    return 0 if verdict.get("ok") else 6
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -812,19 +812,46 @@ class Context:
 
         cap_registry = ModelCapabilityRegistry()
         base_caps = cap_registry.resolve(settings.llm_model)
+        # The static table lags new multimodal releases; the operator's word wins.
+        vision = {"true": True, "false": False}.get(
+            getattr(settings, "llm_supports_vision", "auto"), base_caps.supports_vision
+        )
         cap_registry.register(
             settings.llm_model,
             ModelCapabilities(
                 context_length=self._effective_llm_context_length(settings),
                 max_output_tokens=base_caps.max_output_tokens,
                 supports_tools=settings.native_tool_calling_enabled,
-                supports_vision=base_caps.supports_vision,
+                supports_vision=vision,
                 supports_thinking=base_caps.supports_thinking,
                 supports_streaming_tools=base_caps.supports_streaming_tools,
                 tokens_per_image=base_caps.tokens_per_image,
             ),
         )
         return cap_registry
+
+    def _vision_capability_for(self, settings: Settings) -> Any:
+        """The one probe-backed image capability resolver, reconfigured on reload.
+
+        It is kept across reloads so remembered verdicts and in-flight probes
+        survive; only the operator's ``llm.supports_vision`` is re-applied.
+        """
+        from leapflow.llm.vision_capability import (
+            VisionCapability,
+            VisionVerdictStore,
+            verdicts_path,
+        )
+
+        mode = str(getattr(settings, "llm_supports_vision", "auto") or "auto")
+        resolver = getattr(self, "_vision_capability", None)
+        if resolver is None:
+            resolver = VisionCapability(
+                store=VisionVerdictStore(verdicts_path(settings)), mode=mode
+            )
+            self._vision_capability = resolver
+        elif resolver.mode != mode.strip().lower():
+            resolver.configure(mode=mode)
+        return resolver
 
     def _sync_engine_runtime_budget(self, settings: Settings) -> None:
         """Sync engine-visible budgets and model capability metadata from settings."""
@@ -850,6 +877,7 @@ class Context:
             )
         self.engine.set_tool_result_budget(dynamic_result_budget)
         self.engine.set_model_capabilities(self._build_model_capability_registry(settings))
+        self.engine.set_vision_capability(self._vision_capability_for(settings))
 
         compressor = getattr(self.engine, "_compressor", None)
         if compressor is not None and hasattr(compressor, "reconfigure"):

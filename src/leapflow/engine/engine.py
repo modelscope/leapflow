@@ -15,6 +15,7 @@ import json
 import logging
 import time
 import types
+from contextlib import aclosing
 from dataclasses import asdict
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
@@ -72,6 +73,7 @@ from leapflow.engine.tools.tool_concurrency import (
     ToolConcurrencyPolicy,
 )
 from leapflow.engine.tools.action_executor import ActionExecutor, RecordedActionExecutor
+from leapflow.engine.tools.tool_attachments import retire_tool_images
 from leapflow.engine.tools.tool_execution import (
     ToolExecutionLedger,
 )
@@ -277,6 +279,8 @@ class AgentEngine:
 
         # Model capability registry (injected by CLI)
         self._model_capabilities: Optional[Any] = None
+        # Evidence-based image capability (VisionCapability, injected by CLI)
+        self._vision_capability: Optional[Any] = None
 
         # Session-level counters (survive per-turn tracker resets)
         self._session_turn_count: int = 0
@@ -638,6 +642,9 @@ class AgentEngine:
         phase = dict(decision.audit_metadata).get("phase", "")
 
         if strategy_key == "context_compress":
+            # Old tool images are the cheapest context to lose: a tool can
+            # always be called again for a fresh view.
+            retire_tool_images(messages, keep=0)
             if phase == "multimodal_to_text":
                 self._strip_images_from_messages(messages)
             else:
@@ -688,6 +695,7 @@ class AgentEngine:
             "(estimated=%d tokens > new_window=%d)",
             estimated, new_window,
         )
+        retire_tool_images(messages, keep=0)
         messages[:] = self._compressor.force_compress(messages)
         self._usage_tracker.mark_compression()
 
@@ -773,6 +781,10 @@ class AgentEngine:
     def set_model_capabilities(self, registry: Any) -> None:
         """Inject model capability registry."""
         self._model_capabilities = registry
+
+    def set_vision_capability(self, resolver: Any) -> None:
+        """Inject the resolver that decides by probe whether the model sees images."""
+        self._vision_capability = resolver
 
     def set_doc_store(self, doc_store: Any) -> None:
         """Inject SkillDocStore so SkillMerger can sync SKILL.md on approve."""
@@ -1293,10 +1305,11 @@ class AgentEngine:
             self._skill_dispatcher._inject_pending_skill_reminder()
             self._wm.remember_chat(build_user_message_text(user_text))
             logger.debug("route.slash command=%s", user_text.split()[0])
-            async for event in self._stream_via_sink(
+            async with aclosing(self._stream_via_sink(
                 user_text, enable_thinking=enable_thinking
-            ):
-                yield event
+            )) as events:
+                async for event in events:
+                    yield event
             return
 
         self._skill_dispatcher._inject_pending_skill_reminder()
@@ -1315,10 +1328,13 @@ class AgentEngine:
             self._wm.remember_chat(build_assistant_message(msg))
             yield StreamEvent(type="final", content=msg)
             return
-        async for event in self._stream_via_sink(
+        # ``aclosing``: closing this stream must stop the loop task now, not
+        # whenever the garbage collector finalizes an abandoned inner generator.
+        async with aclosing(self._stream_via_sink(
             user_text, enable_thinking=enable_thinking
-        ):
-            yield event
+        )) as events:
+            async for event in events:
+                yield event
 
     async def _stream_via_sink(
         self, user_text: str, *, enable_thinking: bool = False
@@ -1327,7 +1343,9 @@ class AgentEngine:
 
         Creates a ``StreamSink`` backed by an ``asyncio.Queue``, kicks the
         unified ``_run_agent_loop`` off as a background task (push side),
-        and yields ``StreamEvent`` objects from the queue (pull side).
+        and yields ``StreamEvent`` objects from the queue (pull side). The task
+        is published as ``_active_task`` so ``cancel()`` interrupts an in-flight
+        LLM call or tool instead of waiting for the next loop iteration.
         """
         sink = StreamSink()
         frame = self._build_root_frame(user_text, enable_thinking=enable_thinking)
@@ -1340,18 +1358,23 @@ class AgentEngine:
                 await self._run_agent_loop(frame, sink=sink)
             except BaseException as exc:
                 loop_error = exc
+                cancelled = isinstance(exc, asyncio.CancelledError) and self._cancel_requested
                 try:
-                    await sink.emit_error(str(exc))
+                    await sink.emit_error("Cancelled by user." if cancelled else str(exc))
                 except Exception:
                     pass  # Sink might already be closed
             finally:
                 await sink.close()
 
         task = asyncio.create_task(_run_loop())
+        previous_task = self._active_task
+        self._active_task = task
         try:
             async for event in sink:
                 yield event
         finally:
+            if self._active_task is task:
+                self._active_task = previous_task
             if not task.done():
                 task.cancel()
                 try:
@@ -2295,6 +2318,7 @@ class AgentEngine:
                     tool_name, tool_arguments, result
                 ),
             )
+            await self._tool_dispatch.append_tool_attachments(messages, [f"text-{budget.used}"])
             memory_evidence = self._tool_dispatch.working_memory_evidence([
                 {"name": tool_name, "evidence": result_payload}
             ])

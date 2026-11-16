@@ -22,7 +22,6 @@ location: "yahboom"
 halt_supported: false
 
 capabilities:
-  affordances: ["observe_rgb", "observe_depth"]
   notes: "Passive subscriber to a running ROS 2 camera driver; never opens the device."
 
 transport:

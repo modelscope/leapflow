@@ -6,6 +6,13 @@ reach the same governed state regardless of which path found it.  This module is
 the single execution point for that state transition.  An action is successful
 only when its required physical transition has completed; every incomplete or
 unknown action falls back to an immediate transport halt.
+
+Supervisory actions are opt-in (``HardwareSettings.degradation_actions_enabled``,
+default off).  A host supervisor watching a remote arm sees the arm only through
+its own sampling of the link, so a transient on that path -- not on the arm --
+would otherwise be answered with a damped emergency stop that drops a stationary,
+torque-holding arm.  While disabled, a triggered policy is reported (log plus a
+``degradation_suppressed`` board warning) and nothing is sent or latched.
 """
 
 from __future__ import annotations
@@ -13,11 +20,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable
 
-from leapflow.hardware.context import HardwareContext, Quality
+from leapflow.hardware.context import HardwareContext
 from leapflow.hardware.transport import SIDE_EFFECT_COMMITTED, SIDE_EFFECT_NONE
 
 logger = logging.getLogger(__name__)
@@ -48,6 +56,8 @@ class DegradationOutcome:
     side_effect_state: str = SIDE_EFFECT_NONE
     error: str = ""
     requires_manual_clear: bool = False
+    suppressed: bool = False
+    """The policy triggered but actions are disabled: reported, never executed."""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the outcome for audit, diagnostics, and benchmarks."""
@@ -63,10 +73,62 @@ class DegradationOutcome:
             "side_effect_state": self.side_effect_state,
             "error": self.error,
             "requires_manual_clear": self.requires_manual_clear,
+            "suppressed": self.suppressed,
         }
 
 
 SensorSwitcher = Callable[[str], Awaitable[bool] | bool]
+
+DEGRADATION_SUPPRESSED = "degradation_suppressed"
+"""Event kind for a triggered policy whose action was withheld by configuration."""
+
+
+def degradation_actions_enabled(registry: Any) -> bool:
+    """Whether supervisory degradation actions may act on devices (default: no)."""
+    settings = getattr(registry, "settings", None)
+    return bool(getattr(settings, "degradation_actions_enabled", False))
+
+
+def sensor_loss_debounce_s(registry: Any) -> float:
+    """Minimum duration a sensor loss must persist before its policy triggers."""
+    settings = getattr(registry, "settings", None)
+    try:
+        return max(0.0, float(getattr(settings, "sensor_loss_debounce_s", 0.5)))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def report_suppressed(
+    registry: Any, device_id: str, *, action: str, reason: str, channel_id: str = ""
+) -> None:
+    """Log and publish a board warning for a withheld degradation action."""
+    logger.warning(
+        "DegradationPolicy %s for %s withheld (%s): degradation actions are disabled; "
+        "reporting only",
+        action,
+        device_id,
+        reason,
+    )
+    publish = getattr(registry, "publish_event", None)
+    if publish is None:
+        return
+    # Function-local: stream.py owns HardwareEvent and imports this module.
+    from leapflow.hardware.stream import HardwareEvent
+
+    try:
+        publish(
+            HardwareEvent(
+                kind=DEGRADATION_SUPPRESSED,
+                device_id=device_id,
+                channel_id=channel_id,
+                quantity="",
+                detail=f"{reason}: declared {action!r} withheld (degradation actions disabled)",
+                value=action,
+                observed_at=time.time(),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - reporting must not fail supervision
+        logger.warning("Degradation report publish failed: %s", exc, exc_info=True)
 
 
 class DegradationCoordinator:
@@ -84,7 +146,28 @@ class DegradationCoordinator:
         failed_channel_id: str = "",
         sensor_switcher: SensorSwitcher | None = None,
     ) -> DegradationOutcome:
-        """Execute *action* or halt when its completion cannot be proven."""
+        """Execute *action* or halt when its completion cannot be proven.
+
+        With supervisory actions disabled the trigger is reported and a
+        ``suppressed`` outcome returned: no command is sent and no latch is set.
+        """
+        if not degradation_actions_enabled(self._registry):
+            report_suppressed(
+                self._registry,
+                self._context.device_id,
+                action=action,
+                reason=reason,
+                channel_id=failed_channel_id,
+            )
+            return DegradationOutcome(
+                device_id=self._context.device_id,
+                action=action,
+                reason=reason,
+                completed=False,
+                latched=False,
+                verification="reported only; degradation actions disabled",
+                suppressed=True,
+            )
         try:
             parsed = DegradationAction(action)
         except ValueError:
@@ -147,13 +230,18 @@ class DegradationCoordinator:
 
     async def _halt(self, reason: str, *, action: str, error: str = "") -> DegradationOutcome:
         try:
-            transport = await self._registry.transport(self._context.device_id)
-            status = await transport.halt()
-            completed = bool(getattr(status, "connected", False)) and bool(
-                getattr(status, "halt_supported", True)
-            )
+            # A policy stop has to reach the device, so a link is opened when none
+            # is open; the stop itself goes through the registry, which retires the
+            # link if the driver closed it.
+            await self._registry.transport(self._context.device_id)
+            status = await self._registry.halt(self._context.device_id)
+            # Delivery, not capability, is what a policy stop has to confirm: a
+            # camera that releases its capture reports halt_supported=False and it
+            # is still stopped, while a stop that never reached the device is the
+            # one case this outcome exists to record.
+            completed = bool(status is not None and status.halt_delivered)
             if not completed:
-                error = error or "transport did not confirm emergency halt"
+                error = error or "the emergency halt did not reach the device"
         except Exception as exc:  # noqa: BLE001 - failure must remain auditable
             completed = False
             error = error or f"halt failed: {exc}"
@@ -170,12 +258,12 @@ class DegradationCoordinator:
         if completed:
             logger.warning("DegradationPolicy halted device %s (%s)", outcome.device_id, reason)
         else:
-            logger.error("DegradationPolicy halt could not be confirmed for %s: %s", outcome.device_id, error)
+            logger.error(
+                "DegradationPolicy halt could not be confirmed for %s: %s", outcome.device_id, error
+            )
         return outcome
 
-    async def _halt_fallback(
-        self, action: str, reason: str, error: str
-    ) -> DegradationOutcome:
+    async def _halt_fallback(self, action: str, reason: str, error: str) -> DegradationOutcome:
         halted = await self._halt(reason, action=action, error=error)
         outcome = DegradationOutcome(
             **{
@@ -235,7 +323,9 @@ class DegradationCoordinator:
             active_channel_id=target,
             verification="fallback channel readback is healthy",
         )
-        self._registry.clear_degradation(self._context.device_id, recovery="verified_sensor_fallback")
+        self._registry.clear_degradation(
+            self._context.device_id, recovery="verified_sensor_fallback"
+        )
         logger.warning(
             "DegradationPolicy switched device %s from %s to fallback sensor %s",
             self._context.device_id,
@@ -262,7 +352,10 @@ class DegradationCoordinator:
                 "safe_return requires declared home_joint_targets",
             )
         context_channels = {channel.channel_id: channel for channel in self._context.channels}
-        if any(channel_id not in context_channels or not context_channels[channel_id].is_writable for channel_id in targets):
+        if any(
+            channel_id not in context_channels or not context_channels[channel_id].is_writable
+            for channel_id in targets
+        ):
             return await self._halt_fallback(
                 DegradationAction.SAFE_RETURN.value,
                 reason,
@@ -277,8 +370,12 @@ class DegradationCoordinator:
             from leapflow.hardware.realtime import PIDJointController, TrajectoryTracker
 
             controller = PIDJointController(
-                tuple(targets), kp=1.0, ki=0.0, kd=0.0,
-                max_output=100.0, output_mode="position",
+                tuple(targets),
+                kp=1.0,
+                ki=0.0,
+                kd=0.0,
+                max_output=100.0,
+                output_mode="position",
             )
             tracker = TrajectoryTracker(
                 controller,
@@ -312,8 +409,18 @@ class DegradationCoordinator:
             side_effect_state=SIDE_EFFECT_COMMITTED,
         )
         self._registry.latch_degradation(outcome)
-        logger.warning("DegradationPolicy returned device %s to declared home pose", outcome.device_id)
+        logger.warning(
+            "DegradationPolicy returned device %s to declared home pose", outcome.device_id
+        )
         return outcome
 
 
-__all__ = ["DegradationAction", "DegradationCoordinator", "DegradationOutcome"]
+__all__ = [
+    "DEGRADATION_SUPPRESSED",
+    "DegradationAction",
+    "DegradationCoordinator",
+    "DegradationOutcome",
+    "degradation_actions_enabled",
+    "report_suppressed",
+    "sensor_loss_debounce_s",
+]

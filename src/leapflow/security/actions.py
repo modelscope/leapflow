@@ -50,6 +50,10 @@ class ActionKind(str, Enum):
     DEVICE_ACTUATE = "device.actuate"
     DEVICE_DISPENSE = "device.dispense"
     DEVICE_ESTOP = "device.estop"
+    # A node-local skill run: one approved plan the node executes as a whole
+    # (many motions under one permit). Its own kind because the consent unit is
+    # the plan, not a channel write.
+    DEVICE_SKILL = "device.skill"
 
 
 class ActionEffect(str, Enum):
@@ -205,6 +209,60 @@ class ActionDescriptor:
                 f"{where}."
             ),
             effect=_DEVICE_EFFECTS.get(kind, ActionEffect.EXECUTE.value),
+            resource=resource,
+            origin=origin,
+            metadata=merged,
+        )
+
+    @classmethod
+    def device_skill(
+        cls,
+        *,
+        node_id: str,
+        workcell: str,
+        skill_id: str,
+        version: str,
+        summary: str,
+        plan_digest: str,
+        consent: str,
+        limits: dict[str, float],
+        origin: str = ActionOrigin.AGENT_TOOL.value,
+        metadata: dict[str, Any] | None = None,
+    ) -> "ActionDescriptor":
+        """Describe one run of a node skill, as planned by the node.
+
+        ``resource`` is ``skill:<node>/<workcell>:<skill>@<version>`` plus the
+        speed cap the plan runs under, so a session grant covers later plans of
+        the same skill version in the same workcell at no looser cap -- a new
+        version or a raised cap re-prompts. When the skill declares ``each_run``
+        consent the plan digest joins the resource, so the grant can never
+        cover a second plan. The plan summary is in ``detail`` for the human
+        and excluded from the grant identity (see ``_normalize_detail``).
+        """
+        merged = dict(metadata or {})
+        merged.update(
+            {
+                "node_id": node_id,
+                "workcell": workcell,
+                "skill_id": skill_id,
+                "version": version,
+                "plan_digest": plan_digest,
+                "consent": consent,
+                "limits": dict(limits),
+            }
+        )
+        cap = limits.get("speed_pct_max")
+        resource = f"skill:{node_id}/{workcell}:{skill_id}@{version}"
+        if cap is not None:
+            resource = f"{resource}@speed<={float(cap):g}"
+        if consent == "each_run":
+            resource = f"{resource}#{plan_digest[:16]}"
+        bounds = ", ".join(f"{key}={float(value):g}" for key, value in sorted(limits.items()))
+        return cls(
+            kind=ActionKind.DEVICE_SKILL.value,
+            summary=f"Run {skill_id} on {node_id}/{workcell}",
+            detail=f"{summary} ({bounds})" if bounds else summary,
+            effect=ActionEffect.EXECUTE.value,
             resource=resource,
             origin=origin,
             metadata=merged,
@@ -431,6 +489,7 @@ _DEVICE_EFFECTS: dict[str, str] = {
     ActionKind.DEVICE_ACTUATE.value: ActionEffect.EXECUTE.value,
     ActionKind.DEVICE_DISPENSE.value: ActionEffect.EXECUTE.value,
     ActionKind.DEVICE_ESTOP.value: ActionEffect.EXECUTE.value,
+    ActionKind.DEVICE_SKILL.value: ActionEffect.EXECUTE.value,
 }
 
 

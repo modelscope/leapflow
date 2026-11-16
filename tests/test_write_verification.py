@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from leapflow.hardware import write_verification
 from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.context import (
     HC_VERSION,
@@ -27,6 +28,7 @@ from leapflow.hardware.write_verification import (
     WriteExpectation,
     WriteVerdict,
     WriteVerdictStatus,
+    WriteVerificationCoordinator,
     aggregate_write_verdicts,
 )
 from leapflow.security.approval import ApprovalDecision, SessionAwareGate
@@ -222,6 +224,141 @@ async def test_deferred_cross_channel_expectation_settles_on_later_read() -> Non
     assert read_result["verification"]["status"] == "verified"
     assert read_result["verification"]["channel_id"] == "power"
     assert trust.level("heater", "power") == HardwareTrustLevel.CANDIDATE
+
+
+class _ScriptedSensor:
+    """A verification channel whose value moves the way a servo does."""
+
+    def __init__(self, values: list[float]) -> None:
+        self._values = values
+        self.reads = 0
+
+    async def read(self, channel_id: str) -> Reading:
+        value = self._values[min(self.reads, len(self._values) - 1)]
+        self.reads += 1
+        return Reading(device_id="heater", channel_id=channel_id, value=value)
+
+
+def _verifying(
+    context: HardwareContext,
+    *,
+    follow_s: float = 0.2,
+) -> tuple[WriteVerificationCoordinator, HardwareTrustGate, WriteExpectation, HardwareContext]:
+    registry = HardwareRegistry(
+        HardwareSettings(
+            enabled=True,
+            require_describe_before_write=False,
+            persist_readings=False,
+        ),
+        providers=[_StaticProvider(context)],
+    )
+    registry.load()
+    trust = HardwareTrustGate(candidate_at=1)
+    verifier = WriteVerificationCoordinator(
+        registry,
+        audit_log=HardwareAuditLog(None),
+        trust_gate=trust,
+        identity_provider=lambda: "verification-test",
+        follow_s=follow_s,
+    )
+    resolved = registry.context("heater")
+    assert resolved is not None
+    channel = resolved.channel("power")
+    assert channel is not None
+    expectation = WriteExpectation.from_channel(
+        device_id="heater", channel=channel, commanded_value=5.0
+    )
+    return verifier, trust, expectation, resolved
+
+
+@pytest.fixture
+def fast_convergence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shorten the convergence window so a test waits milliseconds, not seconds."""
+    monkeypatch.setattr(write_verification, "_CONVERGENCE_POLL_S", 0.02)
+    monkeypatch.setattr(write_verification, "_CONVERGENCE_STALL_S", 0.06)
+
+
+@pytest.mark.asyncio
+async def test_a_value_still_travelling_is_pending_not_a_mismatch(
+    fast_convergence: None,
+) -> None:
+    """A servo on its way is not a contradiction, and must not cost trust.
+
+    Observed on a real arm: a 100 mm pose move was read one second after
+    acceptance, was a third of the way there, and the verdict called the write
+    contradicted -- charging the plugin a trust failure for a correct move.
+    """
+    verifier, trust, expectation, context = _verifying(
+        _cross_channel_context(actual=2.0, settling=0.0)
+    )
+    sensor = _ScriptedSensor([2.0 + 0.1 * step for step in range(200)])
+
+    verdict = await verifier._verify_one(
+        context, sensor, context.channel("power"), expectation, None
+    )
+
+    assert verdict.status == WriteVerdictStatus.PENDING.value
+    assert verdict.observed_value == pytest.approx(2.0 + 0.1 * (sensor.reads - 1))
+    assert trust.level("heater", "power") == HardwareTrustLevel.UNTRUSTED
+
+
+@pytest.mark.asyncio
+async def test_a_value_that_comes_to_rest_off_target_is_a_mismatch(
+    fast_convergence: None,
+) -> None:
+    verifier, _trust, expectation, context = _verifying(
+        _cross_channel_context(actual=2.0, settling=0.0)
+    )
+    sensor = _ScriptedSensor([2.0])
+
+    verdict = await verifier._verify_one(
+        context, sensor, context.channel("power"), expectation, None
+    )
+
+    assert verdict.status == WriteVerdictStatus.MISMATCH.value
+    assert verdict.observed_value == pytest.approx(2.0)
+    assert sensor.reads > 1, "a contradiction must be followed before it is reported"
+
+
+@pytest.mark.asyncio
+async def test_a_value_that_arrives_within_the_budget_is_verified(
+    fast_convergence: None,
+) -> None:
+    verifier, _trust, expectation, context = _verifying(
+        _cross_channel_context(actual=2.0, settling=0.0)
+    )
+    sensor = _ScriptedSensor([2.0, 2.5, 5.0])
+
+    verdict = await verifier._verify_one(
+        context, sensor, context.channel("power"), expectation, None
+    )
+
+    assert verdict.status == WriteVerdictStatus.VERIFIED.value
+    assert verdict.observed_value == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
+async def test_a_value_moving_away_from_its_command_is_a_mismatch(
+    fast_convergence: None,
+) -> None:
+    """Departing from the commanded value is not travel toward it.
+
+    Following a value that keeps moving is only justified while it closes the gap;
+    one that walks away from its command is a contradiction the moment it stops
+    progressing, not something to wait out for the whole follow budget.
+    """
+    verifier, _trust, expectation, context = _verifying(
+        _cross_channel_context(actual=2.0, settling=0.0)
+    )
+    sensor = _ScriptedSensor([2.0 - 0.2 * step for step in range(200)])
+
+    verdict = await verifier._verify_one(
+        context, sensor, context.channel("power"), expectation, None
+    )
+
+    assert verdict.status == WriteVerdictStatus.MISMATCH.value
+    assert verdict.observed_value is not None and verdict.observed_value < 5.0
+    assert sensor.reads <= 6, "a departing value is decided by the stall window, not the budget"
 
 
 # ── WriteVerdictEvent payload and structure ─────────────────────────

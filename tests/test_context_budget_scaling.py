@@ -200,6 +200,9 @@ def test_runtime_sync_applies_the_widened_budget_to_the_engine() -> None:
         def set_model_capabilities(self, registry) -> None:
             self.caps = registry
 
+        def set_vision_capability(self, resolver) -> None:
+            pass
+
     ctx = object.__new__(Context)
     engine = _Engine()
     ctx.engine = engine
@@ -230,6 +233,9 @@ def test_runtime_sync_still_contracts_for_a_small_window() -> None:
             self.result_budget = value
 
         def set_model_capabilities(self, registry) -> None:
+            pass
+
+        def set_vision_capability(self, resolver) -> None:
             pass
 
     ctx = object.__new__(Context)

@@ -79,6 +79,32 @@ def test_non_failures_are_not_flagged() -> None:
     assert "side_effect_uncertain" not in result
 
 
+def test_a_failure_reporting_no_side_effect_is_not_flagged() -> None:
+    """A refusal that says nothing was sent settles the question itself.
+
+    Flagging it under the tool's general policy tells the model to verify an
+    effect that cannot exist -- e.g. a hardware skill refused for an unmet
+    requirement before any command reached the device.
+    """
+    refused = _annotate_uncertain_effect(
+        {"ok": False, "error": "skill_unavailable", "side_effect_state": "none"},
+        "external_side_effect",
+    )
+    assert "side_effect_uncertain" not in refused
+
+    for state in ("unknown", "partial", "committed", 7):
+        flagged = _annotate_uncertain_effect(
+            {"ok": False, "error": "timeout", "side_effect_state": state},
+            "external_side_effect",
+        )
+        assert flagged["side_effect_uncertain"] is True, state
+
+    explicit = _annotate_uncertain_effect(
+        {"ok": False, "side_effect_state": "none", "effect_uncertain": True}, "read_only"
+    )
+    assert explicit["side_effect_uncertain"] is True
+
+
 def test_uncertain_policy_set_matches_the_gating_helper() -> None:
     """The helper and the policy set must not drift apart."""
     assert effect_is_uncertain_on_failure("external_side_effect") is True
@@ -312,3 +338,104 @@ def test_duplicate_result_stays_clean_for_certain_outcomes() -> None:
     duplicate = ToolExecutionLedger.duplicate_result(record)
 
     assert "side_effect_uncertain" not in duplicate
+
+
+# ── No-effect results are not protected as side effects ────────────────
+
+
+class _DurableLedgerStore:
+    """The ``tool_executions`` contract: insert-once per key, update by key."""
+
+    def __init__(self) -> None:
+        self.rows: dict[tuple[str, str], object] = {}
+
+    def reserve_tool_execution(self, record) -> None:
+        self.rows.setdefault((record.session_id, record.idempotency_key), record)
+
+    def complete_tool_execution(self, record) -> None:
+        self.rows[(record.session_id, record.idempotency_key)] = record
+
+    def get_tool_execution_by_key(self, session_id: str, key: str):
+        return self.rows.get((session_id, key))
+
+
+def _reserve(ledger, args: dict | None = None, *, turn: str = "t1"):
+    return ledger.reserve(
+        session_id="s", turn_id=turn, command_id="c", tool_call_id=f"call-{turn}",
+        tool_name="hw_skill_run", arguments=args or {"skill": "perceive.snapshot"},
+        policy="external_side_effect",
+    )
+
+
+async def test_a_repeated_observation_runs_again_instead_of_replaying_a_stale_result() -> None:
+    """The live failure: a re-snapshot returned the original, already-expired frame.
+
+    The tool's declared policy is an external side effect (it can drive an arm),
+    so identical arguments were suppressed for the whole session. A result that
+    reports ``side_effect_state: none`` has nothing to duplicate.
+    """
+    from leapflow.engine.tools.tool_execution import ToolExecutionLedger
+
+    store = _DurableLedgerStore()
+    ledger = ToolExecutionLedger(store=store)
+    first, existing = _reserve(ledger)
+    assert existing is None
+    ledger.complete(first, {"ok": True, "side_effect_state": "none", "result": {"frame": "f3"}})
+
+    again, existing = _reserve(ledger, turn="t2")
+    assert existing is None and again.execution_id != first.execution_id
+    durable = store.get_tool_execution_by_key("s", again.idempotency_key)
+    assert durable.status == "running" and durable.result is None
+
+    # A fresh ledger (a restarted daemon) reads the durable row the same way.
+    ledger.complete(again, {"ok": False, "side_effect_state": "none", "error": "refused"})
+    _, existing = _reserve(ToolExecutionLedger(store=store), turn="t3")
+    assert existing is None
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"ok": True, "side_effect_state": "committed"},
+        {"ok": False, "side_effect_state": "partial", "effect_uncertain": True},
+        {"ok": False, "side_effect_state": "none", "effect_uncertain": True},
+        {"ok": False, "error": "timeout"},
+    ],
+)
+async def test_an_attempt_that_may_have_acted_still_suppresses_its_duplicate(result) -> None:
+    from leapflow.engine.tools.tool_execution import ToolExecutionLedger
+
+    ledger = ToolExecutionLedger()
+    first, _ = _reserve(ledger)
+    ledger.complete(first, result)
+    _, existing = _reserve(ledger, turn="t2")
+    assert existing is not None and existing.execution_id == first.execution_id
+
+
+async def test_an_in_flight_original_is_still_waited_for() -> None:
+    from leapflow.engine.tools.tool_execution import ToolExecutionLedger
+
+    ledger = ToolExecutionLedger()
+    first, _ = _reserve(ledger)
+    _, existing = _reserve(ledger)
+    assert existing is not None and existing.status == "running"
+
+
+def test_a_failed_observation_does_not_stop_its_batch() -> None:
+    """A parallel lift was skipped because its sibling's READ failed with no effect."""
+    from leapflow.engine._message_helpers import _should_stop_after_tool_result
+
+    observation = {
+        "ok": False, "failure_code": "target_not_found", "side_effect_state": "none",
+        "observation": True, "execution_policy": "external_side_effect",
+    }
+    assert _should_stop_after_tool_result("hw_skill_run", observation) is False
+
+    # Without the producer's observation verdict, a refused actuation still stops
+    # the batch: later calls may assume it ran.
+    refused = {key: value for key, value in observation.items() if key != "observation"}
+    assert _should_stop_after_tool_result("hw_skill_run", refused) is True
+    uncertain = {**observation, "effect_uncertain": True}
+    assert _should_stop_after_tool_result("hw_skill_run", uncertain) is True
+    acted = {**observation, "side_effect_state": "partial"}
+    assert _should_stop_after_tool_result("hw_skill_run", acted) is True

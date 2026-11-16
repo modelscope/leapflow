@@ -1,0 +1,7 @@
+# Author identity normalization.
+# Format: Proper Name <proper@email> Commit Name <commit@email>
+
+# Same address, several display names.
+班扬 <xingjun.wxj@alibaba-inc.com> Xingjun.Wang <xingjun.wxj@alibaba-inc.com>
+班扬 <xingjun.wxj@alibaba-inc.com> xingjun.wxj <xingjun.wxj@alibaba-inc.com>
+班扬 <xingjun.wxj@alibaba-inc.com> xingjun.wang <xingjun.wxj@alibaba-inc.com>

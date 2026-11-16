@@ -1,0 +1,32 @@
+{
+  "ok": false,
+  "skill": "calib.screws",
+  "status": "failed",
+  "failure_code": "unknown_node",
+  "side_effect_state": "none",
+  "error": "no fleet node 'yahboom/yahboom'",
+  "next_step": "Choose a workcell and a skill listed by hw_skill_list.",
+  "events": [
+    {
+      "event": "connected",
+      "monotonic": 506568.635188666,
+      "node_id": "yahboom",
+      "write_mode": "permit_required",
+      "declaration_digest": "4061e3ce917749911c479896da49fc10c334042cd2751a0a9ad36fb8750852ba",
+      "execute": false
+    },
+    {
+      "event": "calibration_result",
+      "monotonic": 506568.635404291,
+      "result": {
+        "ok": false,
+        "skill": "calib.screws",
+        "status": "failed",
+        "failure_code": "unknown_node",
+        "side_effect_state": "none",
+        "error": "no fleet node 'yahboom/yahboom'",
+        "next_step": "Choose a workcell and a skill listed by hw_skill_list."
+      }
+    }
+  ]
+}

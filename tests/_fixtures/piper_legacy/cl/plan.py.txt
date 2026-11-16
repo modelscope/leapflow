@@ -1,0 +1,287 @@
+"""Geometry: turn one measurement into the four poses the arm is allowed to visit.
+
+The whole plan hangs on one calibrated number, ``C`` -- the flange height at which
+the open jaw touches the table.  With it, a box of height h is grasped with the
+fingertips ``h - d`` below its top, where ``d`` is capped at 14 mm (the jaw pad)
+and at least 3 mm above the table.  Nothing here trusts a nominal tool length:
+``C`` comes from a defended contact search on the day of the run, and the box's
+height and footprint come from the same depth image that will be re-checked
+before every descent.
+
+Flange space throughout: the vendor TCP offset is a software record only, so the
+SDK still reports the flange and every pose below is a flange pose.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from typing import Any
+
+from . import config
+
+
+def interpolate_path(poses: list[list[float]], step_mm: float = 5.0) -> list[list[float]]:
+    """Sample the same straight Cartesian segments used by the execution runner."""
+    if not poses or not math.isfinite(step_mm) or step_mm <= 0:
+        raise ValueError("nonempty path and positive finite waypoint spacing required")
+    if any(len(p) != 6 or not all(math.isfinite(v) for v in p) for p in poses):
+        raise ValueError("finite six-component path poses required")
+    rows = [list(poses[0])]
+    for a, b in zip(poses, poses[1:]):
+        delta = [y - x for x, y in zip(a, b)]
+        delta[3:] = [(v + 180) % 360 - 180 for v in delta[3:]]
+        steps = max(1, math.ceil(math.sqrt(sum(v*v for v in delta[:3])) / step_mm),
+                    math.ceil(max(abs(v) for v in delta[3:]) / 2.0))
+        rows.extend([x + d*i/steps for x, d in zip(a, delta)] for i in range(1, steps+1))
+    return rows
+
+
+def load_table_model() -> dict | None:
+    if not config.TABLE_MODEL.exists():
+        return None
+    try:
+        return config.load_json(config.TABLE_MODEL)
+    except (OSError, ValueError):
+        return None
+
+
+def save_table_model(payload: dict) -> None:
+    payload = {"created_at": time.time(), **payload}
+    config.dump_json(config.TABLE_MODEL, payload)
+
+
+def table_from_model(model: dict, cfg: config.Cfg) -> dict:
+    """The numbers the plan needs, with an explicit fallback for the tool length."""
+    contact = float(model.get("contact_z") or 0.0)
+    declared = float(cfg.geometry.declared_table_z_mm)
+    tool = float(model.get("tool_len_mm") or (contact - declared) or cfg.geometry.tool_len_fallback_mm)
+    return {"contact_z": contact, "tool_len_mm": round(tool, 2),
+            "spread_mm": float(model.get("spread_mm") or 0.0),
+            "points": model.get("points") or [], "created_at": model.get("created_at")}
+
+
+def rz_candidates(yaw_long_deg: float) -> list[float]:
+    """Tool yaw that closes the jaws across the object's short side, both directions.
+
+    The Piper jaw opens along tool X, and with the tool pointing down tool X lies
+    at ``rz`` in the base plane, so the opening is parallel to the short axis when
+    ``rz`` equals the short-axis angle.  The jaw is symmetric, hence two choices,
+    and the IK preflight picks the one with more wrist margin.
+    """
+    short = yaw_long_deg + 90.0
+    return [round(((short + 180.0) % 360.0) - 180.0, 2), round(((short + 360.0) % 360.0) - 180.0, 2)]
+
+
+def z_ceiling(cfg: config.Cfg) -> float:
+    """Highest flange z a plan may ask for: the board refuses anything above the envelope."""
+    return float(cfg.geometry.envelope["z"][1]) - 5.0
+
+
+def grasp_plan(observation: dict, table: dict, cfg: config.Cfg) -> dict:
+    foot = observation["footprint"]
+    height = float(observation["height_mm"])
+    short = float(foot["short_mm"])
+    long_side = float(foot["long_mm"])
+    centre = [float(v) for v in foot["centre_mm"]]
+    table_z = float(observation.get("projection_z") or observation["table"]["z"])
+
+    dip = min(float(cfg.grasp.dip_max_mm), height - float(cfg.grasp.dip_min_clearance_mm))
+    dip = max(2.0, dip)
+    grasp_z = table["contact_z"] + height - dip
+    approach_z = min(table["contact_z"] + height + float(cfg.motion.approach_clearance_mm), z_ceiling(cfg))
+    pre_z = table["contact_z"] + height + float(cfg.motion.pre_clearance_mm)
+    open_mm = min(float(cfg.grasp.open_max_mm), float(cfg.grasp.jaw_max_mm) - 2.0)
+    close_mm = min(open_mm - 2.0, max(float(cfg.grasp.hold_min_mm), short - float(cfg.grasp.close_margin_mm)))
+    plan = {
+        "centre": [round(centre[0], 2), round(centre[1], 2)],
+        "table_z": round(table_z, 2), "height_mm": round(height, 2),
+        "height_quality": observation.get("height_quality", "ok"),
+        "top_spread_mm": round(float((observation.get("top") or {}).get("spread_mm") or 0.0), 2),
+        "table_spread_mm": round(float((observation.get("table") or {}).get("spread_mm") or 0.0), 2),
+        "short_mm": round(short, 2), "long_mm": round(long_side, 2),
+        "yaw_long_deg": float(foot["yaw_long_deg"]),
+        "rz_options": rz_candidates(float(foot["yaw_long_deg"])),
+        "rz": rz_candidates(float(foot["yaw_long_deg"]))[0],
+        "dip_mm": round(dip, 2),
+        "contact_z": round(table["contact_z"], 2),
+        "tool_len_mm": round(table.get("tool_len_mm", 0.0), 2),
+        "grasp_z": round(grasp_z, 2),
+        "pre_z": round(pre_z, 2),
+        "approach_z": round(approach_z, 2),
+        "retreat_z": round(grasp_z + float(cfg.motion.lift_after_grasp_mm), 2),
+        "carry_z": float(cfg.motion.carry_z_mm),
+        "open_mm": round(open_mm, 2),
+        "close_mm": round(close_mm, 2),
+        "fill": float(foot.get("fill") or 0.0),
+        "place_z": None,
+        "source_frame": observation.get("frame"),
+        "observed_at": time.time(),
+    }
+    if plan["fill"] < 0.62:
+        plan.setdefault("notes", []).append(
+            f"the mask fills only {plan['fill']:.2f} of its rectangle, so the short side may read low; "
+            "the jaws open to the mechanical maximum and the close is effort-limited")
+    plan["problems"] = validate_grasp(plan, cfg)
+    return plan
+
+
+def place_plan(grasp: dict, cfg: config.Cfg) -> dict:
+    """Set the box back down; ``place.target_mm: null`` means where it was picked.
+
+    The wrist yaw is the one the arm holds *now* (``rz_place``, written by the
+    flip); placing with the pick yaw would undo the flip on the way down.
+    """
+    target = list(cfg.get_path("place.target_mm") or grasp["centre"])
+    place_z = grasp["contact_z"] + float(cfg.place.clearance_mm) + grasp["height_mm"] - grasp["dip_mm"]
+    plan = {
+        "x": float(target[0]), "y": float(target[1]),
+        "place_z": round(place_z, 2),
+        "pre_z": round(place_z + 20.0, 2),
+        "approach_z": round(min(max(place_z + 60.0, grasp["carry_z"]), z_ceiling(cfg)), 2),
+        "open_mm": float(cfg.place.open_width_mm),
+        "settle_s": float(cfg.place.settle_s),
+        "rz": float(grasp.get("rz_place", grasp["rz"])),
+        "flipped": "rz_place" in grasp,
+    }
+    plan["problems"] = validate_place(plan, grasp, cfg)
+    return plan
+
+
+def validate_grasp(plan: dict, cfg: config.Cfg) -> list[str]:
+    problems: list[str] = []
+    envelope = cfg.geometry.envelope
+    x, y = plan["centre"]
+    if not (envelope["x"][0] + 10 <= x <= envelope["x"][1] - 10):
+        problems.append(f"centre x {x:.1f} outside the reachable band")
+    if not (envelope["y"][0] + 10 <= y <= envelope["y"][1] - 10):
+        problems.append(f"centre y {y:.1f} outside the reachable band")
+    if plan["height_mm"] < 8.0:
+        problems.append(f"height {plan['height_mm']:.1f} mm too thin to grasp")
+    if plan.get("height_quality") != "ok":
+        problems.append(f"height measurement is {plan.get('height_quality')}; re-survey with a clear view")
+    if plan["short_mm"] + 2.0 > plan["open_mm"]:
+        problems.append(f"short side {plan['short_mm']:.1f} mm leaves under 2 mm of jaw clearance "
+                        f"at an opening of {plan['open_mm']:.1f} mm")
+    if plan["short_mm"] < float(cfg.grasp.hold_min_mm) + 2:
+        problems.append(f"short side {plan['short_mm']:.1f} mm too narrow to hold")
+    if plan["close_mm"] > plan["open_mm"]:
+        problems.append("close width exceeds open width")
+    if plan["grasp_z"] <= plan["table_z"] + 3.0:
+        problems.append(f"grasp z {plan['grasp_z']:.1f} leaves no table clearance")
+    if plan["pre_z"] <= plan["grasp_z"] + 5.0:
+        problems.append("pre-grasp is not above the grasp")
+    if plan["approach_z"] <= plan["pre_z"]:
+        problems.append("approach is not above the pre-grasp")
+    for key in ("grasp_z", "pre_z", "approach_z", "retreat_z"):
+        if not (envelope["z"][0] + 5 <= plan[key] <= envelope["z"][1] - 5):
+            problems.append(f"{key} {plan[key]:.1f} outside the z envelope")
+    return problems
+
+
+def validate_place(plan: dict, grasp: dict, cfg: config.Cfg) -> list[str]:
+    problems: list[str] = []
+    envelope = cfg.geometry.envelope
+    if not (envelope["x"][0] + 10 <= plan["x"] <= envelope["x"][1] - 10):
+        problems.append(f"place x {plan['x']:.1f} outside the reachable band")
+    if not (envelope["y"][0] + 10 <= plan["y"] <= envelope["y"][1] - 10):
+        problems.append(f"place y {plan['y']:.1f} outside the reachable band")
+    if plan["place_z"] < 80.0:
+        problems.append(f"place z {plan['place_z']:.1f} implausibly low for a flange pose")
+    if grasp["height_mm"] - grasp["dip_mm"] < 2.0:
+        problems.append("the box bottom would sit on the fingertips")
+    if not plan["place_z"] + 10.0 <= plan["approach_z"] <= z_ceiling(cfg):
+        problems.append(f"place approach z {plan['approach_z']:.1f} outside the z envelope")
+    return problems
+
+
+def grasp_poses(plan: dict) -> dict[str, list[float]]:
+    rz = plan["rz"]
+    x, y = plan["centre"]
+    rpy = [-180.0, 0.0, rz]
+    return {
+        "approach": [x, y, plan["approach_z"], *rpy],
+        "pre": [x, y, plan["pre_z"], *rpy],
+        "grasp": [x, y, plan["grasp_z"], *rpy],
+        "retreat": [x, y, plan["retreat_z"], *rpy],
+    }
+
+
+def carry_pose(plan: dict) -> list[float]:
+    x, y = plan["centre"]
+    return [x, y, plan["carry_z"], -180.0, 0.0, plan["rz"]]
+
+
+def place_poses(plan: dict) -> dict[str, list[float]]:
+    rpy = [-180.0, 0.0, plan["rz"]]
+    return {
+        "approach": [plan["x"], plan["y"], plan["approach_z"], *rpy],
+        "pre": [plan["x"], plan["y"], plan["pre_z"], *rpy],
+        "place": [plan["x"], plan["y"], plan["place_z"], *rpy],
+        "retreat": [plan["x"], plan["y"], plan.get("retreat_z", plan["pre_z"] + 40.0), *rpy],
+    }
+
+
+def choose_rz(ik_results: dict[str, list[dict]], options: list[float]) -> tuple[float, dict]:
+    """Pick the feasible yaw with the largest worst-joint margin."""
+    best = (options[0], {"feasible": False, "margin": None, "reason": "no option"})
+    details: list[str] = []
+    for option in options:
+        rows = ik_results.get(f"{option:.2f}") or []
+        if not rows:
+            details.append(f"{option:.1f}: no result")
+            continue
+        blocked = [row for row in rows if not row.get("feasible")]
+        if blocked:
+            reason = blocked[0].get("error") or blocked[0].get("why")
+            if not reason:
+                reason = (f"off by {float(blocked[0].get('error_mm') or 0):.1f} mm / "
+                          f"{float(blocked[0].get('error_deg') or 0):.1f} deg")
+            details.append(f"{option:.1f}: {reason}")
+            continue
+        margin = min(min(row.get("margins_deg") or [0.0]) for row in rows)
+        if best[1]["margin"] is None or margin > best[1]["margin"]:
+            best = (option, {"feasible": True, "margin": margin, "reason": "ok"})
+    if best[1]["margin"] is None:
+        best[1]["reason"] = "; ".join(details) or "no option"
+    return best[0], best[1]
+
+
+def with_rz(plan: dict, rz: float) -> dict:
+    out = dict(plan)
+    out["rz"] = float(rz)
+    return out
+
+
+def summary(plan: dict) -> dict[str, Any]:
+    return {
+        "centre": plan["centre"], "rz": plan["rz"],
+        "table_z": plan["table_z"], "contact_z": plan["contact_z"],
+        "grasp_z": plan["grasp_z"], "pre_z": plan["pre_z"], "approach_z": plan["approach_z"],
+        "dip_mm": plan["dip_mm"], "open_mm": plan["open_mm"], "close_mm": plan["close_mm"],
+        "box": {"long": plan["long_mm"], "short": plan["short_mm"], "height": plan["height_mm"],
+                "height_quality": plan.get("height_quality"),
+                "top_spread_mm": plan.get("top_spread_mm"),
+                "table_spread_mm": plan.get("table_spread_mm")},
+        "problems": plan.get("problems") or [],
+    }
+
+
+def describe(plan: dict) -> str:
+    lines = [
+        f"box centre ({plan['centre'][0]:.1f}, {plan['centre'][1]:.1f}) mm, "
+        f"{plan['long_mm']:.0f} x {plan['short_mm']:.0f} x {plan['height_mm']:.0f} mm, "
+        f"long-axis yaw {plan['yaw_long_deg']:.1f} deg",
+        f"tool yaw {plan['rz']:.1f} deg (options {plan['rz_options']}), jaws {plan['open_mm']:.0f} -> "
+        f"{plan['close_mm']:.0f} mm",
+        f"contact z {plan['contact_z']:.1f} (tool {plan['tool_len_mm']:.1f}), table z {plan['table_z']:.1f}",
+        f"flange path z: approach {plan['approach_z']:.1f} -> pre {plan['pre_z']:.1f} -> "
+        f"grasp {plan['grasp_z']:.1f} -> retreat {plan['retreat_z']:.1f} -> carry {plan['carry_z']:.0f}",
+        f"at grasp the fingertips sit {plan['dip_mm']:.1f} mm below the box top and "
+        f"{plan['height_mm'] - plan['dip_mm']:.1f} mm above the table "
+        f"(height {plan.get('height_quality')}, top spread {plan.get('top_spread_mm')} mm, "
+        f"table spread {plan.get('table_spread_mm')} mm)",
+    ]
+    if plan.get("problems"):
+        lines.append("PROBLEMS: " + "; ".join(plan["problems"]))
+    return "\n".join(lines)

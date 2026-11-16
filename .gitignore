@@ -223,6 +223,8 @@ __marimo__/
 .leapflow/
 .learnings/
 .idea/
+# Qoder agent scratch space (artifacts, snapshots, vendored wheels)
+.qoder/
 
 # Swift / Xcode
 .build/

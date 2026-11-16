@@ -31,8 +31,19 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Iterable, Iterator, Protocol, runtime_checkable
 
-from leapflow.hardware.context import Channel, DegradationPolicy, HardwareContext, Quality, as_numeric
-from leapflow.hardware.degradation import DegradationCoordinator
+from leapflow.hardware.context import (
+    Channel,
+    DegradationPolicy,
+    HardwareContext,
+    Quality,
+    as_numeric,
+)
+from leapflow.hardware.degradation import (
+    DEGRADATION_SUPPRESSED,
+    DegradationCoordinator,
+    degradation_actions_enabled,
+    sensor_loss_debounce_s,
+)
 from leapflow.hardware.transport import Reading
 
 logger = logging.getLogger(__name__)
@@ -95,6 +106,20 @@ _EVENT_CLASS_MAP: dict[str, str] = {
     "calibration_completed": HardwareEventClass.RECORD,
     "calibration_failed": HardwareEventClass.RECORD,
     "calibration_expired": HardwareEventClass.RECORD,
+    "calibration_candidate": HardwareEventClass.RECORD,
+    "calibration_rejected": HardwareEventClass.RECORD,
+    "calibration_no_op": HardwareEventClass.RECORD,
+    "calibration_activated": HardwareEventClass.RECORD,
+    "calibration_rolled_back": HardwareEventClass.RECORD,
+    "calibration_invalidated": HardwareEventClass.RECORD,
+    "calibration_drift": HardwareEventClass.DELIBERATIVE,
+    # A withheld supervisory action is a warning for a person, never a trigger:
+    # classing it REFLEX would hand the alert policy the stop just withheld.
+    DEGRADATION_SUPPRESSED: HardwareEventClass.RECORD,
+    # Advisory limits watch what the device's own firmware already enforces; a
+    # breach informs a person and must never drive a reflex (see ``advisory``).
+    "advisory_exceeded": HardwareEventClass.RECORD,
+    "advisory_cleared": HardwareEventClass.RECORD,
 }
 
 
@@ -158,6 +183,19 @@ class EventKind:
     """A calibration procedure failed before producing a valid correction."""
     CALIBRATION_EXPIRED = "calibration_expired"
     """The last successful calibration has exceeded its validity period."""
+    CALIBRATION_CANDIDATE = "calibration_candidate"
+    CALIBRATION_REJECTED = "calibration_rejected"
+    CALIBRATION_NO_OP = "calibration_no_op"
+    CALIBRATION_ACTIVATED = "calibration_activated"
+    CALIBRATION_ROLLED_BACK = "calibration_rolled_back"
+    CALIBRATION_INVALIDATED = "calibration_invalidated"
+    CALIBRATION_DRIFT = "calibration_drift"
+    DEGRADATION_SUPPRESSED = DEGRADATION_SUPPRESSED
+    """A degradation policy triggered while actions are disabled; reported only."""
+    ADVISORY_EXCEEDED = "advisory_exceeded"
+    """A monitor-only limit the device protects itself against was breached."""
+    ADVISORY_CLEARED = "advisory_cleared"
+    """A breached advisory limit returned inside its hysteresis band."""
 
 
 @dataclass(frozen=True)
@@ -199,7 +237,11 @@ class HardwareEvent:
     def to_detail(self) -> str:
         """Return a compact one-line description for the signal pipeline."""
         where = f"{self.device_id}.{self.channel_id}"
-        rendered = "" if self.value is None else f" value={self.value}{f' {self.unit}' if self.unit else ''}"
+        rendered = (
+            ""
+            if self.value is None
+            else f" value={self.value}{f' {self.unit}' if self.unit else ''}"
+        )
         return f"[{self.kind}] {where}{rendered}: {self.detail}"
 
     @property
@@ -397,9 +439,7 @@ class HardwareEventDetector:
                 device_id=self._context.device_id,
                 channel_id=channel.channel_id,
                 quantity=channel.quantity,
-                detail=(
-                    f"no sample for {elapsed:.2f}s on a {channel.sample_rate_hz:g} Hz channel"
-                ),
+                detail=(f"no sample for {elapsed:.2f}s on a {channel.sample_rate_hz:g} Hz channel"),
                 unit=channel.unit,
                 observed_at=time.time(),
             ),
@@ -428,11 +468,7 @@ class HardwareEventDetector:
             # Re-entering is worth one event too, so a watcher can see recovery
             # instead of inferring it from silence.
             self._breached = False
-            events.append(
-                self._event(
-                    EventKind.SETTLED, reading, "returned to the declared range"
-                )
-            )
+            events.append(self._event(EventKind.SETTLED, reading, "returned to the declared range"))
 
         if (
             envelope.max_rate is not None
@@ -448,8 +484,7 @@ class HardwareEventDetector:
                     self._event(
                         EventKind.RATE_EXCEEDED,
                         reading,
-                        f"changing at {observed:g}/s, above the declared "
-                        f"{envelope.max_rate:g}/s",
+                        f"changing at {observed:g}/s, above the declared {envelope.max_rate:g}/s",
                     )
                 )
         return events
@@ -511,6 +546,7 @@ class HardwareStreamSource:
         self._comm_loss_start: float | None = None
         self._degradation_triggered: bool = False
         self._sensor_loss_streak: int = 0
+        self._sensor_loss_since: float | None = None
         self._sensor_loss_triggered: bool = False
         self._last_degradation_outcome: Any = None
 
@@ -636,12 +672,14 @@ class HardwareStreamSource:
         """Evaluate DegradationPolicy.sensor_loss_policy on quality streaks.
 
         Non-OK readings (STALE/SATURATED/SUSPECT) accumulate a streak; a run of
-        three triggers the declared ``sensor_loss_policy`` once.  An OK reading
-        resets both the streak and the triggered flag so a future loss can fire.
+        three that has also lasted ``sensor_loss_debounce_s`` triggers the declared
+        ``sensor_loss_policy`` once.  An OK reading resets the streak and the
+        triggered flag so a future loss can fire.
         """
         policy = self._degradation_policy
         if reading.quality == Quality.OK.value:
             self._sensor_loss_streak = 0
+            self._sensor_loss_since = None
             if self._sensor_loss_triggered:
                 self._registry.clear_degradation(
                     self._context.device_id, recovery="healthy_sensor_read"
@@ -649,12 +687,18 @@ class HardwareStreamSource:
             self._sensor_loss_triggered = False
             return
         self._sensor_loss_streak += 1
+        now = time.monotonic()
+        if self._sensor_loss_since is None:
+            self._sensor_loss_since = now
         if policy is None or self._sensor_loss_triggered:
             return
         # Three consecutive degraded samples mirrors the detector's own threshold
         # for QUALITY_DEGRADED: a lone suspect sample is noise, a run of them is
-        # a fault worth acting on.
+        # a fault worth acting on.  The duration floor keeps a fast channel from
+        # reaching three samples inside one transient.
         if self._sensor_loss_streak < 3:
+            return
+        if now - self._sensor_loss_since < sensor_loss_debounce_s(self._registry):
             return
         self._sensor_loss_triggered = True
         await self._execute_degradation(policy.sensor_loss_policy, reason="sensor_loss")
@@ -695,7 +739,10 @@ class HardwareStreamSource:
 
         Callers that gate commands (e.g. ``hold_position``) can read this to
         decide whether to issue new writes without blocking the sampling loop.
+        A withheld (report-only) trigger is not in effect and blocks nothing.
         """
+        if not degradation_actions_enabled(self._registry):
+            return False
         return self._degradation_triggered or self._sensor_loss_triggered
 
     @property
@@ -768,9 +815,7 @@ class HardwareStreamSource:
                     # Reset consecutive counters on recovery so a new breach cycle
                     # starts fresh rather than carrying stale counts.
                     if event.kind == EventKind.SETTLED:
-                        self._alert_policy.reset_channel(
-                            event.device_id, event.channel_id
-                        )
+                        self._alert_policy.reset_channel(event.device_id, event.channel_id)
                 except Exception as exc:  # noqa: BLE001 - policy must not stop sampling
                     logger.warning("Hardware alert policy raised: %s", exc, exc_info=True)
 
@@ -870,8 +915,13 @@ class BatchStreamCoordinator:
         self._started_monotonic: float | None = None
         self._comm_loss_start: float | None = None
         self._degradation_triggered: bool = False
-        self._sensor_loss_streak: int = 0
+        # Streaks are per channel: one batch carries one sample of every channel,
+        # so a single summed counter would read one stale poll of three channels
+        # as "three consecutive degraded samples".
+        self._sensor_loss_streaks: dict[str, int] = {}
+        self._sensor_loss_since: dict[str, float] = {}
         self._sensor_loss_triggered: bool = False
+        self._failed_channel_id: str = ""
         self._last_degradation_outcome: Any = None
 
     @property
@@ -910,16 +960,16 @@ class BatchStreamCoordinator:
 
         The sampling rate is the maximum declared rate across all channels.
         """
-        max_rate = max((ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0)
+        max_rate = max(
+            (ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0
+        )
         interval = 1.0 / max_rate if max_rate > 0 else 1.0
         consecutive_failures = 0
         self._started_monotonic = time.monotonic()
         next_at = self._started_monotonic
         while not self._stopping.is_set():
             try:
-                batch = await self._registry.read_batch(
-                    self._context.device_id, self._channel_ids
-                )
+                batch = await self._registry.read_batch(self._context.device_id, self._channel_ids)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - one device must not stop the rest
@@ -934,7 +984,7 @@ class BatchStreamCoordinator:
                 # Check staleness on all channels during failures.
                 for detector in self._detectors.values():
                     self._dispatch(detector.check_stale(), emit)
-                await self._sleep(min(interval * (2 ** consecutive_failures), 30.0))
+                await self._sleep(min(interval * (2**consecutive_failures), 30.0))
                 next_at = time.monotonic()
                 continue
 
@@ -985,27 +1035,42 @@ class BatchStreamCoordinator:
         await self._execute_degradation(policy.comm_loss_policy, reason="comm_loss")
 
     async def _track_sensor_quality(self, reading: Reading) -> None:
-        """Evaluate DegradationPolicy.sensor_loss_policy on quality streaks."""
+        """Evaluate DegradationPolicy.sensor_loss_policy on per-channel quality streaks.
+
+        A channel must be degraded in three consecutive batches spanning at least
+        ``sensor_loss_debounce_s`` -- the same rule :class:`HardwareStreamSource`
+        applies to its single channel. The latch clears only once every channel
+        reads OK again, so a healthy sibling in the same batch cannot cancel a
+        loss that is still in progress.
+        """
         policy = self._degradation_policy
+        channel_id = reading.channel_id
         if reading.quality == Quality.OK.value:
-            self._sensor_loss_streak = 0
-            if self._sensor_loss_triggered:
+            self._sensor_loss_streaks[channel_id] = 0
+            self._sensor_loss_since.pop(channel_id, None)
+            if self._sensor_loss_triggered and not any(self._sensor_loss_streaks.values()):
                 self._registry.clear_degradation(
                     self._context.device_id, recovery="healthy_batch_sensor_read"
                 )
-            self._sensor_loss_triggered = False
+                self._sensor_loss_triggered = False
             return
-        self._sensor_loss_streak += 1
+        streak = self._sensor_loss_streaks.get(channel_id, 0) + 1
+        self._sensor_loss_streaks[channel_id] = streak
+        now = time.monotonic()
+        since = self._sensor_loss_since.setdefault(channel_id, now)
         if policy is None or self._sensor_loss_triggered:
             return
-        if self._sensor_loss_streak < 3:
+        if streak < 3 or now - since < sensor_loss_debounce_s(self._registry):
             return
         self._sensor_loss_triggered = True
+        self._failed_channel_id = channel_id
         await self._execute_degradation(policy.sensor_loss_policy, reason="sensor_loss")
 
     async def _execute_degradation(self, action: str, *, reason: str) -> None:
         """Delegate batch-source transitions to the shared coordinator."""
-        failed_channel_id = self._channel_ids[0] if self._channel_ids else ""
+        failed_channel_id = self._failed_channel_id or (
+            self._channel_ids[0] if self._channel_ids else ""
+        )
         outcome = await self._degradation_coordinator.execute(
             action,
             reason=reason,
@@ -1016,6 +1081,8 @@ class BatchStreamCoordinator:
         if outcome.completed and outcome.action == "switch_sensor":
             self._degradation_triggered = False
             self._sensor_loss_triggered = False
+            self._sensor_loss_streaks.pop(failed_channel_id, None)
+        self._failed_channel_id = ""
 
     async def _switch_sensor(self, target_channel_id: str) -> bool:
         """Replace one failed batch input only after healthy fallback readback."""
@@ -1030,7 +1097,7 @@ class BatchStreamCoordinator:
             return False
         if reading.quality != Quality.OK.value:
             return False
-        failed = next(
+        failed = self._failed_channel_id or next(
             (channel_id for channel_id in self._channel_ids if channel_id != target_channel_id),
             "",
         )
@@ -1046,6 +1113,8 @@ class BatchStreamCoordinator:
     @property
     def degradation_triggered(self) -> bool:
         """Return True while a declared degradation action is in effect."""
+        if not degradation_actions_enabled(self._registry):
+            return False
         return self._degradation_triggered or self._sensor_loss_triggered
 
     @property
@@ -1098,9 +1167,7 @@ class BatchStreamCoordinator:
                 try:
                     self._alert_policy.evaluate(event)
                     if event.kind == EventKind.SETTLED:
-                        self._alert_policy.reset_channel(
-                            event.device_id, event.channel_id
-                        )
+                        self._alert_policy.reset_channel(event.device_id, event.channel_id)
                 except Exception as exc:  # noqa: BLE001 - policy must not stop sampling
                     logger.warning("Hardware alert policy raised: %s", exc, exc_info=True)
 
@@ -1122,7 +1189,9 @@ class BatchStreamCoordinator:
     @property
     def health(self) -> dict[str, Any]:
         """Return batch sampling health metrics."""
-        max_rate = max((ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0)
+        max_rate = max(
+            (ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0
+        )
         started = self._started_monotonic
         elapsed = (time.monotonic() - started) if started is not None else 0.0
         observed = (self._samples / elapsed) if elapsed > 0 else 0.0
@@ -1160,8 +1229,7 @@ def build_batch_coordinators(
     coordinators: list[BatchStreamCoordinator] = []
     for context in registry.contexts():
         channels = tuple(
-            ch for ch in context.streaming_channels
-            if ch.is_readable and not ch.is_media
+            ch for ch in context.streaming_channels if ch.is_readable and not ch.is_media
         )
         if not channels:
             continue

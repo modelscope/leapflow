@@ -279,7 +279,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # leap board (LeapBoard monitoring dashboard)
     dashboard_parser = subparsers.add_parser("board", help="Open the LeapBoard session analysis board")
-    dashboard_parser.add_argument("template", nargs="?", default="", help="Template lens to render (default: generic)")
+    dashboard_parser.add_argument(
+        "template", nargs="?", default="",
+        help="Template lens to render (default: generic), or 'stop' / 'status' to manage board servers",
+    )
+    dashboard_parser.add_argument(
+        "--all", action="store_true",
+        help="With 'stop': stop every LeapBoard server of this user, not only this profile's",
+    )
     dashboard_parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     dashboard_parser.add_argument("--token", default="", help=argparse.SUPPRESS)
     dashboard_parser.add_argument("--port", type=int, default=0, help="Override the dashboard port")
@@ -347,7 +354,12 @@ def main(argv: list[str] | None = None) -> int:
     hw_verify.add_argument("device", help="Device id to verify")
     hw_verify.add_argument("--as", dest="verifier", default="", help="Verifier identity (e.g. operator name)")
     hw_validate = hw_sub.add_parser("validate", parents=[hw_json], help="Validate a device YAML without loading")
-    hw_validate.add_argument("file_or_device", help="YAML file path or device id")
+    hw_validate.add_argument("file_or_device", nargs="?", default="", help="Device id (default: all)")
+    hw_validate.add_argument(
+        "--workcells", nargs="?", const="", default=None, metavar="DIR",
+        help="Admit workcell declarations offline instead (default DIR: the profile's)",
+    )
+    hw_validate.add_argument("--devices", default="", metavar="DIR", help="Device YAML for --workcells")
     hw_sub.add_parser("permit-key", parents=[hw_json], help="Generate an Ed25519 keypair for execution permits")
     # Onboarding subcommands
     hw_init = hw_sub.add_parser("init", parents=[hw_json], help="Generate an annotated hc.v1 device template")

@@ -5,6 +5,10 @@ Aggregates health signals from multiple sources:
 - HardwareStreamSource / BatchStreamCoordinator: comm_loss, sensor_loss events
 - HighFrequencyControlBus: overrun, safety_violation stats
 - HardwareRegistry: device probe results
+- FrameHub stats in a camera's probe: stale / recovered / frame-loss transitions,
+  published on the registry's signal path as ordinary ``HardwareEvent`` kinds
+- Advisory limits (``hardware.advisory_limits``): monitor-only breaches of what the
+  device firmware already enforces, published with exponential backoff
 - FleetManager: node heartbeat status
 
 Executes DegradationPolicy actions based on aggregated health:
@@ -29,10 +33,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Mapping
 
-from leapflow.hardware.degradation import DegradationCoordinator
+from leapflow.hardware.advisory import AdvisoryWatch, load_advisory_limits
+from leapflow.hardware.degradation import (
+    DegradationCoordinator,
+    degradation_actions_enabled,
+    report_suppressed,
+)
+from leapflow.hardware.vision.health import FrameHealthTracker
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +57,15 @@ _HEALTH_DEGRADED = "degraded"
 _HEALTH_CRITICAL = "critical"
 _HEALTH_OFFLINE = "offline"
 
-_VALID_HEALTH_STATES = frozenset({
-    _HEALTH_OK,
-    _HEALTH_WARNING,
-    _HEALTH_DEGRADED,
-    _HEALTH_CRITICAL,
-    _HEALTH_OFFLINE,
-})
+_VALID_HEALTH_STATES = frozenset(
+    {
+        _HEALTH_OK,
+        _HEALTH_WARNING,
+        _HEALTH_DEGRADED,
+        _HEALTH_CRITICAL,
+        _HEALTH_OFFLINE,
+    }
+)
 
 
 @dataclass
@@ -91,6 +103,33 @@ class DeviceHealthRecord:
         }
 
 
+@dataclass
+class _HaltEpisode:
+    """Halt attempts on one device since it last left the offline state.
+
+    An offline device is re-halted on every probe while degradation actions are
+    enabled -- the stop must land the moment the link returns -- so the attempts are
+    deliberate, but logging each one buried the log under thousands of identical
+    tracebacks. Only the log cadence follows this record; the halt cadence does not.
+    """
+
+    attempts: int = 0
+    failures: int = 0
+
+
+def _is_power_of_two(count: int) -> bool:
+    return count > 0 and count & (count - 1) == 0
+
+
+def _advisory_watch(registry: Any) -> AdvisoryWatch | None:
+    """Build the advisory watch from the registry's settings; None when nothing is watched."""
+    limits = load_advisory_limits(getattr(registry, "settings", None))
+    if not limits:
+        return None
+    logger.info("HealthMonitor: watching %d advisory limit(s)", len(limits))
+    return AdvisoryWatch(registry, limits)
+
+
 # ---------------------------------------------------------------------------
 # HardwareHealthMonitor
 # ---------------------------------------------------------------------------
@@ -123,6 +162,11 @@ class HardwareHealthMonitor:
 
         # Per-device health tracking.
         self._records: dict[str, DeviceHealthRecord] = {}
+        self._halts: dict[str, _HaltEpisode] = {}
+        self._frames = FrameHealthTracker()
+        self._advisories = _advisory_watch(registry)
+        from leapflow.hardware.calibration.lifecycle import LifecycleReceiver
+        self._calibration_lifecycle = LifecycleReceiver(registry)
         self._poll_task: asyncio.Task[None] | None = None
         self._stopped = asyncio.Event()
         self._started = False
@@ -146,9 +190,7 @@ class HardwareHealthMonitor:
         # Seed initial health records from the registry.
         self._seed_records()
 
-        self._poll_task = asyncio.create_task(
-            self._poll_loop(), name="hw-health-monitor"
-        )
+        self._poll_task = asyncio.create_task(self._poll_loop(), name="hw-health-monitor")
         self._started = True
         logger.info(
             "HardwareHealthMonitor started (poll_interval=%.1fs, devices=%d)",
@@ -234,12 +276,16 @@ class HardwareHealthMonitor:
         prev_status = record.status
         new_status = self._compute_health_status(record)
         record.status = new_status
+        if new_status != _HEALTH_OFFLINE:
+            self._halts.pop(device_id, None)
 
         # If status worsened, check degradation policy.
         if new_status in (_HEALTH_DEGRADED, _HEALTH_CRITICAL) and prev_status == _HEALTH_OK:
             await self._apply_degradation_policy(device_id, record)
         elif new_status == _HEALTH_OFFLINE:
-            await self._execute_halt(device_id, reason="device offline (probe failed)")
+            # A withheld halt is reported once per offline episode, not per probe.
+            if prev_status != _HEALTH_OFFLINE or degradation_actions_enabled(self._registry):
+                await self._execute_halt(device_id, reason="device offline (probe failed)")
 
     @staticmethod
     def _compute_health_status(record: DeviceHealthRecord) -> str:
@@ -256,9 +302,7 @@ class HardwareHealthMonitor:
             return _HEALTH_WARNING
         return _HEALTH_OK
 
-    async def _apply_degradation_policy(
-        self, device_id: str, record: DeviceHealthRecord
-    ) -> None:
+    async def _apply_degradation_policy(self, device_id: str, record: DeviceHealthRecord) -> None:
         """Look up and execute the DegradationPolicy for a device."""
         context = self._get_device_context(device_id)
         if context is None:
@@ -289,32 +333,71 @@ class HardwareHealthMonitor:
             policy_action,
             reason=reason,
         )
-        record.degradation_policy_active = outcome.action
+        record.degradation_policy_active = "" if outcome.suppressed else outcome.action
+        if outcome.suppressed:
+            record.degradation_reason = f"{reason}: reported only (degradation actions disabled)"
         if outcome.error:
             record.degradation_reason = f"{reason}: {outcome.error}"
 
     async def _execute_halt(self, device_id: str, reason: str) -> None:
-        """Halt a device immediately via the registry transport."""
-        logger.warning(
-            "HealthMonitor: halting device %s (reason: %s)", device_id, reason,
+        """Halt a device immediately through the registry, which owns the link cache.
+
+        Subject to the same opt-in as every other supervisory action: while
+        degradation actions are disabled the condition is reported, not acted on.
+        """
+        if not degradation_actions_enabled(self._registry):
+            report_suppressed(self._registry, device_id, action="halt", reason=reason)
+            self._emit_event(
+                "device.halt_suppressed",
+                {"device_id": device_id, "reason": reason},
+            )
+            return
+        episode = self._halts.setdefault(device_id, _HaltEpisode())
+        episode.attempts += 1
+        logger.log(
+            logging.WARNING if episode.attempts == 1 else logging.DEBUG,
+            "HealthMonitor: halting device %s (reason: %s)",
+            device_id,
+            reason,
         )
         try:
-            transport = await self._registry.transport(device_id)
-            await transport.halt()
+            # The halt must reach the device, so a link is opened when none is open;
+            # the registry owns the cache and retires a link the stop closed.
+            await self._registry.transport(device_id)
+            await self._registry.halt(device_id)
         except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "HealthMonitor: halt failed for %s: %s",
-                device_id, exc, exc_info=True,
+            episode.failures += 1
+            # Logged at doubling attempt counts, the traceback once: the retry keeps
+            # its cadence, the log only says it is still failing.
+            logger.log(
+                logging.ERROR if _is_power_of_two(episode.failures) else logging.DEBUG,
+                "HealthMonitor: halt failed for %s (failure %d; logged at doubling counts): %s",
+                device_id,
+                episode.failures,
+                exc,
+                exc_info=episode.failures == 1,
             )
-        self._emit_event("device.halted", {
-            "device_id": device_id,
-            "reason": reason,
-        })
+        else:
+            if episode.failures:
+                logger.info(
+                    "HealthMonitor: halt reached %s after %d failed attempt(s)",
+                    device_id,
+                    episode.failures,
+                )
+                episode.failures = 0
+        self._emit_event(
+            "device.halted",
+            {
+                "device_id": device_id,
+                "reason": reason,
+            },
+        )
 
     async def _execute_hold_position(self, device_id: str) -> None:
         """Mark a device for hold-position (no new commands)."""
         logger.warning(
-            "HealthMonitor: hold_position on device %s", device_id,
+            "HealthMonitor: hold_position on device %s",
+            device_id,
         )
         # The hold_position behavior is enforced by the write path checking
         # is_device_degraded() — we only need to log and emit the event.
@@ -346,14 +429,15 @@ class HardwareHealthMonitor:
             device_id,
         )
         await self._execute_hold_position(device_id)
-        self._emit_event("device.safe_return_requested", {
-            "device_id": device_id,
-            "kinematics_available": True,
-        })
+        self._emit_event(
+            "device.safe_return_requested",
+            {
+                "device_id": device_id,
+                "kinematics_available": True,
+            },
+        )
 
-    async def _execute_switch_sensor(
-        self, device_id: str, channel_id: str
-    ) -> None:
+    async def _execute_switch_sensor(self, device_id: str, channel_id: str) -> None:
         """Attempt to use backup sensor channel if available.
 
         Looks for alternative readable channels on the device and logs the
@@ -362,7 +446,8 @@ class HardwareHealthMonitor:
         """
         logger.info(
             "HealthMonitor: switch_sensor requested for %s (channel=%s)",
-            device_id, channel_id or "(auto)",
+            device_id,
+            channel_id or "(auto)",
         )
         context = self._get_device_context(device_id)
         if context is None:
@@ -372,13 +457,15 @@ class HardwareHealthMonitor:
         backup_channels = [
             ch.channel_id
             for ch in context.channels
-            if ch.is_readable and ch.channel_id != channel_id
+            if ch.is_readable
+            and ch.channel_id != channel_id
             and getattr(ch, "representation", "") != "frame"
         ]
         if backup_channels:
             logger.info(
                 "HealthMonitor: available backup sensors for %s: %s",
-                device_id, backup_channels,
+                device_id,
+                backup_channels,
             )
         else:
             logger.warning(
@@ -387,11 +474,14 @@ class HardwareHealthMonitor:
                 device_id,
             )
 
-        self._emit_event("device.switch_sensor", {
-            "device_id": device_id,
-            "channel_id": channel_id,
-            "backup_channels": backup_channels,
-        })
+        self._emit_event(
+            "device.switch_sensor",
+            {
+                "device_id": device_id,
+                "channel_id": channel_id,
+                "backup_channels": backup_channels,
+            },
+        )
 
     # -- Event handling (EventBus subscribers) ------------------------------
 
@@ -464,9 +554,7 @@ class HardwareHealthMonitor:
                 if sub is not None:
                     self._subscriptions.append(sub)
             except Exception:  # noqa: BLE001 — subscription failure is non-fatal
-                logger.debug(
-                    "HealthMonitor: failed to subscribe to %s", topic, exc_info=True
-                )
+                logger.debug("HealthMonitor: failed to subscribe to %s", topic, exc_info=True)
 
     def _unsubscribe_events(self) -> None:
         """Clean up EventBus subscriptions."""
@@ -500,17 +588,19 @@ class HardwareHealthMonitor:
                 except Exception:  # noqa: BLE001 — poll must not crash
                     logger.debug(
                         "HealthMonitor: poll failed for %s",
-                        device_id, exc_info=True,
+                        device_id,
+                        exc_info=True,
                     )
 
             # Check fleet node health if a fleet manager is available.
             if self._fleet_manager is not None:
                 await self._poll_fleet_nodes()
 
+            if self._advisories is not None:
+                await self._observe_advisories()
+
             try:
-                await asyncio.wait_for(
-                    self._stopped.wait(), timeout=self._poll_interval
-                )
+                await asyncio.wait_for(self._stopped.wait(), timeout=self._poll_interval)
                 break  # stopped
             except asyncio.TimeoutError:
                 pass
@@ -534,8 +624,46 @@ class HardwareHealthMonitor:
         except Exception:  # noqa: BLE001 — probe failure is a data point, not an error
             record.last_probe_ok = False
             record.consecutive_probe_failures += 1
+            probe_result = None
 
         record.last_probe_time = time.monotonic()
+        self._observe_frames(device_id, probe_result)
+        if probe_result is not None:
+            try:
+                accepted = self._calibration_lifecycle.observe(device_id, probe_result)
+                acknowledge = getattr(transport, "acknowledge_calibration", None)
+                if callable(acknowledge):
+                    acknowledge(accepted)
+            except (ValueError, TypeError):
+                logger.warning("Calibration lifecycle delivery refused; records remain pending", exc_info=True)
+
+    def _observe_frames(self, device_id: str, status: Any) -> None:
+        """Publish the frame-pump transitions a camera's probe reveals as signals."""
+        metadata = getattr(status, "metadata", None)
+        stats = metadata.get("frame_hub") if isinstance(metadata, Mapping) else None
+        events = self._frames.observe(device_id, stats)
+        self._publish(events, "frame")
+
+    async def _observe_advisories(self) -> None:
+        """Publish advisory-limit transitions; the watch itself paces repeats."""
+        assert self._advisories is not None
+        try:
+            events = await self._advisories.poll()
+        except Exception:  # noqa: BLE001 — telemetry must not break monitoring
+            logger.warning("HealthMonitor: advisory poll failed", exc_info=True)
+            return
+        self._publish(events, "advisory")
+
+    def _publish(self, events: Any, what: str) -> None:
+        publish = getattr(self._registry, "publish_event", None)
+        for event in events:
+            logger.info("HealthMonitor: %s", event.to_detail())
+            if publish is None:
+                continue
+            try:
+                publish(event)
+            except Exception:  # noqa: BLE001 — telemetry must not break monitoring
+                logger.warning("HealthMonitor: %s event publish failed", what, exc_info=True)
 
     async def _poll_fleet_nodes(self) -> None:
         """Check fleet node health and update device records accordingly.

@@ -13,15 +13,15 @@ def test_layout_history_workspace_helpers_and_descriptors(tmp_path) -> None:
     assert profile_layout.history_dir == profile_layout.root / "history"
     assert profile_layout.tui_history_path == profile_layout.history_dir / "tui_history"
     assert layout.workspace_config_path(workspace_root) == workspace_root / ".leapflow" / "config.yaml"
-    assert layout.workspace_manifest_path(workspace_root) == workspace_root / ".leapflow" / "workspace.yaml"
 
-    workspace_manifest = layout.write_workspace_manifest(workspace_root)
     workspace_id = workspace_id_for_path(workspace_root)
     cache_manifest = profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
 
-    assert workspace_manifest.exists()
     assert cache_manifest.exists()
     assert profile_layout.cache.workspace_manifest_path(workspace_id) == cache_manifest
+    # The workspace-local marker is gone: the path-to-id record lives in the
+    # profile cache, so a workspace directory stays exactly as the user left it.
+    assert not (workspace_root / ".leapflow").exists()
 
     history_descriptor = layout.describe_path(profile_layout.tui_history_path)
     assert history_descriptor.category == "history"
@@ -43,9 +43,11 @@ def test_layout_yaml_atomic_write_preserves_existing_manifest(monkeypatch, tmp_p
     import leapflow.layout as layout_module
 
     layout = build_layout(tmp_path / "leap-home")
+    profile_layout = layout.ensure(profile_id="default")
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
-    manifest = layout.write_workspace_manifest(workspace_root)
+    workspace_id = workspace_id_for_path(workspace_root)
+    manifest = profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
     original = manifest.read_text(encoding="utf-8")
 
     def fail_replace(_src, _dst) -> None:
@@ -54,7 +56,7 @@ def test_layout_yaml_atomic_write_preserves_existing_manifest(monkeypatch, tmp_p
     monkeypatch.setattr(layout_module.os, "replace", fail_replace)
 
     try:
-        layout.write_workspace_manifest(workspace_root)
+        profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
     except OSError:
         pass
     else:

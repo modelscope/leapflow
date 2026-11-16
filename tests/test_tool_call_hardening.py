@@ -135,6 +135,33 @@ def test_compaction_preserves_invalid_argument_repair_hints() -> None:
     assert compact["error_type"] == "invalid_arguments"
     assert compact["missing"] == ["path"]
     assert compact["accepted_parameters"] == ["diff", "edits", "path"]
+    assert compact["counts_as_failure"] is False
+
+
+def test_compaction_preserves_a_failed_skill_recovery_contract() -> None:
+    """A failed skill keeps what the model needs to retry differently: the
+    measured result (reach/limit), the next step, and the effect verdict."""
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
+    failed = {
+        "ok": False,
+        "error": "unreachable",
+        "message": "step 7 reaches only 111 of 303 mm",
+        "next_step": "Add a via point or move the target closer.",
+        "side_effect_state": "none",
+        "effect_uncertain": False,
+        "result": {"reach": {"requested_mm": 303.0, "reachable_mm": 111.0, "joint": "j4"}},
+    }
+    compact = ToolEvidenceBuilder().build("hw_skill_run", {}, failed)
+    assert compact["message"] == failed["message"]
+    assert compact["next_step"] == failed["next_step"]
+    assert compact["side_effect_state"] == "none" and compact["effect_uncertain"] is False
+    assert compact["result"]["reach"]["reachable_mm"] == 111.0
+
+
+def test_compaction_does_not_repeat_a_message_equal_to_the_error() -> None:
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
+    compact = ToolEvidenceBuilder().build("hw_skill_run", {}, {"ok": False, "error": "x", "message": "x"})
+    assert "message" not in compact
 
 
 def test_compaction_preserves_anchor_not_unique_match_count() -> None:
@@ -143,6 +170,30 @@ def test_compaction_preserves_anchor_not_unique_match_count() -> None:
     result = {"ok": False, "error": "not unique", "error_type": "anchor_not_unique", "match_count": 3}
     compact = builder.build("edit_file", {}, result)
     assert compact["error_type"] == "anchor_not_unique" and compact["match_count"] == 3
+
+
+def test_readiness_hard_stop_survives_compaction_as_deterministic_recovery() -> None:
+    """A fail-closed readiness refusal must keep its hard-stop markers through
+    compaction so the turn ends with the repair instruction, not an LLM paraphrase."""
+    from leapflow.engine._message_helpers import _last_tool_failures_recovery_message
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
+    from leapflow.security.permission_failures import (
+        build_readiness_failure,
+        is_permission_hard_stop_payload,
+    )
+
+    refusal = build_readiness_failure(
+        device_id="arm",
+        channel_id="joint1",
+        unmet=[{"interlock_id": "homed", "channel_id": "homed", "value": True}],
+    )
+    compact = ToolEvidenceBuilder().build("hw_actuate", {}, refusal)
+    assert compact["failure_class"] == "device_not_ready"
+    assert is_permission_hard_stop_payload(compact)
+
+    messages = [{"role": "tool", "content": json.dumps(compact)}]
+    recovery = _last_tool_failures_recovery_message(messages, include_generic=False)
+    assert recovery.startswith("arm.joint1 is not ready to command")
 
 
 # ── failure visibility: stdout/stderr survive compaction; shell_run sets error ──
@@ -292,14 +343,14 @@ def test_shell_gate_blocks_expanded_and_relative_escapes(tmp_path, monkeypatch) 
     and ``../../..`` straight through, so the same file is reachable by choosing
     a different spelling and the workspace boundary stops being a boundary.
     """
+    import os
+
     from leapflow.tools.execution_context import (
         ToolExecutionContext,
         reset_tool_context,
         set_tool_context,
     )
     from leapflow.tools.shell_tools import shell_run
-
-    import os
 
     workspace = tmp_path / "work"
     other = tmp_path / "other"
@@ -391,6 +442,7 @@ def test_shell_gate_redirects_leapflow_config_targets(tmp_path) -> None:
     escaping path and the shared refusal builder carries the hint — so both are
     asserted here.
     """
+    from leapflow.config import get_settings
     from leapflow.tools.execution_context import (
         ToolExecutionContext,
         reset_tool_context,
@@ -398,7 +450,6 @@ def test_shell_gate_redirects_leapflow_config_targets(tmp_path) -> None:
         workspace_scope_refusal,
     )
     from leapflow.tools.shell_tools import _command_workspace_escape_path
-    from leapflow.config import get_settings
 
     workspace = tmp_path / "work"
     workspace.mkdir()

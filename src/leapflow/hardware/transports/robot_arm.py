@@ -189,8 +189,7 @@ class RobotArmTransport:
             await self._get_observation()
         except Exception:
             logger.debug(
-                "Observation refresh before write failed; "
-                "hold-position may use stale data",
+                "Observation refresh before write failed; hold-position may use stale data",
                 exc_info=True,
             )
         try:
@@ -248,7 +247,8 @@ class RobotArmTransport:
             return TransportStatus(
                 connected=False,
                 halt_supported=True,
-                detail="halt: not connected",
+                halt_delivered=False,
+                detail="halt: not connected; the stop was not sent",
             )
         try:
             zero_commands: dict[str, Any] = {}
@@ -265,6 +265,7 @@ class RobotArmTransport:
             return TransportStatus(
                 connected=self._connected,
                 halt_supported=True,
+                halt_delivered=False,
                 detail=f"halt attempted with error: {exc}",
             )
         return TransportStatus(
@@ -298,8 +299,7 @@ class RobotArmTransport:
                 )
             if ch.representation == Representation.FRAME.value:
                 raise TransportError(
-                    f"frame channel {cid!r} cannot appear in read_batch; "
-                    "use read_frame() instead",
+                    f"frame channel {cid!r} cannot appear in read_batch; use read_frame() instead",
                     failure_code="frame_channel_not_readable",
                 )
             value = self._extract_value(cid, obs)
@@ -324,9 +324,7 @@ class RobotArmTransport:
             monotonic_at=now_mono,
         )
 
-    async def write_batch(
-        self, commands: tuple[tuple[str, Any], ...]
-    ) -> BatchWriteOutcome:
+    async def write_batch(self, commands: tuple[tuple[str, Any], ...]) -> BatchWriteOutcome:
         """Write multiple channels in one send_action() call.
 
         Builds the full action vector from commands, filling non-commanded
@@ -355,8 +353,7 @@ class RobotArmTransport:
             await self._get_observation()
         except Exception:
             logger.debug(
-                "Observation refresh before batch write failed; "
-                "hold-position may use stale data",
+                "Observation refresh before batch write failed; hold-position may use stale data",
                 exc_info=True,
             )
         try:
@@ -429,7 +426,9 @@ class RobotArmTransport:
         obs = await self._get_observation()
         image_data = self._extract_frame(channel_id, obs)
         jpeg_bytes, width, height = self._encode_jpeg(
-            image_data, max_width=max_width, quality=quality,
+            image_data,
+            max_width=max_width,
+            quality=quality,
         )
         seq = self._next_seq(channel_id)
         return FrameReading(
@@ -550,7 +549,8 @@ class RobotArmTransport:
         # No match found -- return None rather than fabricating a value.
         logger.debug(
             "No observation key found for channel %r (obs keys: %s)",
-            channel_id, list(obs.keys()),
+            channel_id,
+            list(obs.keys()),
         )
         return None
 
@@ -715,7 +715,11 @@ def build_transport(config: Mapping[str, Any]) -> RobotArmTransport:
     Actual instantiation happens in open().
     """
     robot_type = str(config.get("robot_type", ""))
-    robot_config = dict(config.get("robot_config", {})) if isinstance(config.get("robot_config"), Mapping) else {}
+    robot_config = (
+        dict(config.get("robot_config", {}))
+        if isinstance(config.get("robot_config"), Mapping)
+        else {}
+    )
 
     # Compat: aggregate top-level serial_port/cameras into robot_config so
     # configs written before the provider placed them inside robot_config
@@ -738,8 +742,7 @@ def build_transport(config: Mapping[str, Any]) -> RobotArmTransport:
             from leapflow.robot.base import make_robot  # type: ignore[import-untyped]
         except ImportError as exc:
             raise TransportError(
-                "robot arm SDK is not installed; "
-                "install it with: pip install leapflow[robot]",
+                "robot arm SDK is not installed; install it with: pip install leapflow[robot]",
                 failure_code="robot_arm_not_installed",
             ) from exc
         kwargs: dict[str, Any] = {"robot_type": robot_type}

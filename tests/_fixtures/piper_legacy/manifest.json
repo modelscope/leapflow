@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "purpose": "offline historical replay only",
+  "files": [
+    {
+      "source": "c5_jaw_test.py",
+      "snapshot": "c5_jaw_test.py.txt",
+      "bytes": 5538,
+      "sha256": "1fdd3314984bbbfe70134427d3f30e505ecbd4435893b8ff093902e1ec388787"
+    },
+    {
+      "source": "cl/__init__.py",
+      "snapshot": "cl/__init__.py.txt",
+      "bytes": 458,
+      "sha256": "bd17384ad11fa93257152b3993bbe4f061a3b76b676414c734385cce625d66d5"
+    },
+    {
+      "source": "cl/bridge.py",
+      "snapshot": "cl/bridge.py.txt",
+      "bytes": 13978,
+      "sha256": "4dd85848b0283cbb3158956061d349db7d0dc6b614cab436d791ab5a2543e89d"
+    },
+    {
+      "source": "cl/config.py",
+      "snapshot": "cl/config.py.txt",
+      "bytes": 5826,
+      "sha256": "c6eea39b6e7c504ad16b94d2130dba2b6948bd1322a59b1c65ef71ba57efebb0"
+    },
+    {
+      "source": "cl/eye.py",
+      "snapshot": "cl/eye.py.txt",
+      "bytes": 12490,
+      "sha256": "fc31f58ecb285635828ef39ebe4f4b1180f99ea5b1c5fd75bbfebe872a770d18"
+    },
+    {
+      "source": "cl/journal.py",
+      "snapshot": "cl/journal.py.txt",
+      "bytes": 2311,
+      "sha256": "01347b68ca597e268770bd5eaedc7c2f87c256f7fc8a5e84bacc8cc484fafcd3"
+    },
+    {
+      "source": "cl/kin.py",
+      "snapshot": "cl/kin.py.txt",
+      "bytes": 1893,
+      "sha256": "0c1fd8547a06b1d7e395dd44d4007a5c46d908ee607a9d3a6a8ae47bd3fbf662"
+    },
+    {
+      "source": "cl/mission.py",
+      "snapshot": "cl/mission.py.txt",
+      "bytes": 50782,
+      "sha256": "05d6f101ff7055301038ce98e0e5d1871493b4c9a741fe1253db1c9d3fdbfa9e"
+    },
+    {
+      "source": "cl/plan.py",
+      "snapshot": "cl/plan.py.txt",
+      "bytes": 13707,
+      "sha256": "074177bb1b1150f030b32c1c1a3f088135e5dbd30222b4b43edf1f0900d4459e"
+    },
+    {
+      "source": "cl/policy_source.py",
+      "snapshot": "cl/policy_source.py.txt",
+      "bytes": 13107,
+      "sha256": "b1f15717c79f8d11d226a1e8d2ffe776c88aab5dca8f3731fa3a73bbc3697049"
+    },
+    {
+      "source": "cl/sidebox.py",
+      "snapshot": "cl/sidebox.py.txt",
+      "bytes": 10262,
+      "sha256": "b13912cd774dee770805ffc24b17207fac219ae452770a16cce3022d3b857f0b"
+    },
+    {
+      "source": "cl/sideeye.py",
+      "snapshot": "cl/sideeye.py.txt",
+      "bytes": 17725,
+      "sha256": "e35c8d303cfc48f6e7d40133872a5c415d8c6267c77c11791f5df4ff783d28eb"
+    },
+    {
+      "source": "cl/vision.py",
+      "snapshot": "cl/vision.py.txt",
+      "bytes": 24711,
+      "sha256": "c7327ccdfe9ff1e265366d3e17020767d14b85d844c5414a3aa86abaa57fc838"
+    },
+    {
+      "source": "cl/wrist_verify.py",
+      "snapshot": "cl/wrist_verify.py.txt",
+      "bytes": 12162,
+      "sha256": "33a8d99920e929cd01c01a21b5fe59b477acadc844997676e28f3782c99ea3c0"
+    },
+    {
+      "source": "cl_board/cl_arm_core.py",
+      "snapshot": "cl_board/cl_arm_core.py.txt",
+      "bytes": 49759,
+      "sha256": "883b8f112f4dac4fe07b8deab4b1218ff20a63f911f517003afc9f98103671b6"
+    },
+    {
+      "source": "cl_board/cl_armd.py",
+      "snapshot": "cl_board/cl_armd.py.txt",
+      "bytes": 33583,
+      "sha256": "ec28621ddc0ca0a7796cccb1c9f05e303e82abffb632406543ab4fd1173adec1"
+    },
+    {
+      "source": "dual_camera_qualify.py",
+      "snapshot": "dual_camera_qualify.py.txt",
+      "bytes": 7834,
+      "sha256": "500843ded6779abc08ac680e4302ed2f1ebead440c0ebc8ce2ae5f5e65474595"
+    },
+    {
+      "source": "grasp_execute.py",
+      "snapshot": "grasp_execute.py.txt",
+      "bytes": 21245,
+      "sha256": "9ada1d6dd9be35515d1da2cec91e4aaded19347bdec370a04ce2c824c5d5b69a"
+    },
+    {
+      "source": "qualification_report.py",
+      "snapshot": "qualification_report.py.txt",
+      "bytes": 17371,
+      "sha256": "9c92a2088e974a78622f81ffe5fee8acdfc653ab69bd3640d4662084e1613606"
+    },
+    {
+      "source": "wrist_handeye.py",
+      "snapshot": "wrist_handeye.py.txt",
+      "bytes": 13355,
+      "sha256": "ddcac3b954ee6994f1c3b78fb52589f1edbbcb2c6ab7ec2d9a827867ad893a45"
+    }
+  ]
+}

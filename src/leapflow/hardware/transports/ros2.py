@@ -33,7 +33,9 @@ by ``control_binding_resolver._resolve_ros2``::
 Channels declared ``representation: frame`` are image topics served through
 ``read_frame()`` (see ``ros2_image``). This is how a camera that a ROS driver
 already owns is previewed: V4L2 capture is exclusive, so the driver's published
-stream is the only non-disruptive view of it.
+stream is the only non-disruptive view of it. Each image topic feeds its own
+``FrameHub`` (``vision.ros.TopicHubs``), so readers get the same freshness bounds,
+shared per-size JPEG views and pump health as a camera LeapFlow opens itself.
 
 There is deliberately no top-level ``import rclpy``.  Every use is
 function-local with a ``try/except ImportError``, so the module can be
@@ -59,6 +61,8 @@ from leapflow.hardware.transport import (
     WriteOutcome,
 )
 from leapflow.hardware import ros2_image
+from leapflow.hardware.vision.hub import FAILURE_FRAME_TIMEOUT
+from leapflow.hardware.vision.ros import TopicHubs
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +82,8 @@ class ROS2Transport:
     """
 
     kind: str = "ros2"
+    frame_reads_concurrent = True
+    """Image reads look at per-topic frame hubs and need no device I/O lock."""
 
     def __init__(
         self,
@@ -101,10 +107,10 @@ class ROS2Transport:
 
         # ROS2 runtime state -- populated by open().
         self._node: Any = None
-        self._subscribers: dict[str, Any] = {}   # channel_id -> Subscription
-        self._publishers: dict[str, Any] = {}    # channel_id -> Publisher
+        self._subscribers: dict[str, Any] = {}  # channel_id -> Subscription
+        self._publishers: dict[str, Any] = {}  # channel_id -> Publisher
         self._service_clients: dict[str, Any] = {}  # channel_id -> Client
-        self._latest_msgs: dict[str, Any] = {}   # channel_id -> latest message
+        self._latest_msgs: dict[str, Any] = {}  # channel_id -> latest message
         self._msg_timestamps: dict[str, float] = {}  # channel_id -> monotonic
         self._spin_task: asyncio.Task[None] | None = None
         self._executor: Any = None
@@ -115,6 +121,7 @@ class ROS2Transport:
         self._cmd_channels: set[str] = set()
         # Subscribed channels declared representation=frame (image topics).
         self._frame_channels: set[str] = set()
+        self._frame_hubs = TopicHubs(node_name)
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -207,6 +214,8 @@ class ROS2Transport:
 
         self._node = None
         self._executor = None
+        hubs, self._frame_hubs = self._frame_hubs, TopicHubs(self._node_name)
+        await asyncio.to_thread(hubs.stop)
         self._subscribers.clear()
         self._publishers.clear()
         self._service_clients.clear()
@@ -315,13 +324,22 @@ class ROS2Transport:
         )
 
     async def read_frame(
-        self, channel_id: str, *, max_width: int = 0, quality: int = 0, fps: float = 0.0
+        self,
+        channel_id: str,
+        *,
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        min_sequence: int = 0,
+        after_monotonic: float | None = None,
     ) -> FrameReading:
         """Return the newest image on a frame channel's topic as a bounded JPEG.
 
         Subscribing is passive: the publishing driver keeps the device and the robot
         keeps its pipeline, which is the point of previewing through ROS. ``fps`` is
         accepted for protocol compatibility; the publisher owns the rate.
+        ``min_sequence`` / ``after_monotonic`` wait for a newer message, counted per
+        topic, and each JPEG size is encoded once per message for all viewers.
         """
         self._require_open(channel_id)
         if channel_id not in self._frame_channels:
@@ -329,23 +347,33 @@ class ROS2Transport:
                 f"channel {channel_id!r} is not a subscribed ROS2 image channel",
                 failure_code="unknown_channel",
             )
-        deadline = time.monotonic() + _FIRST_FRAME_TIMEOUT_S
-        while (msg := self._latest_msgs.get(channel_id)) is None:
-            if time.monotonic() >= deadline:
-                raise TransportError(
-                    f"no image arrived on {self._topics[channel_id]!r} within "
-                    f"{_FIRST_FRAME_TIMEOUT_S:g}s; check that its publisher is running",
-                    failure_code="ros2_frame_unavailable",
-                )
-            await asyncio.sleep(0.05)
-        received = self._msg_timestamps.get(channel_id, 0.0)
+        hub = self._frame_hubs.hub(channel_id)
         try:
-            preview = await asyncio.to_thread(
-                ros2_image.encode_preview, msg, max_width=int(max_width or 0), quality=int(quality or 0)
+            frameset = await hub.latest(
+                min_sequence=int(min_sequence or 0),
+                after_monotonic=after_monotonic,
+                timeout_s=_FIRST_FRAME_TIMEOUT_S,
+            )
+        except TransportError as exc:
+            if exc.failure_code != FAILURE_FRAME_TIMEOUT or hub.peek() is not None:
+                raise
+            raise TransportError(
+                f"no image arrived on {self._topics[channel_id]!r} within "
+                f"{_FIRST_FRAME_TIMEOUT_S:g}s; check that its publisher is running",
+                failure_code="ros2_frame_unavailable",
+            ) from exc
+        width, jpeg_quality = int(max_width or 0), int(quality or 0)
+        try:
+            preview = await hub.view(
+                frameset,
+                ("jpeg", width, jpeg_quality),
+                lambda held: ros2_image.encode_preview(
+                    held.native, max_width=width, quality=jpeg_quality
+                ),
             )
         except ros2_image.ImageConversionError as exc:
             raise TransportError(str(exc), failure_code="ros2_frame_unsupported") from exc
-        age = max(0.0, time.monotonic() - received)
+        age = max(0.0, time.monotonic() - frameset.monotonic_at)
         return FrameReading(
             device_id=self._device_id,
             channel_id=channel_id,
@@ -353,11 +381,15 @@ class ROS2Transport:
             media_type="image/jpeg",
             width=preview.width,
             height=preview.height,
-            observed_at=time.time() - age,
-            monotonic_at=received,
-            sequence=self._next_seq(channel_id),
+            observed_at=frameset.observed_at,
+            monotonic_at=frameset.monotonic_at,
+            sequence=frameset.sequence,
             quality=Quality.OK.value if age < _STALE_THRESHOLD_S else Quality.STALE.value,
-            metadata={**preview.metadata, "topic": self._topics[channel_id], "age_s": round(age, 3)},
+            metadata={
+                **preview.metadata,
+                "topic": self._topics[channel_id],
+                "age_s": round(age, 3),
+            },
         )
 
     async def probe(self) -> TransportStatus:
@@ -388,6 +420,7 @@ class ROS2Transport:
                 "subscribers": len(self._subscribers),
                 "publishers": len(self._publishers),
                 "service_clients": len(self._service_clients),
+                "frame_hub": self._frame_hubs.stats(),
             },
         )
 
@@ -400,8 +433,9 @@ class ROS2Transport:
         if not self._connected or self._node is None:
             return TransportStatus(
                 connected=False,
-                halt_supported=False,
-                detail="halt: not connected",
+                halt_supported=True,
+                halt_delivered=False,
+                detail="halt: not connected; the stop was not sent",
             )
 
         if not self._cmd_channels:
@@ -427,6 +461,7 @@ class ROS2Transport:
         return TransportStatus(
             connected=self._connected,
             halt_supported=True,
+            halt_delivered=not errors,
             detail=detail,
         )
 
@@ -510,6 +545,7 @@ class ROS2Transport:
         depth = self._qos_depth if depth is None else depth
         try:
             from rclpy.qos import QoSProfile, ReliabilityPolicy
+
             return QoSProfile(
                 depth=depth,
                 reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -549,7 +585,8 @@ class ROS2Transport:
         except Exception:
             logger.debug(
                 "Could not discover type for topic %r; using String",
-                topic_name, exc_info=True,
+                topic_name,
+                exc_info=True,
             )
 
         # Fallback: use std_msgs/msg/String as a generic carrier.
@@ -572,16 +609,19 @@ class ROS2Transport:
         except Exception:
             logger.debug(
                 "Could not discover type for service %r",
-                service_name, exc_info=True,
+                service_name,
+                exc_info=True,
             )
         return None
 
     # ── Internal: message handling ────────────────────────────────────
 
     def _msg_callback(self, channel_id: str, msg: Any) -> None:
-        """Cache incoming message for ``read()``."""
+        """Cache incoming message for ``read()``; image messages also feed their hub."""
         self._latest_msgs[channel_id] = msg
         self._msg_timestamps[channel_id] = time.monotonic()
+        if channel_id in self._frame_channels:
+            self._frame_hubs.offer(channel_id, msg)
 
     def _parse_msg(self, channel_id: str, msg: Any) -> Any:
         """Extract a Python-friendly value from a ROS2 message.
@@ -769,6 +809,7 @@ def _require_rclpy() -> Any:
     """Return the ``rclpy`` module or raise TransportError."""
     try:
         import rclpy  # type: ignore[import-untyped]
+
         return rclpy
     except ImportError as exc:
         raise TransportError(
@@ -841,13 +882,19 @@ def build_transport(config: Mapping[str, Any]) -> ROS2Transport:
     topic_types = config.get("topic_types")
     return ROS2Transport(
         topics=dict(config.get("topics", {})) if isinstance(config.get("topics"), Mapping) else {},
-        services=dict(config.get("services", {})) if isinstance(config.get("services"), Mapping) else {},
-        actions=dict(config.get("actions", {})) if isinstance(config.get("actions"), Mapping) else {},
+        services=dict(config.get("services", {}))
+        if isinstance(config.get("services"), Mapping)
+        else {},
+        actions=dict(config.get("actions", {}))
+        if isinstance(config.get("actions"), Mapping)
+        else {},
         node_name=str(config.get("node_name", "leapflow_bridge")),
         namespace=str(config.get("namespace", "")),
         qos_depth=int(config.get("qos_depth", 10)),
         spin_period_s=float(config.get("spin_period_s", 0.01)),
-        topic_types={str(k): str(v) for k, v in topic_types.items()} if isinstance(topic_types, Mapping) else {},
+        topic_types={str(k): str(v) for k, v in topic_types.items()}
+        if isinstance(topic_types, Mapping)
+        else {},
     )
 
 

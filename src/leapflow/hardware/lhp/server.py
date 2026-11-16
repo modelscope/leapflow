@@ -21,6 +21,11 @@ Two entry points share one dispatch path:
   call is stuck -- the same deliberateness as the transport-level lock-freedom
   of those two methods, one layer up.
 
+Every actuating method (``write``, ``write_batch``, ``control.open``,
+``control.update``, ``skill.execute``) passes the one ``WriteAuthority``; every
+leased activity (control loops, skill runs) lives in the one ``NodeSessions``,
+which is also the device mutex wire writes respect.
+
 Write semantics follow the frozen protocol spec: a refusal the node can prove
 (wrong direction, safety policy, batch precheck) is a ``WriteOutcome`` with
 ``side_effect_state="none"``; a failure that might have reached the device
@@ -36,21 +41,36 @@ import asyncio
 import base64
 import hashlib
 import hmac
-import inspect
 import json
 import logging
-import math
-import time
 import uuid
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from leapflow.hardware.context import HardwareContext, as_numeric
+from leapflow.hardware.context import HardwareContext
+from leapflow.hardware.lhp.authority import (
+    WRITE_MODE_OBSERVE_ONLY,
+    WRITE_MODE_PERMIT_REQUIRED,
+    WRITE_MODE_TRUSTED_V1,
+    WriteAuthority,
+)
+from leapflow.hardware.lhp.control_sessions import NodeSessions
+from leapflow.hardware.lhp.params import (
+    freshness_bounds,
+    optional_float,
+    optional_int,
+    require_channel_ids,
+    require_commands,
+    require_str,
+)
 from leapflow.hardware.lhp.protocol import (
     CAP_CONTROL_V1,
+    CAP_FRAME_FRESHNESS_V1,
     CAP_PERMIT_V1,
+    CAP_SKILL_V1,
     ERR_BAD_REQUEST,
     ERR_FRAME_TOO_LARGE,
     ERR_INTERNAL_ERROR,
@@ -60,14 +80,8 @@ from leapflow.hardware.lhp.protocol import (
     ERR_UNKNOWN_CHANNEL,
     ERR_UNKNOWN_DEVICE,
     ERR_UNSUPPORTED_CAPABILITY,
-    FAILURE_BATCH_ABORTED,
-    FAILURE_DEVICE_DEGRADED,
-    FAILURE_INTERLOCK_UNSATISFIED,
-    FAILURE_NOT_WRITABLE,
-    FAILURE_PERMIT_REQUIRED,
-    FAILURE_REMOTE_CONTROL_UNSUPPORTED,
+    FAILURE_DEVICE_BUSY,
     FAILURE_SAFETY_DENIED,
-    FAILURE_WRITES_DISABLED,
     LHP_DEFAULT_PORT,
     LHP_SUPPORTED_VERSIONS,
     MAX_FRAME_BYTES,
@@ -83,30 +97,27 @@ from leapflow.hardware.lhp.protocol import (
     is_valid_device_id,
     ok_response,
 )
+from leapflow.hardware.node_gate import (
+    NodeWriteGate,
+    ReadingIdentityError,
+    control_safety_refusal,
+    merged_batch_state,
+    refusal,
+    verify_reading_identity,
+)
 from leapflow.hardware.transport import (
-    SIDE_EFFECT_COMMITTED,
-    SIDE_EFFECT_NONE,
-    SIDE_EFFECT_PARTIAL,
-    BatchTransport,
     FrameTransport,
     TransportError,
     TransportStatus,
     WriteOutcome,
-    worst_side_effect_state,
 )
+from leapflow.hardware.attestation import declaration_payload
+from leapflow.hardware.vision.frames import accepts_keyword as _accepts_keyword
 
 logger = logging.getLogger(__name__)
 
-
-# ── Write mode constants ─────────────────────────────────────────────────
-
-WRITE_MODE_PERMIT_REQUIRED = "permit_required"
-WRITE_MODE_TRUSTED_V1 = "trusted_v1"
-WRITE_MODE_OBSERVE_ONLY = "observe_only"
-
-_VALID_WRITE_MODES = frozenset(
-    {WRITE_MODE_PERMIT_REQUIRED, WRITE_MODE_TRUSTED_V1, WRITE_MODE_OBSERVE_ONLY}
-)
+_CONNECTION_ID: ContextVar[str] = ContextVar("lhp_connection_id", default="")
+"""The socket connection a request arrived on; each request task sees its own."""
 
 
 @dataclass
@@ -130,6 +141,7 @@ class LhpNodeServer:
         max_concurrent_requests: int = 32,
         write_mode: str = WRITE_MODE_PERMIT_REQUIRED,
         permit_verifier: Any | None = None,
+        skill_runtime: Any | None = None,
     ) -> None:
         text = str(node_id or "").strip()
         if not is_valid_device_id(text):
@@ -137,22 +149,35 @@ class LhpNodeServer:
                 f"node_id {node_id!r} must be non-empty and match [a-z0-9_]+ "
                 "(it becomes the host-side device namespace prefix)"
             )
-        wm = str(write_mode or WRITE_MODE_PERMIT_REQUIRED)
-        if wm not in _VALID_WRITE_MODES:
-            raise ValueError(
-                f"write_mode must be one of {sorted(_VALID_WRITE_MODES)}, got {wm!r}"
-            )
+        self._authority = WriteAuthority(
+            str(write_mode or WRITE_MODE_PERMIT_REQUIRED), permit_verifier
+        )
         self._registry = registry
         self._node_id = text
         self._token = str(token or "")
         self._device_ids = tuple(str(item) for item in device_ids)
         self._max_concurrent_requests = max(1, int(max_concurrent_requests))
-        self._write_mode = wm
-        self._permit_verifier = permit_verifier
+        self._gate = NodeWriteGate(registry)
+        self._skill_runtime = skill_runtime
+        self._sessions = NodeSessions(
+            registry,
+            device_busy=skill_runtime.holds_device if skill_runtime is not None else None,
+            transaction_run_owner=skill_runtime.transaction_run_owner if skill_runtime is not None else None,
+        )
+        bind_sessions = getattr(registry, "bind_node_sessions", None)
+        if callable(bind_sessions):
+            bind_sessions(self._sessions)
         self._server: asyncio.AbstractServer | None = None
         self._unix_path = ""
         self._writers: set[asyncio.StreamWriter] = set()
         self._connection_states: dict[str, _ConnectionState] = {}
+        # Frame channels each connection is consuming, as (device_id, holder) pairs. The
+        # registry closes a node camera only when its last holder leaves, and a dropped
+        # connection releases everything it held -- a host that vanished cannot keep a
+        # camera on.
+        self._frame_holds: dict[str, set[tuple[str, str]]] = {}
+        from leapflow.hardware.calibration.lifecycle import OwnerLifecycle
+        self._calibration_lifecycle = OwnerLifecycle(registry)
         self._handlers: dict[str, Any] = {
             "hello": self._handle_hello,
             "list": self._handle_list,
@@ -170,8 +195,17 @@ class LhpNodeServer:
             "control.close": self._handle_control_close,
             "control.status": self._handle_control_status,
         }
-        self._control_sessions: Any | None = None  # lazy init
-        self._current_connection_id: str = ""  # set per-request in socket mode
+        if skill_runtime is not None:
+            from leapflow.hardware.lhp.skill_methods import SkillMethods
+
+            self._handlers.update(
+                SkillMethods(
+                    skill_runtime,
+                    authority=self._authority,
+                    sessions=self._sessions,
+                    connection_id=_CONNECTION_ID.get,
+                ).handlers()
+            )
 
     @property
     def node_id(self) -> str:
@@ -183,7 +217,11 @@ class LhpNodeServer:
 
     @property
     def write_mode(self) -> str:
-        return self._write_mode
+        return self._authority.mode
+
+    @property
+    def sessions(self) -> NodeSessions:
+        return self._sessions
 
     # ── Dispatch (shared by direct and socket bindings) ──
 
@@ -219,6 +257,8 @@ class LhpNodeServer:
             return error_response(request_id, exc.code, str(exc))
         except TransportError as exc:
             return error_response(request_id, exc.failure_code or ERR_TRANSPORT_ERROR, str(exc))
+        except ReadingIdentityError as exc:
+            return error_response(request_id, ERR_INTERNAL_ERROR, str(exc))
         except Exception as exc:  # noqa: BLE001 - any handler fault is an internal_error frame
             logger.error("LHP %s handler failed: %s", method, exc, exc_info=True)
             return error_response(request_id, ERR_INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
@@ -238,7 +278,7 @@ class LhpNodeServer:
             presented = str(params.get("token") or "")
             if not hmac.compare_digest(presented, self._token):
                 raise LhpProtocolError("invalid or missing token", code=ERR_UNAUTHORIZED)
-        if self._write_mode == WRITE_MODE_TRUSTED_V1 and via != "direct":
+        if self._authority.mode == WRITE_MODE_TRUSTED_V1 and via != "direct":
             logger.warning(
                 "LHP node %r operating in trusted_v1 mode — writes are accepted "
                 "without a permit (token-only authentication). Consider upgrading "
@@ -246,23 +286,26 @@ class LhpNodeServer:
                 self._node_id,
             )
         contexts = self._exported_contexts()
+        verifier = self._authority.verifier
         caps = list(capabilities_for_version(protocol))
-        if self._permit_verifier is not None:
+        if verifier is not None:
             caps.append(CAP_PERMIT_V1)
         caps.append(CAP_CONTROL_V1)
+        if protocol >= 2:
+            caps.append(CAP_FRAME_FRESHNESS_V1)
+        if self._skill_runtime is not None:
+            caps.append(CAP_SKILL_V1)
         result: dict[str, Any] = {
             "protocol": protocol,
             "node_id": self._node_id,
             "device_count": len(contexts),
             "declarations": _declarations_digest(contexts),
             "capabilities": caps,
-            "write_mode": self._write_mode,
+            "write_mode": self._authority.mode,
         }
-        if self._permit_verifier is not None:
+        if verifier is not None:
             result["permit_audience"] = self._node_id
-            result["trusted_issuers"] = list(
-                getattr(self._permit_verifier, "trusted_key_ids", ()) or ()
-            )
+            result["trusted_issuers"] = list(getattr(verifier, "trusted_key_ids", ()) or ())
         return result
 
     async def _handle_list(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -272,8 +315,8 @@ class LhpNodeServer:
         }
 
     async def _handle_read(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        device_id = _require_str(params, "device_id")
-        channel_id = _require_str(params, "channel_id")
+        device_id = require_str(params, "device_id")
+        channel_id = require_str(params, "channel_id")
         _, channel = self._resolve_channel(device_id, channel_id)
         if not channel.is_readable:
             raise LhpProtocolError(
@@ -283,12 +326,12 @@ class LhpNodeServer:
         async with self._registry.device_io(device_id):
             transport = await self._registry.transport(device_id)
             reading = await transport.read(channel_id)
-        _verify_reading_identity(reading, device_id, channel_id)
+        verify_reading_identity(reading, device_id, channel_id)
         return reading.to_dict()
 
     async def _handle_read_batch(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        device_id = _require_str(params, "device_id")
-        channel_ids = _require_channel_ids(params)
+        device_id = require_str(params, "device_id")
+        channel_ids = require_channel_ids(params)
         for channel_id in channel_ids:
             _, channel = self._resolve_channel(device_id, channel_id)
             if not channel.is_readable:
@@ -321,35 +364,25 @@ class LhpNodeServer:
 
     async def _handle_read_frame(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Return one bounded encoded frame over the negotiated v2 control plane."""
-        device_id = _require_str(params, "device_id")
-        channel_id = _require_str(params, "channel_id")
+        device_id = require_str(params, "device_id")
+        channel_id = require_str(params, "channel_id")
         _, channel = self._resolve_channel(device_id, channel_id)
         if not channel.is_readable or not bool(getattr(channel, "is_media", False)):
             raise LhpProtocolError(
                 f"channel {channel_id!r} on {device_id!r} is not a readable frame channel",
                 code=ERR_UNKNOWN_CHANNEL,
             )
-        max_width = _optional_int(params, "max_width", upper=MAX_FRAME_WIDTH)
-        quality = _optional_int(params, "quality", upper=100)
-        fps = _optional_float(params, "fps", upper=MAX_FRAME_RATE_HZ)
-        async with self._registry.device_io(device_id):
-            transport = await self._registry.transport(device_id)
-            if not isinstance(transport, FrameTransport):
-                raise LhpProtocolError(
-                    f"transport for {device_id!r} cannot produce frames",
-                    code=ERR_UNSUPPORTED_CAPABILITY,
-                )
-            frame_kwargs: dict[str, Any] = {
-                "max_width": max_width,
-                "quality": quality,
-            }
-            # ``fps`` postdates the original FrameTransport side protocol. Preserve
-            # structural compatibility with third-party transports while keeping a
-            # TypeError raised inside a driver visible as a real internal defect.
-            if _accepts_keyword(transport.read_frame, "fps"):
-                frame_kwargs["fps"] = fps
-            frame = await transport.read_frame(channel_id, **frame_kwargs)
-        _verify_reading_identity(frame, device_id, channel_id)
+        max_width = optional_int(params, "max_width", upper=MAX_FRAME_WIDTH)
+        quality = optional_int(params, "quality", upper=100)
+        fps = optional_float(params, "fps", upper=MAX_FRAME_RATE_HZ)
+        freshness = freshness_bounds(params)
+        frame = await self._read_held_frame(
+            device_id,
+            channel_id,
+            {"max_width": max_width, "quality": quality, "fps": fps},
+            freshness,
+        )
+        verify_reading_identity(frame, device_id, channel_id)
         data = getattr(frame, "data", None)
         if not isinstance(data, (bytes, bytearray)) or not data:
             raise LhpProtocolError(
@@ -376,16 +409,69 @@ class LhpNodeServer:
         payload["data_b64"] = base64.b64encode(bytes(data)).decode("ascii")
         return payload
 
+    async def _read_held_frame(
+        self,
+        device_id: str,
+        channel_id: str,
+        request: Mapping[str, Any],
+        freshness: Mapping[str, Any],
+    ) -> Any:
+        """Read one frame for this connection, holding the device for it.
+
+        A transport declaring ``frame_reads_concurrent`` serves many readers from one
+        producer (a frame hub, a latest-frame pump), so only resolving the transport
+        and recording the hold need the device's I/O lock: the read itself runs
+        outside it. Otherwise a preview poll waiting on a fresh frame would stall a
+        node-local skill's grasp capture on the same camera for a whole frame period,
+        which is exactly the serialisation the hub exists to remove. The hold comes
+        first so the transport cannot be released between lock and read; it stays
+        even if the read fails, because the connection still consumes the channel
+        and ``release_frame`` or disconnect ends it.
+        """
+        async with self._registry.device_io(device_id):
+            transport = await self._registry.transport(device_id)
+            if not isinstance(transport, FrameTransport):
+                raise LhpProtocolError(
+                    f"transport for {device_id!r} cannot produce frames",
+                    code=ERR_UNSUPPORTED_CAPABILITY,
+                )
+            kwargs = _frame_kwargs(transport, request, freshness)
+            concurrent = bool(getattr(transport, "frame_reads_concurrent", False)) and callable(
+                getattr(self._registry, "hold", None)
+            )
+            if not concurrent:
+                frame = await transport.read_frame(channel_id, **kwargs)
+                self._hold_frame(device_id, channel_id)
+                return frame
+            self._hold_frame(device_id, channel_id)
+        return await transport.read_frame(channel_id, **kwargs)
+
     async def _handle_release_frame(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        """Release node-local capture when the host's last preview lease closes."""
-        device_id = _require_str(params, "device_id")
-        channel_id = _require_str(params, "channel_id")
+        """Release this connection's claim on a node-local frame channel.
+
+        The camera itself closes only when nobody else holds it: another connection's
+        preview, or a node-local consumer, must not lose its device because one host
+        closed a panel.
+        """
+        device_id = require_str(params, "device_id")
+        channel_id = require_str(params, "channel_id")
         _, channel = self._resolve_channel(device_id, channel_id)
         if not bool(getattr(channel, "is_media", False)):
             raise LhpProtocolError(
                 f"channel {channel_id!r} on {device_id!r} is not a frame channel",
                 code=ERR_UNKNOWN_CHANNEL,
             )
+        if callable(getattr(self._registry, "release_hold", None)):
+            holder = _frame_holder(_CONNECTION_ID.get(), channel_id)
+            self._frame_holds.get(_CONNECTION_ID.get(), set()).discard((device_id, holder))
+            closed = await self._registry.release_hold(device_id, holder)
+            return {
+                "device_id": device_id,
+                "channel_id": channel_id,
+                "released": True,
+                "device_closed": bool(closed),
+            }
+        # A registry without a holder ledger: the pre-ledger behaviour, last caller wins.
         drop_transport = getattr(self._registry, "drop_transport", None)
         if not callable(drop_transport):
             raise LhpProtocolError(
@@ -396,32 +482,56 @@ class LhpNodeServer:
             await drop_transport(device_id)
         return {"device_id": device_id, "channel_id": channel_id, "released": True}
 
+    def _hold_frame(self, device_id: str, channel_id: str) -> None:
+        """Record that the requesting connection now consumes *channel_id*."""
+        hold = getattr(self._registry, "hold", None)
+        if not callable(hold):
+            return
+        connection_id = _CONNECTION_ID.get()
+        if connection_id and connection_id not in self._connection_states:
+            # The request outlived its connection, whose holds are already released;
+            # recording one now would keep the camera on with nobody left to drop it.
+            return
+        holder = _frame_holder(connection_id, channel_id)
+        hold(device_id, holder)
+        self._frame_holds.setdefault(connection_id, set()).add((device_id, holder))
+
+    async def _release_connection_frames(self, connection_id: str) -> None:
+        """Release every frame channel a closed connection still held. Never raises."""
+        for device_id, holder in sorted(self._frame_holds.pop(connection_id, set())):
+            try:
+                closed = await self._registry.release_hold(device_id, holder)
+            except Exception as exc:  # noqa: BLE001 - one device must not strand the rest
+                logger.error(
+                    "LHP frame release for %r after disconnect failed: %s",
+                    device_id,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            logger.info(
+                "LHP connection closed; released %s on %s (device closed: %s)",
+                holder,
+                device_id,
+                closed,
+            )
+
     async def _handle_write(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        device_id = _require_str(params, "device_id")
-        channel_id = _require_str(params, "channel_id")
+        device_id = require_str(params, "device_id")
+        channel_id = require_str(params, "channel_id")
         if "value" not in params:
             raise LhpProtocolError("write needs a 'value' (null is a value; omission is not)")
         value = params.get("value")
-        context, channel = self._resolve_channel(device_id, channel_id)
-        # Write mode gate
-        mode_refusal = self._write_mode_gate(params)
-        if mode_refusal is not None:
-            return mode_refusal.to_dict()
-        refusal = await self._write_precheck(context, channel, value)
-        if refusal is not None:
-            return refusal.to_dict()
-        async with self._registry.device_io(device_id):
-            transport = await self._registry.transport(device_id)
-            outcome = await transport.write(channel_id, value)
-        if outcome.readback is not None:
-            _verify_reading_identity(outcome.readback, device_id, channel_id)
-        if outcome.ok:
-            self._record_accepted_command(device_id, channel_id, value)
+        self._resolve_channel(device_id, channel_id)
+        gate_refusal = self._write_feasibility_refusal(device_id) or self._authority.check("write", params)
+        if gate_refusal is not None:
+            return gate_refusal.to_dict()
+        outcome = await self._gate.write(device_id, channel_id, value)
         return outcome.to_dict()
 
     async def _handle_write_batch(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        device_id = _require_str(params, "device_id")
-        commands = _require_commands(params)
+        device_id = require_str(params, "device_id")
+        commands = require_commands(params)
         context = self._registry.context(device_id)
         if context is None:
             raise LhpProtocolError(f"unknown device {device_id!r}", code=ERR_UNKNOWN_DEVICE)
@@ -431,70 +541,15 @@ class LhpNodeServer:
                     f"unknown channel {channel_id!r} on device {device_id!r}",
                     code=ERR_UNKNOWN_CHANNEL,
                 )
-        # Write mode gate
-        mode_refusal = self._write_mode_gate(params)
-        if mode_refusal is not None:
-            outcomes = tuple(mode_refusal for _ in commands)
+        gate_refusal = self._write_feasibility_refusal(device_id) or self._authority.check("write_batch", params)
+        if gate_refusal is not None:
+            outcomes = tuple(gate_refusal for _ in commands)
             return self._batch_payload(ok=False, outcomes=outcomes)
-        # Precheck all commands atomically before executing any.
-        verdicts = [
-            await self._write_precheck(context, context.channel(channel_id), value)
-            for channel_id, value in commands
-        ]
-        if any(verdict is not None for verdict in verdicts):
-            aborted = WriteOutcome(
-                ok=False,
-                side_effect_state=SIDE_EFFECT_NONE,
-                error="batch refused: another command was rejected before anything was attempted",
-                failure_code=FAILURE_BATCH_ABORTED,
-            )
-            outcomes = tuple(verdict if verdict is not None else aborted for verdict in verdicts)
-            return self._batch_payload(ok=False, outcomes=outcomes)
-        async with self._registry.device_io(device_id):
-            transport = await self._registry.transport(device_id)
-            if isinstance(transport, BatchTransport):
-                batch = await transport.write_batch(tuple(commands))
-                outcomes = tuple(batch.outcomes)
-                ok = bool(batch.ok)
-            else:
-                # Stop-on-failure sequential: first failure stops the batch.
-                outcomes_list: list[WriteOutcome] = []
-                ok = True
-                for idx, (channel_id, value) in enumerate(commands):
-                    try:
-                        result = await transport.write(channel_id, value)
-                    except TransportError as exc:
-                        result = WriteOutcome(
-                            ok=False,
-                            side_effect_state=SIDE_EFFECT_NONE,
-                            error=str(exc),
-                            failure_code=exc.failure_code,
-                        )
-                    outcomes_list.append(result)
-                    if not result.ok:
-                        ok = False
-                        # Mark remaining commands as unattempted
-                        for _ in range(idx + 1, len(commands)):
-                            outcomes_list.append(
-                                WriteOutcome(
-                                    ok=False,
-                                    side_effect_state=SIDE_EFFECT_NONE,
-                                    error="batch stopped: a preceding command failed",
-                                    failure_code=FAILURE_BATCH_ABORTED,
-                                )
-                            )
-                        break
-                outcomes = tuple(outcomes_list)
-        for index, outcome in enumerate(outcomes):
-            if outcome.readback is not None and index < len(commands):
-                _verify_reading_identity(outcome.readback, device_id, commands[index][0])
-            if outcome.ok and index < len(commands):
-                channel_id, value = commands[index]
-                self._record_accepted_command(device_id, channel_id, value)
+        ok, outcomes = await self._gate.write_batch(device_id, commands)
         return self._batch_payload(ok=ok, outcomes=outcomes)
 
     async def _handle_probe(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        device_id = _require_str(params, "device_id")
+        device_id = require_str(params, "device_id")
         if self._registry.context(device_id) is None:
             raise LhpProtocolError(f"unknown device {device_id!r}", code=ERR_UNKNOWN_DEVICE)
         try:
@@ -502,57 +557,100 @@ class LhpNodeServer:
             status = await transport.probe()
         except TransportError as exc:
             return TransportStatus(connected=False, halt_supported=False, detail=str(exc)).to_dict()
-        return status.to_dict()
+        payload = status.to_dict()
+        hub = (status.metadata or {}).get("frame_hub")
+        if isinstance(hub, Mapping) and hub:
+            payload["frame_hub"] = dict(hub)  # pump health for the host's monitor; JSON-safe
+        if hasattr(self._registry, "calibration_generations"):
+            try:
+                payload["calibration_lifecycle"] = await self._calibration_lifecycle.probe(
+                    device_id, _CONNECTION_ID.get(), params.get("calibration_ack", ()),
+                )
+            except ValueError as exc:
+                raise LhpProtocolError(str(exc), code=ERR_BAD_REQUEST) from exc
+            except Exception:  # noqa: BLE001 - telemetry storage cannot fail a health probe
+                logger.warning("Calibration lifecycle probe unavailable", exc_info=True)
+                payload["calibration_lifecycle_error"] = "durable lifecycle telemetry unavailable; evolution disabled"
+        return payload
 
     async def _handle_halt(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        device_id = _require_str(params, "device_id")
-        if self._registry.context(device_id) is None:
+        """Stop a device now, over the link that is already open.
+
+        A halt never brings a device up. Opening one runs the whole bring-up
+        (warm-up, firmware-profile verification), so a profile the arm could not
+        report would refuse the stop itself -- a routine shutdown sweep logged
+        ``cannot verify the arm firmware profile`` at ERROR for an arm this node
+        had never opened, and a successful open would have woken a device purely
+        to put it down. A device with no open link here is not being driven by
+        this process and holds no motion this call could stop.
+
+        ``halt_supported`` stays as the device declared it: the device can be
+        stopped and this node simply has nothing to send the stop over, which is
+        not the same as a device declaring that it cannot halt.
+
+        The registry owns the link cache, so the stop goes through it: a stop that
+        ends the link (a camera releases its device) must take the instance out of
+        the cache, or every later frame read on this node fails with "is not open".
+        """
+        device_id = require_str(params, "device_id")
+        context = self._registry.context(device_id)
+        if context is None:
             raise LhpProtocolError(f"unknown device {device_id!r}", code=ERR_UNKNOWN_DEVICE)
         try:
-            transport = await self._registry.transport(device_id)
-            status = await transport.halt()
+            status = await self._registry.halt(device_id)
         except TransportError as exc:
             logger.error("LHP halt for %r failed: %s", device_id, exc, exc_info=True)
-            return TransportStatus(connected=False, halt_supported=False, detail=str(exc)).to_dict()
+            return TransportStatus(
+                connected=False,
+                halt_supported=getattr(context, "halt_supported", None) is not False,
+                halt_delivered=False,
+                detail=str(exc),
+            ).to_dict()
+        if status is None:
+            logger.info("LHP halt for %r: no open link on this node, nothing to stop", device_id)
+            return TransportStatus(
+                connected=False,
+                halt_supported=getattr(context, "halt_supported", None) is not False,
+                detail="no link is open to this device on the node, so nothing is being driven "
+                       "from here",
+            ).to_dict()
         return status.to_dict()
 
     # ── Control session handlers ──
 
-    def _ensure_control_sessions(self) -> Any:
-        """Lazily create the NodeControlSessions manager."""
-        if self._control_sessions is None:
-            from leapflow.hardware.lhp.control_sessions import NodeControlSessions
-
-            self._control_sessions = NodeControlSessions(
-                self._registry, permit_verifier=self._permit_verifier
-            )
-        return self._control_sessions
-
     async def _handle_control_open(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        mode_refusal = self._write_mode_gate(params)
-        if mode_refusal is not None:
-            return mode_refusal.to_dict()
-        sessions = self._ensure_control_sessions()
-        return await sessions.open(params, connection_id=self._current_connection_id)
+        device_id = str(params.get("device_id") or "")
+        if busy := self._write_feasibility_refusal(device_id):
+            return busy.to_dict()
+        if reason := control_safety_refusal(self._registry, device_id):
+            return refusal(reason, FAILURE_SAFETY_DENIED).to_dict()
+        # Missing authority and observe-only refusals consume no nonce. All other
+        # authority is checked after the awaited owner feasibility checks.
+        if self._authority.mode == WRITE_MODE_OBSERVE_ONLY or (
+            self._authority.mode == WRITE_MODE_PERMIT_REQUIRED and params.get("permit") is None
+        ):
+            gate_refusal = self._authority.check("control.open", params)
+            if gate_refusal is not None:
+                return gate_refusal.to_dict()
+        return await self._sessions.open(
+            params, connection_id=_CONNECTION_ID.get(),
+            authorize=lambda: self._authority.check("control.open", params),
+        )
 
     async def _handle_control_renew(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        sessions = self._ensure_control_sessions()
-        return await sessions.renew(params, connection_id=self._current_connection_id)
+        return await self._sessions.renew(params, connection_id=_CONNECTION_ID.get())
 
     async def _handle_control_update(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        mode_refusal = self._write_mode_gate(params)
-        if mode_refusal is not None:
-            return mode_refusal.to_dict()
-        sessions = self._ensure_control_sessions()
-        return await sessions.update(params, connection_id=self._current_connection_id)
+        gate_refusal = self._authority.check("control.update", params)
+        if gate_refusal is not None:
+            return gate_refusal.to_dict()
+        return await self._sessions.update(params, connection_id=_CONNECTION_ID.get())
 
     async def _handle_control_close(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        sessions = self._ensure_control_sessions()
-        return await sessions.close(params, connection_id=self._current_connection_id)
+        return await self._sessions.close(params, connection_id=_CONNECTION_ID.get())
 
     async def _handle_control_status(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        sessions = self._ensure_control_sessions()
-        return await sessions.status(params)
+        return await self._sessions.status(params)
 
     # ── Internals ──
 
@@ -575,157 +673,28 @@ class LhpNodeServer:
             )
         return context, channel
 
-    def _write_mode_gate(self, params: Mapping[str, Any]) -> WriteOutcome | None:
-        """Enforce write mode before precheck. Returns a refusal or None."""
-        if self._write_mode == WRITE_MODE_OBSERVE_ONLY:
-            return WriteOutcome(
-                ok=False,
-                side_effect_state=SIDE_EFFECT_NONE,
-                error="node is in observe-only mode; writes are disabled",
-                failure_code=FAILURE_WRITES_DISABLED,
-            )
-        if self._write_mode == WRITE_MODE_PERMIT_REQUIRED:
-            return self._verify_permit(params)
-        return None
+    def _write_feasibility_refusal(self, device_id: str) -> WriteOutcome | None:
+        """Refuse busy or unreconciled consumers before consuming a wire permit.
 
-    def _verify_permit(self, params: Mapping[str, Any]) -> WriteOutcome | None:
-        """Verify permit from params when in permit_required mode."""
-        verifier = self._permit_verifier
-        permit_data = params.get("permit")
-        if permit_data is None or verifier is None:
-            return WriteOutcome(
-                ok=False,
-                side_effect_state=SIDE_EFFECT_NONE,
-                error=(
-                    "node requires a signed execution permit for writes"
-                    if verifier is not None and getattr(verifier, "has_trusted_keys", False)
-                    else "node has no trusted issuer keys; all writes are refused "
-                    "until permit issuer keys are configured"
-                ),
-                failure_code=FAILURE_PERMIT_REQUIRED,
-            )
-        from leapflow.hardware.lhp.permit import ExecutionPermit as _EP
-
-        try:
-            permit = _EP.from_dict(permit_data)
-        except (TypeError, ValueError, KeyError) as exc:
-            return WriteOutcome(
-                ok=False,
-                side_effect_state=SIDE_EFFECT_NONE,
-                error=f"malformed permit: {exc}",
-                failure_code=FAILURE_PERMIT_REQUIRED,
-            )
-        # Build expected digest from the request params for verification.
-        # The caller is responsible for including the correct digest in the permit.
-        expected = permit.action_digest
-        rejection = verifier.verify(permit, expected_digest=expected)
-        if rejection is not None:
-            return WriteOutcome(
-                ok=False,
-                side_effect_state=SIDE_EFFECT_NONE,
-                error=rejection.message,
-                failure_code=rejection.code,
-            )
-        return None
-
-    async def _write_precheck(
-        self, context: HardwareContext, channel: Any, value: Any
-    ) -> WriteOutcome | None:
-        """Return a provable refusal for *value*, or None when the write may proceed.
-
-        Defense in depth: the host already runs its own feasibility checks, but a
-        node must never rely on a remote caller having done so -- the same reason
-        ``check_safety_policy`` exists below the tool layer.
-
-        Check order: writable → envelope → interlocks → degradation → rate → safety.
+        Restart stop-use, like a resource hold, is feasibility rather than authority.
         """
-        if not channel.is_writable:
-            return WriteOutcome(
-                ok=False,
-                side_effect_state=SIDE_EFFECT_NONE,
-                error=f"channel {channel.channel_id!r} is not writable",
-                failure_code=FAILURE_NOT_WRITABLE,
+        if self._sessions.busy_device((device_id,)):
+            return refusal(
+                f"device {device_id!r} is held by a running session; stop it or wait for it to end",
+                FAILURE_DEVICE_BUSY,
             )
-        if not channel.envelope.contains(value):
-            return WriteOutcome(
-                ok=False,
-                side_effect_state=SIDE_EFFECT_NONE,
-                error=(
-                    f"value {value!r} is outside the admitted envelope for "
-                    f"{context.device_id}.{channel.channel_id}"
-                ),
-                failure_code=FAILURE_SAFETY_DENIED,
-            )
-        # Interlocks (fail-closed)
-        from leapflow.hardware.interlocks import failed_interlocks
+        from leapflow.hardware.node_gate import recovery_safety_refusal
 
-        failed = await failed_interlocks(self._registry, context, channel)
-        if failed:
-            return WriteOutcome(
-                ok=False,
-                side_effect_state=SIDE_EFFECT_NONE,
-                error=f"interlocks not satisfied: {', '.join(failed)}",
-                failure_code=FAILURE_INTERLOCK_UNSATISFIED,
-            )
-        # Degradation
-        is_degraded = getattr(self._registry, "is_device_degraded", None)
-        if callable(is_degraded) and is_degraded(context.device_id):
-            return WriteOutcome(
-                ok=False,
-                side_effect_state=SIDE_EFFECT_NONE,
-                error=f"device {context.device_id!r} is in a degraded state",
-                failure_code=FAILURE_DEVICE_DEGRADED,
-            )
-        # Rate limiting
-        numeric = as_numeric(value)
-        last_command = getattr(self._registry, "last_command", None)
-        if numeric is not None and callable(last_command):
-            baseline = last_command(context.device_id, channel.channel_id)
-            if baseline is not None:
-                previous, previous_at = baseline
-                wait_s = channel.envelope.rate_wait_s(
-                    delta=numeric - previous,
-                    elapsed_s=time.monotonic() - previous_at,
-                )
-                if wait_s > 0.0:
-                    return WriteOutcome(
-                        ok=False,
-                        side_effect_state=SIDE_EFFECT_NONE,
-                        error=(
-                            f"command exceeds the declared maximum rate for "
-                            f"{context.device_id}.{channel.channel_id}; retry after "
-                            f"approximately {wait_s:.3f}s"
-                        ),
-                        failure_code="rate_limited",
-                    )
-        allowed, reason = self._registry.check_safety_policy(context, channel, value)
-        if not allowed:
-            return WriteOutcome(
-                ok=False,
-                side_effect_state=SIDE_EFFECT_NONE,
-                error=reason,
-                failure_code=FAILURE_SAFETY_DENIED,
-            )
+        if reason := recovery_safety_refusal(self._registry, device_id):
+            return refusal(reason, FAILURE_SAFETY_DENIED)
         return None
-
-    def _record_accepted_command(self, device_id: str, channel_id: str, value: Any) -> None:
-        numeric = as_numeric(value)
-        record_command = getattr(self._registry, "record_command", None)
-        if numeric is not None and callable(record_command):
-            record_command(device_id, channel_id, numeric)
 
     @staticmethod
     def _batch_payload(*, ok: bool, outcomes: tuple[WriteOutcome, ...]) -> dict[str, Any]:
-        merged = worst_side_effect_state(outcome.side_effect_state for outcome in outcomes)
-        # A vector command that left the device mixed (some channels landed, one
-        # provably did not) is PARTIAL, not COMMITTED -- "committed" would claim
-        # the batch as a whole took effect.
-        if not ok and merged == SIDE_EFFECT_COMMITTED:
-            merged = SIDE_EFFECT_PARTIAL
         return {
             "ok": bool(ok),
             "outcomes": [outcome.to_dict() for outcome in outcomes],
-            "side_effect_state": merged,
+            "side_effect_state": merged_batch_state(ok, outcomes),
         }
 
     # ── Socket listener ──
@@ -769,6 +738,10 @@ class LhpNodeServer:
         server, self._server = self._server, None
         if server is not None:
             server.close()
+        try:
+            await self._sessions.shutdown()
+        except Exception as exc:  # noqa: BLE001 - shutdown must still drop the connections
+            logger.error("LHP session shutdown failed: %s", exc, exc_info=True)
         for writer in list(self._writers):
             with suppress(Exception):
                 writer.close()
@@ -787,6 +760,7 @@ class LhpNodeServer:
         state = _ConnectionState()
         connection_id = str(uuid.uuid4())
         state.connection_id = connection_id
+        self._connection_states[connection_id] = state
         semaphore = asyncio.Semaphore(self._max_concurrent_requests)
         write_lock = asyncio.Lock()
         handlers: set[asyncio.Task[None]] = set()
@@ -832,7 +806,10 @@ class LhpNodeServer:
                     continue
                 task = asyncio.get_running_loop().create_task(
                     self._dispatch_and_reply(
-                        request, writer, write_lock, semaphore,
+                        request,
+                        writer,
+                        write_lock,
+                        semaphore,
                         connection_id=connection_id,
                     )
                 )
@@ -841,12 +818,14 @@ class LhpNodeServer:
         except (ConnectionError, OSError):
             pass
         finally:
-            # Notify control sessions about disconnect
-            if state.connection_id and self._control_sessions is not None:
-                try:
-                    await self._control_sessions.on_disconnect(state.connection_id)
-                except Exception:  # noqa: BLE001
-                    logger.debug("control disconnect callback failed", exc_info=True)
+            # Sessions owned by a dropped connection fail safe.
+            try:
+                self._calibration_lifecycle.disconnect(state.connection_id)
+                await self._sessions.on_disconnect(state.connection_id)
+            except Exception as exc:  # noqa: BLE001 - a fail-safe fault must not leak the writer
+                logger.error("LHP disconnect fail-safe failed: %s", exc, exc_info=True)
+            self._connection_states.pop(connection_id, None)
+            await self._release_connection_frames(state.connection_id)
             self._writers.discard(writer)
             with suppress(Exception):
                 writer.close()
@@ -861,10 +840,14 @@ class LhpNodeServer:
         connection_id: str = "",
     ) -> None:
         async with semaphore:
-            self._current_connection_id = connection_id
+            _CONNECTION_ID.set(connection_id)  # task-local: concurrent requests cannot mix
             response = await self.handle_request(request, via="socket")
-            self._current_connection_id = ""
             await _send_frame(writer, write_lock, response)
+
+
+def _frame_holder(connection_id: str, channel_id: str) -> str:
+    """Name one connection's claim on one frame channel in the registry's holder ledger."""
+    return f"lhp:{connection_id or 'direct'}:{channel_id}"
 
 
 def _declarations_digest(contexts: Sequence[HardwareContext]) -> str:
@@ -873,11 +856,13 @@ def _declarations_digest(contexts: Sequence[HardwareContext]) -> str:
     Carried in ``hello`` because a heartbeat is the only conversation a host keeps
     with an idle node. A node restarted inside one heartbeat interval never looks
     offline, so liveness alone cannot reveal that it now declares a corrected
-    envelope or a camera plugged in since. Hashing the wire form, not the full
-    context, keeps node-private bindings out of the fingerprint too.
+    envelope or a camera plugged in since. Hashing the same canonical form the
+    host uses to bind a review (``verification.declaration_payload``) keeps
+    node-private bindings out of the fingerprint and keeps the two sides'
+    digests comparable.
     """
-    wire = [_wire_context(context) for context in contexts]
-    encoded = json.dumps(wire, sort_keys=True, separators=(",", ":"), default=str)
+    payloads = [declaration_payload(context) for context in contexts]
+    encoded = json.dumps(payloads, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
 
@@ -900,88 +885,27 @@ def _wire_context(context: HardwareContext) -> dict[str, Any]:
     return payload
 
 
-def _accepts_keyword(callable_: Any, name: str) -> bool:
-    """Return whether a frame callable accepts an optional keyword."""
-    try:
-        parameters = inspect.signature(callable_).parameters.values()
-    except (TypeError, ValueError):
-        return False
-    return any(
-        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters
-    )
+def _frame_kwargs(
+    transport: Any, request: Mapping[str, Any], freshness: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Build the keywords one transport's ``read_frame`` can honour.
 
-
-def _require_str(params: Mapping[str, Any], key: str) -> str:
-    value = params.get(key)
-    if not isinstance(value, str) or not value:
-        raise LhpProtocolError(f"{key!r} must be a non-empty string")
-    return value
-
-
-def _optional_int(params: Mapping[str, Any], key: str, *, upper: int) -> int:
-    value = params.get(key, 0)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > upper:
-        raise LhpProtocolError(f"{key!r} must be an integer from 0 through {upper}")
-    return value
-
-
-def _optional_float(params: Mapping[str, Any], key: str, *, upper: float) -> float:
-    value = params.get(key, 0.0)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise LhpProtocolError(f"{key!r} must be a number from 0 through {upper:g}")
-    numeric = float(value)
-    if not math.isfinite(numeric) or numeric < 0 or numeric > upper:
-        raise LhpProtocolError(f"{key!r} must be a number from 0 through {upper:g}")
-    return numeric
-
-
-def _require_channel_ids(params: Mapping[str, Any]) -> list[str]:
-    raw = params.get("channel_ids")
-    if not isinstance(raw, (list, tuple)) or not raw:
-        raise LhpProtocolError("'channel_ids' must be a non-empty list of channel ids")
-    channel_ids: list[str] = []
-    for item in raw:
-        if not isinstance(item, str) or not item:
-            raise LhpProtocolError("every entry of 'channel_ids' must be a non-empty string")
-        channel_ids.append(item)
-    return channel_ids
-
-
-def _require_commands(params: Mapping[str, Any]) -> list[tuple[str, Any]]:
-    raw = params.get("commands")
-    if not isinstance(raw, (list, tuple)) or not raw:
-        raise LhpProtocolError("'commands' must be a non-empty list of [channel, value] pairs")
-    commands: list[tuple[str, Any]] = []
-    for item in raw:
-        if not isinstance(item, (list, tuple)) or len(item) != 2:
-            raise LhpProtocolError("every command must be a [channel, value] pair")
-        channel_id = item[0]
-        if not isinstance(channel_id, str) or not channel_id:
-            raise LhpProtocolError("a command channel must be a non-empty string")
-        commands.append((channel_id, item[1]))
-    return commands
-
-
-def _verify_reading_identity(reading: Any, device_id: str, channel_id: str) -> None:
-    """Refuse a reading whose identity contradicts the request.
-
-    A transport that returns another channel's value produces a result that is
-    indistinguishable from success, so this is checked here -- where the request
-    identity is still known -- rather than trusted downstream.
+    ``fps`` postdates the original ``FrameTransport`` side protocol and is dropped
+    for a transport that cannot take it, preserving structural compatibility while
+    a ``TypeError`` raised inside a driver stays visible as a real defect. A
+    freshness bound is different: silently dropping it would return a stale frame
+    to a caller that asked for a fresh one, so it is refused instead.
     """
-    actual_channel = str(getattr(reading, "channel_id", ""))
-    if actual_channel != channel_id:
-        raise LhpProtocolError(
-            f"transport returned a reading for channel {actual_channel!r}, not {channel_id!r}",
-            code=ERR_INTERNAL_ERROR,
-        )
-    actual_device = str(getattr(reading, "device_id", ""))
-    if actual_device and actual_device != device_id:
-        raise LhpProtocolError(
-            f"transport returned a reading for device {actual_device!r}, not {device_id!r}",
-            code=ERR_INTERNAL_ERROR,
-        )
+    kwargs: dict[str, Any] = {"max_width": request["max_width"], "quality": request["quality"]}
+    if _accepts_keyword(transport.read_frame, "fps"):
+        kwargs["fps"] = request["fps"]
+    for name, value in freshness.items():
+        if not _accepts_keyword(transport.read_frame, name):
+            raise LhpProtocolError(
+                f"frame transport cannot honour {name!r}", code=ERR_UNSUPPORTED_CAPABILITY
+            )
+        kwargs[name] = value
+    return kwargs
 
 
 async def _send_frame(
@@ -996,4 +920,9 @@ async def _send_frame(
         logger.debug("LHP reply could not be delivered: %s", exc)
 
 
-__all__ = ["LhpNodeServer"]
+__all__ = [
+    "WRITE_MODE_OBSERVE_ONLY",
+    "WRITE_MODE_PERMIT_REQUIRED",
+    "WRITE_MODE_TRUSTED_V1",
+    "LhpNodeServer",
+]

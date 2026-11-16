@@ -96,6 +96,45 @@ def test_real_provider_conditions_still_use_the_provider_taxonomy() -> None:
     assert overflow.category == "context_overflow"
 
 
+def test_a_tool_reporting_its_own_defect_is_terminal_and_keeps_the_diagnosis() -> None:
+    """A producer's ``internal_defect`` must halt the turn, not be retried as generic."""
+    from leapflow.hardware.skill_results import outcome_fields
+
+    fields = outcome_fields(
+        {
+            "status": "failed",
+            "failure_code": INTERNAL_DEFECT_CATEGORY,
+            "side_effect_state": "none",  # a planning defect; nothing moved
+            "message": "AttributeError: 'NoneType' object has no attribute 'z'",
+        }
+    )
+    assert fields["failure_class"] == INTERNAL_DEFECT_CATEGORY
+    assert "AttributeError" in fields["error"]
+
+    envelope = _classifier().classify_tool_result(
+        fields, tool_name="hw_skill_run", execution_policy="side_effect"
+    )
+    assert envelope is not None
+    assert envelope.category == INTERNAL_DEFECT_CATEGORY
+    assert envelope.recoverability is Recoverability.NON_RECOVERABLE
+    assert "AttributeError" in envelope.message
+    assert envelope.provider_hint is not None
+
+    coordinator = RecoveryCoordinator(strategies=default_strategies(), budget=_budget())
+    coordinator.new_turn(turn_id=0)
+    assert coordinator.evaluate(envelope).action is RecoveryAction.HALT_CLEAN
+
+
+def test_a_defect_named_only_by_failure_code_falls_back_to_the_message() -> None:
+    envelope = _classifier().classify_tool_result(
+        {"ok": False, "failure_code": INTERNAL_DEFECT_CATEGORY, "message": "KeyError: 'x'"},
+        tool_name="some_tool",
+    )
+    assert envelope is not None
+    assert envelope.recoverability is Recoverability.NON_RECOVERABLE
+    assert envelope.message == "KeyError: 'x'"
+
+
 # ── Recovery: no compression/failover/rotation for a local bug ───────────
 
 def test_defect_halts_immediately_without_burning_strategies() -> None:
@@ -172,8 +211,9 @@ def test_recovery_audit_is_written_to_disk(tmp_path) -> None:
 def test_engine_points_the_audit_sink_at_the_profile_layout(tmp_path) -> None:
     """The sink must be constructed with a layout-owned path, not left in memory."""
     from conftest import StubLLM, make_settings
-    from leapflow.engine.engine import AgentEngine
+
     from leapflow.engine import build_default_registry
+    from leapflow.engine.engine import AgentEngine
     from leapflow.engine.intent_classifier import Intent
     from leapflow.memory import (
         EpisodicMemoryProvider,

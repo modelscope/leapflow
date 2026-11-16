@@ -152,10 +152,15 @@ class TurnAdmission:
         try:
             yield
         finally:
-            _current_slot.reset(token)
             # Only release what is still held: a parked turn cancelled before it
-            # re-acquired no longer owns a slot.
+            # re-acquired no longer owns a slot. Release before the ContextVar
+            # reset — a finalizer driven from a foreign Context makes ``reset``
+            # raise, and that must never strand the slot.
             holder.release()
+            try:
+                _current_slot.reset(token)
+            except ValueError:
+                pass  # foreign Context: the owning one is already gone
 
     @asynccontextmanager
     async def exclusive(self) -> AsyncIterator[None]:

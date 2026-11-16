@@ -1,0 +1,436 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""Scene skills: locate objects, share a frame, lift S2's pointing, propose grasps --
+read-only, everything by id.
+
+Perception reports every candidate it saw with its score and a fresh id; the
+grasp planner reports every grasp it found with its score and a fresh id. The
+skills never match labels, never break ties, and never pick on the model's
+behalf: S2 reads the candidates and names the ones it wants in a
+``motion.sequence``. Where the locator falls short, S2 can look for itself: a
+workcell that shares frames (and a host that consents) answers
+``perceive.snapshot`` with an image, and ``perceive.lift`` turns the points or
+boxes S2 names in it into objects like any other.
+
+Every observing skill takes a ``camera`` role (the workcell camera by default,
+or e.g. ``camera.wrist``), and its requirements are bound to that argument: a
+listing reports which cameras each skill can serve right now (``bindings``).
+Looking needs only the camera; placing what is seen in the arm base frame needs
+its hand-eye mount and the table, so an uncalibrated camera can still show S2
+the scene, and ``perceive.lift`` explains which camera to look with instead.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+from leapflow.hardware.skills.ports import SkillContext
+from leapflow.hardware.skills.protocol import (
+    COORDS,
+    COORDS_PIXEL,
+    EFFECT_READ,
+    FAILURE_CALIBRATION_MISSING,
+    FAILURE_INVALID_ARGS,
+    FAILURE_UNREACHABLE,
+    MAX_VIEW_CAMERAS,
+    PLANE_COLOR,
+    PLANES,
+    REQUIRE_CALIBRATION,
+    REQUIRE_MODEL,
+    REQUIRE_ROLE,
+    REQUIRE_SHARE,
+    SHARE_FRAMES,
+    SIDE_EFFECT_NONE,
+    PixelTarget,
+    SkillError,
+    SkillOutcome,
+    SkillPlan,
+    SkillSpec,
+    VIEW_DETAILS,
+)
+
+_WORKSPACE = f"{REQUIRE_CALIBRATION}workspace"
+_SHARE = f"{REQUIRE_SHARE}{SHARE_FRAMES}"
+# Bound to the skill's ``camera`` argument (``frames.bind_requirements``).
+_CAMERA_REQUIRES = (f"{REQUIRE_ROLE}{{camera}}", f"{REQUIRE_CALIBRATION}{{camera}}", _WORKSPACE)
+_PERCEPTION_REQUIRES = (*_CAMERA_REQUIRES, f"{REQUIRE_MODEL}locator")
+_SNAPSHOT_REQUIRES = (f"{REQUIRE_ROLE}{{camera}}", _SHARE)
+# The frame names its camera; lifting checks that camera's mount when it runs.
+_LIFT_REQUIRES = (_WORKSPACE, _SHARE)
+# No camera or locator here: the object already carries the camera it was seen
+# with, and may be one S2 lifted out of a shared frame -- bounding the planner on
+# the locator made every lifted object ungraspable on a workcell that runs no
+# model service. A planner that looks again reports its own camera problem.
+_GRASP_REQUIRES = (
+    f"{REQUIRE_ROLE}arm",
+    f"{REQUIRE_ROLE}gripper",
+    f"{REQUIRE_CALIBRATION}tcp",
+    _WORKSPACE,
+)
+_COORD = {"type": "number", "minimum": 0}
+_CAMERA_ARG = {
+    "type": "string",
+    "pattern": "^camera(\\.[a-z0-9_]+)*$",
+    "default": "camera",
+    "description": "Camera role to look with, e.g. camera.wrist; see this skill's bindings.",
+}
+
+
+def _fmt(point: Any) -> str:
+    return f"({point[0]:.0f}, {point[1]:.0f}, {point[2]:.0f}) mm"
+
+
+class Locate:
+    """Report every detection of the queried objects, each under a fresh id."""
+
+    spec = SkillSpec(
+        skill_id="perceive.locate",
+        version="2.1.0",
+        card=(
+            "Look at the table with a workcell camera and report every detection of "
+            "the queried descriptions (e.g. ['red cup', 'plate']): id, label, score, "
+            "centre (mm, arm base frame), size, yaw, how many depth points support "
+            "it, and its geometry (mask or box; a point has no size), plus what the "
+            "gripper holds. Several detections may answer one query; "
+            "all of them are returned. Ids replace those of earlier calls and expire "
+            "after a short while."
+        ),
+        args_schema={
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "minItems": 1,
+                    "maxItems": 8,
+                },
+                "min_score": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "Lowest detection score reported; the workcell's when omitted.",
+                },
+                "camera": _CAMERA_ARG,
+            },
+            "required": ["queries"],
+        },
+        effect=EFFECT_READ,
+        requires=_PERCEPTION_REQUIRES,
+    )
+
+    async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
+        return SkillPlan(
+            skill_id=self.spec.skill_id,
+            args=args,
+            summary=f"Locate {', '.join(args['queries'])} on the table with {args['camera']}",
+        )
+
+    async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
+        found = await ctx.scene.locate(
+            plan.args["queries"], min_score=plan.args.get("min_score"), camera=plan.args["camera"]
+        )
+        held = ctx.scene.held
+        table = ctx.frames.table
+        listed = "; ".join(
+            f"{o.object_id} {o.label} ({o.score:.2f}) at {_fmt(o.center)}" for o in found
+        )
+        return SkillOutcome.succeeded(
+            {
+                "objects": [obj.to_dict() for obj in found],
+                "held": None if held is None else held.to_dict(),
+                "table": None if table is None else table.to_dict(),
+            },
+            side_effect_state=SIDE_EFFECT_NONE,
+            message=f"Found {len(found)} detection(s): {listed}" if found else "Found nothing",
+        )
+
+
+class Snapshot:
+    """Share camera frames with S2 -- several cameras and planes in one image, with
+    what changed -- remembered for ``perceive.lift``."""
+
+    spec = SkillSpec(
+        skill_id="perceive.snapshot",
+        version="1.2.0",
+        card=(
+            "Look through workcell cameras and get one image you can see. camera is the "
+            "main view; with_cameras adds others (e.g. ['camera.wrist'], or ['all']) as "
+            "more rows of the same image, captured together. planes picks what each row "
+            "shows: color, depth (false colour, red=near, blue=far, black=no reading; "
+            "the range is in the tile label), infrared (look only, when the camera has "
+            "it). detail trades resolution for tiles: overview, standard, full, or auto. "
+            "With overlay, remembered objects (oN, red when not where expected), the TCP, "
+            "and the other cameras with where they aim are drawn in. The result names "
+            "the image: fN for one tile, vN for a mosaic (tiles gives each tile's "
+            "position); stats, changes (since each camera's previous snapshot), objects "
+            "(per camera: visible, occluded, moved_or_gone, no_depth, out_of_view), arm, "
+            "sync, and situation (what needs attention, in words). zoom {frame, box} "
+            "re-shows a box of a remembered frame at native resolution as a new fN. "
+            "Point into fN or vN with perceive.lift; a camera without a hand-eye "
+            "calibration shows the scene but cannot be lifted from. Only the newest few "
+            "images are kept, and they expire after a short while."
+        ),
+        args_schema={
+            "type": "object",
+            "properties": {
+                "camera": _CAMERA_ARG,
+                "with_cameras": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^(all|camera(\\.[a-z0-9_]+)*)$"},
+                    "maxItems": MAX_VIEW_CAMERAS,
+                    "default": [],
+                    "description": "More camera roles in the same image, or ['all'].",
+                },
+                "planes": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(PLANES)},
+                    "minItems": 1,
+                    "maxItems": len(PLANES),
+                    "default": [PLANE_COLOR],
+                },
+                "detail": {"type": "string", "enum": list(VIEW_DETAILS), "default": "auto"},
+                "overlay": {"type": "boolean", "default": True},
+                "zoom": {
+                    "type": "object",
+                    "properties": {
+                        "frame": {"type": "string", "minLength": 1, "maxLength": 16},
+                        "box": {"type": "array", "items": _COORD, "minItems": 4, "maxItems": 4},
+                        "coords": {"type": "string", "enum": list(COORDS), "default": COORDS_PIXEL},
+                    },
+                    "required": ["frame", "box"],
+                    "description": "Re-show box [x0, y0, x1, y1] of a remembered fN instead.",
+                },
+            },
+        },
+        effect=EFFECT_READ,
+        requires=_SNAPSHOT_REQUIRES,
+    )
+
+    async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
+        zoom = args.get("zoom")
+        if zoom is not None:
+            summary = f"Zoom into frame {zoom['frame']}"
+        else:
+            cameras = ", ".join([args["camera"], *args.get("with_cameras", ())])
+            summary = f"Share {'/'.join(args.get('planes', ()))} of {cameras}"
+        return SkillPlan(skill_id=self.spec.skill_id, args=args, summary=summary)
+
+    async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
+        args, zoom = plan.args, plan.args.get("zoom")
+        if zoom is not None:
+            box = zoom["box"]
+            if box[2] <= box[0] or box[3] <= box[1]:
+                raise SkillError(
+                    FAILURE_INVALID_ARGS, "zoom.box is [x0, y0, x1, y1] with x0 < x1 and y0 < y1"
+                )
+            shot = dict(await ctx.scene.zoom(
+                zoom["frame"], tuple(box), coords=zoom["coords"], planes=tuple(args["planes"])
+            ))
+        else:
+            shot = dict(await ctx.scene.snapshot(
+                args["camera"],
+                with_cameras=tuple(args["with_cameras"]),
+                planes=tuple(args["planes"]),
+                detail=args["detail"],
+                overlay=args["overlay"],
+            ))
+        unlifted = "" if shot.get("liftable") else f"; {shot.get('unliftable') or 'not liftable'}"
+        kind = "View" if str(shot["frame"]).startswith("v") else "Frame"
+        if "zoom_of" in shot:
+            source = f"a zoom into {shot['zoom_of']}"
+        elif "frames" in shot:
+            source = ", ".join(f"{cam} ({entry['frame']})" for cam, entry in shot["frames"].items())
+        else:
+            source = shot["camera"]
+        situation = "".join(f"\n- {line}" for line in shot.get("situation", ()))
+        return SkillOutcome.succeeded(
+            shot,
+            side_effect_state=SIDE_EFFECT_NONE,
+            message=(
+                f"{kind} {shot['frame']} from {source} "
+                f"({shot['width']}x{shot['height']} pixels){unlifted}{situation}"
+            ),
+        )
+
+
+class Lift:
+    """Turn points or boxes S2 names in a shared frame into base-frame objects."""
+
+    spec = SkillSpec(
+        skill_id="perceive.lift",
+        version="1.2.0",
+        card=(
+            "Turn what you point at in a perceive.snapshot image into objects, without "
+            "moving. frame is the image's fN, or vN for a mosaic (a target resolves to "
+            "the color or depth tile it lands in; keep a box inside one tile). Each "
+            "target has a label and either a point [u, v] on the object's "
+            "surface or a box [x0, y0, x1, y1] around it; coords says whether they are "
+            "pixels of the shared image, fractions (0-1) of its sides, or thousandths "
+            "(0-1000). Each lifted target gets an object id with the same fields as "
+            "perceive.locate (a point gives a surface point with no size); a target "
+            "with no depth behind it, or in a look-only tile, is reported as dropped. "
+            "Lifted ids live beside located ones until the next perceive.locate."
+        ),
+        args_schema={
+            "type": "object",
+            "properties": {
+                "frame": {"type": "string", "minLength": 1, "maxLength": 16},
+                "capture_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "targets": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string", "minLength": 1, "maxLength": 80},
+                            "point": {
+                                "type": "array",
+                                "items": _COORD,
+                                "minItems": 2,
+                                "maxItems": 2,
+                            },
+                            "box": {
+                                "type": "array",
+                                "items": _COORD,
+                                "minItems": 4,
+                                "maxItems": 4,
+                            },
+                        },
+                        "required": ["label"],
+                    },
+                },
+                "coords": {"type": "string", "enum": list(COORDS), "default": COORDS_PIXEL},
+            },
+            "required": ["frame", "targets"],
+        },
+        effect=EFFECT_READ,
+        requires=_LIFT_REQUIRES,
+    )
+
+    async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
+        labels = ", ".join(target.label for target in _targets(args))
+        return SkillPlan(
+            skill_id=self.spec.skill_id,
+            args=args,
+            summary=f"Lift {labels} from frame {args['frame']}",
+        )
+
+    async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
+        binding = {"capture_id": plan.args["capture_id"]} if "capture_id" in plan.args else {}
+        lifted, dropped = await ctx.scene.lift(
+            plan.args["frame"], _targets(plan.args), coords=plan.args["coords"], **binding
+        )
+        listed = "; ".join(f"{o.object_id} {o.label} at {_fmt(o.center)}" for o in lifted)
+        result: dict[str, Any] = {"objects": [obj.to_dict() for obj in lifted]}
+        if dropped:
+            result["dropped"] = [dict(entry) for entry in dropped]
+        return SkillOutcome.succeeded(
+            result,
+            side_effect_state=SIDE_EFFECT_NONE,
+            message=(
+                f"Lifted {len(lifted)} of {len(lifted) + len(dropped)} target(s)"
+                + (f": {listed}" if listed else "")
+            ),
+        )
+
+
+def _targets(args: Mapping[str, Any]) -> tuple[PixelTarget, ...]:
+    targets = []
+    for index, raw in enumerate(args["targets"]):
+        point, box = raw.get("point"), raw.get("box")
+        try:
+            if box is not None and (box[2] <= box[0] or box[3] <= box[1]):
+                raise ValueError("a box is [x0, y0, x1, y1] with x0 < x1 and y0 < y1")
+            targets.append(
+                PixelTarget(
+                    str(raw["label"]),
+                    point=None if point is None else (point[0], point[1]),
+                    box=None if box is None else (box[0], box[1], box[2], box[3]),
+                )
+            )
+        except ValueError as exc:
+            raise SkillError(FAILURE_INVALID_ARGS, f"targets[{index}]: {exc}") from exc
+    return tuple(targets)
+
+
+class GraspPropose:
+    """Ask the workcell's grasp planner for scored grasps of one located object."""
+
+    spec = SkillSpec(
+        skill_id="grasp.propose",
+        version="1.1.0",
+        card=(
+            "Propose grasps for one object id from perceive.locate, without moving: "
+            "each grasp has an id, the TCP poses pregrasp / grasp / retreat (mm, deg, "
+            "arm base frame), the width the jaws should open to, the expected closed "
+            "width, a score, and the planner that produced it. Every candidate is "
+            "inside the workspace at planning time. Grasp ids expire with their object."
+        ),
+        args_schema={
+            "type": "object",
+            "properties": {
+                "object": {"type": "string", "minLength": 1, "maxLength": 16},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3},
+            },
+            "required": ["object"],
+        },
+        effect=EFFECT_READ,
+        requires=_GRASP_REQUIRES,
+    )
+
+    async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
+        return SkillPlan(
+            skill_id=self.spec.skill_id,
+            args=args,
+            summary=f"Propose grasps for {args['object']}",
+        )
+
+    async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
+        obj = ctx.scene.object(plan.args["object"])
+        table = ctx.frames.table
+        if table is None:
+            raise SkillError(
+                FAILURE_CALIBRATION_MISSING,
+                "the table is not calibrated; run calib.workspace with table_z or table_points",
+            )
+        state = await ctx.motion.state()
+        planner = ctx.grasp_planner
+        proposed = await planner.candidates(obj, table=table, current=state.tcp)
+        feasible, refused = [], []
+        for candidate in proposed:
+            try:
+                for name in ("pregrasp", "grasp", "retreat"):
+                    ctx.motion.check_target(candidate.waypoint(name))
+            except SkillError as error:
+                refused.append(error.message)
+                continue
+            feasible.append(candidate)
+        if not feasible:
+            reason = f"; first refusal: {refused[0]}" if refused else ""
+            raise SkillError(
+                FAILURE_UNREACHABLE,
+                f"{planner.name} proposed no reachable grasp for {obj.object_id} ({obj.label}, "
+                f"{obj.length:.0f} x {obj.width:.0f} x {obj.height:.0f} mm){reason}",
+            )
+        named = ctx.scene.remember_grasps(obj, feasible[: int(plan.args["top_k"])])
+        ctx.note("grasps", {"planner": planner.name, "proposed": len(proposed), "refused": refused})
+        listed = "; ".join(
+            f"{g.grasp_id} score {g.score:.2f} open {g.open_mm:.0f} mm" for g in named
+        )
+        return SkillOutcome.succeeded(
+            {
+                "object": obj.to_dict(),
+                "grasps": [grasp.to_dict() for grasp in named],
+                "planner": planner.name,
+            },
+            side_effect_state=SIDE_EFFECT_NONE,
+            message=f"{len(named)} grasp(s) for {obj.object_id}: {listed}",
+        )
+
+
+def skills() -> tuple[Locate, Snapshot, Lift, GraspPropose]:
+    """Entry point for ``leapflow.hardware.skills``."""
+    return (Locate(), Snapshot(), Lift(), GraspPropose())
+
+
+__all__ = ["GraspPropose", "Lift", "Locate", "Snapshot", "skills"]

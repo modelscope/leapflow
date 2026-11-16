@@ -74,12 +74,14 @@ def _supported_rate(detail: str, requested: float) -> float | None:
     """
     if "not supported by the device" not in detail:
         return None
-    rates = sorted({
-        value
-        for group in _MODE_RATES_RE.findall(detail)
-        for value in (float(token) for token in group.split() if token)
-        if value > 0
-    })
+    rates = sorted(
+        {
+            value
+            for group in _MODE_RATES_RE.findall(detail)
+            for value in (float(token) for token in group.split() if token)
+            if value > 0
+        }
+    )
     if not rates:
         return None
     affordable = [rate for rate in rates if rate <= requested]
@@ -116,6 +118,7 @@ class _LinuxVideoCandidate:
     spec: str
     parent_key: str
     driver: str
+    usb_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,7 @@ class MediaDevice:
     ``spec`` is the platform's own input identifier (an AVFoundation index, a V4L2
     path, a DirectShow name). It is carried verbatim rather than reformatted so the
     capture backend hands the platform exactly what the platform named.
+    ``usb_id`` is ``vid:pid`` (lowercase hex) when the platform publishes it.
     """
 
     kind: str
@@ -133,6 +137,7 @@ class MediaDevice:
     spec: str
     input_format: str
     device_class: str = ""
+    usb_id: str = ""
 
     @property
     def device_id(self) -> str:
@@ -149,9 +154,7 @@ class MediaDevice:
         also means a device whose name is entirely non-ASCII still gets a usable id
         rather than an empty one.
         """
-        slug = "".join(
-            ch if (ch.isascii() and ch.isalnum()) else "_" for ch in self.name.lower()
-        )
+        slug = "".join(ch if (ch.isascii() and ch.isalnum()) else "_" for ch in self.name.lower())
         slug = "_".join(part for part in slug.split("_") if part)
         base = f"{self.kind}_{self.index}"
         return f"{base}_{slug}"[:64].rstrip("_") if slug else base
@@ -168,6 +171,11 @@ def enumerate_devices(config: Mapping[str, Any] | None = None) -> tuple[MediaDev
     screen" on the board beside the webcam, at one click. It remains available
     (``include_screens``) because it is a legitimate capability -- it is the default
     that should not make the decision for anyone.
+
+    ``exclude_usb`` lists USB identities (``vid`` or ``vid:pid``) whose video nodes a
+    dedicated driver owns -- a depth camera's UVC endpoints, say. Listing those as
+    generic cameras would put a second, competing opener of the same hardware on the
+    board.
     """
     config = config or {}
     enumerator = _ENUMERATORS.get(sys.platform) or _ENUMERATORS.get("linux")
@@ -181,14 +189,25 @@ def enumerate_devices(config: Mapping[str, Any] | None = None) -> tuple[MediaDev
 
     include_screens = bool(config.get("include_screens", False))
     include_microphones = bool(config.get("include_microphones", True))
+    excluded = usb_exclusions(config.get("exclude_usb"))
     selected = []
     for device in devices:
         if device.kind == SCREEN and not include_screens:
             continue
         if device.kind == MICROPHONE and not include_microphones:
             continue
+        if device.usb_id and any(
+            device.usb_id == item or device.usb_id.startswith(f"{item}:") for item in excluded
+        ):
+            continue
         selected.append(device)
     return tuple(selected)
+
+
+def usb_exclusions(raw: Any) -> tuple[str, ...]:
+    """Normalise ``exclude_usb`` (comma string or list) to lowercase ``vid[:pid]`` items."""
+    items = raw.split(",") if isinstance(raw, str) else list(raw or ())
+    return tuple(str(item).strip().lower() for item in items if str(item).strip())
 
 
 def _enumerate_darwin() -> tuple[MediaDevice, ...]:
@@ -202,9 +221,18 @@ def _enumerate_darwin() -> tuple[MediaDevice, ...]:
     binary = _ffmpeg_binary()
     if not binary:
         return ()
-    output = _run([
-        binary, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "",
-    ])
+    output = _run(
+        [
+            binary,
+            "-hide_banner",
+            "-f",
+            "avfoundation",
+            "-list_devices",
+            "true",
+            "-i",
+            "",
+        ]
+    )
     devices: list[MediaDevice] = []
     section = ""
     for line in output.splitlines():
@@ -223,19 +251,27 @@ def _enumerate_darwin() -> tuple[MediaDevice, ...]:
             # discovery layer, because mapping a platform's naming to a device class is
             # exactly what discovery is for -- nothing downstream branches on the name.
             is_screen = name.lower().startswith("capture screen")
-            devices.append(MediaDevice(
-                kind=SCREEN if is_screen else CAMERA,
-                index=index,
-                name=name,
-                spec=f"{index}:none",
-                input_format="avfoundation",
-                device_class=SCREEN if is_screen else CAMERA,
-            ))
+            devices.append(
+                MediaDevice(
+                    kind=SCREEN if is_screen else CAMERA,
+                    index=index,
+                    name=name,
+                    spec=f"{index}:none",
+                    input_format="avfoundation",
+                    device_class=SCREEN if is_screen else CAMERA,
+                )
+            )
         else:
-            devices.append(MediaDevice(
-                kind=MICROPHONE, index=index, name=name,
-                spec=f":{index}", input_format="avfoundation", device_class=MICROPHONE,
-            ))
+            devices.append(
+                MediaDevice(
+                    kind=MICROPHONE,
+                    index=index,
+                    name=name,
+                    spec=f":{index}",
+                    input_format="avfoundation",
+                    device_class=MICROPHONE,
+                )
+            )
     return tuple(devices)
 
 
@@ -256,10 +292,16 @@ def _enumerate_linux() -> tuple[MediaDevice, ...]:
             if not match:
                 continue
             index, label = int(match.group(1)), match.group(2).strip()
-            devices.append(MediaDevice(
-                kind=MICROPHONE, index=index, name=label, spec=f"hw:{index}",
-                input_format="alsa", device_class=MICROPHONE,
-            ))
+            devices.append(
+                MediaDevice(
+                    kind=MICROPHONE,
+                    index=index,
+                    name=label,
+                    spec=f"hw:{index}",
+                    input_format="alsa",
+                    device_class=MICROPHONE,
+                )
+            )
     return tuple(devices)
 
 
@@ -282,9 +324,19 @@ def _linux_video_devices(v4l: Path, dev_root: Path) -> tuple[MediaDevice, ...]:
                 spec=str(node),
                 parent_key=str(resolved.parent),
                 driver=(resolved / "device" / "driver").resolve().name,
+                usb_id=_usb_id(resolved),
             )
         )
     return _select_linux_video_candidates(tuple(candidates))
+
+
+def _usb_id(node: Path) -> str:
+    """``vid:pid`` of the USB device a sysfs video node hangs off, or ``""``."""
+    for ancestor in list(node.parents)[:5]:
+        vendor = _read_text(ancestor / "idVendor")
+        if vendor:
+            return f"{vendor}:{_read_text(ancestor / 'idProduct')}".lower()
+    return ""
 
 
 def _select_linux_video_candidates(
@@ -326,6 +378,7 @@ def _select_linux_video_candidates(
                 spec=candidate.spec,
                 input_format="v4l2",
                 device_class=CAMERA,
+                usb_id=candidate.usb_id,
             )
         )
     return tuple(devices)
@@ -366,10 +419,16 @@ def _enumerate_windows() -> tuple[MediaDevice, ...]:
         kind = CAMERA if sort == "video" else MICROPHONE
         index = counters[kind]
         counters[kind] += 1
-        devices.append(MediaDevice(
-            kind=kind, index=index, name=name,
-            spec=f'{sort}={name}', input_format="dshow", device_class=kind,
-        ))
+        devices.append(
+            MediaDevice(
+                kind=kind,
+                index=index,
+                name=name,
+                spec=f"{sort}={name}",
+                input_format="dshow",
+                device_class=kind,
+            )
+        )
     return tuple(devices)
 
 
@@ -457,10 +516,22 @@ class FfmpegFrameGrabber:
         qscale = max(2, min(31, round(31 - (self._quality / 100.0) * 29)))
         return [
             _ffmpeg_binary() or "ffmpeg",
-            "-hide_banner", "-loglevel", "error", "-nostdin",
-            "-fflags", "nobuffer", "-avioflags", "direct", "-flags", "low_delay",
-            "-probesize", "32", "-analyzeduration", "0",
-            "-f", self._device.input_format,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-fflags",
+            "nobuffer",
+            "-avioflags",
+            "direct",
+            "-flags",
+            "low_delay",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            "-f",
+            self._device.input_format,
             # An *input* option, and it has to be: a capture device negotiates its rate
             # when it is opened, so this must precede -i. avfoundation's default is
             # 29.97 (NTSC), which real webcams reject -- they offer exactly 15 and 30 --
@@ -471,15 +542,25 @@ class FfmpegFrameGrabber:
             # Note this is the *device* rate, not the preview rate. The source must use a
             # supported mode; the broker and the ``fps`` filter below cap how often frames
             # are scaled and JPEG-encoded for the page.
-            "-framerate", f"{self._input_rate:g}",
-            "-i", self._device.spec,
+            "-framerate",
+            f"{self._input_rate:g}",
+            "-i",
+            self._device.spec,
             # Drop at the requested preview cadence *before* scaling: ``-r`` alone is an
             # output option, so FFmpeg would still scale every 30fps input frame and only
             # discard the extra work at the encoder. The source device stays at a supported
             # 30fps mode; the page profile changes the expensive scale/JPEG path.
-            "-vf", f"fps={self._fps:g},scale={self._max_width}:-2",
-            self._sync_option, "passthrough", "-q:v", str(qscale),
-            "-flush_packets", "1", "-f", "mjpeg", "pipe:1",
+            "-vf",
+            f"fps={self._fps:g},scale={self._max_width}:-2",
+            self._sync_option,
+            "passthrough",
+            "-q:v",
+            str(qscale),
+            "-flush_packets",
+            "1",
+            "-f",
+            "mjpeg",
+            "pipe:1",
         ]
 
     async def start(self) -> None:
@@ -541,10 +622,14 @@ class FfmpegFrameGrabber:
             elif self._latest is not None:
                 return self._latest
             else:  # pragma: no cover - condition invariants above cover this
-                raise MediaCaptureError("capture is not running", failure_code="capture_not_started")
+                raise MediaCaptureError(
+                    "capture is not running", failure_code="capture_not_started"
+                )
 
         if restart_at_rate is None:  # pragma: no cover - guarded by the branch above
-            raise MediaCaptureError("capture restart was not configured", failure_code="capture_not_started")
+            raise MediaCaptureError(
+                "capture restart was not configured", failure_code="capture_not_started"
+            )
         self._input_rate = restart_at_rate
         await self.stop()
         await self.start()
@@ -560,7 +645,9 @@ class FfmpegFrameGrabber:
         process = self._process
         if process is None or process.stdout is None:
             await self._set_pump_error(
-                MediaCaptureError("capture process has no stdout", failure_code="capture_stream_failed")
+                MediaCaptureError(
+                    "capture process has no stdout", failure_code="capture_stream_failed"
+                )
             )
             return
         try:
@@ -572,7 +659,7 @@ class FfmpegFrameGrabber:
                     return
                 self._buffer.extend(chunk)
                 if len(self._buffer) > 4 * 1024 * 1024:
-                    del self._buffer[:-2 * 1024 * 1024]
+                    del self._buffer[: -2 * 1024 * 1024]
                 frame = self._take_frame()
                 if frame is None:
                     continue
@@ -584,8 +671,10 @@ class FfmpegFrameGrabber:
         except asyncio.CancelledError:
             return
         except Exception as exc:  # noqa: BLE001 - every terminal pump failure must wake waiters
-            failure = exc if isinstance(exc, MediaCaptureError) else MediaCaptureError(
-                str(exc), failure_code="capture_stream_failed"
+            failure = (
+                exc
+                if isinstance(exc, MediaCaptureError)
+                else MediaCaptureError(str(exc), failure_code="capture_stream_failed")
             )
             await self._set_pump_error(failure)
 
@@ -599,7 +688,9 @@ class FfmpegFrameGrabber:
         unplugged camera gives, so it only counts as contention when a holder is found.
         """
         busy = "Device or resource busy" in detail
-        holders = _device_holders(self._device.spec) if busy or "Input/output error" in detail else []
+        holders = (
+            _device_holders(self._device.spec) if busy or "Input/output error" in detail else []
+        )
         if not busy and not holders:
             return MediaCaptureError(
                 f"capture ended for {self._device.name!r}{detail}",
@@ -626,8 +717,8 @@ class FfmpegFrameGrabber:
         start = self._buffer.rfind(_JPEG_SOI, 0, end)
         if start == -1:
             return None
-        data = bytes(self._buffer[start:end + 2])
-        del self._buffer[:end + 2]
+        data = bytes(self._buffer[start : end + 2])
+        del self._buffer[: end + 2]
         self._size = _jpeg_size(data) or self._size
         return data, self._size[0], self._size[1]
 
@@ -641,7 +732,9 @@ class FfmpegFrameGrabber:
         except (asyncio.TimeoutError, OSError):
             return ""
         text = [line.strip() for line in raw.decode("utf-8", "replace").strip().splitlines()]
-        useful = [line for line in text if line and "NSCameraUseContinuityCameraDeviceType" not in line]
+        useful = [
+            line for line in text if line and "NSCameraUseContinuityCameraDeviceType" not in line
+        ]
         return f": {' | '.join(useful)}" if useful else ""
 
     async def stop(self) -> None:
@@ -706,7 +799,9 @@ class OpenCvFrameGrabber:
         if self._capture is not None:
             return
         cv2 = _import_cv2()
-        target: Any = self._device.index if self._device.input_format != "v4l2" else self._device.spec
+        target: Any = (
+            self._device.index if self._device.input_format != "v4l2" else self._device.spec
+        )
         capture = await asyncio.to_thread(cv2.VideoCapture, target)
         if not capture.isOpened():
             await asyncio.to_thread(capture.release)
@@ -736,7 +831,9 @@ class OpenCvFrameGrabber:
                 height, width = frame.shape[:2]
             ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._quality])
             if not ok:
-                raise MediaCaptureError("frame could not be encoded", failure_code="capture_encode_failed")
+                raise MediaCaptureError(
+                    "frame could not be encoded", failure_code="capture_encode_failed"
+                )
             return bytes(buffer), int(width), int(height)
 
         return await asyncio.to_thread(_read)
@@ -804,15 +901,22 @@ class FfmpegLevelReader:
     def _command(self) -> list[str]:
         return [
             _ffmpeg_binary() or "ffmpeg",
-            "-hide_banner", "-loglevel", "info", "-nostdin",
-            "-f", self._device.input_format,
-            "-i", self._device.spec,
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-nostdin",
+            "-f",
+            self._device.input_format,
+            "-i",
+            self._device.spec,
             "-af",
             (
                 f"asetnsamples=n={max(64, int(48000 * self._window_s))},"
                 f"astats=metadata=1:reset=1,ametadata=print:key={_RMS_KEY}"
             ),
-            "-f", "null", "-",
+            "-f",
+            "null",
+            "-",
         ]
 
     async def start(self) -> None:
@@ -862,7 +966,9 @@ class FfmpegLevelReader:
 
     async def read(self) -> float:
         if self._process is None:
-            raise MediaCaptureError("level measurement is not running", failure_code="capture_not_started")
+            raise MediaCaptureError(
+                "level measurement is not running", failure_code="capture_not_started"
+            )
         if self._process.returncode is not None:
             raise MediaCaptureError(
                 f"level measurement ended for {self._device.name!r}; the device may be "
@@ -1076,10 +1182,10 @@ def _jpeg_size(data: bytes) -> tuple[int, int] | None:
         if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
             index += 2
             continue
-        segment = int.from_bytes(data[index + 2:index + 4], "big")
+        segment = int.from_bytes(data[index + 2 : index + 4], "big")
         if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
-            height = int.from_bytes(data[index + 5:index + 7], "big")
-            width = int.from_bytes(data[index + 7:index + 9], "big")
+            height = int.from_bytes(data[index + 5 : index + 7], "big")
+            width = int.from_bytes(data[index + 7 : index + 9], "big")
             return width, height
         if segment <= 0:
             return None

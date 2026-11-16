@@ -1,0 +1,1133 @@
+#!/usr/bin/env python3
+"""Real-time Piper arm core (board side): sampler, guard, motion, gripper, contact, IK.
+
+Design rules encoded here, each one paid for by a measured failure:
+
+* **One absolute target per command.**  Re-sending a changing sub-millimetre
+  target every 25 ms left this firmware motionless twice (a 0.5 mm and a 1.2 mm
+  lead both held z 189.75 for four seconds), and a command issued the instant the
+  previous one arrived is dropped.  So every move sends one target, waits for the
+  measured pose to settle, and plans the next target from measurement.
+* **Decisions read a coherent 200 Hz snapshot.**  A serial poll of seven SDK
+  frames took 20-30 ms and mixed frames of different ages; the effort step needs
+  5 ms resolution to stay a brake instead of a press.
+* **Torque is a step detector, never a level.**  Posture alone changes the
+  holding torque by 3.6 N.m between z 165 and z 123, which is why a level gate
+  once declared three contacts in free air.  A 1.2 N.m step sustained 20 ms is an
+  obstruction; a ramp is posture.
+* **Contact means a position stall that survives a 0.4 mm verification step**,
+  searched with the gripper OPEN.  A closed flat jaw pressed on a smooth table
+  stores energy, slips, and the impact trips a driver -- twice.  Press depth is
+  budgeted, the arm lifts immediately, and no point is pressed twice per run.
+* **A fault ends motion at once.**  Lost enablement, a latched driver flag, a
+  stale feedback frame or a hot motor stops the motion before the next tick.
+
+Units at this boundary are millimetres and degrees; the SDK's milli-integers are
+converted only here.
+
+This module intentionally keeps sampling, guarding, motion, contact, and kinematics
+in one board-side file: it is deployed as a standalone artifact to a constrained
+controller, and splitting it would create partially updated safety components.
+"""
+
+from __future__ import annotations
+
+import collections
+import math
+import statistics
+import threading
+import time
+from typing import Any, Iterable, Sequence
+
+from leapflow.hardware.drivers._piper_feedback import CAN_GROUPS, ReceiveSource, receipt_problem
+
+RECEIVE_GROUPS = CAN_GROUPS
+
+SCALE = 1000  # SDK integer resolution: 0.001 mm and 0.001 deg
+
+# Official PIPER X model envelope intersected with a 5° planning margin.
+# This deliberately differs from piper_sdk 0.6.2's standard-Piper j4–j6 table.
+MODEL_JOINT_LIMITS_DEG = [
+    (-150.0, 150.0),  # j1
+    (0.0, 180.0),  # j2
+    (-170.0, 0.0),  # j3
+    (-89.0, 89.0),  # j4
+    (-89.0, 89.0),  # j5
+    (-165.0, 165.0),  # j6: manual ∩ pyAgxArm
+]
+JOINT_LIMITS_DEG = [
+    (-145.0, 145.0),
+    (5.0, 175.0),
+    (-165.0, -5.0),
+    (-84.0, 84.0),
+    (-84.0, 84.0),
+    (-160.0, 160.0),
+]
+ENVELOPE = {"x": (70.0, 300.0), "y": (-80.0, 220.0), "z": (35.0, 215.0)}
+TILT_MAX_DEG = 3.0
+TEMP_PREFLIGHT_MAX_C = 45.0
+TEMP_MAX_C = 55.0
+VOLTAGE_MIN_V = 21.6
+VOLTAGE_MAX_V = 26.0
+TEMP_HOT_RISE_C = 8.0  # over TEMP_WINDOW_S; 4.0 tripped during normal extended-pose hold at 33C
+TEMP_WINDOW_S = 60.0
+FRAME_AGE_MAX_S = 0.12
+JUMP_STOP_NM = 5.0  # gravitational torque on j2 changes ~2.4Nm during a 20mm descent at extended reach
+JUMP_SAMPLES = 4  # 20 ms of a sustained step
+INSTANT_NM = 6.0
+MAX_SPEED_PCT = 20
+GRIP_MAX_NM = 1.0
+REFUSALS = {0x02: "no_ik", 0x03: "singularity", 0x04: "joint_limit"}
+
+# j2 and j3 share a mechanical rest stop at their zero-pose boundary.
+# Feedback reads up to ~1° beyond the stop due to sensor noise and gravity.
+REST_STOP_TOLERANCE_DEG = 4.0  # j3 reaches 3.1° at extended grasp positions (x=200, z=117)
+
+FAULT_FLAGS = (
+    "driver_overcurrent",
+    "driver_overheating",
+    "driver_error_status",
+    "collision_status",
+    "stall_status",
+    "motor_overheating",
+)
+
+
+class Trip(Exception):
+    """A guard fired; callers stop the motion and report the snapshot."""
+
+    def __init__(self, reason: str, snapshot: dict | None = None, detail: str = ""):
+        super().__init__(reason + (f": {detail}" if detail else ""))
+        self.reason = reason
+        self.detail = detail
+        self.snapshot = snapshot
+
+
+class Refused(Exception):
+    """A command was rejected before it reached the arm."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+# ── sampling ────────────────────────────────────────────────────────────────
+
+
+def _motor(container: Any, index: int) -> Any:
+    return getattr(container, f"motor_{index}", None)
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(value.value)  # python Enum
+        except (AttributeError, TypeError, ValueError):
+            return default
+
+
+def _enable_status(arm: Any) -> list[bool]:
+    """Return six explicit motor-enable flags, or an empty fail-closed value."""
+    try:
+        raw = arm.GetArmEnableStatus()
+    except Exception:  # noqa: BLE001 - unavailable telemetry must fail closed
+        return []
+    if not isinstance(raw, (list, tuple)) or len(raw) != 6:
+        return []
+    return [bool(value) for value in raw]
+
+
+class Sampler:
+    """A 200 Hz reader that turns the SDK's cached frames into coherent snapshots."""
+
+    def __init__(self, arm: Any, hz: int = 200, *, receive_source: ReceiveSource | None = None):
+        self._arm = arm
+        self._receive_source = receive_source or (arm if isinstance(arm, ReceiveSource) else None)
+        self._hz = hz
+        self._ring: collections.deque = collections.deque(maxlen=hz * 5)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="cl-sampler", daemon=True)
+        self._stamp = -1
+        self._stamp_at = 0.0
+        self._last_joints: tuple[float, ...] = ()
+        self._joints_changed_at = 0.0
+        self._rate = 0.0
+        self._last_tick = 0.0
+        self.count = 0
+
+    def start(self) -> "Sampler":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def latest(self) -> dict:
+        with self._lock:
+            if not self._ring:
+                return self._read()
+            return dict(self._ring[-1])
+
+    def since(self, mono: float) -> list[dict]:
+        with self._lock:
+            return [dict(row) for row in self._ring if row["mono"] >= mono]
+
+    @property
+    def rate(self) -> float:
+        return round(self._rate, 1)
+
+    def _run(self) -> None:
+        interval = 1.0 / self._hz
+        next_at = time.monotonic()
+        while not self._stop.is_set():
+            row = self._read()
+            with self._lock:
+                self._ring.append(row)
+            self.count += 1
+            now = time.monotonic()
+            if self._last_tick:
+                instant = 1.0 / max(1e-6, now - self._last_tick)
+                self._rate = self._rate * 0.95 + instant * 0.05 if self._rate else instant
+            self._last_tick = now
+            next_at += interval
+            delay = next_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_at = time.monotonic()
+
+    def _read(self) -> dict:
+        if self._receive_source is not None:
+            with self._receive_source.capture():
+                return self._read_cached()
+        return self._read_cached()
+
+    def _read_cached(self) -> dict:
+        arm = self._arm
+        before = dict(self._receive_source.receipts()) if self._receive_source else {}
+        pose = arm.GetArmEndPoseMsgs()
+        end = pose.end_pose
+        hi = arm.GetArmHighSpdInfoMsgs()
+        low = arm.GetArmLowSpdInfoMsgs()
+        joints = arm.GetArmJointMsgs().joint_state
+        grip = arm.GetArmGripperMsgs().gripper_state
+        status = arm.GetArmStatus().arm_status
+        enable_status = _enable_status(arm)
+
+        efforts: list[float] = []
+        currents: list[float] = []
+        speeds: list[float] = []
+        driver_temps: list[float] = []
+        voltages: list[float] = []
+        temps: list[float] = []
+        flags: list[list[str]] = []
+        for index in range(1, 7):
+            high, slow = _motor(hi, index), _motor(low, index)
+            efforts.append(float(getattr(high, "effort", 0)) / SCALE if high else 0.0)
+            currents.append(float(getattr(high, "current", float("nan"))) / SCALE if high else float("nan"))
+            speeds.append(float(getattr(high, "motor_speed", float("nan"))) / SCALE if high else float("nan"))
+            driver_temps.append(float(getattr(slow, "foc_temp", float("nan"))) if slow else float("nan"))
+            voltages.append(float(getattr(slow, "vol", 0)) / 10.0 if slow else 0.0)
+            temps.append(float(getattr(slow, "motor_temp", 0)) if slow else 0.0)
+            found: list[str] = []
+            foc = getattr(slow, "foc_status", None)
+            if foc is not None:
+                if not bool(getattr(foc, "driver_enable_status", True)):
+                    found.append("disabled")
+                for flag in FAULT_FLAGS:
+                    if bool(getattr(foc, flag, False)):
+                        found.append(flag)
+            flags.append(found)
+
+        joint_deg = [float(getattr(joints, f"joint_{i}", 0)) / SCALE for i in range(1, 7)]
+
+        now = time.monotonic()
+        stamp = _as_int(getattr(pose, "time_stamp", 0))
+        if stamp != self._stamp:
+            self._stamp, self._stamp_at = stamp, now
+        # Primary freshness: detect when joint feedback actually changes.
+        cur_joints = tuple(joint_deg)
+        if cur_joints != self._last_joints:
+            self._last_joints = cur_joints
+            self._joints_changed_at = now
+        # Use the most recent of (pose-timestamp change, joint-data change).
+        best_at = max(self._stamp_at, self._joints_changed_at)
+        age = round(now - best_at, 3) if best_at > 0 else None
+        ctrl_mode = _as_int(getattr(status, "ctrl_mode", 0))
+        err = getattr(status, "err_status", None)
+        angle_limit = [
+            index for index in range(1, 7)
+            if bool(getattr(err, f"joint_{index}_angle_limit", False))
+        ]
+        joint_comm = [
+            index for index in range(1, 7)
+            if bool(getattr(err, f"communication_status_joint_{index}", False))
+        ]
+        enabled = (
+            ctrl_mode == 0x01
+            and len(enable_status) == 6
+            and all(enable_status)
+            and all("disabled" not in row for row in flags)
+        )
+        return {
+            "mono": now,
+            "wall": time.time(),
+            "receive": {key: row.to_dict() for key, row in before.items()},
+            "receive_coherent": bool(before) and before == dict(self._receive_source.receipts()),
+            "gripper_faults": [flag for flag in FAULT_FLAGS
+                               if bool(getattr(getattr(grip, "foc_status", None), flag, False))],
+            "gripper_enabled": bool(getattr(getattr(grip, "foc_status", None),
+                                            "driver_enable_status", False)),
+            "x": float(end.X_axis) / SCALE,
+            "y": float(end.Y_axis) / SCALE,
+            "z": float(end.Z_axis) / SCALE,
+            "rx": float(end.RX_axis) / SCALE,
+            "ry": float(end.RY_axis) / SCALE,
+            "rz": float(end.RZ_axis) / SCALE,
+            "joints": joint_deg,
+            "efforts": efforts,
+            "currents": currents,
+            "speeds_rad_s": speeds,
+            "driver_temps": driver_temps,
+            "voltages": voltages,
+            "temps": temps,
+            "flags": flags,
+            "enable_status": enable_status,
+            "enabled": enabled,
+            "angle_limit": angle_limit,
+            "joint_comm": joint_comm,
+            "ctrl_mode": ctrl_mode,
+            "arm_status": _as_int(getattr(status, "arm_status", 0)),
+            "motion_status": _as_int(getattr(status, "motion_status", 0)),
+            "teach_status": _as_int(getattr(status, "teach_status", 0)),
+            "gripper_mm": float(getattr(grip, "grippers_angle", 0)) / SCALE,
+            "gripper_nm": float(getattr(grip, "grippers_effort", 0)) / SCALE,
+            "frame_age_s": age,
+            "sample": self.count,
+        }
+
+
+# ── guard ───────────────────────────────────────────────────────────────────
+
+
+def _median_jump(history: Sequence[Sequence[float]], short: int = 5, lag: int = 30) -> tuple[float, int]:
+    """Largest per-joint step between two medians of the same moving signal."""
+    if len(history) < lag + short:
+        return 0.0, 0
+    buf = list(history)  # deque does not support slicing
+    recent = buf[-short:]
+    old = buf[-lag - short : -lag]
+    best, joint = 0.0, 0
+    for index in range(6):
+        now = statistics.median(row[index] for row in recent)
+        before = statistics.median(row[index] for row in old)
+        delta = abs(now - before)
+        if delta > best:
+            best, joint = delta, index + 1
+    return best, joint
+
+
+class Guard:
+    """Health and effort checks shared by every motion loop."""
+
+    def __init__(self, temp_max: float = TEMP_MAX_C, *, max_age_s: float = FRAME_AGE_MAX_S,
+                 max_skew_s: float = 0.15, stopped_speed_rad_s: float = 0.05):
+        if not all(math.isfinite(v) and v > 0 for v in (temp_max, max_age_s, max_skew_s, stopped_speed_rad_s)):
+            raise ValueError("positive finite feedback guard limits required")
+        self.temp_max = temp_max
+        self.max_age_s = max_age_s
+        self.max_skew_s = max_skew_s
+        self.stopped_speed_rad_s = stopped_speed_rad_s
+        self.baseline: list[float] | None = None
+        self.history: collections.deque = collections.deque(maxlen=45)
+        self.peak_jump = 0.0
+        self.sustained = 0
+        self.started = time.monotonic()
+        self._temp_at: list[tuple[float, list[float]]] = []
+        self._current_sequences: tuple[int, ...] = ()
+        self._temperature_sequences: tuple[int, ...] = ()
+        self.gripper_convention: dict | None = None
+
+    def reset(self) -> None:
+        self.history.clear()
+        self.peak_jump = 0.0
+        self.sustained = 0
+        self._current_sequences = ()
+
+    def calibrate(self, sampler: Sampler, seconds: float = 0.6, *, min_updates: int = 10) -> dict:
+        """Guarded baseline from distinct current updates at a stopped posture."""
+        if not math.isfinite(seconds) or seconds <= 0 or min_updates < 2:
+            raise Refused("bad_baseline", "positive duration and distinct update budget required")
+        rows, previous = [], ()
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            snap = sampler.latest()
+            self.check(snap, armed=True)
+            if not self.stopped(snap):
+                raise Trip("baseline_moving", snap)
+            sequences = tuple(snap["receive"][f"0x{i:03x}"]["sequence"] for i in range(0x251, 0x257))
+            if not previous or all(a > b for a, b in zip(sequences, previous)):
+                rows.append(snap["efforts"])
+                previous = sequences
+            time.sleep(0.01)
+        if len(rows) < min_updates:
+            raise Trip("baseline_insufficient", sampler.latest(), "distinct current updates required")
+        mean = [statistics.mean(col) for col in zip(*rows)]
+        sd = [statistics.pstdev(col) for col in zip(*rows)]
+        self.baseline = mean
+        self.reset()
+        return {"mean": [round(v, 3) for v in mean], "sd": [round(v, 3) for v in sd],
+                "n": len(rows)}
+
+    def stopped(self, snap: dict) -> bool:
+        speeds = snap.get("speeds_rad_s", [])
+        return len(speeds) == 6 and all(math.isfinite(v) and abs(v) <= self.stopped_speed_rad_s for v in speeds)
+
+    def preflight(self, snap: dict) -> None:
+        """Check passive health before changing mode or energizing motors."""
+        self._check_health(snap, temp_max=TEMP_PREFLIGHT_MAX_C)
+
+    def check(self, snap: dict, *, armed: bool = False) -> None:
+        if snap["ctrl_mode"] != 0x01:
+            raise Trip("lost_can_mode", snap, f"ctrl_mode={snap['ctrl_mode']}")
+        if not snap["enabled"]:
+            raise Trip("lost_enablement", snap, f"motors={snap.get('enable_status', [])}")
+        self._check_health(snap, temp_max=self.temp_max)
+        arm_status = snap["arm_status"]
+        if arm_status != 0x00:
+            detail = REFUSALS.get(arm_status, f"status=0x{arm_status:02X}")
+            raise Trip("arm_status", snap, detail)
+        if self.baseline:
+            deltas = [abs(e - b) for e, b in zip(snap["efforts"], self.baseline)]
+            if max(deltas[1:5]) >= INSTANT_NM:
+                raise Trip("effort_spike", snap, f"+{max(deltas[1:5]):.1f}Nm")
+
+        sequences = tuple(snap.get("receive", {}).get(f"0x{i:03x}", {}).get("sequence", 0)
+                          for i in range(0x251, 0x257))
+        if self._current_sequences and any(a <= b for a, b in zip(sequences, self._current_sequences)):
+            return
+        self._current_sequences = sequences
+        self.history.append(snap["efforts"])
+        jump, joint = _median_jump(self.history)
+        self.peak_jump = max(self.peak_jump, jump)
+        if armed and jump >= JUMP_STOP_NM:
+            self.sustained += 1
+            if self.sustained >= JUMP_SAMPLES:
+                raise Trip("effort_rise", snap, f"j{joint}+{jump:.2f}Nm")
+        else:
+            self.sustained = 0
+
+    def _check_health(self, snap: dict, *, temp_max: float) -> None:
+        now = time.monotonic()
+        snap_age = now - snap.get("mono", 0)
+        if not 0 <= snap_age <= self.max_age_s:
+            raise Trip("stale_sampler", snap, f"snap_age={snap_age * 1000:.0f}ms")
+        problem = receipt_problem(snap.get("receive", {}), RECEIVE_GROUPS,
+                                  now=now, max_age_s=self.max_age_s, max_skew_s=self.max_skew_s)
+        if problem or not snap.get("receive_coherent"):
+            raise Trip("stale_feedback", snap, problem or "cache changed during capture")
+        for field in ("efforts", "currents", "speeds_rad_s", "driver_temps"):
+            values = snap.get(field, [])
+            if len(values) != 6 or any(not math.isfinite(v) for v in values):
+                raise Trip("telemetry_missing", snap, field)
+        if max(snap["driver_temps"]) > temp_max:
+            raise Trip("driver_overtemp", snap)
+        voltages = snap.get("voltages", [])
+        valid_voltage = (
+            len(voltages) == 6
+            and all(math.isfinite(value) for value in voltages)
+            and min(voltages) >= VOLTAGE_MIN_V
+            and max(voltages) <= VOLTAGE_MAX_V
+        )
+        if not valid_voltage:
+            detail = "missing" if len(voltages) != 6 else f"{min(voltages):.1f}..{max(voltages):.1f}V"
+            raise Trip("voltage", snap, detail)
+        flat = [flag for row in snap["flags"] for flag in row if flag != "disabled"]
+        if flat:
+            raise Trip("driver_fault", snap, ",".join(sorted(set(flat))[:4]))
+        if snap.get("angle_limit"):
+            raise Trip("firmware_angle_limit", snap, str(snap["angle_limit"]))
+        if snap.get("joint_comm"):
+            raise Trip("joint_comm", snap, str(snap["joint_comm"]))
+        joints = snap.get("joints", [])
+        if len(joints) != 6:
+            raise Trip("joint_feedback", snap, "six joints required")
+        for index, (value, (lo, hi)) in enumerate(zip(joints, MODEL_JOINT_LIMITS_DEG), 1):
+            if not math.isfinite(value) or not (lo - REST_STOP_TOLERANCE_DEG) <= value <= (hi + REST_STOP_TOLERANCE_DEG):
+                raise Trip("joint_envelope", snap, f"j{index}={value} outside [{lo}, {hi}]±{REST_STOP_TOLERANCE_DEG}")
+        temps = snap.get("temps", [])
+        if len(temps) != 6 or any(not math.isfinite(value) or value <= 0 for value in temps):
+            raise Trip("temperature_missing", snap)
+        hottest = max(temps)
+        if hottest > temp_max:
+            raise Trip("overtemp", snap, f"{hottest:.0f}C > {temp_max:.0f}C")
+        sequences = tuple(snap["receive"][f"0x{i:03x}"]["sequence"] for i in range(0x261, 0x267))
+        if not self._temperature_sequences or all(a > b for a, b in zip(sequences, self._temperature_sequences)):
+            received_at = min(snap["receive"][f"0x{i:03x}"]["received_mono"] for i in range(0x261, 0x267))
+            self._temp_at.append((received_at, list(temps)))
+            self._temperature_sequences = sequences
+        while self._temp_at and snap["mono"] - self._temp_at[0][0] > TEMP_WINDOW_S:
+            self._temp_at.pop(0)
+        if len(self._temp_at) > 30:
+            first = self._temp_at[0][1]
+            rise = max((now - was) for now, was in zip(temps, first))
+            if rise >= TEMP_HOT_RISE_C:
+                raise Trip("thermal_ramp", snap, f"+{rise:.1f}C/min")
+
+
+# ── geometry helpers ────────────────────────────────────────────────────────
+
+
+def _wrap(angle: float) -> float:
+    return (angle + 180.0) % 360.0 - 180.0
+
+
+def tilt_deg(snap: dict, reference: tuple[float, float, float] = (-180.0, 0.0, -90.0)) -> float:
+    """How far the tool axis is from pointing straight down."""
+    return max(abs(_wrap(snap["rx"] - reference[0])), abs(_wrap(snap["ry"] - reference[1])))
+
+
+def pose_list(snap: dict) -> list[float]:
+    return [snap["x"], snap["y"], snap["z"], snap["rx"], snap["ry"], snap["rz"]]
+
+
+def envelope_problem(x: float, y: float, z: float) -> str:
+    for axis, value in (("x", x), ("y", y), ("z", z)):
+        low, high = ENVELOPE[axis]
+        if not (low <= value <= high):
+            return f"{axis} {value:.1f} outside [{low:.0f}, {high:.0f}]"
+    return ""
+
+
+def joint_problem(joints: Iterable[float]) -> str:
+    for index, (value, (low, high)) in enumerate(zip(joints, JOINT_LIMITS_DEG), 1):
+        if not (low <= value <= high):
+            return f"j{index} {value:.1f} outside [{low:.0f}, {high:.0f}]"
+    return ""
+
+
+def planar_distance(a: dict, b: Sequence[float]) -> float:
+    return math.hypot(a["x"] - b[0], a["y"] - b[1])
+
+
+def speed_mm_s(sampler: Sampler, window_s: float = 0.1) -> float:
+    rows = sampler.since(time.monotonic() - window_s)
+    if len(rows) < 2:
+        return 0.0
+    first, last = rows[0], rows[-1]
+    span = last["mono"] - first["mono"]
+    if span < 1e-6:
+        return 0.0
+    moved = math.dist((first["x"], first["y"], first["z"]),
+                      (last["x"], last["y"], last["z"]))
+    return moved / span
+
+
+# ── motion ──────────────────────────────────────────────────────────────────
+
+
+def set_mode(arm: Any, move_mode: int, speed_pct: float) -> None:
+    speed = int(max(1, min(MAX_SPEED_PCT, round(speed_pct))))
+    arm.MotionCtrl_2(ctrl_mode=0x01, move_mode=move_mode, move_spd_rate_ctrl=speed,
+                     is_mit_mode=0x00, residence_time=0, installation_pos=0)
+
+
+def _pose_within(snap: dict, target: Sequence[float], arrive_mm: float, arrive_deg: float) -> bool:
+    return (all(math.isfinite(v) for v in pose_list(snap))
+            and planar_distance(snap, target) <= arrive_mm and abs(snap["z"] - target[2]) <= arrive_mm
+            and max(abs(_wrap(snap[k] - v)) for k, v in zip(("rx", "ry", "rz"), target[3:6])) <= arrive_deg)
+
+
+def hold(arm: Any, snap: dict, seconds: float = 0.25, hz: float = 30.0, *,
+         sampler: Sampler, guard: Guard, target: Sequence[float] | None = None,
+         arrive_mm: float = 1.2, arrive_deg: float = 1.5) -> None:
+    """Guard before every hold write and throughout the waiting interval."""
+    if not math.isfinite(seconds) or seconds < 0 or not math.isfinite(hz) or hz <= 0:
+        raise Refused("bad_hold", "finite duration and positive rate required")
+    expected = list(target) if target is not None else pose_list(snap)
+    if len(expected) != 6 or not all(math.isfinite(v) for v in expected) or not all(math.isfinite(v) and v > 0 for v in (arrive_mm, arrive_deg)):
+        raise Refused("bad_hold", "finite pose and positive tolerance required")
+
+    def check() -> None:
+        current = sampler.latest()
+        guard.check(current, armed=True)
+        if not _pose_within(current, expected, arrive_mm, arrive_deg):
+            raise Trip("settlement_deviation", current, "hold pose contradicts arrival")
+
+    pose = [int(round(v * SCALE)) for v in expected]
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        check()
+        arm.EndPoseCtrl(*pose)
+        until = min(deadline, time.monotonic() + 1.0 / hz)
+        while time.monotonic() < until:
+            time.sleep(min(0.005, max(0.0, until - time.monotonic())))
+            check()
+    check()
+
+
+def _trace(row: dict, elapsed: float, travel: float, peak: float, phase: str) -> list:
+    return [round(elapsed, 2), round(row["z"], 2), round(travel, 2), round(peak, 2), phase]
+
+
+def move(
+    arm: Any,
+    sampler: Sampler,
+    guard: Guard,
+    target: Sequence[float],
+    *,
+    kind: str = "linear",
+    speed_pct: float = 3.0,
+    timeout_s: float = 40.0,
+    arrive_mm: float = 1.2,
+    arrive_deg: float = 1.5,
+    settle_s: float = 0.15,
+    stall_s: float | None = None,
+    armed_travel_mm: float = 1.0,
+    resend_if_short_mm: float = 3.0,
+    stable_s: float = 0.3,
+) -> dict:
+    """One target, continuously guarded arrival and final settlement; no replay.
+
+    ``resend_if_short_mm`` is retained for call compatibility, not authorization
+    to retry a command whose physical effect is uncertain.
+    """
+    if len(target) < 6:
+        raise Refused("bad_target", "target needs 6 values")
+    x, y, z, rx, ry, rz = (float(v) for v in target[:6])
+    problem = envelope_problem(x, y, z)
+    if problem:
+        raise Refused("envelope", problem)
+    snap = sampler.latest()
+    guard.check(snap, armed=False)
+    tilt = max(abs(_wrap(rx - (-180.0))), abs(_wrap(ry)))
+    if tilt > TILT_MAX_DEG:
+        raise Refused("tilt", f"tool axis {tilt:.1f} deg off vertical")
+
+    if (kind not in ("linear", "point") or not all(math.isfinite(v) for v in target)
+            or not all(math.isfinite(v) and v > 0 for v in (timeout_s, arrive_mm, arrive_deg, stable_s))
+            or not math.isfinite(settle_s) or settle_s < 0):
+        raise Refused("bad_motion", "invalid motion parameters")
+    start = snap
+    attempts = 0
+    while True:
+        attempts += 1
+        stable_at = None
+        set_mode(arm, 0x02 if kind == "linear" else 0x00, speed_pct)
+        arm.EndPoseCtrl(*(int(round(v * SCALE)) for v in (x, y, z, rx, ry, rz)))
+        t0 = time.monotonic()
+        best = [snap["x"], snap["y"], snap["z"]]
+        last_move = t0
+        trace: list = []
+        last_trace = 0.0
+        why = "timeout"
+        while True:
+            time.sleep(0.005)
+            snap = sampler.latest()
+            guard.check(snap, armed=abs(snap["z"] - start["z"]) >= armed_travel_mm)
+            now = time.monotonic()
+            planar = planar_distance(snap, (x, y))
+            dz = abs(snap["z"] - z)
+            ang = max(abs(_wrap(snap["rx"] - rx)), abs(_wrap(snap["ry"] - ry)),
+                      abs(_wrap(snap["rz"] - rz)))
+            moved = math.dist((snap["x"], snap["y"], snap["z"]), best)
+            if moved > 0.02:
+                best = [snap["x"], snap["y"], snap["z"]]
+                last_move = now
+            travel = math.dist((snap["x"], snap["y"], snap["z"]),
+                               (start["x"], start["y"], start["z"]))
+            if now - last_trace >= 0.1:
+                trace.append(_trace(snap, now - t0, travel, guard.peak_jump, "run"))
+                last_trace = now
+            if _pose_within(snap, (x, y, z, rx, ry, rz), arrive_mm, arrive_deg) and guard.stopped(snap):
+                source_at = min(snap["receive"][f"0x{i:03x}"]["received_mono"] for i in range(0x2A2, 0x2A5))
+                stable_at = source_at if stable_at is None else stable_at
+                if source_at - stable_at >= stable_s:
+                    why = "arrived"
+                    break
+            else:
+                stable_at = None
+            if now - t0 > timeout_s:
+                why = "timeout"
+                break
+            if stall_s and travel >= armed_travel_mm and now - last_move > stall_s:
+                why = "stalled"
+                break
+        if why != "arrived":
+            raise Trip("motion_" + why, snap, "target sent; checkpoint required, no retry")
+        hold(arm, snap, 0.12, sampler=sampler, guard=guard,
+             target=(x, y, z, rx, ry, rz), arrive_mm=arrive_mm, arrive_deg=arrive_deg)
+        deadline = time.monotonic() + settle_s
+        while True:
+            end = sampler.latest()
+            guard.check(end, armed=True)
+            if not _pose_within(end, (x, y, z, rx, ry, rz), arrive_mm, arrive_deg) or not guard.stopped(end):
+                raise Trip("settlement_deviation", end, "final pose contradicts arrival")
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.005)
+        short = math.dist((end["x"], end["y"], end["z"]), (x, y, z))
+        break
+    return {
+        "why": why,
+        "kind": kind,
+        "target": [round(v, 2) for v in (x, y, z, rx, ry, rz)],
+        "start": [round(v, 2) for v in pose_list(start)],
+        "end": [round(v, 2) for v in pose_list(end)],
+        "short_mm": round(short, 2),
+        "travel_mm": round(math.dist((end["x"], end["y"], end["z"]),
+                                     (start["x"], start["y"], start["z"])), 2),
+        "duration_s": round(time.monotonic() - t0, 2),
+        "attempts": attempts,
+        "peak_jump_nm": round(guard.peak_jump, 2),
+        "trace": trace[-120:],
+    }
+
+
+def transit(arm: Any, sampler: Sampler, guard: Guard, x: float, y: float, z: float,
+            rpy: Sequence[float] = (-180.0, 0.0, -90.0), speed_pct: float = 10.0) -> dict:
+    """Free-air point move; the fastest path between two safe poses."""
+    return move(arm, sampler, guard, (x, y, z, rpy[0], rpy[1], rpy[2]),
+                kind="point", speed_pct=speed_pct, timeout_s=45.0, arrive_mm=1.5,
+                arrive_deg=5.0, settle_s=0.25)
+
+
+def lift_to(arm: Any, sampler: Sampler, guard: Guard, z: float, rpy: Sequence[float],
+            speed_pct: float = 10.0) -> dict:
+    snap = sampler.latest()
+    return transit(arm, sampler, guard, snap["x"], snap["y"], z, rpy, speed_pct)
+
+
+# ── gripper ─────────────────────────────────────────────────────────────────
+
+
+def grip(arm: Any, sampler: Sampler, width_mm: float, *, guard: Guard,
+         effort_nm: float = 0.5, timeout_s: float = 3.0,
+         stable_s: float = 0.15, width_tol_mm: float = 0.8) -> dict:
+    """Command a stroke and report the width the jaws actually reached."""
+    target = max(0.0, min(75.0, float(width_mm)))
+    effort = max(0.1, min(GRIP_MAX_NM, float(effort_nm)))
+    if not all(math.isfinite(v) for v in (width_mm, effort_nm, timeout_s, stable_s, width_tol_mm)) or min(timeout_s, stable_s, width_tol_mm) <= 0:
+        raise Refused("bad_grip", "finite gripper parameters required")
+    start = sampler.latest()
+    guard.check(start, armed=True)
+    closing = target < start["gripper_mm"]
+    convention = guard.gripper_convention
+    if closing and (not convention or convention.get("closing_sign") not in (-1, 1)
+                    or not convention.get("verified") or not convention.get("evidence_ref")
+                    or not math.isfinite(convention.get("unloaded_nm", float("nan")))):
+        raise Refused("gripper_unqualified", "verified closing sign and unloaded baseline required")
+    if not start.get("gripper_enabled") or start.get("gripper_faults"):
+        raise Trip("gripper_fault", start)
+    arm.GripperCtrl(int(round(target * SCALE)), int(round(effort * SCALE)), 0x01, 0)
+    t0 = time.monotonic()
+    trace: list = []
+    last_trace = 0.0
+    last_width = start["gripper_mm"]
+    last_change = t0
+    why = "timeout"
+    candidate, candidate_at = "", None
+    while True:
+        time.sleep(0.01)
+        snap = sampler.latest()
+        now = time.monotonic()
+        guard.check(snap, armed=True)
+        if not snap.get("gripper_enabled") or snap.get("gripper_faults"):
+            raise Trip("gripper_fault", snap)
+        width, load = snap["gripper_mm"], snap["gripper_nm"]
+        if not math.isfinite(width) or not math.isfinite(load):
+            raise Trip("gripper_feedback", snap)
+        normalized = (convention["closing_sign"] * (load - convention["unloaded_nm"])) if closing else 0.0
+        if abs(width - last_width) > 0.05:
+            last_width, last_change = width, now
+        if now - last_trace >= 0.1:
+            trace.append([round(now - t0, 2), round(width, 2), round(load, 2)])
+            last_trace = now
+        result = ("reached" if abs(width - target) <= width_tol_mm else
+                  "effort_limit" if closing and normalized >= effort * 0.95 else "")
+        if result:
+            received_at = snap["receive"]["0x2a8"]["received_mono"]
+            if candidate != result:
+                candidate, candidate_at = result, received_at
+            if received_at - candidate_at >= stable_s:
+                why = result
+                break
+        else:
+            candidate, candidate_at = "", None
+        if not result and now - last_change > 0.6 and now - t0 > 0.8:
+            raise Trip("gripper_stalled", snap, "stall is not object contact; checkpoint, no retry")
+        if now - t0 > timeout_s:
+            why = "timeout"
+            break
+    end = sampler.latest()
+    guard.check(end, armed=True)
+    if not end.get("gripper_enabled") or end.get("gripper_faults"):
+        raise Trip("gripper_fault", end)
+    if why == "timeout":
+        raise Trip("gripper_timeout", end, "closure effect uncertain; no replay")
+    final_normalized = convention["closing_sign"] * (end["gripper_nm"] - convention["unloaded_nm"]) if closing else 0.0
+    if (not math.isfinite(end["gripper_nm"]) or not math.isfinite(end["gripper_mm"])
+            or (why == "reached" and abs(end["gripper_mm"] - target) > width_tol_mm)
+            or (why == "effort_limit" and final_normalized < effort * 0.95)):
+        raise Trip("gripper_settlement_deviation", end, "final feedback contradicts closure")
+    return {"why": why, "grasp_state": "empty" if why == "reached" and closing else "unknown",
+            "contact_proven": False, "target_mm": round(target, 2), "width_mm": round(end["gripper_mm"], 2),
+            "effort_nm": round(end["gripper_nm"], 2), "start_mm": round(start["gripper_mm"], 2),
+            "duration_s": round(time.monotonic() - t0, 2), "trace": trace[-60:]}
+
+
+def open_gripper(arm: Any, sampler: Sampler, width_mm: float = 70.0, *, guard: Guard) -> dict:
+    return grip(arm, sampler, width_mm, guard=guard, effort_nm=0.5, timeout_s=2.5)
+
+
+# ── contact search ──────────────────────────────────────────────────────────
+
+
+def descend_contact(
+    arm: Any,
+    sampler: Sampler,
+    guard: Guard,
+    *,
+    x: float,
+    y: float,
+    rpy: Sequence[float],
+    floor_z: float = 40.0,
+    speed_pct: float = 3.0,
+    reach_mm: float = 90.0,
+    stall_window_s: float = 0.35,
+    stall_mm: float = 0.08,
+    verify_step_mm: float = 0.4,
+    verify_air_mm: float = 0.30,
+    verify_s: float = 0.6,
+    press_budget_mm: float = 0.6,
+    max_candidates: int = 2,
+    lift_mm: float = 25.0,
+) -> dict:
+    """Walk one long MOVE L down and decide contact by position, not torque.
+
+    Phase machine: wait for motion (4 s), arm after 1 mm of travel, then a stall
+    inside the step is only a *candidate*.  A candidate is held, then probed with
+    a single ``verify_step_mm`` command: free air advances at least
+    ``verify_air_mm`` in ``verify_s``, a rigid table does not.  The probe is the
+    entire press budget; after two inconclusive candidates the search stops
+    instead of pressing again.
+    """
+    snap = sampler.latest()
+    guard.check(snap, armed=False)
+    problem = envelope_problem(x, y, floor_z)
+    if problem:
+        raise Refused("envelope", problem)
+    if snapshot_z(snap) < 60.0:
+        raise Refused("too_low", f"start z {snap['z']:.1f} must be above 60")
+    target_z = max(floor_z, snap["z"] - reach_mm)
+    start_z = snap["z"]
+    probes = 0
+    candidates = 0
+    trace: list = []
+    last_trace = 0.0
+    t0 = time.monotonic()
+    set_mode(arm, 0x02, speed_pct)
+    arm.EndPoseCtrl(*(int(round(v * SCALE)) for v in (x, y, target_z, rpy[0], rpy[1], rpy[2])))
+    phase = "wait_motion"
+    best_z = start_z
+    last_move = t0
+    while True:
+        time.sleep(0.005)
+        snap = sampler.latest()
+        now = time.monotonic()
+        travel = start_z - snap["z"]
+        armed = travel >= 1.0
+        guard.check(snap, armed=armed)
+        if snap["z"] < best_z - 0.01:
+            best_z, last_move = snap["z"], now
+        if now - last_trace >= 0.1:
+            trace.append([round(now - t0, 2), round(snap["z"], 2), round(travel, 2),
+                          round(guard.peak_jump, 2), phase])
+            last_trace = now
+        if snap["z"] <= target_z + 0.05:
+            hold(arm, snap, 0.2, sampler=sampler, guard=guard)
+            return _contact_result("reached_floor", snap, start_z, travel, guard, trace, probes)
+        if now - t0 > 90.0:
+            hold(arm, snap, 0.2, sampler=sampler, guard=guard)
+            return _contact_result("timeout", snap, start_z, travel, guard, trace, probes)
+        if phase == "wait_motion":
+            if armed:
+                phase = "descend"
+            elif now - t0 > 4.0:
+                hold(arm, snap, 0.2, sampler=sampler, guard=guard)
+                return _contact_result("no_motion_start", snap, start_z, travel, guard, trace, probes)
+        if phase == "descend" and armed and now - last_move > stall_window_s:
+            candidates += 1
+            if candidates > max_candidates or probes * verify_step_mm >= press_budget_mm:
+                hold(arm, snap, 0.2, sampler=sampler, guard=guard)
+                return _contact_result("uncertain", snap, start_z, travel, guard, trace, probes)
+            # Release the lead, hold, then probe exactly once.
+            hold(arm, snap, 0.25, sampler=sampler, guard=guard)
+            held = sampler.latest()
+            probes += 1
+            arm.EndPoseCtrl(*(int(round(v * SCALE)) for v in
+                              (x, y, held["z"] - verify_step_mm, rpy[0], rpy[1], rpy[2])))
+            probe_t0 = time.monotonic()
+            probe_best = held["z"]
+            while time.monotonic() - probe_t0 < verify_s:
+                time.sleep(0.005)
+                snap = sampler.latest()
+                guard.check(snap, armed=True)
+                probe_best = min(probe_best, snap["z"])
+                if held["z"] - probe_best >= verify_air_mm:
+                    break
+            advance = held["z"] - probe_best
+            trace.append([round(time.monotonic() - t0, 2), round(probe_best, 2),
+                          round(advance, 2), round(guard.peak_jump, 2), "probe"])
+            if advance >= verify_air_mm:
+                # Free air: resume the original lead once, from the measured pose.
+                best_z, last_move, phase = probe_best, time.monotonic(), "descend"
+                arm.EndPoseCtrl(*(int(round(v * SCALE)) for v in
+                                  (x, y, target_z, rpy[0], rpy[1], rpy[2])))
+                continue
+            contact = sampler.latest()
+            contact_z = contact["z"]
+            hold(arm, contact, 0.12, sampler=sampler, guard=guard)
+            spot = [x, y]
+            lift = transit(arm, sampler, guard, x, y, contact_z + lift_mm,
+                           (rpy[0], rpy[1], rpy[2]), speed_pct=10.0)
+            result = _contact_result("contact", contact, start_z, start_z - contact_z,
+                                     guard, trace, probes)
+            result.update({"contact_z": round(contact_z, 2), "press_mm": round(probes * verify_step_mm, 2),
+                           "point": spot, "lifted_to": lift["end"][2], "verify_advance_mm": round(advance, 2)})
+            return result
+
+
+def snapshot_z(snap: dict) -> float:
+    return float(snap["z"])
+
+
+def _contact_result(why: str, snap: dict, start_z: float, travel: float, guard: Guard,
+                    trace: list, probes: int) -> dict:
+    return {
+        "why": why,
+        "start_z": round(start_z, 2),
+        "z": round(snap["z"], 2),
+        "travel_mm": round(travel, 2),
+        "press_mm": round(probes * 0.4, 2),
+        "probes": probes,
+        "peak_jump_nm": round(guard.peak_jump, 2),
+        "temps": [round(v) for v in snap["temps"]],
+        "efforts": [round(v, 2) for v in snap["efforts"]],
+        "faults": [f for row in snap["flags"] for f in row],
+        "trace": trace[-150:],
+    }
+
+
+# ── forward/inverse kinematics (official PIPER X MDH, numeric IK) ──────────
+
+
+def _matmul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def _transpose(a):
+    return [[a[j][i] for j in range(3)] for i in range(3)]
+
+
+def _rot(rpy_deg):
+    rx, ry, rz = (math.radians(v) for v in rpy_deg)
+    cx, sx, cy, sy, cz, sz = math.cos(rx), math.sin(rx), math.cos(ry), math.sin(ry), math.cos(rz), math.sin(rz)
+    mx = [[1, 0, 0], [0, cx, -sx], [0, sx, cx]]
+    my = [[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]
+    mz = [[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]
+    return _matmul(_matmul(mz, my), mx)
+
+
+def _solve(a, b):
+    size = len(b)
+    m = [row[:] + [b[i]] for i, row in enumerate(a)]
+    for col in range(size):
+        pivot = max(range(col, size), key=lambda r: abs(m[r][col]))
+        if abs(m[pivot][col]) < 1e-12:
+            return None
+        m[col], m[pivot] = m[pivot], m[col]
+        for row in range(col + 1, size):
+            factor = m[row][col] / m[col][col]
+            for k in range(col, size + 1):
+                m[row][k] -= factor * m[col][k]
+    out = [0.0] * size
+    for row in reversed(range(size)):
+        out[row] = (m[row][size] - sum(m[row][k] * out[k] for k in range(row + 1, size))) / m[row][row]
+    return out
+
+
+def _piper_x_model():
+    """Official pyAgxArm PIPER X modified-DH chain (mm/deg at this boundary)."""
+    from leapflow.hardware.skills.kinematics import DhChain
+
+    mdh = (
+        (0.123, 0.0, 0.0, math.pi),
+        (0.0, 0.0, math.pi / 2, 0.13578661580515886),
+        (0.0, 0.28503, 0.0, 2.8380798966679794),
+        (0.0, 0.27364, 0.0, 0.08063421144213803),
+        (0.0, 0.07466, -math.pi / 2, math.pi / 2),
+        (0.03526, 0.0, math.pi / 2, 0.0),
+    )
+    return DhChain.from_mapping({
+        "convention": "modified",
+        "links": [
+            {"d": d * 1000.0, "a": a * 1000.0, "alpha": math.degrees(alpha),
+             "theta_offset": math.degrees(offset)}
+            for d, a, alpha, offset in mdh
+        ],
+    })
+
+
+def _fk(model, joints_deg):
+    pose = model.forward(joints_deg)
+    return [pose.x, pose.y, pose.z, pose.rx, pose.ry, pose.rz]
+
+
+def _pose_error(current, target):
+    delta = [target[i] - current[i] for i in range(3)]
+    err = _matmul(_rot(target[3:]), _transpose(_rot(current[3:])))
+    trace = err[0][0] + err[1][1] + err[2][2]
+    angle = math.degrees(math.acos(max(-1.0, min(1.0, (trace - 1) / 2))))
+    if angle < 1e-9:
+        return delta + [0.0, 0.0, 0.0]
+    sine = 2 * math.sin(math.radians(angle))
+    axis = [(err[2][1] - err[1][2]) / sine, (err[0][2] - err[2][0]) / sine,
+            (err[1][0] - err[0][1]) / sine]
+    return delta + [c * angle for c in axis]
+
+
+def ik_solve(target: Sequence[float], seed: Sequence[float], iterations: int = 300) -> dict:
+    """Damped Gauss-Newton on the official PIPER X MDH model."""
+    model = _piper_x_model()
+    joints = [float(v) for v in seed]
+    damping = 1.0
+    residual = None
+    for _ in range(iterations):
+        residual = _pose_error(_fk(model, joints), target)
+        if math.hypot(*residual[:3]) < 0.3 and math.hypot(*residual[3:]) < 0.3:
+            break
+        jac = [[0.0] * 6 for _ in range(6)]
+        for index in range(6):
+            probe = list(joints)
+            probe[index] += 1e-4
+            shifted = _pose_error(_fk(model, probe), target)
+            for row in range(6):
+                jac[row][index] = (residual[row] - shifted[row]) / 1e-4
+        normal = [[sum(jac[k][i] * jac[k][j] for k in range(6)) + (damping if i == j else 0.0)
+                   for j in range(6)] for i in range(6)]
+        gradient = [sum(jac[k][i] * residual[k] for k in range(6)) for i in range(6)]
+        # jac is d fk / d q and residual is target - fk, so the step is +J^T r.
+        step = _solve(normal, gradient)
+        if step is None:
+            damping *= 10.0
+            if damping > 1e6:
+                break
+            continue
+        candidate = [j + s for j, s in zip(joints, step)]
+        candidate = [max(low, min(high, v)) for v, (low, high) in zip(candidate, JOINT_LIMITS_DEG)]
+        improved = math.hypot(*_pose_error(_fk(model, candidate), target))
+        if improved < math.hypot(*residual):
+            joints = candidate
+            damping = max(0.1, damping * 0.7)
+        else:
+            damping *= 2.0
+    error = _pose_error(_fk(model, joints), target)
+    margins = [min(v - low, high - v) for v, (low, high) in zip(joints, JOINT_LIMITS_DEG)]
+    return {
+        "feasible": math.hypot(*error[:3]) < 1.0 and math.hypot(*error[3:]) < 1.0,
+        "joints": [round(v, 2) for v in joints],
+        "error_mm": round(math.hypot(*error[:3]), 2),
+        "error_deg": round(math.hypot(*error[3:]), 2),
+        "margins_deg": [round(v, 1) for v in margins],
+    }
+
+
+# ── chunk executor (policy layer) ───────────────────────────────────────────
+
+
+def run_chunk(
+    arm: Any,
+    sampler: Sampler,
+    guard: Guard,
+    rows: Sequence[Sequence[float]],
+    *,
+    kind: str = "joint",
+    fps: float = 30.0,
+    max_rate_deg_s: float = 45.0,
+    max_rate_mm_s: float = 60.0,
+    lease=None,
+) -> dict:
+    """Stream one policy chunk through the same guard the scripted path uses.
+
+    Every tick is bounded by the declared rate and checked by the guard; a model
+    cannot widen a limit by asking for a bigger step.  A tick that would jump is
+    clamped and counted, never sent.
+    """
+    if not rows:
+        raise Refused("empty_chunk", "no rows")
+    tick = 1.0 / max(1.0, fps)
+    set_mode(arm, 0x01 if kind == "joint" else 0x00, 30.0)
+    start = sampler.latest()
+    prev = list(start["joints"]) if kind == "joint" else pose_list(start)
+    max_deg_step = max_rate_deg_s * tick
+    max_mm_step = max_rate_mm_s * tick
+    clamped = 0
+    late_ms = 0.0
+    sent = 0
+    last_grip = start["gripper_mm"]
+    t0 = time.monotonic()
+    for index, row in enumerate(rows):
+        due = t0 + index * tick
+        now = time.monotonic()
+        if now > due:
+            late_ms = max(late_ms, (now - due) * 1000.0)
+        else:
+            time.sleep(due - now)
+        if lease is not None and not lease.alive():
+            raise Trip("lease_lost", sampler.latest())
+        snap = sampler.latest()
+        guard.check(snap, armed=True)
+        if kind == "joint":
+            target = [float(v) for v in row[:6]]
+            for i in range(6):
+                delta = target[i] - prev[i]
+                if abs(delta) > max_deg_step:
+                    target[i] = prev[i] + math.copysign(max_deg_step, delta)
+                    clamped += 1
+            problem = joint_problem(target)
+            if problem:
+                raise Refused("joint_limit", problem)
+            arm.JointCtrl(*(int(round(v * SCALE)) for v in target))
+            prev = target
+            grip_mm = float(row[6]) if len(row) > 6 else last_grip
+        else:
+            target = [float(v) for v in row[:6]]
+            move_vec = [target[i] - prev[i] for i in range(3)]
+            dist = math.sqrt(sum(v * v for v in move_vec))
+            if dist > max_mm_step:
+                scale = max_mm_step / dist
+                for i in range(3):
+                    target[i] = prev[i] + move_vec[i] * scale
+                clamped += 1
+            problem = envelope_problem(*target[:3])
+            if problem:
+                raise Refused("envelope", problem)
+            arm.EndPoseCtrl(*(int(round(v * SCALE)) for v in target))
+            prev = target
+            grip_mm = float(row[6]) if len(row) > 6 else last_grip
+        if abs(grip_mm - last_grip) > 1.0:
+            arm.GripperCtrl(int(round(grip_mm * SCALE)), int(round(0.5 * SCALE)), 0x01, 0)
+            last_grip = grip_mm
+        sent += 1
+    hold(arm, sampler.latest(), 0.2)
+    end = sampler.latest()
+    return {"ticks": sent, "clamped": clamped, "max_late_ms": round(late_ms, 1),
+            "duration_s": round(time.monotonic() - t0, 2), "peak_jump_nm": round(guard.peak_jump, 2),
+            "end": [round(v, 2) for v in pose_list(end)],
+            "joints": [round(v, 2) for v in end["joints"]]}

@@ -15,12 +15,15 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from leapflow.daemon._service_helpers import (
     ProducerServices as _ProducerServices,
+)
+from leapflow.daemon._service_helpers import (
     checkpoint_open_connection,
     engine_context_metadata,
     engine_runtime_extras,
@@ -574,7 +577,6 @@ class RuntimeLeapService:
                 physical_source = PhysicalEnvironmentSource(
                     hardware_registry,
                     evidence_store=getattr(hardware_registry, "evidence_store", None),
-                    capability_index=getattr(hardware_registry, "capability_index", None),
                 )
                 manager.register(physical_source)
                 registered_any = True
@@ -843,51 +845,80 @@ class RuntimeLeapService:
                     if getattr(engine, "_current_session_id", None) != session_id:
                         engine._current_session_id = session_id
 
-                # Serialize turns within one session
+                # Serialize turns within one session. Say so when a previous turn
+                # (typically one still unwinding after /cancel) holds the lock,
+                # rather than leaving the client on a bare "Thinking…".
                 if session_lock is not None:
+                    if session_lock.locked():
+                        yield StreamChunk(
+                            request_id=request_id,
+                            content="Waiting for the previous turn in this session to finish…",
+                            event_type="status",
+                            metadata={"request_id": request_id, "session_busy": True},
+                        )
                     await session_lock.acquire()
 
                 enable_thinking = bool(kwargs.get("enable_thinking", False))
                 approval_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
                 previous_request_id = self._active_engine_request_id
-                route_token = _approval_route.set((approval_queue, request_id))
-                self._approval_coordinator.register_route(request_id)
-                self._active_engine_request_id = request_id
-                self._active_engines[request_id] = engine
+                route_token: Any = None
                 try:
+                    route_token = _approval_route.set((approval_queue, request_id))
+                    self._approval_coordinator.register_route(request_id)
+                    self._active_engine_request_id = request_id
+                    self._active_engines[request_id] = engine
                     sig = inspect.signature(engine.run_stream)
                     if "request_id" in sig.parameters:
                         stream = engine.run_stream(message, enable_thinking=enable_thinking, request_id=request_id)
                     else:
                         stream = engine.run_stream(message, enable_thinking=enable_thinking)
-                    async for chunk in self._stream_engine_events(
+                    async with aclosing(self._stream_engine_events(
                         stream, approval_queue, request_id=request_id, engine=engine,
-                    ):
-                        request_record["chunks"].append(chunk)
-                        yield chunk
+                    )) as events:
+                        async for chunk in events:
+                            request_record["chunks"].append(chunk)
+                            yield chunk
                     request_record["status"] = "completed"
                     request_record["completed_at"] = time.time()
                     self._prune_engine_request_ledger()
                 finally:
-                    _approval_route.reset(route_token)
-                    self._approval_coordinator.unregister_route(request_id)
-                    self._active_engine_request_id = previous_request_id
-                    self._active_engines.pop(request_id, None)
-                    self._approval_coordinator.deny_for_request(request_id, reason="turn_ended")
+                    # Ownership first: the lock and the engine registration must be
+                    # released even if a later bookkeeping step raises.
                     if session_lock is not None:
                         session_lock.release()
+                    self._active_engines.pop(request_id, None)
+                    self._active_engine_request_id = previous_request_id
+                    self._end_engine_turn_route(request_id, route_token)
             except Exception:
                 request_record["status"] = "failed"
                 request_record["completed_at"] = time.time()
                 self._prune_engine_request_ledger()
                 raise
 
+    def _end_engine_turn_route(self, request_id: str, route_token: Any) -> None:
+        """Tear down a finished turn's approval route, tolerating a foreign Context."""
+        try:
+            if route_token is not None:
+                _approval_route.reset(route_token)
+        except ValueError:
+            logger.warning(
+                "daemon: turn %s finalized outside its Context; approval route not reset",
+                request_id,
+            )
+        try:
+            self._approval_coordinator.unregister_route(request_id)
+            self._approval_coordinator.deny_for_request(request_id, reason="turn_ended")
+        except Exception:
+            logger.warning("daemon: approval cleanup failed for turn %s", request_id, exc_info=True)
+
     async def engine_cancel(self, request_id: str = "") -> bool:
         targets: list[Any] = []
         if request_id:
+            # A named turn cancels only that turn: never another client's work.
             eng = self._active_engines.get(request_id)
-            if eng is not None:
-                targets = [eng]
+            if eng is None:
+                return False
+            targets = [eng]
         else:
             targets = list(self._active_engines.values())
         if not targets:
@@ -936,15 +967,23 @@ class RuntimeLeapService:
                     )
                     engine_task = asyncio.create_task(anext(stream))
         finally:
-            for task in (engine_task, approval_task):
-                if task is not None and not task.done():
-                    task.cancel()
+            # Await cancelled children before closing: ``aclose()`` on a stream whose
+            # ``anext`` is still in flight raises "already running" and leaves the
+            # engine loop alive with nobody consuming it.
+            children = [
+                task for task in (engine_task, approval_task)
+                if task is not None and not task.done()
+            ]
+            for task in children:
+                task.cancel()
+            if children:
+                await asyncio.gather(*children, return_exceptions=True)
             self._approval_coordinator.deny_for_queue(approval_queue, reason="stream_closed")
             if hasattr(stream, "aclose"):
                 try:
                     await stream.aclose()
                 except Exception:
-                    logger.debug("daemon: failed to close engine stream", exc_info=True)
+                    logger.warning("daemon: failed to close engine stream", exc_info=True)
 
     def _active_engine(self, session_id: str = "") -> Any:
         """Return the engine holding a caller's live conversation state.
@@ -1441,24 +1480,27 @@ class RuntimeLeapService:
 
         owner = viewer_id or uuid.uuid4().hex
         try:
-            async for frame in registry.preview_broker.stream(
+            # The relay owns the nested generator: closing at a yield must release now,
+            # not when async-generator finalization or the idle sweeper eventually runs.
+            async with aclosing(registry.preview_broker.stream(
                 device,
                 channel,
                 max_width=int(max_width or 0),
                 quality=int(quality or 0),
                 fps=float(fps or 0.0),
                 viewer_id=owner,
-            ):
-                yield StreamChunk(
-                    request_id="",
-                    content="",
-                    event_type="frame",
-                    metadata={
-                        **frame.to_metadata(),
-                        "data_b64": base64.b64encode(frame.data).decode("ascii"),
-                        "viewer_id": owner,
-                    },
-                )
+            )) as stream:
+                async for frame in stream:
+                    yield StreamChunk(
+                        request_id="",
+                        content="",
+                        event_type="frame",
+                        metadata={
+                            **frame.to_metadata(),
+                            "data_b64": base64.b64encode(frame.data).decode("ascii"),
+                            "viewer_id": owner,
+                        },
+                    )
         except Exception as exc:  # noqa: BLE001 - a broken preview must become a structured stream error
             logger.warning("daemon: preview stream failed: %s", exc, exc_info=True)
             yield _preview_stream_error({
@@ -1749,7 +1791,6 @@ class RuntimeLeapService:
             "user_config_path": str(layout.user_config_path),
             "mcp_servers_path": str(layout.mcp_servers_path),
             "workspace_config_path": str(layout.workspace_config_path(workspace_root)),
-            "workspace_manifest_path": str(layout.workspace_manifest_path(workspace_root)),
             "config_sources": list(getattr(settings, "config_sources", ())),
             "config_warnings": list(getattr(settings, "config_warnings", ())),
             "watched_config_paths": [str(p) for p in getattr(settings, "watched_config_paths", ())],

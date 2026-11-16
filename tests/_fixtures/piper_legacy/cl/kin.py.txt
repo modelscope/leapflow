@@ -1,0 +1,57 @@
+"""Host-side kinematics on the same PIPER X model the board uses.
+
+The board's ``ik`` answer is only as good as the ``cl_armd`` build it runs, and
+the deployed build returns its seed for every target.  The preflight is a pure
+function of the model, so the host evaluates it with the corrected solver and
+the arm's live joints as the seed; nothing here talks to the arm.
+"""
+
+from __future__ import annotations
+
+import sys
+from typing import Sequence
+
+from . import config
+
+REPO = config.ROOT.parents[2]
+for path in (REPO / "src", config.ROOT / "cl_board"):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+import cl_arm_core as core  # noqa: E402
+
+_MODEL = None
+
+
+def _model():
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = core._piper_x_model()
+    return _MODEL
+
+
+def ik(poses: Sequence[Sequence[float]], seed: Sequence[float]) -> dict:
+    """Same reply shape as the board's ``ik`` command."""
+    out = []
+    for pose in poses:
+        problem = core.envelope_problem(*[float(v) for v in pose[:3]])
+        if problem:
+            out.append({"feasible": False, "error": problem})
+            continue
+        result = core.ik_solve([float(v) for v in pose[:6]], list(seed))
+        result["pose"] = [round(float(v), 2) for v in pose[:6]]
+        out.append(result)
+    return {"results": out, "seed": [round(float(v), 2) for v in seed], "solver": "host"}
+
+
+def skeleton(joints_deg: Sequence[float]) -> list[tuple[float, float, float]]:
+    """Base-frame origins of every link frame, base first, flange last."""
+    from leapflow.hardware.skills.geometry import Transform
+
+    model = _model()
+    pose = Transform()
+    points = [(0.0, 0.0, 0.0)]
+    for link, q in zip(model.links, joints_deg):
+        pose = pose.compose(link.transform(float(q), model.convention))
+        points.append(tuple(float(v) for v in pose.translation))
+    return points

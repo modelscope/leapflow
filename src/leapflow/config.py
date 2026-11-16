@@ -58,6 +58,20 @@ def _expand_path(value: str) -> Path:
     return Path(value.replace("~", str(Path.home()))).expanduser()
 
 
+_TRI_STATE = {"auto": "auto", "": "auto", "true": "true", "1": "true", "yes": "true",
+              "on": "true", "false": "false", "0": "false", "no": "false", "off": "false"}
+
+
+def _tri_state(name: str) -> str:
+    """An ``auto`` / ``true`` / ``false`` environment value; anything else is ``auto``."""
+    raw = os.getenv(name, "auto").strip().lower()
+    value = _TRI_STATE.get(raw)
+    if value is None:
+        logger.warning("%s=%r is not auto, true or false; using auto", name, raw)
+        return "auto"
+    return value
+
+
 # Directory creation is owned by PathLayout/ProfileLayout.
 def ensure_data_dir(data_dir: Path, *, profile: str = "default") -> None:
     """Create the LeapFlow data directory using the canonical layout."""
@@ -204,6 +218,20 @@ class Settings:
     # operator decision, and the safety invariant (irreversible channels always
     # require approval) holds regardless.
     hardware_trust_skip_enabled: bool = False
+    # Whether a triggered DegradationPolicy (comm/sensor loss) and the health
+    # monitor's offline halt may act on a device (halt, safe_state, ...). Off by
+    # default: a supervisory stop the operator did not ask for has repeatedly
+    # dropped an arm mid-task on a transient feedback gap. While off, the
+    # condition is still detected, logged and reported to the board as a warning.
+    hardware_degradation_actions_enabled: bool = False
+    # Minimum duration a sensor-loss streak must last before the policy fires,
+    # so a fast channel cannot reach its sample-count threshold in one transient.
+    hardware_sensor_loss_debounce_s: float = 0.5
+    # How long a post-write verdict may follow a value that is still travelling
+    # toward its command before it reports "pending". A declared settling time
+    # says when an observation becomes meaningful, not when a servo has arrived:
+    # judging a slow move by it alone reports a correct write as contradicted.
+    hardware_write_verification_follow_s: float = 10.0
     # Continuous sampling for channels that declare a sample rate.
     hardware_stream_enabled: bool = True
     # Per-channel ring buffer depth for raw samples. Raw readings never enter the
@@ -226,6 +254,11 @@ class Settings:
     # finished one is a write-once artifact -- its recorded size and TTL are correct,
     # and old data can be dropped without discarding the file being written to.
     hardware_raw_segment_mb: float = 32.0
+    # Minimum spacing between cache-index refreshes of a raw segment still being
+    # written. Each refresh is a DuckDB open/update/close on the shared cache index, so
+    # refreshing on every append kept cores busy on a multi-channel arm. New and rolled
+    # segments are indexed immediately; 0 refreshes on every write.
+    hardware_raw_index_refresh_s: float = 60.0
     # Whether the durable ``instrument.duckdb`` history tier is registered as sensitive
     # and non-syncable, so a profile backup excludes physical series that may carry a
     # trade secret or sample information. On by default; opt out only for a bench known
@@ -252,6 +285,10 @@ class Settings:
     hardware_media_screens: bool = False
     # Enumerate microphones alongside cameras.
     hardware_media_microphones: bool = True
+    # Comma-separated USB identities ("vid" or "vid:pid", hex) whose video nodes a
+    # dedicated driver owns (e.g. "8086" for RealSense UVC endpoints); they are not
+    # listed as generic cameras, so the board never offers a second opener.
+    hardware_media_exclude_usb: str = ""
     # The broker enforces hard ceilings. The board's default is a balanced profile below
     # these limits (960px / 8fps / JPEG 75); Detail is 1280px / 30fps / JPEG 85. A viewer
     # can choose a profile for its own live preview but never exceed these caps, and no
@@ -268,6 +305,36 @@ class Settings:
     # JSON array of event-to-action rules evaluated by hardware stream sources.
     # Empty keeps reflex actions disabled until an operator declares them.
     hardware_alert_policies: str = ""
+    # JSON array of monitor-only limits for conditions a device's firmware already
+    # enforces (drive temperature, supply voltage, advisory fault flags). Breaches
+    # are reported to the board with backoff and never gate a command.
+    hardware_advisory_limits: str = ""
+    # Node-local skills (S1.5). Comma-separated fnmatch patterns of enabled skill
+    # ids; empty enables every discovered skill. The speed cap bounds every
+    # skill plan; the duration cap bounds one skill execution end to end.
+    # Compute-only calibration defaults off; JSON budgets may tighten initial ceilings.
+    hardware_calibration_worker_enabled: bool = False
+    hardware_calibration_worker_budgets: str = "{}"
+    hardware_skills_enabled: str = ""
+    hardware_skills_speed_pct_max: float = 30.0
+    hardware_skills_max_duration_s: float = 120.0
+    # Skill-run timing: how long an unexecuted plan stays valid, how long one
+    # actuator's halt may take, how long a stopped skill may unwind before it is
+    # cancelled, and how long an in-flight write is awaited before the run ends
+    # with side effect UNKNOWN (its devices stay held until the write resolves).
+    hardware_skills_plan_ttl_s: float = 300.0
+    hardware_skills_halt_timeout_s: float = 2.0
+    hardware_skills_stop_grace_s: float = 1.0
+    hardware_skills_dispatch_settle_s: float = 2.0
+    # Every executed skill run is recorded as an episode under the profile's
+    # hardware/episodes at this rate (0 disables recording); recording is skipped
+    # when the disk has less than the free-space floor left.
+    hardware_skills_episode_fps: float = 30.0
+    hardware_skills_episode_min_free_mb: float = 2048.0
+    # Host consent to let the model look at workcell camera frames (perceive.snapshot).
+    # Both this and the workcell's own share_frames must be on; every frame shared
+    # is audited and none is persisted.
+    hardware_share_frames: bool = False
     runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
@@ -562,6 +629,8 @@ class Settings:
     agent_subagent_max_concurrent: int = 3
     agent_subagent_max_iterations: int = 15
     agent_max_parallel_tools: int = 8  # Max tool calls run in parallel within one response's batch
+    # Newest tool-result images kept in the live conversation; older ones become text.
+    agent_tool_images_kept: int = 2
     agent_subagent_full_loop: bool = False
     agent_calibration_enabled: bool = False
     agent_calibration_min_confidence: float = 0.3
@@ -695,6 +764,9 @@ class Settings:
     llm_context_length: int = (
         DEFAULT_LLM_CONTEXT_LENGTH  # Primary provider's runtime context budget
     )
+    # Whether the primary model accepts images: "auto" trusts the static model
+    # table, "true"/"false" override it for a model the table does not know.
+    llm_supports_vision: str = "auto"
     llm_credential_cooldown_s: float = 60.0  # Per-key rate-limit cooldown
 
     # ── Benchmark Qualification ──
@@ -902,7 +974,6 @@ def load_config() -> Settings:
     profile_layout = layout.ensure(profile_id=profile)
     workspace_id = workspace_id_for_path(workspace_root)
     try:
-        layout.write_workspace_manifest(workspace_root)
         profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
     except OSError:
         logger.debug("Workspace manifest write skipped", exc_info=True)
@@ -964,7 +1035,6 @@ def _build_settings_from_env(
     profile_manifest = profile_manifest or profile_layout.load_manifest()
     workspace_id = workspace_id_for_path(workspace_root)
     try:
-        layout.write_workspace_manifest(workspace_root)
         profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
     except OSError:
         logger.debug("Workspace manifest write skipped", exc_info=True)
@@ -1291,6 +1361,7 @@ def _build_settings_from_env(
     agent_subagent_max_concurrent = int(os.getenv("LEAPFLOW_AGENT_SUBAGENT_MAX_CONCURRENT", "3"))
     agent_subagent_max_iterations = int(os.getenv("LEAPFLOW_AGENT_SUBAGENT_MAX_ITERATIONS", "15"))
     agent_max_parallel_tools = int(os.getenv("LEAPFLOW_AGENT_MAX_PARALLEL_TOOLS", "8"))
+    agent_tool_images_kept = max(0, int(os.getenv("LEAPFLOW_AGENT_TOOL_IMAGES_KEPT", "2")))
     agent_subagent_full_loop = os.getenv(
         "LEAPFLOW_AGENT_SUBAGENT_FULL_LOOP", "0"
     ).strip().lower() in ("1", "true", "yes")
@@ -1323,7 +1394,9 @@ def _build_settings_from_env(
         "true",
         "yes",
     )
-    agent_reentry_hardware_enabled = os.getenv("LEAPFLOW_AGENT_REENTRY_HARDWARE_ENABLED", "0").strip().lower() in (
+    agent_reentry_hardware_enabled = os.getenv(
+        "LEAPFLOW_AGENT_REENTRY_HARDWARE_ENABLED", "0"
+    ).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -1415,6 +1488,15 @@ def _build_settings_from_env(
     hardware_trust_skip_enabled = os.getenv(
         "LEAPFLOW_HARDWARE_TRUST_SKIP_ENABLED", "0"
     ).strip().lower() in ("1", "true", "yes")
+    hardware_degradation_actions_enabled = os.getenv(
+        "LEAPFLOW_HARDWARE_DEGRADATION_ACTIONS_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes")
+    hardware_sensor_loss_debounce_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SENSOR_LOSS_DEBOUNCE_S", "0.5") or 0.5
+    )
+    hardware_write_verification_follow_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_WRITE_VERIFICATION_FOLLOW_S", "10") or 10.0
+    )
     hardware_stream_enabled = os.getenv(
         "LEAPFLOW_HARDWARE_STREAM_ENABLED", "1"
     ).strip().lower() in ("1", "true", "yes")
@@ -1430,6 +1512,9 @@ def _build_settings_from_env(
         os.getenv("LEAPFLOW_HARDWARE_HISTORY_RETENTION_DAYS", "90")
     )
     hardware_raw_segment_mb = float(os.getenv("LEAPFLOW_HARDWARE_RAW_SEGMENT_MB", "32"))
+    hardware_raw_index_refresh_s = max(
+        0.0, float(os.getenv("LEAPFLOW_HARDWARE_RAW_INDEX_REFRESH_S", "60") or 60.0)
+    )
     hardware_reading_store_sensitive = os.getenv(
         "LEAPFLOW_HARDWARE_READING_STORE_SENSITIVE", "1"
     ).strip().lower() in ("1", "true", "yes")
@@ -1447,6 +1532,7 @@ def _build_settings_from_env(
     hardware_media_microphones = os.getenv(
         "LEAPFLOW_HARDWARE_MEDIA_MICROPHONES", "1"
     ).strip().lower() in ("1", "true", "yes")
+    hardware_media_exclude_usb = os.getenv("LEAPFLOW_HARDWARE_MEDIA_EXCLUDE_USB", "").strip()
     hardware_preview_max_fps = float(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_FPS", "30") or 30.0)
     hardware_preview_max_width = int(
         os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_WIDTH", "1280") or 1280
@@ -1460,6 +1546,39 @@ def _build_settings_from_env(
     # LEAPFLOW_FLEET_NODES fallback is applied later, in fleet_config.
     hardware_fleet_nodes = os.getenv("LEAPFLOW_HARDWARE_FLEET_NODES", "").strip()
     hardware_alert_policies = os.getenv("LEAPFLOW_HARDWARE_ALERT_POLICIES", "").strip()
+    hardware_advisory_limits = os.getenv("LEAPFLOW_HARDWARE_ADVISORY_LIMITS", "").strip()
+    hardware_calibration_worker_enabled = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+    hardware_calibration_worker_budgets = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_BUDGETS", "{}").strip() or "{}"
+    hardware_skills_enabled = os.getenv("LEAPFLOW_HARDWARE_SKILLS_ENABLED", "").strip()
+    hardware_skills_speed_pct_max = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_SPEED_PCT_MAX", "30") or 30.0
+    )
+    hardware_skills_max_duration_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_MAX_DURATION_S", "120") or 120.0
+    )
+    hardware_skills_plan_ttl_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_PLAN_TTL_S", "300") or 300.0
+    )
+    hardware_skills_halt_timeout_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_HALT_TIMEOUT_S", "2") or 2.0
+    )
+    hardware_skills_stop_grace_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_STOP_GRACE_S", "1") or 1.0
+    )
+    hardware_skills_dispatch_settle_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_DISPATCH_SETTLE_S", "2") or 2.0
+    )
+    hardware_skills_episode_fps = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_EPISODE_FPS", "30") or 30.0
+    )
+    hardware_skills_episode_min_free_mb = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_EPISODE_MIN_FREE_MB", "2048") or 2048.0
+    )
+    hardware_share_frames = os.getenv("LEAPFLOW_HARDWARE_SHARE_FRAMES", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     web_transport = os.getenv("LEAPFLOW_WEB_TRANSPORT", "auto").strip().lower() or "auto"
     web_timeout_s = float(os.getenv("LEAPFLOW_WEB_TIMEOUT_S", "20"))
     web_max_bytes = int(os.getenv("LEAPFLOW_WEB_MAX_BYTES", "2000000"))
@@ -1549,6 +1668,7 @@ def _build_settings_from_env(
     llm_context_length = int(
         os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", str(DEFAULT_LLM_CONTEXT_LENGTH))
     )
+    llm_supports_vision = _tri_state("LEAPFLOW_LLM_SUPPORTS_VISION")
     llm_credential_cooldown_s = float(os.getenv("LEAPFLOW_LLM_CREDENTIAL_COOLDOWN_S", "60.0"))
 
     # Benchmark Qualification
@@ -1900,6 +2020,7 @@ def _build_settings_from_env(
         agent_subagent_max_concurrent=agent_subagent_max_concurrent,
         agent_subagent_max_iterations=agent_subagent_max_iterations,
         agent_max_parallel_tools=agent_max_parallel_tools,
+        agent_tool_images_kept=agent_tool_images_kept,
         agent_subagent_full_loop=agent_subagent_full_loop,
         agent_calibration_enabled=agent_calibration_enabled,
         agent_calibration_min_confidence=agent_calibration_min_confidence,
@@ -1910,6 +2031,7 @@ def _build_settings_from_env(
         agent_calibration_finalizing_max_ratio=agent_calibration_finalizing_max_ratio,
         agent_compression_writeback=agent_compression_writeback,
         agent_reentry_enabled=agent_reentry_enabled,
+        agent_reentry_hardware_enabled=agent_reentry_hardware_enabled,
         agent_reentry_tick_seconds=agent_reentry_tick_seconds,
         agent_reentry_global_budget=agent_reentry_global_budget,
         agent_reentry_send_enabled=agent_reentry_send_enabled,
@@ -1948,6 +2070,9 @@ def _build_settings_from_env(
         hardware_require_describe=hardware_require_describe,
         hardware_envelope_grant=hardware_envelope_grant,
         hardware_trust_skip_enabled=hardware_trust_skip_enabled,
+        hardware_degradation_actions_enabled=hardware_degradation_actions_enabled,
+        hardware_sensor_loss_debounce_s=hardware_sensor_loss_debounce_s,
+        hardware_write_verification_follow_s=hardware_write_verification_follow_s,
         hardware_stream_enabled=hardware_stream_enabled,
         hardware_stream_ring_capacity=hardware_stream_ring_capacity,
         hardware_persist_readings=hardware_persist_readings,
@@ -1955,6 +2080,7 @@ def _build_settings_from_env(
         hardware_raw_retention_days=hardware_raw_retention_days,
         hardware_history_retention_days=hardware_history_retention_days,
         hardware_raw_segment_mb=hardware_raw_segment_mb,
+        hardware_raw_index_refresh_s=hardware_raw_index_refresh_s,
         hardware_reading_store_sensitive=hardware_reading_store_sensitive,
         hardware_host_interval_s=hardware_host_interval_s,
         hardware_host_include=hardware_host_include,
@@ -1962,12 +2088,26 @@ def _build_settings_from_env(
         hardware_rediscover_interval_s=hardware_rediscover_interval_s,
         hardware_media_screens=hardware_media_screens,
         hardware_media_microphones=hardware_media_microphones,
+        hardware_media_exclude_usb=hardware_media_exclude_usb,
         hardware_preview_max_fps=hardware_preview_max_fps,
         hardware_preview_max_width=hardware_preview_max_width,
         hardware_preview_quality=hardware_preview_quality,
         hardware_preview_idle_timeout_s=hardware_preview_idle_timeout_s,
         hardware_fleet_nodes=hardware_fleet_nodes,
         hardware_alert_policies=hardware_alert_policies,
+        hardware_advisory_limits=hardware_advisory_limits,
+        hardware_calibration_worker_enabled=hardware_calibration_worker_enabled,
+        hardware_calibration_worker_budgets=hardware_calibration_worker_budgets,
+        hardware_skills_enabled=hardware_skills_enabled,
+        hardware_skills_speed_pct_max=hardware_skills_speed_pct_max,
+        hardware_skills_max_duration_s=hardware_skills_max_duration_s,
+        hardware_skills_plan_ttl_s=hardware_skills_plan_ttl_s,
+        hardware_skills_halt_timeout_s=hardware_skills_halt_timeout_s,
+        hardware_skills_stop_grace_s=hardware_skills_stop_grace_s,
+        hardware_skills_dispatch_settle_s=hardware_skills_dispatch_settle_s,
+        hardware_skills_episode_fps=hardware_skills_episode_fps,
+        hardware_skills_episode_min_free_mb=hardware_skills_episode_min_free_mb,
+        hardware_share_frames=hardware_share_frames,
         web_transport=web_transport,
         web_timeout_s=web_timeout_s,
         web_max_bytes=web_max_bytes,
@@ -2026,6 +2166,7 @@ def _build_settings_from_env(
         llm_aux_api_key=llm_aux_api_key,
         llm_aux_base_url=llm_aux_base_url,
         llm_context_length=llm_context_length,
+        llm_supports_vision=llm_supports_vision,
         llm_credential_cooldown_s=llm_credential_cooldown_s,
         # Benchmark Qualification
         benchmark_commands=benchmark_commands,

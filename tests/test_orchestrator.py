@@ -1,13 +1,12 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for MultiDeviceOrchestrator: multi-device orchestration primitives.
 
-Covers SEQUENTIAL, PARALLEL, BARRIER modes, halt_all, affordance resolution,
-and leader-follower teleoperation scenarios using mock transports.
+Covers SEQUENTIAL, PARALLEL, BARRIER modes, halt_all, and leader-follower
+teleoperation scenarios using mock transports.
 """
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,7 +18,6 @@ from leapflow.robot.orchestrator import (
     MultiDeviceOrchestrator,
     OrchestrationStep,
 )
-
 
 # ════════════════════════════════════════════════════════════════
 # Mock transport and registry
@@ -104,23 +102,6 @@ class MockRegistry:
     async def read(self, device_id: str, channel_id: str) -> _MockReading:
         t = await self.transport(device_id)
         return await t.read(channel_id)
-
-
-class MockCapabilityEntry:
-    """Minimal CapabilityEntry for affordance resolution tests."""
-
-    def __init__(self, device_id: str) -> None:
-        self.device_id = device_id
-
-
-class MockCapabilityIndex:
-    """Simulates CapabilityIndex returning pre-set entries."""
-
-    def __init__(self, mapping: dict[str, list[MockCapabilityEntry]]) -> None:
-        self._mapping = mapping
-
-    def resolve(self, affordance: str) -> list[MockCapabilityEntry]:
-        return list(self._mapping.get(affordance, []))
 
 
 class MockHardwareTools:
@@ -280,18 +261,17 @@ class TestBarrierExecution:
         assert not result.halted
 
     @pytest.mark.asyncio
-    async def test_barrier_timeout_triggers_halt(self, transports):
+    async def test_barrier_timeout_triggers_halt(self, transports, monkeypatch):
         """Barrier timeout triggers halt_all when a device never reaches target."""
         # Override arm_b read to always return 0.0, simulating a device
         # that never reaches the commanded 999.0 target.
-        original_read = transports["arm_b"].read
 
         async def _stuck_read(channel_id: str) -> _MockReading:
             return _MockReading(
                 device_id="arm_b", channel_id=channel_id, value=0.0
             )
 
-        transports["arm_b"].read = _stuck_read
+        monkeypatch.setattr(transports["arm_b"], "read", _stuck_read)
         # Override registry.read for arm_b too.
         registry = MockRegistry(transports)
         orch = MultiDeviceOrchestrator(registry)
@@ -361,33 +341,7 @@ class TestHaltAll:
 
 
 # ════════════════════════════════════════════════════════════════
-# 5. Affordance resolution
-# ════════════════════════════════════════════════════════════════
-
-
-class TestResolveByAffordance:
-    """resolve_by_affordance routes to CapabilityIndex."""
-
-    def test_resolve_returns_device_ids(self):
-        index = MockCapabilityIndex({
-            "grasp": [MockCapabilityEntry("arm_a"), MockCapabilityEntry("arm_b")],
-        })
-        orch = MultiDeviceOrchestrator(MockRegistry(), capability_index=index)
-        result = orch.resolve_by_affordance("grasp")
-        assert result == ("arm_a", "arm_b")
-
-    def test_resolve_unknown_affordance(self):
-        index = MockCapabilityIndex({})
-        orch = MultiDeviceOrchestrator(MockRegistry(), capability_index=index)
-        assert orch.resolve_by_affordance("fly") == ()
-
-    def test_resolve_without_index(self):
-        orch = MultiDeviceOrchestrator(MockRegistry())
-        assert orch.resolve_by_affordance("grasp") == ()
-
-
-# ════════════════════════════════════════════════════════════════
-# 6. Leader-follower scenario
+# 5. Leader-follower scenario
 # ════════════════════════════════════════════════════════════════
 
 
@@ -421,7 +375,7 @@ class TestLeaderFollowerScenario:
 
 
 # ════════════════════════════════════════════════════════════════
-# 7. Approval-gated path (HardwareTools)
+# 6. Approval-gated path (HardwareTools)
 # ════════════════════════════════════════════════════════════════
 
 
@@ -460,7 +414,7 @@ class TestApprovalGatedPath:
 
 
 # ════════════════════════════════════════════════════════════════
-# 8. execute_plan
+# 7. execute_plan
 # ════════════════════════════════════════════════════════════════
 
 

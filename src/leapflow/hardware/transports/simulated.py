@@ -357,11 +357,7 @@ class SimulatedTransport:
 
     def _apply_connectivity(self, attempt: int) -> None:
         """Recover a scheduled reconnect, then fire any drop due at *attempt*."""
-        if (
-            not self._connected
-            and self._reconnect_at is not None
-            and attempt >= self._reconnect_at
-        ):
+        if not self._connected and self._reconnect_at is not None and attempt >= self._reconnect_at:
             self._connected = True
             self._reconnect_at = None
         for rule in self._disconnects:

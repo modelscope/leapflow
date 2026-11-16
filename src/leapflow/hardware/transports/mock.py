@@ -89,7 +89,9 @@ class MockTransport:
         # Must never raise: teardown runs during interpreter shutdown paths where
         # an exception would mask the original failure.
         self._connected = False
-        return TransportStatus(connected=False, halt_supported=self._halt_supported, detail="closed")
+        return TransportStatus(
+            connected=False, halt_supported=self._halt_supported, detail="closed"
+        )
 
     async def probe(self) -> TransportStatus:
         return TransportStatus(

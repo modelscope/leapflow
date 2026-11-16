@@ -7,9 +7,9 @@ the node side (wraps a ``HardwareRegistry``), ``DirectLhpClient`` /
 ``transports/lhp.py``) adapting the host registry's transport contract onto
 either binding.
 
-The frozen v1 specification is ``temp/devices/plan/02-lhp-wire-protocol-v1.md``;
-``protocol.py`` is the executable source for negotiated versions, capabilities,
-error codes, frame shape, and the write-error classification.
+``protocol.py`` is the frozen, executable specification for negotiated
+versions, capabilities, error codes, frame shape, and the write-error
+classification.
 """
 
 from __future__ import annotations

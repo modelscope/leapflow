@@ -27,7 +27,7 @@ space-sync:  ## Sync all dependencies including the leapspace extra
 # `make lint` and CI can never disagree. leapspace is opt-in everywhere else and
 # CI never syncs it (--no-extra leapspace), so it stays out of the lint gate too.
 lint:  ## Lint source code (mirrors the CI Lint step exactly)
-	uv run ruff check src/leapflow/ tests/ tools/
+	uv run ruff check src/leapflow/ src/leapcalib/ src/benchmarks/ tests/benchmarks/ tests/ tools/
 
 # ── Test layers ───────────────────────────────────────────────────────────────
 # The mock layer is broad and fast; the real layer is small, coarse, and never

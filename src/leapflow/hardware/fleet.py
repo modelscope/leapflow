@@ -58,6 +58,7 @@ from typing import Any, Mapping
 
 from leapflow.hardware.context import HardwareContext, TransportRef
 from leapflow.hardware.lhp import LhpRemoteError, SocketLhpClient, is_valid_device_id
+from leapflow.hardware.attestation import verification_stamp
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +76,14 @@ _NODE_STATUS_OFFLINE = "offline"
 _NODE_STATUS_DEGRADED = "degraded"
 _NODE_STATUS_UNKNOWN = "unknown"
 
-_VALID_STATUSES = frozenset({
-    _NODE_STATUS_ONLINE,
-    _NODE_STATUS_OFFLINE,
-    _NODE_STATUS_DEGRADED,
-    _NODE_STATUS_UNKNOWN,
-})
+_VALID_STATUSES = frozenset(
+    {
+        _NODE_STATUS_ONLINE,
+        _NODE_STATUS_OFFLINE,
+        _NODE_STATUS_DEGRADED,
+        _NODE_STATUS_UNKNOWN,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -168,6 +171,67 @@ class FleetTopology:
 
 
 # ---------------------------------------------------------------------------
+# Talking to a node
+# ---------------------------------------------------------------------------
+
+
+async def fetch_node_declarations(
+    endpoint: str, *, token: str = ""
+) -> tuple[str, tuple[HardwareContext, ...], str]:
+    """Fetch a node's identity and raw device declarations over LHP.
+
+    Returns ``(reported_node_id, contexts, declarations_fingerprint)``.  The
+    *reported* id comes from the node's hello answer; the caller decides whether
+    to pin it (register: a mismatch refuses) or adopt it (discover: it is the
+    authoritative name).  Declarations stay in the node's own id space;
+    namespacing the ids is the caller's job.
+
+    Module-level rather than a manager method because confirming a node's
+    declaration is a read: an operator reviewing a declaration must not have to
+    start a fleet that would halt the node's hardware when it shuts down.
+
+    Raises ``FleetError`` when the node is unreachable, fails the exchange, or
+    answers a declaration this host cannot read.  A machine-generated
+    declaration that does not parse is a version mismatch, so the whole node is
+    refused loudly rather than admitted partially.
+    """
+    client = SocketLhpClient(endpoint, token=token)
+    try:
+        hello = await client.connect()
+        devices = await client.request("list", {})
+    except (LhpRemoteError, ValueError, OSError) as exc:
+        raise FleetError(
+            f"node at {endpoint!r} unreachable: {exc}",
+            failure_code="fleet_unreachable",
+        ) from exc
+    finally:
+        await client.close()
+
+    if not isinstance(devices, Mapping):
+        raise FleetError(
+            f"node at {endpoint!r} returned a malformed list payload",
+            failure_code="fleet_malformed_list",
+        )
+
+    contexts: list[HardwareContext] = []
+    raw_devices = devices.get("devices", ())
+    if isinstance(raw_devices, (list, tuple)):
+        for payload in raw_devices:
+            if not isinstance(payload, Mapping):
+                continue
+            try:
+                contexts.append(HardwareContext.from_mapping(dict(payload)))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise FleetError(
+                    f"node at {endpoint!r} declaration is unreadable: {exc}",
+                    failure_code="fleet_bad_declaration",
+                ) from exc
+
+    reported = str(hello.get("node_id") or "")
+    return reported, tuple(contexts), str(hello.get("declarations") or "")
+
+
+# ---------------------------------------------------------------------------
 # FleetManager
 # ---------------------------------------------------------------------------
 
@@ -187,14 +251,24 @@ class FleetManager:
         *,
         heartbeat_interval_s: float = 10.0,
         node_timeout_s: float = 30.0,
+        permit_issuer: Any | None = None,
     ) -> None:
         self._registry = registry
+        # Signs execution permits for nodes in ``permit_required`` mode. Shared
+        # by every remote device's transport and by the skill service; absent,
+        # such nodes refuse writes with a host-side message naming why.
+        self._permit_issuer = permit_issuer
         self._nodes: dict[str, FleetNode] = {}
         self._device_to_node: dict[str, str] = {}  # device_id → node_id
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._heartbeat_interval = max(1.0, float(heartbeat_interval_s))
         self._node_timeout = max(1.0, float(node_timeout_s))
         self._stopped = asyncio.Event()
+
+    @property
+    def permit_issuer(self) -> Any | None:
+        """The host's permit issuer, or ``None`` when permits cannot be minted."""
+        return self._permit_issuer
 
     # -- Node management -------------------------------------------------
 
@@ -226,15 +300,14 @@ class FleetManager:
                 failure_code="fleet_no_endpoint",
             )
 
-        reported, remote_contexts, declarations = await self._fetch_node_contexts(
+        reported, remote_contexts, declarations = await fetch_node_declarations(
             node.endpoint, token=node.token
         )
         if reported and reported != node.node_id:
             # Identity mismatch is never resolved automatically: adopting the
             # reported id could silently merge two boards into one namespace.
             raise FleetError(
-                f"node at {node.endpoint!r} reports itself as {reported!r}, "
-                f"not {node.node_id!r}",
+                f"node at {node.endpoint!r} reports itself as {reported!r}, not {node.node_id!r}",
                 failure_code="fleet_node_mismatch",
             )
 
@@ -251,7 +324,7 @@ class FleetManager:
 
         report = await self._registry.reconcile()
         admitted_local = tuple(
-            did[len(prefix):] for did in report.admitted if did.startswith(prefix)
+            did[len(prefix) :] for did in report.admitted if did.startswith(prefix)
         )
         dropped = tuple(did for did in report.rejected if did.startswith(prefix))
         if dropped:
@@ -307,7 +380,9 @@ class FleetManager:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Fleet: halt device %r on unregister failed: %s",
-                    local_did, exc, exc_info=True,
+                    local_did,
+                    exc,
+                    exc_info=True,
                 )
 
         # Remove routing entries.
@@ -321,9 +396,7 @@ class FleetManager:
 
         logger.info("Fleet: unregistered node %r", node_id)
 
-    async def discover_nodes(
-        self, endpoints: tuple[str, ...]
-    ) -> tuple[FleetNode, ...]:
+    async def discover_nodes(self, endpoints: tuple[str, ...]) -> tuple[FleetNode, ...]:
         """Probe multiple endpoints for fleet nodes.
 
         Returns discovered nodes (not yet registered).  Unreachable
@@ -334,7 +407,7 @@ class FleetManager:
         discovered: list[FleetNode] = []
 
         async def _probe_one(endpoint: str) -> FleetNode | None:
-            reported, remote_contexts, _ = await self._fetch_node_contexts(endpoint)
+            reported, remote_contexts, _ = await fetch_node_declarations(endpoint)
             node_id = reported or _endpoint_to_node_id(endpoint)
             return FleetNode(
                 node_id=node_id,
@@ -376,9 +449,7 @@ class FleetManager:
         if self._heartbeat_task is not None:
             return
         self._stopped.clear()
-        self._heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(), name="fleet-heartbeat"
-        )
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="fleet-heartbeat")
 
     async def stop_heartbeat(self) -> None:
         """Stop heartbeat monitoring.  Idempotent."""
@@ -406,9 +477,7 @@ class FleetManager:
         while not self._stopped.is_set():
             await self._heartbeat_sweep()
             try:
-                await asyncio.wait_for(
-                    self._stopped.wait(), timeout=self._heartbeat_interval
-                )
+                await asyncio.wait_for(self._stopped.wait(), timeout=self._heartbeat_interval)
                 break  # stopped
             except asyncio.TimeoutError:
                 pass
@@ -453,13 +522,15 @@ class FleetManager:
                 if node.status != _NODE_STATUS_OFFLINE:
                     logger.warning(
                         "Fleet: node %r offline (%.1fs since last heartbeat)",
-                        node_id, elapsed,
+                        node_id,
+                        elapsed,
                     )
                     self._nodes[node_id] = node.with_status(_NODE_STATUS_OFFLINE)
             elif node.status == _NODE_STATUS_ONLINE:
                 logger.info(
                     "Fleet: node %r degraded (heartbeat missed, %.1fs since last)",
-                    node_id, elapsed,
+                    node_id,
+                    elapsed,
                 )
                 self._nodes[node_id] = node.with_status(_NODE_STATUS_DEGRADED)
         for node_id in changed:
@@ -494,9 +565,7 @@ class FleetManager:
         reachable = await self._probe_endpoint(node.endpoint, token=node.token) is not None
         now = time.monotonic()
         if reachable:
-            self._nodes[node_id] = node.with_status(
-                _NODE_STATUS_ONLINE, heartbeat=now
-            )
+            self._nodes[node_id] = node.with_status(_NODE_STATUS_ONLINE, heartbeat=now)
         return {
             "node_id": node_id,
             "display_name": node.display_name,
@@ -541,7 +610,9 @@ class FleetManager:
                     failures += 1
                     logger.warning(
                         "Fleet halt_all: device %r on node %r failed: %s",
-                        did, node.node_id, exc,
+                        did,
+                        node.node_id,
+                        exc,
                     )
             results["successes"] = successes
             results["failures"] = failures
@@ -593,9 +664,7 @@ class FleetManager:
         fleet_trust: dict[str, dict[str, Any]] = {}
 
         # Collect from the local registry's trust gate if available.
-        trust_gate: HardwareTrustGate | None = getattr(
-            self._registry, "_trust_gate", None
-        )
+        trust_gate: HardwareTrustGate | None = getattr(self._registry, "_trust_gate", None)
         if trust_gate is not None:
             for record in trust_gate.all_records():
                 key = f"{record.device_id}:{record.channel_id}"
@@ -612,9 +681,7 @@ class FleetManager:
 
         return {
             "strategy": "conservative_merge",
-            "description": (
-                "Lowest trust level across all nodes for each (device, channel) pair"
-            ),
+            "description": ("Lowest trust level across all nodes for each (device, channel) pair"),
             "trust": fleet_trust,
             "node_count": len(self._nodes),
             "timestamp": time.time(),
@@ -646,61 +713,7 @@ class FleetManager:
 
     # -- Internal helpers ------------------------------------------------
 
-    async def _fetch_node_contexts(
-        self, endpoint: str, *, token: str = ""
-    ) -> tuple[str, tuple[HardwareContext, ...], str]:
-        """Fetch a node's identity and raw device declarations over LHP.
-
-        Returns ``(reported_node_id, contexts, declarations_fingerprint)``.
-        The *reported* id comes from the node's hello answer; the caller
-        decides whether to pin it (register: mismatch refuses) or adopt it
-        (discover: it is the authoritative name).  Declarations stay in the
-        node's own id space; namespacing the ids is the caller's job.
-
-        Raises ``FleetError`` when the node is unreachable, fails the
-        exchange, or answers a declaration this host cannot read.  A
-        machine-generated declaration that does not parse is a version
-        mismatch, so the whole node is refused loudly rather than admitted
-        partially.
-        """
-        client = SocketLhpClient(endpoint, token=token)
-        try:
-            hello = await client.connect()
-            devices = await client.request("list", {})
-        except (LhpRemoteError, ValueError, OSError) as exc:
-            raise FleetError(
-                f"node at {endpoint!r} unreachable: {exc}",
-                failure_code="fleet_unreachable",
-            ) from exc
-        finally:
-            await client.close()
-
-        if not isinstance(devices, Mapping):
-            raise FleetError(
-                f"node at {endpoint!r} returned a malformed list payload",
-                failure_code="fleet_malformed_list",
-            )
-
-        contexts: list[HardwareContext] = []
-        raw_devices = devices.get("devices", ())
-        if isinstance(raw_devices, (list, tuple)):
-            for payload in raw_devices:
-                if not isinstance(payload, Mapping):
-                    continue
-                try:
-                    contexts.append(HardwareContext.from_mapping(dict(payload)))
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise FleetError(
-                        f"node at {endpoint!r} declaration is unreadable: {exc}",
-                        failure_code="fleet_bad_declaration",
-                    ) from exc
-
-        reported = str(hello.get("node_id") or "")
-        return reported, tuple(contexts), str(hello.get("declarations") or "")
-
-    async def _probe_endpoint(
-        self, endpoint: str, *, token: str = ""
-    ) -> Mapping[str, Any] | None:
+    async def _probe_endpoint(self, endpoint: str, *, token: str = "") -> Mapping[str, Any] | None:
         """Probe an LHP endpoint for liveness; return its hello, or None.
 
         One hello exchange with a short timeout: a lightweight connectivity
@@ -709,9 +722,7 @@ class FleetManager:
         declarations fingerprint is how a sweep notices changed devices.
         Never raises.
         """
-        client = SocketLhpClient(
-            endpoint, token=token, timeout_s=_HEARTBEAT_PROBE_TIMEOUT_S
-        )
+        client = SocketLhpClient(endpoint, token=token, timeout_s=_HEARTBEAT_PROBE_TIMEOUT_S)
         try:
             return await client.connect()
         except (LhpRemoteError, ValueError, OSError):
@@ -719,14 +730,14 @@ class FleetManager:
         finally:
             await client.close()
 
-    @staticmethod
-    def _transport_ref(node: FleetNode, remote_device_id: str) -> TransportRef:
+    def _transport_ref(self, node: FleetNode, remote_device_id: str) -> TransportRef:
         """Build the LHP binding for one remote device.
 
         ``remote_device_id`` is what the *node* calls the device; the host
         side calls it ``<node_id>__<device_id>``.  Both ids travel so the
         transport can address the right device on the node while every
-        host-side artifact carries the namespaced id.
+        host-side artifact carries the namespaced id. The permit issuer rides
+        along in-process only (declaration digests strip transport config).
         """
         return TransportRef(
             kind="lhp",
@@ -735,73 +746,60 @@ class FleetManager:
                 "token": node.token,
                 "node_id": node.node_id,
                 "remote_device_id": remote_device_id,
+                "permit_issuer": self._permit_issuer,
             },
         )
 
-    def _adjust_remote_provenance(
-        self, context: Any, node_id: str
-    ) -> Any:
+    def _adjust_remote_provenance(self, context: Any, node_id: str) -> Any:
         """Strip self-reported verified status from remote contexts (P2-J).
 
-        A node cannot be trusted to assert its own verification. The host
-        only trusts verification for remote devices when it has a local
-        digest-bound ``verified.json`` entry for ``<node>__<device>``.
-        Otherwise, provenance is marked ``remote:<node>`` declared.
+        A node cannot be trusted to assert its own verification: a machine that
+        can rewrite its declaration can also rewrite its claim that a human read
+        it.  The host therefore lets the claim through only when it holds its own
+        confirmation for ``<node>__<device>``, bound to the digest of the
+        declaration the node is sending now.  A confirmation of some earlier
+        declaration does not transfer to this one.
+
+        The digest is computed over *this* context, in the node's own id space,
+        so it matches the digest the node computes for the same declaration and
+        an operator can compare the two.
         """
         provenance = getattr(context, "provenance", None)
-        if provenance is None:
+        if provenance is None or not getattr(provenance, "is_verified", False):
             return context
-        if not getattr(provenance, "is_verified", False):
-            return context
-        # Remote context claims verified — check local verified.json
         host_device_id = f"{node_id}__{context.device_id}"
-        local_verified = self._check_local_verification(host_device_id, context)
-        if local_verified:
-            return context  # host has digest-bound verification
-        # Strip: mark as remote-declared only
+        verifier, verified_at = verification_stamp(
+            self._verified_path(), host_device_id, context
+        )
+        if verifier:
+            return replace(
+                context,
+                provenance=replace(
+                    provenance,
+                    verified_by=verifier,
+                    verified_at=verified_at,
+                ),
+            )
         logger.info(
             "Fleet: stripping self-reported verification for %s from node %s; "
-            "no local digest-bound entry exists",
-            context.device_id, node_id,
+            "this host holds no confirmation of that declaration",
+            context.device_id,
+            node_id,
         )
         return replace(
             context,
             provenance=replace(
                 provenance,
                 verified_by="",
+                verified_at=0.0,
                 source=f"remote:{node_id}",
             ),
         )
 
-    def _check_local_verification(self, host_device_id: str, context: Any) -> bool:
-        """Check if the host has a digest-bound verification for this remote device."""
-        try:
-            verified_path = getattr(
-                getattr(self._registry, "_settings", None),
-                "hardware_verified_path", None
-            )
-            if not verified_path:
-                layout = getattr(self._registry, "_layout", None)
-                if layout is not None:
-                    verified_path = getattr(layout, "verified_path", None)
-            if not verified_path:
-                return False
-            from pathlib import Path
-
-            import yaml
-
-            target = Path(str(verified_path)).expanduser()
-            if not target.is_file():
-                return False
-            raw = yaml.safe_load(target.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                return False
-            entry = raw.get(host_device_id)
-            if not isinstance(entry, dict):
-                return False
-            return bool(entry.get("declaration_digest"))
-        except Exception:  # noqa: BLE001
-            return False
+    def _verified_path(self) -> str:
+        """The host's confirmation record, as resolved by the active profile."""
+        settings = getattr(self._registry, "settings", None)
+        return str(getattr(settings, "verified_path", "") or "")
 
     async def _halt_device(self, device_id: str) -> None:
         """Halt a single device through the local registry's transport.
@@ -809,25 +807,35 @@ class FleetManager:
         Lock-free: ``transport.halt()`` does not acquire the I/O lock
         (HCP requirement), so this preempts in-flight operations.
 
-        Raises ``FleetError`` when the transport could not deliver the halt
-        (``connected=False``, e.g. an unreachable node).  ``halt()`` never
-        raises by contract, so without this check a dead node would be
-        reported as halted -- exactly the lie an emergency stop must not
-        tell.  A transport that answers while reporting no halt support is
-        tolerated: the attempt was delivered, and the device's own
-        capability is not this layer's failure.
+        Raises ``FleetError`` when the transport could not deliver the halt.
+        ``halt()`` never raises by contract, so without checking the delivery
+        verdict a dead node would be reported as halted -- exactly the lie an
+        emergency stop must not tell.
+
+        The verdict is read from ``halt_delivered``, never inferred from
+        ``connected``/``halt_supported``: a passive camera releases its capture and
+        answers ``connected=False, halt_supported=False``, which is a stop that
+        succeeded, while a closed link to an arm that may still be travelling
+        answers the same shape for a stop that was never sent. A device declaring
+        no halt support has no motion to arrest, so its stop is satisfied whatever
+        the link did.
+
+        The link is opened when none is open -- a stop has to reach the device --
+        and the stop itself goes through the registry, which retires the link when
+        the driver closed it.
         """
         try:
-            transport = await self._registry.transport(device_id)
-            status = await transport.halt()
+            await self._registry.transport(device_id)
+            status = await self._registry.halt(device_id)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Fleet: halt device %r failed: %s", device_id, exc)
             raise
-        if status is not None and not getattr(status, "connected", True):
-            detail = getattr(status, "detail", "")
+        if status is None:
+            logger.debug("Fleet: no link for %r survived to carry the halt", device_id)
+            return
+        if status.halt_supported and not status.halt_delivered:
             raise FleetError(
-                f"halt for {device_id!r} was not delivered: "
-                f"{detail or 'transport not connected'}",
+                f"halt for {device_id!r} was not delivered: {status.detail or 'no link'}",
                 failure_code="fleet_halt_undelivered",
             )
 
@@ -844,7 +852,8 @@ class FleetManager:
             except Exception:  # noqa: BLE001 — teardown must not propagate
                 logger.warning(
                     "Fleet: unregister node %r during close failed",
-                    node_id, exc_info=True,
+                    node_id,
+                    exc_info=True,
                 )
 
 
@@ -868,9 +877,7 @@ class FleetSessionRouter:
     def __init__(self, fleet_manager: FleetManager) -> None:
         self._fleet = fleet_manager
 
-    async def route_write(
-        self, device_id: str, channel_id: str, value: Any
-    ) -> Any:
+    async def route_write(self, device_id: str, channel_id: str, value: Any) -> Any:
         """Route a write operation to the correct node.
 
         If the device is remote, the write goes through the ``lhp``
@@ -881,9 +888,7 @@ class FleetSessionRouter:
         transport = await registry.transport(device_id)
         return await transport.write(channel_id, value)
 
-    async def route_read(
-        self, device_id: str, channel_id: str
-    ) -> Any:
+    async def route_read(self, device_id: str, channel_id: str) -> Any:
         """Route a read operation to the correct node.
 
         Same delegation pattern as ``route_write``: the transport
@@ -896,12 +901,13 @@ class FleetSessionRouter:
     async def route_halt(self, device_id: str) -> Any:
         """Route a halt to the correct node.
 
-        Lock-free requirement preserved: ``transport.halt()`` does
-        not acquire the device I/O lock.
+        Lock-free requirement preserved: the registry's halt never acquires the
+        device I/O lock. It does own the link cache, so a stop that closed the
+        link leaves nothing behind for the next read to trip over.
         """
         registry = self._fleet._registry
-        transport = await registry.transport(device_id)
-        return await transport.halt()
+        await registry.transport(device_id)
+        return await registry.halt(device_id)
 
 
 # ---------------------------------------------------------------------------
@@ -935,7 +941,7 @@ def _endpoint_to_node_id(endpoint: str) -> str:
     cleaned = endpoint.lower()
     for prefix in ("tcp://", "unix://", "http://", "https://", "stdio:"):
         if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix):]
+            cleaned = cleaned[len(prefix) :]
     return "".join(c if c.isalnum() else "_" for c in cleaned).strip("_")
 
 

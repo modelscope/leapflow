@@ -18,15 +18,20 @@ import re
 import sys
 from typing import Any, Dict, List, Optional
 
+from leapflow.engine._tool_helpers import _resolve_tool_name
+from leapflow.engine.context.result_budget import (
+    fit_result_to_budget as _truncate_result_for_budget,
+    head_tail_truncate as _head_tail_truncate,
+)
+from leapflow.engine.tools.tool_execution import (
+    exit_code_from,
+    failed_effect_is_uncertain,
+    result_is_observation,
+)
 from leapflow.security.permission_failures import (
     is_permission_failure_payload,
     is_permission_hard_stop_payload,
 )
-from leapflow.engine.tools.tool_execution import (
-    effect_is_uncertain_on_failure,
-    exit_code_from,
-)
-from leapflow.engine._tool_helpers import _resolve_tool_name
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -92,101 +97,6 @@ def _single_line_preview(value: Any, *, limit: int, keep_tail: bool = False) -> 
         tail = max(1, limit - 1 - head)
         return compact[:head] + "…" + compact[-tail:]
     return compact[: limit - 1] + "…"
-
-
-def _head_tail_truncate(text: str, allow: int) -> str:
-    """Keep the head and tail of a long string with an explicit elision marker.
-
-    The tail of stdout/stderr/tracebacks/test output usually holds the actual
-    error, so a naive head-only cut discards the most useful part.
-    """
-    if len(text) <= allow:
-        return text
-    keep = max(40, allow - 40)  # leave room for the marker
-    head = (keep * 2) // 3
-    tail = keep - head
-    elided = len(text) - head - tail
-    return f"{text[:head]}\n… [{elided} chars elided] …\n{text[-tail:]}"
-
-
-def _truncate_result_for_budget(payload: Any, budget: int) -> str:
-    """Serialize a tool result to JSON within ``budget``, preserving structure.
-
-    Pass 1 – prune list fields (e.g. file_list entries): drop tail elements
-    and annotate ``<key>_omitted`` so the LLM knows how many were removed.
-    Pass 2 – shrink the largest string fields with head+tail truncation so
-    the tail error / trace survives.  The final fallback emits a minimal
-    valid-JSON sentinel; a raw string cut that leaves invalid JSON is never
-    returned.  Never raises.
-    """
-    try:
-        text = json.dumps(payload, default=str, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return str(payload)[:budget]
-    if len(text) <= budget:
-        return text
-    if isinstance(payload, dict):
-        shrunk = dict(payload)
-
-        # Pass 1: prune list fields until the result fits.
-        # This handles file_list / file_find payloads that carry many entries.
-        for key in list(shrunk):
-            v = shrunk[key]
-            if not isinstance(v, list) or not v:
-                continue
-            orig_len = len(v)
-            # Estimate target entry count from a small sample to minimise
-            # iterations; then fine-tune with a tight while-loop.
-            sample = json.dumps(v[: min(4, orig_len)], default=str, ensure_ascii=False)
-            chars_per = max(1, len(sample) / min(4, orig_len))
-            empty_payload = {**shrunk, key: [], key + "_omitted": orig_len}
-            overhead = len(json.dumps(empty_payload, default=str, ensure_ascii=False))
-            target = max(0, int((budget - overhead) / chars_per))
-            shrunk[key] = v[:target]
-            if target < orig_len:
-                shrunk[key + "_omitted"] = orig_len - target
-            # Fine-tune (estimation may be off by ±1 entry).
-            while shrunk[key] and len(json.dumps(shrunk, default=str, ensure_ascii=False)) > budget:
-                shrunk[key] = shrunk[key][:-1]
-                shrunk[key + "_omitted"] = orig_len - len(shrunk[key])
-            if len(json.dumps(shrunk, default=str, ensure_ascii=False)) <= budget:
-                return json.dumps(shrunk, default=str, ensure_ascii=False)
-
-        # Pass 2: shrink the largest string fields with head+tail truncation.
-        while True:
-            over = len(json.dumps(shrunk, default=str, ensure_ascii=False)) - budget
-            if over <= 0:
-                break
-            candidates = [(k, v) for k, v in shrunk.items() if isinstance(v, str) and len(v) > 160]
-            if not candidates:
-                break
-            key, value = max(candidates, key=lambda kv: len(kv[1]))
-            allow = max(120, len(value) - over - 60)
-            if allow >= len(value):
-                break
-            shrunk[key] = _head_tail_truncate(value, allow)
-
-        text = json.dumps(shrunk, default=str, ensure_ascii=False)
-        if len(text) <= budget:
-            return text
-
-        # Sentinel: emit minimal valid JSON rather than a raw string cut that
-        # leaves the LLM with an unparseable fragment.
-        sentinel = json.dumps(
-            {
-                "ok": payload.get("ok"),
-                "kind": payload.get("kind", ""),
-                "truncated": True,
-                "original_chars": len(text),
-                "budget_chars": budget,
-            },
-            default=str,
-            ensure_ascii=False,
-        )
-        return sentinel
-
-    # Non-dict: hard string cut is unavoidable; the LLM sees a partial raw value.
-    return text[:budget]
 
 
 # ---------------------------------------------------------------------------
@@ -508,11 +418,12 @@ def _annotate_uncertain_effect(payload: Dict[str, Any], policy: str) -> Dict[str
 
     Advisory by design: only the tool's own state can settle whether the effect
     landed, so a hard block would also reject legitimate retries (e.g. resending
-    after fixing an argument).
+    after fixing an argument). A result that itself reports no side effect (a
+    refusal before anything was sent) is not flagged.
     """
     if not _tool_result_counts_as_failure(payload):
         return payload
-    if not effect_is_uncertain_on_failure(policy):
+    if not failed_effect_is_uncertain(payload, policy):
         return payload
     payload["side_effect_uncertain"] = True
     payload["retry_guidance"] = (
@@ -530,10 +441,16 @@ def _should_stop_after_tool_result(tool_name: str, payload: Dict[str, Any]) -> b
     idempotency) into every executed tool result, so a mutating/side-effecting
     tool is identified by its declared policy rather than a hardcoded tool-name
     list. This keeps the safety gate general and free of vendor-specific names.
+
+    A result that declares itself an observation with no effect (see
+    ``result_is_observation``) narrows that policy for its own call: a failed read
+    changed nothing, so the calls after it run against the state they expected.
     """
     if _is_permission_hard_stop_payload(payload):
         return True
     if not _tool_result_counts_as_failure(payload):
+        return False
+    if result_is_observation(payload):
         return False
     return str(payload.get("execution_policy") or "") in _SIDE_EFFECT_STOP_POLICIES
 
@@ -686,21 +603,44 @@ def _build_native_tool_assistant_message(
 
 
 def _extract_recent_tool_failures(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Return recent consecutive tool failure payloads, most recent first."""
+    """Return the trailing run of consecutive tool failures, most recent first.
+
+    The run ends at the latest successful tool result or at the previous
+    turn's final answer, so a failure the model already repaired is never
+    reported as the reason a turn stopped. Results that do not count as a
+    failure (argument-repair prompts, control signals) neither extend nor end
+    the run, and engine-injected user notes are skipped.
+    """
     failures: List[Dict[str, Any]] = []
+    follows_tool_result = False
     for msg in reversed(messages[-24:]):
+        if msg.get("_tool_attachment"):
+            continue  # images a tool returned, not a result of its own
+        role = msg.get("role", "")
         content = str(msg.get("content") or "").strip()
-        if not content:
+        if role == "assistant":
+            # A text-only answer that no tool result follows is the previous
+            # turn's reply: nothing before it belongs to this run.
+            if content and not msg.get("tool_calls") and not follows_tool_result:
+                break
+            follows_tool_result = False
             continue
-        # Strip "Tool result (name):\n" prefix from text-mode tool messages
-        if content.startswith("Tool result (") and ":\n" in content:
+        is_text_mode_result = role == "user" and content.startswith("Tool result (") and ":\n" in content
+        if role != "tool" and not is_text_mode_result:
+            continue
+        follows_tool_result = True
+        if is_text_mode_result:
             content = content.split(":\n", 1)[1].strip()
         try:
             payload = json.loads(content)
         except (json.JSONDecodeError, ValueError):
+            break  # plain-text output is a completed call
+        if not isinstance(payload, dict):
+            break
+        if payload.get("counts_as_failure") is False or _tool_result_is_control_signal(payload):
             continue
-        if not isinstance(payload, dict) or not _tool_result_counts_as_failure(payload):
-            continue
+        if not _tool_result_counts_as_failure(payload):
+            break
         failures.append(payload)
         if len(failures) >= 3:
             break
@@ -718,6 +658,8 @@ def _latest_turn_tool_result(messages: List[Dict[str, Any]]) -> Dict[str, Any] |
     for msg in reversed(messages):
         role = msg.get("role", "")
         content = msg.get("content", "")
+        if msg.get("_tool_attachment"):
+            continue  # images a tool returned, not the turn's user message
         if role == "tool":
             if not isinstance(content, str):
                 return None
@@ -780,6 +722,10 @@ def _last_tool_failures_recovery_message(
     # Authorization / permission failures — deterministic, no retry via LLM
     if _is_permission_failure_payload(last):
         lines.append(_build_permission_recovery_text(last))
+    elif last.get("blocks_approval") and error:
+        # A fail-closed hard stop (e.g. device readiness) carries its own
+        # executable repair instruction; surface it verbatim, never via the LLM.
+        lines.append(error)
     elif failure_code == "unknown_platform_action":
         platform = str(last.get("platform") or "")
         action = str(last.get("requested_action") or "")

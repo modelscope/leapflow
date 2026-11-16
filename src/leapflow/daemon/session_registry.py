@@ -16,7 +16,7 @@ engine, which carries no conversation.
 
 This module is pure infrastructure: it does not import daemon internals and is
 unit-tested in isolation. Wiring into ``engine_chat`` (session-id routing) is
-P3-2b. See ``temp/plan/concurrent_turns_stage3.md`` §4.1/4.4.
+P3-2b.
 """
 from __future__ import annotations
 

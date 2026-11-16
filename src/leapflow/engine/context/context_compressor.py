@@ -28,6 +28,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
+from leapflow.llm.image_tokens import IMAGE_PART_TYPES, image_part_tokens
+
 logger = logging.getLogger(__name__)
 
 SummarizeFn = Callable[[str], Awaitable[str]]
@@ -1061,7 +1063,6 @@ class ContextCompressor:
         Always handles multimodal content parts and images regardless
         of whether a custom ``token_count_fn`` is set.
         """
-        _IMAGE_TOKEN_ESTIMATE = 1600
         if self._config.token_count_fn is not None:
             fn = self._config.token_count_fn
             total = 0
@@ -1074,8 +1075,8 @@ class ContextCompressor:
                         if isinstance(part, dict):
                             if part.get("type") == "text":
                                 total += fn(part.get("text", ""))
-                            elif part.get("type") in ("image_url", "input_image", "image"):
-                                total += _IMAGE_TOKEN_ESTIMATE
+                            elif part.get("type") in IMAGE_PART_TYPES:
+                                total += image_part_tokens(part)
                 for tc in msg.get("tool_calls") or []:
                     args = tc.get("function", {}).get("arguments", "")
                     if isinstance(args, str):
@@ -1179,11 +1180,9 @@ class ContextCompressor:
         """CJK-aware token estimation with multimodal support.
 
         Uses ``estimate_text_tokens`` for consistent CJK-aware counting
-        and adds ~1600 tokens per image part.
+        and adds each image part's pixel-size estimate.
         """
-        _IMAGE_TOKEN_ESTIMATE = 1600
         total_tokens = 0
-        image_count = 0
 
         for msg in messages:
             content = msg.get("content", "")
@@ -1196,12 +1195,12 @@ class ContextCompressor:
                     part_type = part.get("type", "")
                     if part_type == "text":
                         total_tokens += estimate_text_tokens(part.get("text", ""))
-                    elif part_type in ("image_url", "input_image", "image"):
-                        image_count += 1
+                    elif part_type in IMAGE_PART_TYPES:
+                        total_tokens += image_part_tokens(part)
 
             for tc in msg.get("tool_calls") or []:
                 args = tc.get("function", {}).get("arguments", "")
                 if isinstance(args, str):
                     total_tokens += estimate_text_tokens(args)
 
-        return total_tokens + (image_count * _IMAGE_TOKEN_ESTIMATE)
+        return total_tokens

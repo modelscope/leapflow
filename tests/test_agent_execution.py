@@ -1691,7 +1691,8 @@ def test_duplicate_suppression_is_not_counted_as_consecutive_tool_failure() -> N
     assert "duplicate execution was not replayed" not in recovery
 
 
-
+def test_successful_tool_result_yields_no_recovery_message() -> None:
+    """A turn whose latest tool call succeeded has no failure to report."""
     import json
     from leapflow.engine._message_helpers import _last_tool_failures_recovery_message
 
@@ -1701,6 +1702,99 @@ def test_duplicate_suppression_is_not_counted_as_consecutive_tool_failure() -> N
         {"role": "tool", "content": json.dumps({"ok": True, "data": {}})},
     ]
     assert _last_tool_failures_recovery_message(messages) == ""
+
+
+def _native_call(name: str) -> dict:
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": name, "type": "function", "function": {"name": name, "arguments": "{}"}}],
+    }
+
+
+def test_repaired_failure_is_not_reported_after_a_later_success() -> None:
+    """A failure the model already repaired must not become the turn's final word.
+
+    Regression: a turn ended on the tool-call cap right after a successful
+    ``hw_skill_run``; the fallback reported an earlier, self-repaired
+    missing-argument error as "3 consecutive tool failures" and hid the success.
+    """
+    import json
+    from leapflow.engine._message_helpers import _last_tool_failures_recovery_message
+
+    missing = {
+        "ok": False,
+        "failure_code": "missing_required_fields",
+        "error": "Invalid arguments for hw_skill_run: missing required parameter(s): skill, workcell",
+        "missing": ["skill", "workcell"],
+    }
+    guard_failed = {"ok": False, "error": "grasp guard failed: jaws closed on nothing"}
+    messages = [
+        {"role": "user", "content": "pick up the cup"},
+        _native_call("hw_skill_run"),
+        {"role": "tool", "content": json.dumps(guard_failed)},
+        _native_call("hw_skill_run"),
+        {"role": "tool", "content": json.dumps(missing)},
+        _native_call("hw_skill_run"),
+        {"role": "tool", "content": json.dumps({"ok": True, "skill": "lift"})},
+        {"role": "user", "content": "SYSTEM GUARDRAIL: Turn tool-call cap reached (50/50)."},
+    ]
+
+    assert _last_tool_failures_recovery_message(messages, include_generic=False) == ""
+    assert _last_tool_failures_recovery_message(messages) == ""
+
+
+def test_argument_repair_prompt_does_not_count_as_a_consecutive_failure() -> None:
+    """``counts_as_failure: False`` results neither extend nor end a failure run."""
+    import json
+    from leapflow.engine._message_helpers import _extract_recent_tool_failures
+
+    real = {"ok": False, "error": "grasp guard failed"}
+    repair = {"ok": False, "failure_code": "missing_required_fields", "counts_as_failure": False, "error": "x"}
+    messages = [
+        _native_call("hw_skill_run"),
+        {"role": "tool", "content": json.dumps(real)},
+        _native_call("hw_skill_run"),
+        {"role": "tool", "content": json.dumps(repair)},
+    ]
+
+    assert _extract_recent_tool_failures(messages) == [real]
+
+
+def test_previous_turn_failures_are_not_part_of_the_run() -> None:
+    """The previous turn's final answer bounds the run of failures."""
+    import json
+    from leapflow.engine._message_helpers import _extract_recent_tool_failures
+
+    old = {"ok": False, "error": "old failure"}
+    new = {"ok": False, "error": "new failure"}
+    messages = [
+        _native_call("shell_run"),
+        {"role": "tool", "content": json.dumps(old)},
+        {"role": "assistant", "content": "That command failed."},
+        {"role": "user", "content": "try again"},
+        _native_call("shell_run"),
+        {"role": "tool", "content": json.dumps(new)},
+    ]
+
+    assert _extract_recent_tool_failures(messages) == [new]
+
+
+def test_text_mode_failures_still_form_a_consecutive_run() -> None:
+    """Text-mode tool calls are assistant text followed by a result note."""
+    import json
+    from leapflow.engine._message_helpers import _extract_recent_tool_failures
+
+    first = {"ok": False, "error": "first"}
+    second = {"ok": False, "error": "second"}
+    messages = [
+        {"role": "assistant", "content": '<tool_call>{"name": "shell_run"}</tool_call>'},
+        {"role": "user", "content": f"Tool result (shell_run):\n{json.dumps(first)}"},
+        {"role": "assistant", "content": '<tool_call>{"name": "shell_run"}</tool_call>'},
+        {"role": "user", "content": f"Tool result (shell_run):\n{json.dumps(second)}"},
+    ]
+
+    assert _extract_recent_tool_failures(messages) == [second, first]
 
 
 @pytest.mark.asyncio

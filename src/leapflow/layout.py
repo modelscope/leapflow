@@ -18,7 +18,6 @@ from typing import Any, Iterable
 
 import yaml
 
-
 _PROFILE_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 _CONFIG_NAMES = (
     "runtime.yaml",
@@ -195,7 +194,9 @@ class HardwareLayout:
     Device declarations are durable user assets: they encode physical operating
     limits a person is accountable for, so they live under the profile and are
     never regenerated. Raw samples do not live here -- they are session-scoped
-    sensitive artifacts and route through CacheLayout instead.
+    sensitive artifacts and route through CacheLayout instead. Recorded skill
+    episodes are the exception by intent: they are a dataset the operator curates
+    and trains on, not a session by-product.
     """
 
     root: Path
@@ -203,6 +204,25 @@ class HardwareLayout:
     @property
     def devices_dir(self) -> Path:
         return self.root / "devices"
+
+    @property
+    def workcells_dir(self) -> Path:
+        """Workcell declarations: which devices cooperate, frames, workspace, home."""
+        return self.root / "workcells"
+
+    @property
+    def episodes_dir(self) -> Path:
+        """Recorded skill runs (state, commands, camera frames) for offline training."""
+        return self.root / "episodes"
+
+    @property
+    def calibration_worker_dir(self) -> Path:
+        """Owner-private compute endpoint directory, created lazily in mode 0700."""
+        return self.root / "calib-runtime"
+
+    @property
+    def calibration_worker_socket(self) -> Path:
+        return self.calibration_worker_dir / "compute.sock"
 
     @property
     def verified_path(self) -> Path:
@@ -214,8 +234,13 @@ class HardwareLayout:
         """Append-only NDJSON audit trail for hardware read/write/estop operations."""
         return self.root / "audit" / "hardware_audit.ndjson"
 
+    @property
+    def permit_issuer_key_path(self) -> Path:
+        """Host Ed25519 key that signs LHP execution permits (0600, never shared)."""
+        return self.root / "lhp_permit_issuer.key"
+
     def ensure(self) -> None:
-        for path in (self.root, self.devices_dir):
+        for path in (self.root, self.devices_dir, self.workcells_dir):
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -624,46 +649,17 @@ class PathLayout:
         return profile_layout
 
     def workspace_config_path(self, workspace_root: Path) -> Path:
-        return workspace_root / ".leapflow" / "config.yaml"
+        """Return the opt-in workspace config override path.
 
-    def workspace_manifest_path(self, workspace_root: Path) -> Path:
-        return workspace_root / ".leapflow" / "workspace.yaml"
-
-    def write_workspace_manifest(self, workspace_root: Path) -> Path | None:
-        """Write the workspace-local manifest; return its path, or ``None`` if skipped.
-
-        Skipped when the workspace's ``.leapflow`` directory *is* the LeapFlow
-        home (i.e. the workspace root is the home's parent, typically ``$HOME``).
-        Writing there would drop a workspace marker into the global home
-        alongside ``config/``, ``profiles/`` and ``secrets/`` — the two
-        directories collapse onto one path and the layout stops being readable.
-        The profile-side manifest (addressed by ``workspace_id``) is written
-        unconditionally by the caller, so nothing is lost by skipping this copy.
+        Nothing creates this directory on its own: a ``.leapflow`` tree appears
+        in a user's project only once they deliberately scope a setting to the
+        workspace (``leap config set --scope workspace``). Writing a marker
+        manifest on every command used to litter every directory LeapFlow ran
+        in, and nothing ever read it back -- the workspace id is derived from
+        the canonical path, and the path-to-id record lives in the profile's
+        cache, so no reader was lost with it.
         """
-        workspace_root = workspace_root.expanduser().resolve()
-        path = self.workspace_manifest_path(workspace_root)
-        if path.parent.resolve() == self.root.resolve():
-            return None
-        workspace_id = workspace_id_for_path(workspace_root)
-        now = datetime.now(timezone.utc).isoformat()
-        existing: dict[str, Any] = {}
-        if path.exists():
-            try:
-                loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-                if isinstance(loaded, dict):
-                    existing = loaded
-            except (OSError, yaml.YAMLError, ValueError):
-                existing = {}
-        payload = {
-            "version": 1,
-            "workspace_id": workspace_id,
-            "canonical_path": str(workspace_root),
-            "display_name": workspace_root.name,
-            "first_seen_at": existing.get("first_seen_at") or now,
-            "last_seen_at": now,
-        }
-        _write_yaml(path, payload)
-        return path
+        return workspace_root / ".leapflow" / "config.yaml"
 
     def describe_path(self, path: Path) -> ManagedPathDescriptor:
         """Return semantic metadata for a path under this layout."""

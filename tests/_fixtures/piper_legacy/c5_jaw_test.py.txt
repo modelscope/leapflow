@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""C.5: Gripper qualification + jaw stroke verification."""
+import argparse
+import math
+import json
+import time
+from pathlib import Path
+
+from cl import config
+from cl.bridge import ArmBridge, BridgeError, checkpoint
+
+JAW_TEST_WIDTHS = [10.0, 40.0, 68.0]
+
+
+def qualified_report(report: object) -> bool:
+    """Validate measured strokes rather than trusting a historical passing flag."""
+    try:
+        if not isinstance(report, dict) or report.get("passed") is not True or report.get("error"):
+            return False
+        convention = report["convention"]
+        if (not isinstance(convention, dict) or convention.get("verified") is not True
+                or type(convention.get("closing_sign")) is not int or convention["closing_sign"] not in (-1, 1)
+                or type(convention.get("unloaded_nm")) not in (int, float)
+                or not math.isfinite(convention["unloaded_nm"]) or not report.get("session_id")):
+            return False
+        strokes = report["strokes"]
+        if not isinstance(strokes, list) or not all(isinstance(row, dict) for row in strokes):
+            return False
+        if [row["commanded_mm"] for row in strokes] != [70.0, *JAW_TEST_WIDTHS, 70.0]:
+            return False
+        for row in strokes:
+            values = [row[key] for key in ("commanded_mm", "actual_mm", "error_mm", "effort_nm")]
+            if (not all(type(v) in (int, float) and math.isfinite(v) for v in values)
+                    or row["result"] != "reached" or not 0 <= row["error_mm"] <= 1.5
+                    or abs(abs(values[1] - values[0]) - values[2]) > 0.01):
+                return False
+        return report["jaw_tests"] == strokes[1:-1]
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def run_test(arm: ArmBridge, output: Path) -> dict:
+    """Stop on the first failure; never run cleanup strokes after uncertain effects."""
+    report = {"convention": None, "jaw_tests": [], "passed": False,
+              "session_id": arm.hello["session_id"], "started_at": time.time()}
+    try:
+        state, check = arm.latest(max_age_s=0.12), arm.check()
+        if (check.get("ok") is not True or check.get("halted") or check.get("enabled") is not True
+                or not math.isfinite(state["z"]) or state["z"] < 130.0
+                or not 0 <= state.get("tilt_deg", float("inf")) <= config.load_profile().geometry.tilt_deg):
+            raise ValueError(f"Jaw test blocked by live safety/height/tilt check: {check}")
+        report["convention"] = arm.call("gripper_qualify")
+        if report["convention"].get("verified") is not True:
+            raise ValueError("gripper convention not verified")
+        for width in [70.0, *JAW_TEST_WIDTHS, 70.0]:
+            result = (arm.open_gripper(width) if width == 70.0
+                      else arm.grip(width, effort_nm=0.3, timeout_s=5.0))
+            state = arm.latest(max_age_s=0.12)
+            actual = float(state["gripper_mm"])
+            error = abs(actual - width)
+            row = {"commanded_mm": width, "actual_mm": actual, "error_mm": error,
+                   "effort_nm": state["gripper_nm"], "result": result.get("why")}
+            report.setdefault("strokes", []).append(row)
+            if not math.isfinite(error) or error > 1.5 or result.get("why") != "reached":
+                raise ValueError(f"jaw stroke not verified: {row}")
+            if width in JAW_TEST_WIDTHS:
+                report["jaw_tests"].append(row)
+        report["passed"] = len(report["jaw_tests"]) == len(JAW_TEST_WIDTHS)
+    except (BridgeError, ValueError, KeyError, TypeError) as error:
+        report["error"] = str(error)
+        report["envelope"] = checkpoint(error, effects_attempted=arm.effects_attempted,
+                                         tool="c5_jaw", session_id=report["session_id"])
+        if arm.effects_attempted:
+            try:
+                report["stop"] = arm.stop()
+            except BridgeError as stop_error:
+                report["stop_error"] = str(stop_error)
+                report["operator_action"] = "Use the physical emergency stop immediately."
+    finally:
+        report["completed_at"] = time.time()
+        config.dump_json(output, report)
+    return report
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--execute", action="store_true", help="Run the approved empty-air jaw test")
+    args = parser.parse_args()
+    if not args.execute:
+        print("No writes: pass --execute after verifying empty jaws and a safe arm pose.")
+        return 0
+    cfg = config.load_profile()
+    output = config.DATA / "calibration" / "c5_jaw_latest.json"
+    arm = ArmBridge(cfg.bridge.host, cfg.bridge.port)
+    try:
+        with arm:
+            # Continuous heartbeats cover long commands without widening the watchdog.
+            report = run_test(arm, output)
+    except (BridgeError, OSError) as error:
+        report = {"passed": False, "error": str(error), "completed_at": time.time(),
+                  "envelope": checkpoint(error, effects_attempted=arm.effects_attempted,
+                                         tool="c5_jaw", session_id=arm.hello.get("session_id", ""))}
+        if arm.effects_attempted:
+            report["operator_action"] = "Qualification interrupted; verify the arm before any further motion."
+        config.dump_json(output, report)
+    print(json.dumps(report, indent=2))
+    return 0 if report["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

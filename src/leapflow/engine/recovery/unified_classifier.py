@@ -369,7 +369,30 @@ class UnifiedErrorClassifier:
                 context=FailureContext.from_dict_args(tool_name=tool_name),
             )
 
-        # 3. Stable terminal failure contract. The producer must name a known
+        # 3. A defect in the code that produced the result (a tool, a plugin, a
+        # remote runtime), declared by class or code. No retry or changed
+        # argument can fix a bug, so the turn halts, and the producer's own
+        # detail -- the exception it caught -- is the diagnosis to keep.
+        if INTERNAL_DEFECT_CATEGORY in (failure_class, failure_code):
+            detail = error_msg or str(result.get("message") or "")
+            return FailureEnvelope.create(
+                source=FailureSource.TOOL,
+                category=INTERNAL_DEFECT_CATEGORY,
+                failure_class=INTERNAL_DEFECT_CATEGORY,
+                failure_code=failure_code or INTERNAL_DEFECT_CATEGORY,
+                message=(detail or "The tool reported an internal defect")[:500],
+                recoverability=Recoverability.NON_RECOVERABLE,
+                side_effect_state=side_effect_state,
+                context=FailureContext.from_dict_args(tool_name=tool_name),
+                provider_hint=RecoveryHint(
+                    hint_text=(
+                        f"{tool_name or 'The tool'} hit a defect in its own code; retrying "
+                        "will not help. The producer's log holds the traceback."
+                    )
+                ),
+            )
+
+        # 4. Stable terminal failure contract. The producer must name a known
         # terminal code: a generic ``retryable=False`` failure may still require
         # a safe read-back or a different action and must remain agent-correctable.
         if failure_code in _TERMINAL_TOOL_FAILURE_CODES:
@@ -384,7 +407,7 @@ class UnifiedErrorClassifier:
                 context=FailureContext.from_dict_args(tool_name=tool_name),
             )
 
-        # 4. Unknown tool with retryable flag
+        # 5. Unknown tool with retryable flag
         if error_type == "unknown_tool" and retryable:
             return FailureEnvelope.create(
                 source=FailureSource.TOOL,
@@ -397,7 +420,7 @@ class UnifiedErrorClassifier:
                 context=FailureContext.from_dict_args(tool_name=tool_name),
             )
 
-        # 5. Timeout detection (data-driven keyword set)
+        # 6. Timeout detection (data-driven keyword set)
         error_lower = error_msg.lower()
         if any(kw in error_lower for kw in _TOOL_TIMEOUT_KEYWORDS):
             timeout_recoverability = (
@@ -416,7 +439,7 @@ class UnifiedErrorClassifier:
                 context=FailureContext.from_dict_args(tool_name=tool_name),
             )
 
-        # 6. Generic tool failure
+        # 7. Generic tool failure
         recoverability = (
             Recoverability.AUTO_RETRY if retryable else Recoverability.USER_FIXABLE
         )

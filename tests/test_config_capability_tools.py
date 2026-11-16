@@ -14,18 +14,17 @@ Covered:
 - credentials never echo into the transcript
 - unknown keys are self-correctable in the same turn
 - the sandbox refusal is honest about approval and points at the config tools
-- the workspace manifest never lands inside the LeapFlow home
+- no workspace-local marker is written into the user's directory
 """
 
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from leapflow.layout import build_layout
+from leapflow.layout import build_layout, workspace_id_for_path
 from leapflow.tools import config_tools
 
 
@@ -336,29 +335,26 @@ def test_sandbox_refusal_redirects_config_paths_to_the_tools(cfg_home) -> None:
     assert "config_set" not in plain_error["error"]
 
 
-# ── Workspace manifest must not land in the LeapFlow home ────────────────
+# ── No workspace-local marker is written into the user's directory ────────
 
 
-def test_manifest_is_skipped_when_workspace_is_the_leapflow_home(tmp_path) -> None:
-    """Writing here would drop a workspace marker beside config/ and secrets/."""
-    home = tmp_path / ".leapflow"
-    layout = build_layout(home)
+def test_runtime_never_creates_a_workspace_local_manifest(tmp_path) -> None:
+    """The workspace marker was write-only and made every command litter cwd.
 
-    written = layout.write_workspace_manifest(tmp_path)
-
-    assert written is None
-    assert not (home / "workspace.yaml").exists()
-
-
-def test_manifest_is_written_for_a_normal_workspace(tmp_path) -> None:
+    Nothing ever read it back: the workspace id is derived from the canonical
+    path, and the path-to-id record lives in the profile's cache. The only
+    remaining workspace-local file is the opt-in ``.leapflow/config.yaml``.
+    """
     layout = build_layout(tmp_path / "leap-home")
+    profile_layout = layout.ensure(profile_id="default")
     workspace = tmp_path / "project"
     workspace.mkdir()
 
-    written = layout.write_workspace_manifest(workspace)
+    workspace_id = workspace_id_for_path(workspace)
+    profile_layout.cache.write_workspace_manifest(workspace_id, workspace)
 
-    assert written == workspace / ".leapflow" / "workspace.yaml"
-    assert Path(written).exists()
+    assert not (workspace / ".leapflow").exists()
+    assert profile_layout.cache.workspace_manifest_path(workspace_id).exists()
 
 
 # ── Writes are gated: the model must not be able to unsupervise itself ─────

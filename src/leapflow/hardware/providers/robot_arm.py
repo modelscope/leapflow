@@ -120,13 +120,9 @@ class RobotArmContextProvider:
             logger.warning("robot_arm provider: 'robot_type' is required; skipping")
             return ()
 
-        device_name = str(
-            self._config.get("device_name") or robot_type
-        ).strip()
+        device_name = str(self._config.get("device_name") or robot_type).strip()
         device_id = f"robot.{device_name}"
-        display_name = str(
-            self._config.get("display_name") or robot_type
-        ).strip()
+        display_name = str(self._config.get("display_name") or robot_type).strip()
 
         sample_rate_hz = float(self._config.get("sample_rate_hz") or 0.0)
 

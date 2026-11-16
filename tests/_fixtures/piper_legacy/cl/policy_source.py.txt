@@ -1,0 +1,303 @@
+"""One interface for "who proposes the next motion", with the scripted plan first.
+
+The mission never calls a model directly.  It asks a ``PolicySource`` for a
+:class:`Chunk` and hands that chunk to the same guarded executor whether the
+rows came from a plan, from the zero-dependency fake server, or from a fine-tuned
+SmolVLA checkpoint.  That is the whole point: the model is a *proposer*, and the
+200 Hz guard, the rate clamp and the vision checks do not know which one spoke.
+
+The scripted source emits one pose row per call so the mission can verify vision
+between rows; a learned source emits 30 Hz joint rows, which is why only the
+learned path runs through ``cl_armd``'s chunk executor and only within a stage
+that was approved.
+
+Wire contract (already shipped in this repo, ``deployment/models``)::
+
+    GET  /v1/health  -> {"status": "ok", "model_info": {...}}
+    POST /v1/infer   -> {"actions": [[j1..j6, grip], ...]}
+         body: {"images": {"top": "<base64 jpeg>"}, "state": [j1..j6, grip], "task": "..."}
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Protocol, Sequence, runtime_checkable
+
+import cv2
+import numpy as np
+
+from . import config
+
+
+class PolicyError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+# A machine-wide http_proxy intercepts 127.0.0.1 and answers 502 for the model
+# service, so every policy request bypasses proxies explicitly.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+NORM_EPS = 1e-8
+
+
+def to_model(values: Sequence[float], norm: dict) -> list[float]:
+    """Physical -> model space, matching ``skills.adapt.spec.Normalization.to_model``."""
+    mode = (norm or {}).get("mode", "identity")
+    if mode == "mean_std":
+        return [(x - m) / (s + NORM_EPS) for x, m, s in zip(values, norm["mean"], norm["std"])]
+    if mode == "min_max":
+        return [(x - lo) / max(hi - lo, NORM_EPS) * 2.0 - 1.0
+                for x, lo, hi in zip(values, norm["min"], norm["max"])]
+    return [float(v) for v in values]
+
+
+def to_physical(values: Sequence[float], norm: dict) -> list[float]:
+    """Model space -> physical, matching ``Normalization.to_physical``."""
+    mode = (norm or {}).get("mode", "identity")
+    if mode == "mean_std":
+        return [z * (s + NORM_EPS) + m for z, m, s in zip(values, norm["mean"], norm["std"])]
+    if mode == "min_max":
+        return [(z + 1.0) / 2.0 * max(hi - lo, NORM_EPS) + lo
+                for z, lo, hi in zip(values, norm["min"], norm["max"])]
+    return [float(v) for v in values]
+
+
+@dataclass(frozen=True)
+class Chunk:
+    kind: str  # "pose" (one row per stage step) or "joint" (a timed chunk)
+    rows: tuple[tuple[float, ...], ...]
+    fps: float
+    done: bool
+    source: str
+    meta: dict = field(default_factory=dict)
+
+    @property
+    def width(self) -> int:
+        return len(self.rows[0]) if self.rows else 0
+
+
+@runtime_checkable
+class PolicySource(Protocol):
+    name: str
+
+    def describe(self) -> dict: ...
+    def act(self, context: dict) -> Chunk: ...
+    def close(self) -> None: ...
+
+
+def encode_observation(rgb: np.ndarray, width: int = 512, height: int = 512,
+                       quality: int = 92) -> bytes:
+    """Letterbox to the declared square with black padding, then JPEG.
+
+    ``fit: pad`` in ``smolvla_piper_space.yaml`` is what the node would apply;
+    doing it here keeps the model's view identical to training.
+    """
+    source_h, source_w = rgb.shape[:2]
+    scale = min(width / source_w, height / source_h)
+    new_w, new_h = max(1, int(round(source_w * scale))), max(1, int(round(source_h * scale)))
+    resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    x0, y0 = (width - new_w) // 2, (height - new_h) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    ok, buffer = cv2.imencode(".jpg", cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR),
+                              [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        raise PolicyError("encode", "cv2 refused to encode the observation")
+    return buffer.tobytes()
+
+
+class ScriptedPolicy:
+    """A fixed list of named poses, one per call, so vision can check between them."""
+
+    name = "scripted"
+
+    def __init__(self, poses: Sequence[dict] | None = None):
+        self._queue: list[dict] = list(poses or [])
+        self._index = 0
+
+    def load(self, poses: Sequence[dict]) -> None:
+        self._queue = list(poses)
+        self._index = 0
+
+    def describe(self) -> dict:
+        return {"name": self.name, "queued": len(self._queue), "next": self._peek()}
+
+    def _peek(self) -> str:
+        if self._index >= len(self._queue):
+            return ""
+        return str(self._queue[self._index].get("name", f"step{self._index}"))
+
+    def act(self, context: dict) -> Chunk:
+        if self._index >= len(self._queue):
+            return Chunk("pose", (), 1.0, True, self.name, {"step": self._index})
+        step = self._queue[self._index]
+        self._index += 1
+        row = tuple(float(v) for v in step["pose"][:6])
+        return Chunk("pose", (row,), 1.0, self._index >= len(self._queue), self.name,
+                     {"step": step.get("name", ""), "kind": step.get("kind", "linear"),
+                      "speed_pct": step.get("speed_pct", 3.0),
+                      "arrive_mm": step.get("arrive_mm", 1.2)})
+
+    def close(self) -> None:
+        return None
+
+
+class RemotePolicy:
+    """HTTP client for ``contract_server.py`` -- the fake and the real model alike."""
+
+    def __init__(self, url: str, *, expect_name: str | None = None, timeout_s: float = 3.0,
+                 fps: float = 30.0, frame: tuple[int, int] = (512, 512), chunk: int = 50):
+        self.url = url.rstrip("/")
+        self.expect_name = expect_name
+        self.timeout_s = timeout_s
+        self.fps = fps
+        self.frame = frame
+        self.chunk = chunk
+        self.info: dict = {}
+        self.name = expect_name or "remote"
+        self.action_norm: dict = {"mode": "identity"}
+        self.state_norm: dict = {"mode": "identity"}
+        self.action_normalized = False
+
+    def health(self) -> dict:
+        try:
+            with _OPENER.open(f"{self.url}/v1/health", timeout=self.timeout_s) as reply:
+                payload = json.loads(reply.read())
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise PolicyError("unreachable", f"{self.url}: {error}") from error
+        info = payload.get("model_info") or {}
+        if not info:
+            raise PolicyError("no_model_info", "the service answered without model_info")
+        if self.expect_name and info.get("name") != self.expect_name:
+            raise PolicyError("wrong_model", f"expected {self.expect_name}, got {info.get('name')}")
+        action = info.get("action_space") or {}
+        self.fps = float(action.get("fps") or self.fps)
+        self.chunk = int(info.get("horizon") or self.chunk)
+        images = (info.get("observation_space") or {}).get("images") or {}
+        spec = images.get("top") or {}
+        if spec:
+            self.frame = (int(spec.get("width", 512)), int(spec.get("height", 512)))
+        self.info = info
+        self.name = str(info.get("name") or self.name)
+        self.action_norm = action.get("normalization") or {"mode": "identity"}
+        self.state_norm = (info.get("observation_space") or {}).get("state", {}).get(
+            "normalization") or {"mode": "identity"}
+        self.action_normalized = bool(action.get("normalized", False))
+        if self.action_normalized and not (len(self.action_norm.get("mean") or self.action_norm.get("min") or []) == 7):
+            raise PolicyError("bad_stats", "the model declares normalised rows without 7-dim stats")
+        return info
+
+    def describe(self) -> dict:
+        action = self.info.get("action_space") or {}
+        state = (self.info.get("observation_space") or {}).get("state") or {}
+        return {"name": self.name, "version": self.info.get("version"),
+                "checksum": (self.info.get("checksum") or "")[:12],
+                "fps": action.get("fps"), "horizon": self.info.get("horizon"),
+                "action_groups": [g.get("name") for g in action.get("groups") or []],
+                "state_width": state.get("width"), "frame": list(self.frame),
+                "normalized": self.action_normalized,
+                "action_norm": self.action_norm.get("mode"),
+                "state_norm": self.state_norm.get("mode")}
+
+    def act(self, context: dict) -> Chunk:
+        rgb = context.get("rgb")
+        state = context.get("state") or []
+        instruction = str(context.get("instruction") or "pick up the blue box")
+        if rgb is None:
+            raise PolicyError("no_frame", "context.rgb is required")
+        body = {
+            "images": {"top": base64.b64encode(
+                encode_observation(rgb, self.frame[0], self.frame[1])).decode()},
+            "state": (to_model(state, self.state_norm) if self.action_normalized
+                      else [float(v) for v in state]),
+            "task": instruction,
+        }
+        request = urllib.request.Request(
+            f"{self.url}/v1/infer", data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        started = time.monotonic()
+        try:
+            with _OPENER.open(request, timeout=self.timeout_s) as reply:
+                payload = json.loads(reply.read())
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise PolicyError("infer_failed", f"{self.url}: {error}") from error
+        latency = time.monotonic() - started
+        rows = payload.get("actions") or []
+        if not rows:
+            raise PolicyError("empty_actions", "the service returned no rows")
+        clean: list[tuple[float, ...]] = []
+        for row in rows[: self.chunk]:
+            raw = [float(v) for v in row]
+            if len(raw) < 7:
+                raise PolicyError("bad_row", f"row width {len(raw)} < 7")
+            values = tuple(to_physical(raw[:7], self.action_norm) if self.action_normalized
+                           else raw[:7])
+            clean.append(values)
+        return Chunk("joint", tuple(clean), self.fps, False, self.name,
+                     {"latency_s": round(latency, 3), "instruction": instruction})
+
+    def close(self) -> None:
+        return None
+
+
+def fake_policy(url: str | None = None, cfg: config.Cfg | None = None) -> RemotePolicy:
+    cfg = cfg or config.load_profile()
+    return RemotePolicy(url or cfg.vla.service, expect_name=None, timeout_s=cfg.vla.timeout_s)
+
+
+def smolvla(url: str | None = None, cfg: config.Cfg | None = None) -> RemotePolicy:
+    cfg = cfg or config.load_profile()
+    return RemotePolicy(url or cfg.vla.service, expect_name="smolvla_piper",
+                        timeout_s=cfg.vla.timeout_s)
+
+
+def make_source(kind: str, cfg: config.Cfg | None = None,
+                poses: Sequence[dict] | None = None) -> PolicySource:
+    cfg = cfg or config.load_profile()
+    if kind == "scripted":
+        return ScriptedPolicy(poses)
+    if kind == "fake":
+        return fake_policy(cfg=cfg)
+    if kind == "smolvla":
+        return smolvla(cfg=cfg)
+    raise PolicyError("unknown_source", kind)
+
+
+def clamp_rows(rows: Sequence[Sequence[float]], kind: str = "joint") -> list[list[float]]:
+    """Belt and braces: the board clamps too, but a malformed row never leaves here."""
+    limits = [(-150.0, 150.0), (0.0, 180.0), (-170.0, 0.0), (-100.0, 100.0),
+              (-70.0, 70.0), (-120.0, 120.0)]
+    out: list[list[float]] = []
+    for row in rows:
+        values = [float(v) for v in row[:7]]
+        if kind == "joint":
+            for index in range(6):
+                low, high = limits[index]
+                values[index] = max(low, min(high, values[index]))
+        values[6] = max(0.0, min(75.0, values[6]))
+        out.append(values)
+    return out
+
+
+def dry_run(source: PolicySource, rgb: np.ndarray | None = None, state: Sequence[float] | None = None,
+            instruction: str = "pick up the blue box") -> dict:
+    """One call, no arm: proves the service answers before a stage depends on it."""
+    started = time.monotonic()
+    if isinstance(source, ScriptedPolicy):
+        chunk = source.act({})
+    else:
+        if rgb is None:
+            raise PolicyError("no_frame", "a remote policy needs an image")
+        chunk = source.act({"rgb": rgb, "state": list(state or [0.0] * 7),
+                            "instruction": instruction})
+    return {"source": chunk.source, "kind": chunk.kind, "rows": len(chunk.rows),
+            "width": chunk.width, "fps": chunk.fps, "latency_s": round(time.monotonic() - started, 3),
+            "first": [round(v, 2) for v in chunk.rows[0]] if chunk.rows else [],
+            "meta": chunk.meta}

@@ -301,15 +301,16 @@ def test_config_cli_secret_and_llm_set(monkeypatch, tmp_path, capsys) -> None:
 
 def test_load_config_degrades_when_workspace_manifest_write_fails(monkeypatch, tmp_path) -> None:
     from leapflow import config as config_module
+    from leapflow.layout import CacheLayout
 
     monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "leap-home"))
     monkeypatch.setenv("LEAPFLOW_WORKSPACE_ROOT", str(tmp_path / "workspace"))
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
 
-    def fail_workspace_manifest(self, workspace_root):
-        raise OSError("read-only workspace")
+    def fail_workspace_manifest(self, workspace_id, workspace_root):
+        raise OSError("unwritable profile cache")
 
-    monkeypatch.setattr(config_module.PathLayout, "write_workspace_manifest", fail_workspace_manifest)
+    monkeypatch.setattr(CacheLayout, "write_workspace_manifest", fail_workspace_manifest)
 
     settings = config_module.load_config()
 
