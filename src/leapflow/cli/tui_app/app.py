@@ -41,7 +41,6 @@ from prompt_toolkit import Application
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text.utils import fragment_list_len, fragment_list_width
-from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import HSplit, Layout, Window
@@ -57,12 +56,14 @@ from prompt_toolkit.widgets import TextArea
 
 from leapflow.cli.tui_app.approval_modal import ApprovalModal
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus, command_key
+from leapflow.cli.tui_app.history import SecretAwareFileHistory
 from leapflow.cli.tui_app.input import build_completer
 from leapflow.cli.tui_app.paste import (
     PASTE_FRAGMENT_WINDOW_S,
     PasteHeuristics,
     PasteStore,
 )
+from leapflow.cli.tui_app.render_guard import install_wide_glyph_guard
 from leapflow.cli.tui_app.status import StatusBar
 from leapflow.cli.tui_app.theme import Theme
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest
@@ -933,7 +934,7 @@ class LeapApp:
             multiline=True,
             wrap_lines=True,
             dont_extend_height=True,
-            history=FileHistory(str(self._history_path)),
+            history=SecretAwareFileHistory(str(self._history_path)),
             completer=completer,
             complete_while_typing=True,
             auto_suggest=AutoSuggestFromHistory(),
@@ -1018,6 +1019,9 @@ class LeapApp:
         except ImportError:
             pass
 
+        # Must precede the first render: Terminal.app crashes when a redraw
+        # overwrites part of a wide (CJK) glyph. See render_guard.
+        install_wide_glyph_guard()
         return Application(
             layout=layout,
             key_bindings=self._build_keybindings(),
