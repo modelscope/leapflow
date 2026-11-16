@@ -190,6 +190,32 @@ class GenerationStore:
                 raise ValueError("indexed candidate digest mismatch")
             return value
 
+    def candidates(self, workcell_id: str, *, limit: int = 32) -> list[tuple[str, dict[str, Any], float]]:
+        """The newest indexed candidates of *workcell_id* as ``(digest, value, created_at)``.
+
+        A row whose content no longer hashes to its digest is skipped: an index
+        that cannot vouch for a candidate must not offer it for promotion. Strictly
+        read-only -- a catalog listing calls this, so an absent index is simply
+        empty and no schema is created.
+        """
+        with self._lock:
+            connection = self._holder.connection
+            if not self._ready and not connection.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name='calib_candidates'"
+            ).fetchone()[0]:
+                return []
+            rows = connection.execute(
+                "SELECT candidate_digest,candidate_json,created_at FROM calib_candidates "
+                "WHERE workcell_id=? ORDER BY created_at DESC LIMIT ?",
+                [workcell_id, max(1, int(limit))],
+            ).fetchall()
+        found = []
+        for identity, encoded, created_at in rows:
+            value = json.loads(encoded)
+            if digest_of(value) == identity:
+                found.append((identity, value, float(created_at)))
+        return found
+
     def record_assessment(self, candidate_digest: str, assessment: Mapping[str, Any]) -> str:
         encoded = _json(assessment)
         identity = digest_of({"candidate_digest": candidate_digest, "assessment": json.loads(encoded)})

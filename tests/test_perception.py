@@ -20,6 +20,7 @@ import pytest
 
 from leapflow.hardware.model_contract import Detection
 from leapflow.hardware.rgbd import CameraIntrinsics
+from leapflow.hardware.skills.builtin.camera_calibration import skills as camera_skills
 from leapflow.hardware.skills.builtin.scene import skills as scene_skills
 from leapflow.hardware.skills.frames import (
     FrameGraph,
@@ -629,7 +630,8 @@ async def test_missing_table_or_mount_is_missing_calibration(tmp_path: Path) -> 
     bare = perception_registry(tmp_path / "bare.duckdb", (CUP,))
     bare.calibrate_cell()
     error = await _refusal(_scene(bare))
-    assert error.failure_code == FAILURE_CALIBRATION_MISSING and "calib.handeye" in error.message
+    assert error.failure_code == FAILURE_CALIBRATION_MISSING
+    assert "camera is not calibrated" in error.message and "shortest way" in error.message
 
 
 async def test_device_and_model_failures_are_typed(tmp_path: Path) -> None:
@@ -694,8 +696,12 @@ async def test_perception_skills_are_unavailable_without_the_camera_calibration(
 ) -> None:
     registry = perception_registry(tmp_path / "instrument.duckdb", (CUP,))
     registry.calibrate_cell()
-    runtime = _runtime(tmp_path, registry, PERCEPTION_WORKCELL_YAML, skills=scene_skills())
+    runtime = _runtime(
+        tmp_path, registry, PERCEPTION_WORKCELL_YAML, skills=(*scene_skills(), *camera_skills())
+    )
     refused = await runtime.plan(WORKCELL_ID, "perceive.locate", {"queries": ["cup"]})
     assert isinstance(refused, SkillOutcome)
     assert refused.failure_code == FAILURE_SKILL_UNAVAILABLE
-    assert "calib.handeye" in refused.message
+    # The refusal names the providing skill, and the readiness result says how to run it.
+    first = refused.result["readiness"]["next_steps"][0]
+    assert first["skill_id"].startswith("calib.") and first["skill_id"] in refused.message

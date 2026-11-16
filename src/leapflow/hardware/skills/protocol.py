@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Mapping
 
 from leapflow.hardware.context import HardwareEffect
+from leapflow.hardware.skills.frame_status import FRAME_STATUSES
 from leapflow.hardware.skills.geometry import Pose, Transform, Vec3
 from leapflow.hardware.transport import (
     SIDE_EFFECT_COMMITTED,
@@ -87,6 +88,21 @@ REQUIRE_MODEL = "model:"
 # workcell's ``share_frames`` and, per request, the host's consent.
 REQUIRE_SHARE = "share:"
 SHARE_FRAMES = "frames"
+# A record a skill reads besides frame geometry, by procedure: ``record:grasp.qualification``
+# holds once the workcell's calibration store has one, so a listing marks the skill
+# unavailable instead of letting it fail on the first run.
+REQUIRE_RECORD = "record:"
+# A measured-but-uninstalled estimate of a frame (``candidate:camera``): holds once
+# some calibration produced one that is still admissible, so promoting it is listed.
+REQUIRE_CANDIDATE = "candidate:"
+REQUIRE_PREFIXES = (
+    REQUIRE_ROLE,
+    REQUIRE_CALIBRATION,
+    REQUIRE_MODEL,
+    REQUIRE_SHARE,
+    REQUIRE_RECORD,
+    REQUIRE_CANDIDATE,
+)
 
 # How a camera mount was measured. A calibration record names its method, and the
 # frame graph checks the evidence that method produces -- a board's measured mount
@@ -178,9 +194,11 @@ class SkillSpec:
 
     ``requires`` tokens: ``role:<name>`` (``arm``, ``camera.wrist``...); ``calib:<frame>`` where
     ``<frame>`` is a workcell frame name (``tcp``, ``camera``) or ``workspace``;
-    and ``model:<name>`` for a model the workcell binds under ``models``. A name in
-    braces (``calib:{camera}``) is the value of that skill argument, so a skill can
-    serve whichever role its caller picks.
+    ``model:<name>`` for a model the workcell binds under ``models``;
+    ``share:frames`` for a workcell that shares camera frames; and
+    ``record:<procedure>`` for an installed non-frame record (e.g. a grasp
+    qualification). A name in braces (``calib:{camera}``) is the value of that
+    skill argument, so a skill can serve whichever role its caller picks.
 
     ``leased`` marks a READ skill that still runs as a leased run holding the
     workcell's devices (a recording) instead of answering from ``plan``: it is
@@ -189,6 +207,14 @@ class SkillSpec:
     ``region`` names the box the skill's motions must stay inside (see the
     ``REGION_*`` values): a skill declares it rather than being recognised by its
     id, so the exception for calibration is visible where the skill is defined.
+
+    ``provides`` names the requirement tokens a successful run establishes, in
+    the same vocabulary as ``requires`` (``calib:{camera}``, ``record:...``,
+    ``candidate:...``). It is what lets the node answer "what would unblock this
+    skill?" from declarations instead of a table of skill names. ``provides_when``
+    narrows a ``calib:`` provision to frames in those ``FrameStatus`` values (a
+    skill that vouches for an existing measurement cannot create a missing one);
+    empty means any status.
     """
 
     skill_id: str
@@ -201,10 +227,20 @@ class SkillSpec:
     leased: bool = False
     region: str = REGION_WORKSPACE
     motion_allowed: bool = True
+    provides: tuple[str, ...] = ()
+    provides_when: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.motion_allowed) is not bool:
             raise ValueError("motion permission must be an explicit boolean")
+        for token in self.provides:
+            if not isinstance(token, str) or not token.startswith(REQUIRE_PREFIXES):
+                raise ValueError(f"skill {self.skill_id!r} provides unknown token {token!r}")
+        unknown = sorted(set(self.provides_when) - FRAME_STATUSES)
+        if unknown:
+            raise ValueError(
+                f"skill {self.skill_id!r} provides_when names unknown frame statuses {unknown}"
+            )
         if self.effect not in SKILL_EFFECTS:
             raise ValueError(
                 f"skill {self.skill_id!r} effect must be one of {sorted(SKILL_EFFECTS)}"
@@ -733,6 +769,7 @@ __all__ = [
     "FAILURE_WRITE_REFUSED",
     "REQUIRE_CALIBRATION",
     "REQUIRE_MODEL",
+    "REQUIRE_RECORD",
     "REQUIRE_ROLE",
     "REQUIRE_SHARE",
     "SHARE_FRAMES",

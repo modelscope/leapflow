@@ -21,6 +21,7 @@ from leapflow.engine.tools.tool_execution import (
     effect_is_uncertain_on_failure,
     execution_policy_for,
     exit_code_from,
+    failed_effect_is_uncertain,
     normalize_execution_policy,
 )
 from leapflow.engine.tools.tool_guardrails import (
@@ -61,6 +62,7 @@ __all__ = [
     "entries_from_tool_definitions",
     "execution_policy_for",
     "exit_code_from",
+    "failed_effect_is_uncertain",
     "normalize_execution_policy",
     "render_tool_listing",
 ]

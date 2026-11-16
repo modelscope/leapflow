@@ -232,3 +232,23 @@ async def test_event_driven_watch_stop_unregisters(tmp_path: Path) -> None:
 
     # No trigger should be in the bridge anymore
     assert view.watch_id not in manager.event_bridge._triggers
+
+
+# ── 6. Built-in signal producer ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_signal_producer_builds_a_valid_finding() -> None:
+    """The built-in ``signal`` producer must construct ``Finding`` with its real fields.
+
+    It once passed ``description=``, which ``Finding`` does not have, so every
+    event-driven ``signal`` watch failed its run with a TypeError.
+    """
+    from leapflow.monitor import SignalObservationProducer
+
+    spec = WatchSpec(name="FSWatch", domain="signal", watch_id="w-signal")
+    (finding,) = await SignalObservationProducer().observe(
+        ProducerContext(spec=spec, now=time.time(), run_count=2)
+    )
+    assert finding.watch_id == "w-signal" and finding.domain == "signal"
+    assert finding.summary == "Event-driven trigger fired for FSWatch (run #3)"

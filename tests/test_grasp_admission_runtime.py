@@ -339,6 +339,8 @@ async def test_real_inspection_requires_current_overview_holdout(admission_rig: 
     request = {"workcell": QUALIFIED, "skill": "grasp.inspect", "args": {}}
     missing = await setup.rig.service.hw_skill_run(**request)
     assert not missing["ok"] and missing["side_effect_state"] == "none"
+    assert missing["failure_code"] == "skill_unavailable", missing
+    assert "camera.verify" in missing["error"], missing
     setup.registry.calibrate("camera.verify", parameters={
         "camera_role": "camera", "training_disjoint": True,
         "depends_on": {"camera": setup.frames.versions["camera"]},
@@ -353,6 +355,40 @@ async def test_real_inspection_requires_current_overview_holdout(admission_rig: 
     assert not stale["ok"] and stale["side_effect_state"] == "none", stale
     assert stale["failure_code"] != "internal_defect", stale
     assert not setup.rig.sim.batches and setup.rig.sim.halts == 0
+
+
+async def test_the_listing_reports_skills_that_need_an_uninstalled_record(
+    admission_rig: Any,
+) -> None:
+    """Verification skills are unavailable, with the reason, until their records exist.
+
+    The listing used to call them available, so a planner picked grasp.inspect
+    and every run refused it as skill_unavailable.
+    """
+    setup = admission_rig
+
+    async def availability() -> dict[str, Any]:
+        listed = await setup.rig.service.hw_skill_list()
+        (cell,) = [view for view in listed["workcells"] if view.get("skills")]
+        return {s["skill_id"]: (s["available"], s.get("reason", "")) for s in cell["skills"]}
+
+    before = await availability()
+    assert before["calib.grasp_evidence"][0] is True
+    for skill in ("grasp.verify", "grasp.inspect"):
+        available, reason = before[skill]
+        assert available is False and "grasp.qualification record" in reason, before[skill]
+
+    await install(setup)
+    after = await availability()
+    assert after["grasp.verify"] == (True, "")
+    assert after["grasp.inspect"][0] is False and "camera.verify" in after["grasp.inspect"][1]
+
+
+def test_record_tokens_name_the_procedures_the_verifier_reads() -> None:
+    """Skill modules spell the token literally; this keeps it on the real procedure."""
+    token = f"record:{PROCEDURE}"
+    assert token in GraspVerify.spec.requires and token in GraspInspect.spec.requires
+    assert token not in InstallGraspEvidence.spec.requires, "installing must not need itself"
 
 
 @pytest.mark.parametrize("fault", ["config", "arm", "frame"])

@@ -76,6 +76,7 @@ from leapflow.hardware.skills.episodes import MAX_INTENT_CHARS, MAX_LABEL_NOTE_C
 from leapflow.hardware.skills.protocol import (
     FAILURE_INVALID_ARGS,
     FAILURE_STOPPED,
+    FAILURE_UNKNOWN_SKILL,
     FAILURE_UNKNOWN_WORKCELL,
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_UNKNOWN,
@@ -199,8 +200,13 @@ class SkillService:
     # ── Tools ──
 
     async def hw_skill_list(self, **kwargs: Any) -> dict[str, Any]:
-        """Workcells and skill cards across nodes; ids are qualified ``node/workcell``."""
+        """Workcells and skill cards across nodes; ids are qualified ``node/workcell``.
+
+        Naming a ``skill`` narrows every workcell to that skill and discloses its
+        full ``args_schema``; the catalog carries one-line argument signatures.
+        """
         wanted = str(kwargs.get("node") or "")
+        skill = str(kwargs.get("skill") or "").strip()
         nodes = [node for node in self._nodes() if not wanted or node.node_id == wanted]
         if wanted and not nodes:
             return refusal_result(FAILURE_UNKNOWN_NODE, f"no fleet node {wanted!r}")
@@ -214,12 +220,17 @@ class SkillService:
             except SkillRefusal as refusal:
                 unavailable.append(unavailable_entry(node.node_id, refusal))
                 continue
-            workcells.extend(
-                workcell_view(node.node_id, cell)
+            views = (
+                workcell_view(node.node_id, cell, skill=skill)
                 for cell in listed.get("workcells") or ()
                 if isinstance(cell, Mapping)
             )
+            workcells.extend(view for view in views if view["skills"] or not skill)
             rejected.extend(listed.get("rejected") or ())
+        if skill and not workcells and not unavailable:
+            return refusal_result(
+                FAILURE_UNKNOWN_SKILL, f"no workcell offers skill {skill!r}", skill=skill
+            )
         result: dict[str, Any] = {"ok": True, "workcells": workcells}
         if unavailable:
             result["unavailable"] = unavailable

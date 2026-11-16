@@ -20,6 +20,7 @@ from leapflow.hardware.skills.args import validate_args
 from leapflow.hardware.skills.builtin.calibration import skills as calibration_skills
 from leapflow.hardware.skills.builtin.camera_calibration import skills as camera_skills
 from leapflow.hardware.skills.builtin.episode import skills as episode_skills
+from leapflow.hardware.skills.builtin.frame_lifecycle import skills as frame_lifecycle_skills
 from leapflow.hardware.skills.builtin.governed_calibration import skills as governed_calibration_skills
 from leapflow.hardware.skills.builtin.grasp_cycle import skills as cycle_skills
 from leapflow.hardware.skills.builtin.grasp_verify import skills as verify_skills
@@ -59,6 +60,8 @@ _ALLOWED = {
     # Measurement maths only -- clouds and screws in, a camera mount out -- and the
     # same rule as geometry: no transport, no device, no registry.
     "leapflow.hardware.skills.screw",
+    # Typed frame diagnoses (statuses, accuracies): pure contract values, no device.
+    "leapflow.hardware.skills.frame_status",
 }
 # The adapter is pure embodiment math: declarations in, vectors out. It knows no
 # workcell, transport, or binding, so training-side converters can import it alone.
@@ -120,6 +123,7 @@ def _builtin_skills() -> tuple[NodeSkill, ...]:
         *episode_skills(),
         *cycle_skills(),
         *verify_skills(),
+        *frame_lifecycle_skills(),
     )
 
 

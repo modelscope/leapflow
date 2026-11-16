@@ -166,7 +166,7 @@ class Snapshot:
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
         shot = dict(await ctx.scene.snapshot(plan.args["camera"]))
-        unlifted = "" if shot.get("liftable") else "; not liftable (camera not calibrated)"
+        unlifted = "" if shot.get("liftable") else f"; {shot.get('unliftable') or 'not liftable'}"
         return SkillOutcome.succeeded(
             shot,
             side_effect_state=SIDE_EFFECT_NONE,

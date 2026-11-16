@@ -19,9 +19,13 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from leapflow.engine._tool_helpers import _resolve_tool_name
+from leapflow.engine.context.result_budget import (
+    fit_result_to_budget as _truncate_result_for_budget,
+    head_tail_truncate as _head_tail_truncate,
+)
 from leapflow.engine.tools.tool_execution import (
-    effect_is_uncertain_on_failure,
     exit_code_from,
+    failed_effect_is_uncertain,
 )
 from leapflow.security.permission_failures import (
     is_permission_failure_payload,
@@ -92,101 +96,6 @@ def _single_line_preview(value: Any, *, limit: int, keep_tail: bool = False) -> 
         tail = max(1, limit - 1 - head)
         return compact[:head] + "…" + compact[-tail:]
     return compact[: limit - 1] + "…"
-
-
-def _head_tail_truncate(text: str, allow: int) -> str:
-    """Keep the head and tail of a long string with an explicit elision marker.
-
-    The tail of stdout/stderr/tracebacks/test output usually holds the actual
-    error, so a naive head-only cut discards the most useful part.
-    """
-    if len(text) <= allow:
-        return text
-    keep = max(40, allow - 40)  # leave room for the marker
-    head = (keep * 2) // 3
-    tail = keep - head
-    elided = len(text) - head - tail
-    return f"{text[:head]}\n… [{elided} chars elided] …\n{text[-tail:]}"
-
-
-def _truncate_result_for_budget(payload: Any, budget: int) -> str:
-    """Serialize a tool result to JSON within ``budget``, preserving structure.
-
-    Pass 1 – prune list fields (e.g. file_list entries): drop tail elements
-    and annotate ``<key>_omitted`` so the LLM knows how many were removed.
-    Pass 2 – shrink the largest string fields with head+tail truncation so
-    the tail error / trace survives.  The final fallback emits a minimal
-    valid-JSON sentinel; a raw string cut that leaves invalid JSON is never
-    returned.  Never raises.
-    """
-    try:
-        text = json.dumps(payload, default=str, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return str(payload)[:budget]
-    if len(text) <= budget:
-        return text
-    if isinstance(payload, dict):
-        shrunk = dict(payload)
-
-        # Pass 1: prune list fields until the result fits.
-        # This handles file_list / file_find payloads that carry many entries.
-        for key in list(shrunk):
-            v = shrunk[key]
-            if not isinstance(v, list) or not v:
-                continue
-            orig_len = len(v)
-            # Estimate target entry count from a small sample to minimise
-            # iterations; then fine-tune with a tight while-loop.
-            sample = json.dumps(v[: min(4, orig_len)], default=str, ensure_ascii=False)
-            chars_per = max(1, len(sample) / min(4, orig_len))
-            empty_payload = {**shrunk, key: [], key + "_omitted": orig_len}
-            overhead = len(json.dumps(empty_payload, default=str, ensure_ascii=False))
-            target = max(0, int((budget - overhead) / chars_per))
-            shrunk[key] = v[:target]
-            if target < orig_len:
-                shrunk[key + "_omitted"] = orig_len - target
-            # Fine-tune (estimation may be off by ±1 entry).
-            while shrunk[key] and len(json.dumps(shrunk, default=str, ensure_ascii=False)) > budget:
-                shrunk[key] = shrunk[key][:-1]
-                shrunk[key + "_omitted"] = orig_len - len(shrunk[key])
-            if len(json.dumps(shrunk, default=str, ensure_ascii=False)) <= budget:
-                return json.dumps(shrunk, default=str, ensure_ascii=False)
-
-        # Pass 2: shrink the largest string fields with head+tail truncation.
-        while True:
-            over = len(json.dumps(shrunk, default=str, ensure_ascii=False)) - budget
-            if over <= 0:
-                break
-            candidates = [(k, v) for k, v in shrunk.items() if isinstance(v, str) and len(v) > 160]
-            if not candidates:
-                break
-            key, value = max(candidates, key=lambda kv: len(kv[1]))
-            allow = max(120, len(value) - over - 60)
-            if allow >= len(value):
-                break
-            shrunk[key] = _head_tail_truncate(value, allow)
-
-        text = json.dumps(shrunk, default=str, ensure_ascii=False)
-        if len(text) <= budget:
-            return text
-
-        # Sentinel: emit minimal valid JSON rather than a raw string cut that
-        # leaves the LLM with an unparseable fragment.
-        sentinel = json.dumps(
-            {
-                "ok": payload.get("ok"),
-                "kind": payload.get("kind", ""),
-                "truncated": True,
-                "original_chars": len(text),
-                "budget_chars": budget,
-            },
-            default=str,
-            ensure_ascii=False,
-        )
-        return sentinel
-
-    # Non-dict: hard string cut is unavoidable; the LLM sees a partial raw value.
-    return text[:budget]
 
 
 # ---------------------------------------------------------------------------
@@ -508,11 +417,12 @@ def _annotate_uncertain_effect(payload: Dict[str, Any], policy: str) -> Dict[str
 
     Advisory by design: only the tool's own state can settle whether the effect
     landed, so a hard block would also reject legitimate retries (e.g. resending
-    after fixing an argument).
+    after fixing an argument). A result that itself reports no side effect (a
+    refusal before anything was sent) is not flagged.
     """
     if not _tool_result_counts_as_failure(payload):
         return payload
-    if not effect_is_uncertain_on_failure(policy):
+    if not failed_effect_is_uncertain(payload, policy):
         return payload
     payload["side_effect_uncertain"] = True
     payload["retry_guidance"] = (

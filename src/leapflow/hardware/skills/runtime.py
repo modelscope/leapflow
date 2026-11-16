@@ -40,7 +40,8 @@ The declared grasp planner is validated at admission and built per context,
 bound to that context's sensing.
 
 This lifecycle orchestrator retains the run/dispatch settlement ordering in one
-place; declaration reload and run admission are delegated to focused helpers.
+place; declaration reload, run admission, and the catalog view (frame snapshots,
+readiness, refusals -- ``runtime_readiness.py``) are delegated to focused helpers.
 The file remains near the 800-line soft limit to keep stop/late-landing ownership
 and the single execution path auditable without splitting their shared state.
 """
@@ -66,9 +67,8 @@ from leapflow.hardware.skills.episodes import (
     EpisodeTap,
     label_episode,
 )
-from leapflow.hardware.skills.frames import (
-    FrameGraph, bind_requirements, requirement_bindings, unmet_requirements,
-)
+from leapflow.hardware.skills.frames import FrameGraph
+from leapflow.hardware.skills.runtime_readiness import cell_listing, plan_refusal, snapshot_frames
 from leapflow.hardware.skills.grasp import (
     AdmissionSensing,
     GraspSensing,
@@ -248,25 +248,7 @@ class SkillRuntime:
         for spec in self._workcells.values():
             if workcell and spec.workcell_id != workcell:
                 continue
-            frames = self._frames(spec)
-            skills = []
-            for skill_id in self._offered(spec):
-                skill_spec = self._skills[skill_id].spec
-                reasons, bindings = requirement_bindings(
-                    skill_spec.requires, skill_spec.args_schema, spec, frames
-                )
-                skills.append({
-                    **skill_spec.to_dict(), "available": not reasons,
-                    "reason": "; ".join(reasons), "bindings": bindings,
-                })
-            cells.append(
-                {
-                    **spec.to_dict(),
-                    "calibration": dict(frames.versions),
-                    "calibration_stale": dict(frames.stale),
-                    "skills": skills,
-                }
-            )
+            cells.append(cell_listing(self._skills, self._offered(spec), spec, self._frames(spec)))
         return {"workcells": cells, "rejected": self._report.to_dict()["rejected"]}
 
     def _offered(self, spec: WorkcellSpec) -> tuple[str, ...]:
@@ -296,15 +278,15 @@ class SkillRuntime:
             spec, skill = self._resolve(workcell, skill_id)
             arguments = validate_args(skill.spec.args_schema, args)
             frames = self._frames(spec)
-            requires = bind_requirements(skill.spec.requires, arguments)
-            reasons = unmet_requirements(requires, spec, frames)
+            offered = [self._skills[sid] for sid in self._offered(spec)]
+            reasons, readiness = plan_refusal(offered, spec, frames, skill.spec, arguments)
             if f"{REQUIRE_SHARE}{SHARE_FRAMES}" in skill.spec.requires and not share_frames:
                 reasons.append(
                     "the host has not consented to receive camera frames (its operator sets "
                     "hardware.share_frames)"
                 )
             if reasons:
-                raise SkillError(FAILURE_SKILL_UNAVAILABLE, "; ".join(reasons))
+                raise SkillError(FAILURE_SKILL_UNAVAILABLE, "; ".join(reasons), result=readiness)
             limits = self._effective_limits(spec, {})
             if not skill.spec.runs_leased:
                 return await self._run_read(spec, skill, frames, limits, arguments)
@@ -703,7 +685,7 @@ class SkillRuntime:
         return await generation_basis(self._registry, spec)
 
     def _frames(self, spec: WorkcellSpec) -> FrameGraph:
-        return FrameGraph.snapshot(spec, getattr(self._registry, "calibration_store", None))
+        return snapshot_frames(self._registry, spec, self._skills.values())
 
     def _motion(
         self,

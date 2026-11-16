@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
+from leapflow.hardware.skills.frame_status import Accuracy, FrameDiagnosis
 from leapflow.hardware.skills.geometry import Plane, Pose, Transform, WorkspaceBox
 from leapflow.hardware.skills.protocol import (
     ArmState,
@@ -46,6 +47,11 @@ class WorkcellView(Protocol):
 
     @property
     def workcell_id(self) -> str: ...
+
+    @property
+    def roles(self) -> Mapping[str, str]:
+        """Every bound role and the device id it names."""
+        ...
 
     def role(self, name: str) -> str:
         """Device id bound to a role (``arm``, ``gripper``, ``camera.wrist``...), or ``""``."""
@@ -105,6 +111,14 @@ class FrameView(Protocol):
 
     def parameters(self, name: str) -> Mapping[str, Any]:
         """The parameters recorded with a resolved frame; empty when unresolved."""
+        ...
+
+    def diagnosis(self, name: str) -> FrameDiagnosis:
+        """Why *name* does or does not hold, with its achieved and required accuracy."""
+        ...
+
+    def required_accuracy(self, name: str) -> Accuracy | None:
+        """The accuracy the workcell requires of a frame; None when it sets none."""
         ...
 
 
@@ -202,7 +216,8 @@ class ScenePort(Protocol):
 
     async def snapshot(self, camera: str = "camera") -> Mapping[str, Any]:
         """A fresh frame of *camera*, remembered as ``frame`` and shared downscaled as
-        ``image``; ``liftable`` says whether ``lift`` can place what is pointed at in it."""
+        ``image``; ``liftable`` says whether ``lift`` can place what is pointed at in it,
+        and when it cannot, ``unliftable`` says why and which camera could instead."""
         ...
 
     async def lift(
@@ -258,6 +273,25 @@ class BridgeCalibrationPort(Protocol):
     """Approved stationary acquisition and conditional shadow evaluation; no motion."""
     async def basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
     async def execute(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class FrameLifecyclePort(Protocol):
+    """Install a measured candidate, or vouch for a frame by an independent check.
+
+    Neither moves an actuator: promotion persists an estimate some calibration
+    already measured, and attestation compares two cameras' simultaneous view
+    of one stationary target. Each ``*_basis`` is read-only and computes what the
+    approved run will do; the run re-checks that basis before it writes.
+    """
+
+    async def promotion_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def promote(self, plan: SkillPlan) -> Mapping[str, Any]: ...
+
+    async def attestation_basis(self, args: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    async def attest(self, plan: SkillPlan) -> Mapping[str, Any]: ...
 
 
 @runtime_checkable
@@ -451,6 +485,9 @@ class SkillContext(Protocol):
     def bridge(self) -> BridgeCalibrationPort: ...
 
     @property
+    def frame_lifecycle(self) -> FrameLifecyclePort: ...
+
+    @property
     def policies(self) -> PolicyPort: ...
 
     @property
@@ -498,6 +535,22 @@ class NodeSkill(Protocol):
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome: ...
 
 
+@runtime_checkable
+class ProvidingSkill(Protocol):
+    """A skill whose provisions depend on the workcell it is listed in.
+
+    ``SkillSpec.provides`` is enough when a provision follows from the skill's
+    own arguments; a skill whose output is fixed by a workcell declaration (which
+    camera a bridge estimates, which frames a fixed-camera method can measure)
+    answers per workcell instead. Its answer replaces ``provides`` for that
+    workcell; a concrete token that instantiates one of the ``provides``
+    templates (``calib:camera`` for ``calib:{camera}``) carries the argument
+    values that template implies, so a skill can narrow its own templates.
+    """
+
+    def provides_in(self, workcell: WorkcellView, frames: FrameView) -> tuple[str, ...]: ...
+
+
 __all__ = [
     "PATH_DEFAULT",
     "PATH_LINEAR",
@@ -505,7 +558,9 @@ __all__ = [
     "CalibrationPort",
     "CalibrationReferencePort",
     "CalibrationRollbackPort",
+    "FrameLifecyclePort",
     "FrameView",
+    "ProvidingSkill",
     "GraspPlanner",
     "GraspVerificationPort",
     "MotionFacade",

@@ -79,6 +79,32 @@ def test_non_failures_are_not_flagged() -> None:
     assert "side_effect_uncertain" not in result
 
 
+def test_a_failure_reporting_no_side_effect_is_not_flagged() -> None:
+    """A refusal that says nothing was sent settles the question itself.
+
+    Flagging it under the tool's general policy tells the model to verify an
+    effect that cannot exist -- e.g. a hardware skill refused for an unmet
+    requirement before any command reached the device.
+    """
+    refused = _annotate_uncertain_effect(
+        {"ok": False, "error": "skill_unavailable", "side_effect_state": "none"},
+        "external_side_effect",
+    )
+    assert "side_effect_uncertain" not in refused
+
+    for state in ("unknown", "partial", "committed", 7):
+        flagged = _annotate_uncertain_effect(
+            {"ok": False, "error": "timeout", "side_effect_state": state},
+            "external_side_effect",
+        )
+        assert flagged["side_effect_uncertain"] is True, state
+
+    explicit = _annotate_uncertain_effect(
+        {"ok": False, "side_effect_state": "none", "effect_uncertain": True}, "read_only"
+    )
+    assert explicit["side_effect_uncertain"] is True
+
+
 def test_uncertain_policy_set_matches_the_gating_helper() -> None:
     """The helper and the policy set must not drift apart."""
     assert effect_is_uncertain_on_failure("external_side_effect") is True

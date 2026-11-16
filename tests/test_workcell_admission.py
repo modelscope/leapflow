@@ -8,8 +8,10 @@ from typing import Any
 
 import pytest
 
+from leapflow.hardware.skills.frame_status import FrameStatus
 from leapflow.hardware.skills.frames import (
     FrameGraph,
+    required_records,
     unmet_requirements,
 )
 from leapflow.hardware.skills.workcell import (
@@ -130,10 +132,14 @@ def test_a_camera_frame_without_a_measured_target_mount_is_not_a_calibration(
     assert frames.transform("camera") is None
     assert frames.parameters("camera") == {}
     assert "target mount" in frames.stale["camera"]
+    assert frames.diagnosis("camera").status is FrameStatus.UNPROVEN
     assert unmet_requirements(("calib:camera",), spec, frames) == [
-        "camera calibration is stale (the record carries no measured target mount and "
-        "no screw-motion evidence); run calib.handeye again"
+        "camera calibration is unproven (the record carries no measured target mount and "
+        "no screw-motion evidence); record handeye.eye_to_hand"
     ]
+    # A remedy hint (the readiness solver's) replaces the default procedure name.
+    hinted = unmet_requirements(("calib:camera",), spec, frames, lambda token: f"fix {token}")
+    assert hinted[0].endswith("; fix calib:camera")
 
 
 def test_a_record_naming_a_method_without_its_evidence_is_not_a_calibration(
@@ -225,8 +231,8 @@ def test_unmet_requirements_name_the_procedure_to_run() -> None:
     )
     assert reasons == [
         f"workcell {WORKCELL_ID!r} binds no camera",
-        "tcp is not calibrated (run calib.tcp)",
-        "camera is not calibrated (run calib.handeye)",
+        "tcp is not calibrated (record tcp.offset)",
+        "camera is not calibrated (declare camera under 'frames')",
         "unknown requirement 'bogus'",
     ]
 
@@ -241,6 +247,30 @@ def test_roles_are_open_and_every_bound_device_is_leased(tmp_path: Path) -> None
     assert spec.actuator_ids == (ARM_ID,), "a camera-kind role is no actuator by kind"
     assert role_kind("camera.wrist") == "camera"
     assert unmet_requirements(("role:camera.wrist",), spec, FrameGraph(spec, {}, None, {})) == []
+
+
+def test_a_record_requirement_holds_only_once_that_record_is_installed(tmp_path: Path) -> None:
+    """A skill that reads a non-frame record must not be listed before it exists.
+
+    Otherwise the listing calls it available and the run refuses it, so the
+    model plans with a skill it can never reach. The record never joins the
+    frame versions a plan binds to.
+    """
+    registry = SkillNodeRegistry(store_path=tmp_path / "instrument.duckdb")
+    spec = WorkcellSpec.from_mapping(WORKCELL_YAML)
+    requires = ("role:arm", "record:grasp.qualification", "record:grasp.qualification")
+    assert required_records(requires) == ("grasp.qualification",)
+
+    frames = FrameGraph.snapshot(spec, registry.calibration_store, required_records(requires))
+    assert unmet_requirements(requires[:2], spec, frames) == [
+        f"workcell {WORKCELL_ID!r} has no grasp.qualification record installed"
+    ]
+
+    registry.calibrate("grasp.qualification", parameters={"passed": True}, recorded_at=7.0)
+    frames = FrameGraph.snapshot(spec, registry.calibration_store, required_records(requires))
+    assert frames.records == {"grasp.qualification": 7.0}
+    assert "grasp.qualification" not in frames.versions
+    assert unmet_requirements(requires[:2], spec, frames) == []
 
 
 def test_admission_halts_every_writable_device_and_checks_each_role_kind(tmp_path: Path) -> None:
@@ -298,7 +328,7 @@ def test_camera_frames_keep_distinct_calibration_procedures() -> None:
     })
     spec = WorkcellSpec.from_mapping(data)
     assert spec.frames["camera.wrist"].parent == "flange"
-    assert "calib.handeye" in unmet_requirements(
+    assert "handeye.eye_in_hand" in unmet_requirements(
         ("calib:camera.wrist",), spec, FrameGraph(spec, {}, None, {}),
     )[0]
     data["frames"]["camera.wrist"]["procedure"] = "handeye.eye_to_hand"

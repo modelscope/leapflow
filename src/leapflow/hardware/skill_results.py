@@ -61,8 +61,10 @@ _NO_REPLAY = "The arm may have moved: never repeat this plan; a retry is a new p
 
 _NEXT_STEPS: dict[str, str] = {
     FAILURE_CALIBRATION_MISSING: (
-        "Run the calib.* skill this skill requires on the same workcell (hw_skill_list "
-        "shows each skill's requirements), then plan again."
+        "A frame this skill needs does not hold. hw_skill_list names, for each unavailable "
+        "skill, the shortest way to restore it (next; motion=false steps move nothing) -- "
+        "often vouching for or installing an existing measurement rather than recalibrating. "
+        "Offer that to the user, run it, then plan again."
     ),
     FAILURE_TARGET_NOT_FOUND: (
         "The id expired or the object is gone. Locate again and use the new ids, or ask the "
@@ -93,8 +95,15 @@ _NEXT_STEPS: dict[str, str] = {
         "Another run or control session holds the arm. Wait for it (hw_skill_status) or "
         "stop it (hw_skill_stop)."
     ),
-    FAILURE_SKILL_UNAVAILABLE: "A requirement is unmet; hw_skill_list shows the reason.",
-    FAILURE_INVALID_ARGS: "Fix the arguments against the skill's args_schema (hw_skill_list).",
+    FAILURE_SKILL_UNAVAILABLE: (
+        "A requirement is unmet (the error names it). When result.readiness.next_steps is "
+        "present, offer the user its first step (steps with motion=false move nothing) and "
+        "run it as written, then plan again; otherwise satisfy the requirement the error "
+        "names, or reach the goal with a skill hw_skill_list shows as available."
+    ),
+    FAILURE_INVALID_ARGS: (
+        "Fix the arguments against the skill's args_schema (hw_skill_list with skill=<id>)."
+    ),
     FAILURE_CHECK_FAILED: (
         "A calibration or bring-up check measured out of tolerance (see result.problems). "
         "Tell the user what it found, have them fix it, then run the same calib.* skill again."
@@ -188,22 +197,36 @@ def unavailable_entry(node_id: str, refusal: SkillRefusal) -> dict[str, Any]:
     return {"node_id": node_id, "failure_code": refusal.failure_code, "error": refusal.message}
 
 
-def workcell_view(node_id: str, cell: Mapping[str, Any]) -> dict[str, Any]:
-    """A compact, node-qualified workcell card; frame internals stay on the node."""
+def workcell_view(
+    node_id: str, cell: Mapping[str, Any], *, skill: str = ""
+) -> dict[str, Any]:
+    """A compact, node-qualified workcell card; frame internals stay on the node.
+
+    Disclosure is progressive: the catalog names each skill's arguments in one
+    line (``args``) so every skill, its availability and its reason stay visible
+    however many skills a node offers, and naming one *skill* returns only that
+    skill with its full ``args_schema``.
+    """
     skills = []
-    for skill in cell.get("skills") or ():
-        if not isinstance(skill, Mapping):
+    for entry in cell.get("skills") or ():
+        if not isinstance(entry, Mapping) or (skill and entry.get("skill_id") != skill):
             continue
-        card = {
-            key: skill.get(key)
-            for key in ("skill_id", "version", "effect", "card", "args_schema", "consent")
-        }
-        card["available"] = bool(skill.get("available"))
+        card = {key: entry.get(key) for key in ("skill_id", "version", "effect", "card", "consent")}
+        if skill:
+            card["args_schema"] = entry.get("args_schema")
+        else:
+            card["args"] = args_signature(as_mapping(entry.get("args_schema")))
+        card["available"] = bool(entry.get("available"))
         if not card["available"]:
-            card["reason"] = skill.get("reason")
-        if skill.get("bindings"):
+            card["reason"] = entry.get("reason")
+            if entry.get("next"):
+                # The shortest declared way to make it available, one run per line.
+                card["next"] = entry.get("next")
+            if skill and entry.get("readiness"):
+                card["readiness"] = entry.get("readiness")  # every blocker and its options
+        if entry.get("bindings"):
             # The argument values this workcell can serve, e.g. which camera is ready.
-            card["bindings"] = skill.get("bindings")
+            card["bindings"] = entry.get("bindings")
         skills.append(card)
     return {
         "workcell": f"{node_id}/{cell.get('workcell') or ''}",
@@ -212,8 +235,50 @@ def workcell_view(node_id: str, cell: Mapping[str, Any]) -> dict[str, Any]:
         "gripper_spec": cell.get("gripper_spec"),
         "calibration": cell.get("calibration"),
         "calibration_stale": cell.get("calibration_stale") or {},
+        "calibration_status": frame_status_view(as_mapping(cell.get("calibration_status"))),
         "skills": skills,
     }
+
+
+def frame_status_view(statuses: Mapping[str, Any]) -> dict[str, Any]:
+    """Each frame's status; a frame that does not hold also says why and how accurate."""
+    view: dict[str, Any] = {}
+    for name, diagnosis in statuses.items():
+        diagnosis = as_mapping(diagnosis)
+        entry = {"status": diagnosis.get("status")}
+        if diagnosis.get("status") != "valid":
+            for key in ("reason", "achieved", "required"):
+                if diagnosis.get(key):
+                    entry[key] = diagnosis[key]
+            if diagnosis.get("candidates"):
+                entry["candidates"] = len(diagnosis["candidates"])
+        view[str(name)] = entry
+    return view
+
+
+def args_signature(schema: Mapping[str, Any]) -> dict[str, str]:
+    """Each argument of *schema* as its type, marked required or with its default.
+
+    Enough to call a simple skill correctly; bounds, item shapes and nested
+    programs are in the full ``args_schema``.
+    """
+    required = set(schema.get("required") or ())
+    signature: dict[str, str] = {}
+    for name, prop in as_mapping(schema.get("properties")).items():
+        prop = as_mapping(prop)
+        kind = prop.get("type")
+        text = "|".join(map(str, kind)) if isinstance(kind, list) else str(kind or "any")
+        items = as_mapping(prop.get("items")).get("type")
+        if kind == "array" and isinstance(items, str):
+            text += f" of {items}"
+        if isinstance(prop.get("enum"), list):
+            text += " in " + "|".join(map(str, prop["enum"]))
+        if name in required:
+            text += ", required"
+        elif "default" in prop:
+            text += f", default {prop['default']!r}"
+        signature[str(name)] = text
+    return signature
 
 
 def plan_view(plan: Mapping[str, Any], consent: str) -> dict[str, Any]:
@@ -362,8 +427,10 @@ __all__ = [
     "FAILURE_UNKNOWN_NODE",
     "FAILURE_WRITES_DISABLED",
     "SkillRefusal",
+    "args_signature",
     "as_mapping",
     "audit_outcome",
+    "frame_status_view",
     "next_step",
     "outcome_fields",
     "outcome_result",

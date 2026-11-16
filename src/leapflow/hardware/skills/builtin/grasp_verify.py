@@ -27,6 +27,16 @@ _REQUIRES = (
     "calib:tcp",
     "calib:workspace",
 )
+# Reading evidence needs the installed qualification it is judged against, and a
+# report also scopes it by the overview camera's held-out verification. Declaring
+# both lets a listing say so, instead of each run failing on its first read.
+_VERIFY_REQUIRES = (*_REQUIRES, "record:grasp.qualification")
+_INSPECT_REQUIRES = (
+    *_VERIFY_REQUIRES,
+    "role:camera",
+    "calib:camera",
+    "record:camera.verify",
+)
 
 
 class GraspVerify:
@@ -37,7 +47,7 @@ class GraspVerify:
         "Stages pre_grasp, hold and empty never command motion. A standalone hold cannot "
         "prove a lift without a continuous on-support baseline in the same run.",
         effect=EFFECT_READ,
-        requires=_REQUIRES,
+        requires=_VERIFY_REQUIRES,
         args_schema={
             "type": "object",
             "properties": {
@@ -72,6 +82,7 @@ class InstallGraspEvidence:
         effect=EFFECT_ACTUATE,
         consent=CONSENT_EACH_RUN,
         requires=_REQUIRES,
+        provides=("record:grasp.qualification",),
         card="Validate and persist independently measured geometry and stationary N-unit "
         "force qualification bound to current calibrations. No arm or gripper motion. "
         "Incomplete, synthetic or mismatched certificates are refused.",
@@ -118,7 +129,7 @@ class GraspInspect:
         skill_id="grasp.inspect",
         version="1.0.0",
         effect=EFFECT_READ,
-        requires=_REQUIRES,
+        requires=_INSPECT_REQUIRES,
         card="Read installed physical grasp qualification, calibration dependencies and fresh "
         "wrist depth measurements for reporting. No motion or certificate installation.",
         args_schema={"type": "object", "properties": {}},

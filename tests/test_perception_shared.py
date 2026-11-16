@@ -622,7 +622,9 @@ async def test_an_uncalibrated_camera_shows_the_scene_but_cannot_be_lifted(
     runtime = _runtime(tmp_path, _wrist_cell(tmp_path), WRIST_YAML)
     shot = await _read(runtime, "perceive.snapshot", {})
     assert shot.ok and shot.result["camera"] == "camera" and shot.result["liftable"] is False
-    assert "not liftable" in shot.message
+    # The snapshot already names the camera to use, before a lift is refused.
+    assert "cannot be lifted" in shot.message
+    assert "take a snapshot with camera camera.wrist instead" in shot.result["unliftable"]
     refused = await _read(
         runtime,
         "perceive.lift",

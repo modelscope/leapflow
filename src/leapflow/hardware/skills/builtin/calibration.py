@@ -251,6 +251,7 @@ class ToolCentrePoint:
         effect=EFFECT_ACTUATE,
         requires=(f"{REQUIRE_ROLE}arm",),
         consent=CONSENT_EACH_RUN,
+        provides=(f"{REQUIRE_CALIBRATION}tcp",),
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
@@ -408,6 +409,7 @@ class Workspace:
         requires=(f"{REQUIRE_ROLE}arm", f"{REQUIRE_CALIBRATION}tcp"),
         consent=CONSENT_EACH_RUN,
         region=REGION_BOOTSTRAP,
+        provides=(f"{REQUIRE_CALIBRATION}workspace",),
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:

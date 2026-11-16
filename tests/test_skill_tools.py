@@ -52,6 +52,7 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_CALIBRATION_STALE,
     FAILURE_LEASE_LOST,
     FAILURE_STOPPED,
+    FAILURE_UNKNOWN_SKILL,
     FAILURE_UNKNOWN_WORKCELL,
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_NONE,
@@ -269,7 +270,20 @@ async def test_list_qualifies_workcells_by_node(tmp_path: Path, rigs: Any) -> No
     assert result["ok"] and cell["workcell"] == QUALIFIED
     skills = {skill["skill_id"]: skill for skill in cell["skills"]}
     assert skills[SEQUENCE]["available"] is True
-    assert skills[SEQUENCE]["args_schema"]
+    # The catalog names arguments in one line; the full schema is disclosed per skill.
+    assert skills[SEQUENCE]["args"]["steps"].startswith("array")
+    assert all("args_schema" not in skill for skill in skills.values())
+    detail = await rig.service.hw_skill_list(skill=SEQUENCE)
+    (narrowed,) = detail["workcells"]
+    (only,) = narrowed["skills"]
+    assert only["skill_id"] == SEQUENCE and only["args_schema"]["properties"]["steps"]
+
+
+async def test_list_refuses_a_skill_no_workcell_offers(tmp_path: Path, rigs: Any) -> None:
+    rig = rigs(tmp_path)
+    result = await rig.service.hw_skill_list(skill="no.such_skill")
+    assert result["ok"] is False and result["failure_code"] == FAILURE_UNKNOWN_SKILL
+    assert result["side_effect_state"] == SIDE_EFFECT_NONE
 
 
 async def test_list_reports_an_unreachable_node_without_failing(tmp_path: Path, rigs: Any) -> None:
@@ -525,7 +539,8 @@ def test_next_step_forbids_replay_only_when_something_may_have_moved() -> None:
     assert "never repeat" not in next_step(FAILURE_APPROVAL_DENIED, SIDE_EFFECT_NONE)
     assert "never repeat" in next_step(FAILURE_STOPPED, SIDE_EFFECT_COMMITTED)
     assert "never repeat" in next_step("an_unmapped_code", SIDE_EFFECT_UNKNOWN)
-    assert next_step(FAILURE_CALIBRATION_STALE, SIDE_EFFECT_NONE).startswith("Run the calib.*")
+    stale = next_step(FAILURE_CALIBRATION_STALE, SIDE_EFFECT_NONE)
+    assert "shortest way to restore" in stale and "rather than recalibrating" in stale
     assert next_step("an_unmapped_code", SIDE_EFFECT_NONE).startswith("Nothing moved")
 
 

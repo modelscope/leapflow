@@ -92,6 +92,8 @@ class UnixRpcServer:
         self._server: asyncio.AbstractServer | None = None
         self._active_connections = 0
         self._connections: dict[asyncio.Task[Any], asyncio.StreamWriter] = {}
+        # Strong refs for stream finalizers that outlive a cancelled connection.
+        self._stream_closers: set[asyncio.Task[Any]] = set()
         self._stopping = False
         if hasattr(service, "set_client_count_provider"):
             service.set_client_count_provider(lambda: self._active_connections)
@@ -423,10 +425,7 @@ class UnixRpcServer:
                 except (asyncio.CancelledError, Exception):
                     pass
             if stream is not None and hasattr(stream, "aclose"):
-                try:
-                    await stream.aclose()
-                except Exception:
-                    logger.debug("daemon: failed to close stream", exc_info=True)
+                await self._close_stream_in_context(stream, ctx, request.method)
             if route_token is not None:
                 from leapflow.daemon.approval_route import approval_route as _approval_route
 
@@ -442,6 +441,27 @@ class UnixRpcServer:
             await _write_json(writer, done.to_json())
             response = RpcResponse.success(request.id, {"ok": True})
             await _write_json(writer, response.to_json())
+
+    async def _close_stream_in_context(
+        self, stream: Any, ctx: contextvars.Context, method: str,
+    ) -> None:
+        """Finalize *stream* inside the Context its steps ran in.
+
+        The generator's ``finally`` resets ContextVars it set while running in
+        ``ctx`` (approval route, turn slot). Closing it from the connection task's
+        own Context makes every such ``reset`` raise "created in a different
+        Context", which aborted the cleanup that releases the session lock and
+        the turn slot: a client disconnecting mid-stream (TUI ``/cancel``) left
+        the next turn in that session waiting forever. The close is shielded so
+        a connection torn down during shutdown still finishes releasing them.
+        """
+        closer = asyncio.create_task(stream.aclose(), context=ctx)
+        self._stream_closers.add(closer)
+        closer.add_done_callback(self._stream_closers.discard)
+        try:
+            await asyncio.shield(closer)
+        except Exception:
+            logger.warning("daemon: failed to close stream method=%s", method, exc_info=True)
 
     async def _write_stream_heartbeat(
         self,

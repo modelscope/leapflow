@@ -209,6 +209,10 @@ async def cycle_rig(tmp_path, rigs, monkeypatch):
         "wrist.handeye", pose=Pose(0, 0, 0).to_dict(),
         parameters={"target_mount": IDENTITY_MATRIX},
     )
+    # The skills list as available only once these records exist; their content
+    # is read by the verifier, which is synthetic here.
+    registry.calibrate("grasp.qualification", parameters={"synthetic": True})
+    registry.calibrate("camera.verify", parameters={"synthetic": True})
     request = {
         "workcell": QUALIFIED,
         "skill": "grasp.cycle",

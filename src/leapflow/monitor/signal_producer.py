@@ -27,7 +27,7 @@ class SignalObservationProducer:
                 watch_id=ctx.spec.watch_id or "",
                 domain=self.domain,
                 title="Signal activity detected",
-                description=f"Event-driven trigger fired for {ctx.spec.name} (run #{ctx.run_count + 1})",
+                summary=f"Event-driven trigger fired for {ctx.spec.name} (run #{ctx.run_count + 1})",
                 severity=Severity.INFO,
             )
         ]

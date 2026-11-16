@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from leapflow.hardware.skills.ports import BridgeCalibrationPort, SkillContext
+from leapflow.hardware.skills.ports import BridgeCalibrationPort, FrameView, SkillContext, WorkcellView
 from leapflow.hardware.skills.protocol import (
-    CONSENT_EACH_RUN, EFFECT_ACTUATE, FAILURE_SKILL_UNAVAILABLE,
+    CONSENT_EACH_RUN, EFFECT_ACTUATE, FAILURE_SKILL_UNAVAILABLE, REQUIRE_CANDIDATE,
     SkillError, SkillOutcome, SkillPlan, SkillSpec,
 )
 
@@ -25,6 +25,12 @@ class BridgeCalibration:
         effect=EFFECT_ACTUATE, leased=True, motion_allowed=False,
         consent=CONSENT_EACH_RUN, requires=("role:arm",),
     )
+
+    def provides_in(self, workcell: WorkcellView, frames: FrameView) -> tuple[str, ...]:
+        """A candidate of the declared fixed camera, once a bridge is declared at all."""
+        declared = getattr(workcell, "calibration_bridge", None)
+        fixed = declared.get("fixed_role") if isinstance(declared, Mapping) else None
+        return (f"{REQUIRE_CANDIDATE}{fixed}",) if isinstance(fixed, str) and fixed else ()
 
     def _port(self, ctx: SkillContext) -> BridgeCalibrationPort:
         port = ctx.bridge

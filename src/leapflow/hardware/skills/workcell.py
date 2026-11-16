@@ -151,11 +151,17 @@ def role_kind(role: str) -> str:
 
 @dataclass(frozen=True)
 class FrameDecl:
-    """A named frame, the frame it is expressed in, and the procedure that measures it."""
+    """A named frame, the frame it is expressed in, and the procedure that measures it.
+
+    *accuracy* is what this frame must achieve to be trusted
+    (``{"translation_mm": .., "rotation_deg": ..}``); empty means the workcell's
+    ``calibration.max_verify_p95_mm`` applies.
+    """
 
     name: str
     parent: str
     procedure: str
+    accuracy: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -229,7 +235,11 @@ class WorkcellSpec:
             "workcell": self.workcell_id,
             "roles": dict(self.roles),
             "frames": {
-                name: {"parent": decl.parent, "procedure": decl.procedure}
+                name: {
+                    "parent": decl.parent,
+                    "procedure": decl.procedure,
+                    **({"accuracy": dict(decl.accuracy)} if decl.accuracy else {}),
+                }
                 for name, decl in self.frames.items()
             },
             "workspace_procedure": self.workspace_procedure,
@@ -617,7 +627,7 @@ def _parse_frames(raw: Any, *, roles: Mapping[str, str]) -> dict[str, FrameDecl]
             raise WorkcellError(f"frame name {name!r} is reserved")
         if not isinstance(decl, Mapping):
             raise WorkcellError(f"frame {name!r} must be a mapping")
-        if set(decl) - {"parent", "procedure"}:
+        if set(decl) - {"parent", "procedure", "accuracy"}:
             raise WorkcellError(f"frame {name!r} has unknown fields")
         parent = str(decl.get("parent") or "")
         if parent not in FRAME_PARENTS:
@@ -625,8 +635,25 @@ def _parse_frames(raw: Any, *, roles: Mapping[str, str]) -> dict[str, FrameDecl]
         procedure = str(decl.get("procedure") or "")
         if not procedure:
             raise WorkcellError(f"frame {name!r} needs a calibration 'procedure'")
-        frames[name] = FrameDecl(name, parent, procedure)
+        frames[name] = FrameDecl(name, parent, procedure, _parse_accuracy(name, decl.get("accuracy")))
     return frames
+
+
+def _parse_accuracy(frame: str, raw: Any) -> dict[str, float]:
+    """A frame's required accuracy: positive ``translation_mm`` and optional ``rotation_deg``."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping) or set(raw) - {"translation_mm", "rotation_deg"}:
+        raise WorkcellError(f"frame {frame!r} accuracy takes translation_mm and rotation_deg")
+    parsed: dict[str, float] = {}
+    for key in ("translation_mm", "rotation_deg"):
+        value = raw.get(key)
+        if value is None and key == "rotation_deg":
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < float("inf"):
+            raise WorkcellError(f"frame {frame!r} accuracy.{key} must be a positive number")
+        parsed[key] = float(value)
+    return parsed
 
 
 def _parse_roles(raw: Any, workcell_id: str) -> dict[str, str]:

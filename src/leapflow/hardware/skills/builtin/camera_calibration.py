@@ -46,7 +46,9 @@ from leapflow.hardware.skills.geometry import (
     tool_cone_deg,
 )
 from leapflow.hardware.skills.ports import (
+    FrameView,
     SkillContext,
+    WorkcellView,
 )
 from leapflow.hardware.skills.protocol import (
     CONSENT_EACH_RUN,
@@ -61,6 +63,8 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_UNREACHABLE,
     METHOD_MARKERLESS_SCREW,
     REGION_BOOTSTRAP_UNTIL_MEASURED,
+    REQUIRE_CALIBRATION,
+    REQUIRE_RECORD,
     REQUIRE_ROLE,
     SIDE_EFFECT_COMMITTED,
     ArmState,
@@ -253,6 +257,7 @@ class HandEye:
         requires=(f"{REQUIRE_ROLE}arm",),
         consent=CONSENT_EACH_RUN,
         region=REGION_BOOTSTRAP_UNTIL_MEASURED,
+        provides=(f"{REQUIRE_CALIBRATION}{{camera}}",),
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
@@ -625,7 +630,16 @@ class Screws:
         requires=(f"{REQUIRE_ROLE}arm",),
         consent=CONSENT_EACH_RUN,
         region=REGION_BOOTSTRAP_UNTIL_MEASURED,
+        provides=(f"{REQUIRE_CALIBRATION}{{camera}}",),
     )
+
+    def provides_in(self, workcell: WorkcellView, frames: FrameView) -> tuple[str, ...]:
+        """The fixed cameras of *workcell*: only a camera on the base can be measured here."""
+        return tuple(
+            f"{REQUIRE_CALIBRATION}{role}"
+            for role in workcell.roles
+            if role.split(".", 1)[0] == CAMERA_FRAME and frames.parent(role) == "base"
+        )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
         role = _camera(ctx, args)
@@ -909,9 +923,10 @@ class VerifyCamera:
             },
         },
         effect=EFFECT_ACTUATE,
-        requires=(f"{REQUIRE_ROLE}arm",),
+        requires=(f"{REQUIRE_ROLE}arm", f"{REQUIRE_CALIBRATION}{{camera}}"),
         consent=CONSENT_EACH_RUN,
         region=REGION_BOOTSTRAP_UNTIL_MEASURED,
+        provides=(f"{REQUIRE_RECORD}{{camera}}.verify",),
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:

@@ -15,6 +15,7 @@ import json
 import logging
 import time
 import types
+from contextlib import aclosing
 from dataclasses import asdict
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
@@ -1298,10 +1299,11 @@ class AgentEngine:
             self._skill_dispatcher._inject_pending_skill_reminder()
             self._wm.remember_chat(build_user_message_text(user_text))
             logger.debug("route.slash command=%s", user_text.split()[0])
-            async for event in self._stream_via_sink(
+            async with aclosing(self._stream_via_sink(
                 user_text, enable_thinking=enable_thinking
-            ):
-                yield event
+            )) as events:
+                async for event in events:
+                    yield event
             return
 
         self._skill_dispatcher._inject_pending_skill_reminder()
@@ -1320,10 +1322,13 @@ class AgentEngine:
             self._wm.remember_chat(build_assistant_message(msg))
             yield StreamEvent(type="final", content=msg)
             return
-        async for event in self._stream_via_sink(
+        # ``aclosing``: closing this stream must stop the loop task now, not
+        # whenever the garbage collector finalizes an abandoned inner generator.
+        async with aclosing(self._stream_via_sink(
             user_text, enable_thinking=enable_thinking
-        ):
-            yield event
+        )) as events:
+            async for event in events:
+                yield event
 
     async def _stream_via_sink(
         self, user_text: str, *, enable_thinking: bool = False
@@ -1332,7 +1337,9 @@ class AgentEngine:
 
         Creates a ``StreamSink`` backed by an ``asyncio.Queue``, kicks the
         unified ``_run_agent_loop`` off as a background task (push side),
-        and yields ``StreamEvent`` objects from the queue (pull side).
+        and yields ``StreamEvent`` objects from the queue (pull side). The task
+        is published as ``_active_task`` so ``cancel()`` interrupts an in-flight
+        LLM call or tool instead of waiting for the next loop iteration.
         """
         sink = StreamSink()
         frame = self._build_root_frame(user_text, enable_thinking=enable_thinking)
@@ -1345,18 +1352,23 @@ class AgentEngine:
                 await self._run_agent_loop(frame, sink=sink)
             except BaseException as exc:
                 loop_error = exc
+                cancelled = isinstance(exc, asyncio.CancelledError) and self._cancel_requested
                 try:
-                    await sink.emit_error(str(exc))
+                    await sink.emit_error("Cancelled by user." if cancelled else str(exc))
                 except Exception:
                     pass  # Sink might already be closed
             finally:
                 await sink.close()
 
         task = asyncio.create_task(_run_loop())
+        previous_task = self._active_task
+        self._active_task = task
         try:
             async for event in sink:
                 yield event
         finally:
+            if self._active_task is task:
+                self._active_task = previous_task
             if not task.done():
                 task.cancel()
                 try:

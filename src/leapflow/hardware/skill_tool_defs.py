@@ -34,7 +34,7 @@ _RUN_SCHEMA: dict[str, Any] = {
     "properties": {
         "workcell": {"type": "string", "description": "<node>/<workcell>"},
         "skill": {"type": "string", "description": "Skill id from hw_skill_list"},
-        "args": {"type": "object", "description": "Arguments per args_schema"},
+        "args": {"type": "object", "description": "Arguments per the skill's args_schema"},
         "dry_run": {"type": "boolean", "description": "Plan only; nothing moves"},
         "intent": {
             "type": "string",
@@ -65,12 +65,20 @@ def build_skill_tools(service: "SkillService") -> list[ToolMetadata]:
             name="hw_skill_list",
             description=(
                 "List robot workcells on the hardware nodes and the skills each offers: skill "
-                "cards, argument schemas, availability, calibration, and limits. Start here "
-                "before hw_skill_run; workcell ids are qualified as <node>/<workcell>."
+                "cards, one-line argument signatures, availability (with the unmet reason), "
+                "calibration, and limits. Start here before hw_skill_run; workcell ids are "
+                "qualified as <node>/<workcell>. Pass skill=<id> for that skill's full "
+                "args_schema before calling it with structured arguments."
             ),
             parameters_schema={
                 "type": "object",
-                "properties": {"node": {"type": "string", "description": "Limit to one node"}},
+                "properties": {
+                    "node": {"type": "string", "description": "Limit to one node"},
+                    "skill": {
+                        "type": "string",
+                        "description": "Limit to one skill id and include its full args_schema",
+                    },
+                },
             },
             handler=service.hw_skill_list,
             x_leapflow=dict(_READ_METADATA),

@@ -89,6 +89,7 @@ class RunContext:
         self._grasp_verification: Any = None
         self._calibration: Any = None
         self._bridge: Any = None
+        self._frame_lifecycle: Any = None
         self._committed = False
         self.evidence: dict[str, Any] = {}
 
@@ -179,6 +180,13 @@ class RunContext:
             from leapflow.hardware.calibration.bridge_port import WorkcellBridge
             self._bridge = WorkcellBridge(self.calibration)
         return self._bridge
+
+    @property
+    def frame_lifecycle(self) -> Any:
+        if self._frame_lifecycle is None:
+            from leapflow.hardware.calibration.frame_lifecycle import WorkcellFrameLifecycle
+            self._frame_lifecycle = WorkcellFrameLifecycle(self, self._registry)
+        return self._frame_lifecycle
 
     @property
     def policies(self) -> WorkcellPolicies:

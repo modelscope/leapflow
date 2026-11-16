@@ -15,6 +15,7 @@ from leapflow.hardware.skills.protocol import (
     SkillError,
 )
 from leapflow.hardware.attestation import declaration_digest
+from leapflow.hardware.skills.workcell import ROLE_CAMERA
 
 PROCEDURE = "grasp.qualification"
 
@@ -46,21 +47,28 @@ class WorkcellGraspVerification:
             "parameters": dict(qualification.data),
         }
 
-    def qualification(self) -> Mapping[str, Any]:
+    def qualification(self, overview: str = ROLE_CAMERA) -> Mapping[str, Any]:
+        """The installed qualification and *overview*'s held-out placement accuracy.
+
+        The overview camera must hold through an independent check of its current
+        version -- a direct held-out verification or a cross-view attestation --
+        and its accuracy is the larger of that check's p95 and its stated bound.
+        """
         qualification = self._qualification()
         store = self.registry.calibration_store
-        overview = store.latest(self.ctx.workcell.workcell_id, "camera.verify")
-        if (
-            overview is None
-            or overview.parameters.get("camera_role") != "camera"
-            or overview.parameters.get("training_disjoint") is not True
-            or overview.parameters.get("depends_on")
-            != {"camera": self.ctx.frames.versions.get("camera")}
-        ):
+        diagnosis = self.ctx.frames.diagnosis(overview)
+        check = (
+            store.latest(self.ctx.workcell.workcell_id, diagnosis.verified_by)
+            if diagnosis.ok and diagnosis.verified_by
+            else None
+        )
+        if check is None:
+            why = f" ({diagnosis.status.value}: {diagnosis.reason})" if diagnosis.reason else ""
             raise SkillError(
-                FAILURE_SKILL_UNAVAILABLE, "fresh held-out overview-camera verification required"
+                FAILURE_SKILL_UNAVAILABLE,
+                f"{overview} needs a held-out check of its current calibration{why}",
             )
-        errors = overview.parameters.get("errors_mm", [])
+        errors = check.parameters.get("errors_mm", [])
         if (
             not isinstance(errors, (list, tuple))
             or len(errors) < self.ctx.workcell.calibration["min_verify_points"]
@@ -68,12 +76,16 @@ class WorkcellGraspVerification:
             raise ValueError("overview verification lacks held-out measurements")
         errors = sorted(number(e) for e in errors)
         p95 = errors[max(0, math.ceil(len(errors) * 0.95) - 1)]
-        if min(errors) < 0 or p95 > self.ctx.workcell.calibration["max_verify_p95_mm"]:
+        if min(errors) < 0:
+            raise ValueError("overview held-out physical errors are malformed")
+        required = self.ctx.frames.required_accuracy(overview)
+        if required is not None and p95 > required.translation_mm:
             raise ValueError("overview held-out physical errors exceed acceptance")
+        bound = diagnosis.achieved.translation_mm if diagnosis.achieved is not None else 0.0
         return {
             "qualification_digest": qualification.digest,
-            "planar_p95_mm": p95,
-            "overview_verified_at": overview.recorded_at,
+            "planar_p95_mm": max(p95, bound),
+            "overview_verified_at": check.recorded_at,
             "command_force_n": qualification.effort.data["command_force_n"],
         }
 

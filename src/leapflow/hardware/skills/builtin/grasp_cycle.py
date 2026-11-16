@@ -45,6 +45,10 @@ class GraspCycle:
             "calib:camera.wrist",
             "calib:tcp",
             "calib:workspace",
+            # Planning reads the installed qualification and the overview camera's
+            # held-out verification (``grasp_verification.qualification``).
+            "record:grasp.qualification",
+            "record:camera.verify",
         ),
         card="Run one fixed-orientation grasp cycle with bounded IK paths, wrist alignment, "
         "on-support contact, a 5–10 mm proof lift, monitored carry, release and fresh "

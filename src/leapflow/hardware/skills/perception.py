@@ -52,6 +52,7 @@ from leapflow.hardware.model_contract import (
     ground,
 )
 from leapflow.hardware.rgbd import CameraIntrinsics, FrameSource, RgbdFrame
+from leapflow.hardware.skills.frame_status import FrameStatus
 from leapflow.hardware.skills.frames import FrameGraph
 from leapflow.hardware.skills.geometry import Plane, Transform, Vec3, footprint
 from leapflow.hardware.skills.ports import MotionFacade
@@ -481,7 +482,7 @@ class WorkcellScene:
                 "width": width, "height": height, "liftable": capture.liftable,
             },
         )
-        return {
+        shot: dict[str, Any] = {
             "frame": frame_id,
             "capture_id": capture.capture_id,
             "camera": camera,
@@ -491,6 +492,10 @@ class WorkcellScene:
             "observed_at": frame.observed_at,
             "image": {"mime": "image/jpeg", "data": data},
         }
+        if not capture.liftable:
+            # Said at the snapshot, not first at a refused lift: which camera to use instead.
+            shot["unliftable"] = self._unplaced(frame_id, capture)
+        return shot
 
     async def lift(
         self, frame_id: str, targets: Sequence[PixelTarget], *, coords: str,
@@ -553,16 +558,23 @@ class WorkcellScene:
                 f"{frame_id} cannot be lifted: the table is not calibrated; run calib.workspace "
                 "with table_z or table_points"
             )
-        why = self._frames.stale.get(camera) or "it is not calibrated"
+        why = self._unmounted(camera)
         ready = [
             role for role in sorted(self._spec.roles)
             if role.split(".", 1)[0] == ROLE_CAMERA and self._frames.transform(role) is not None
         ]
         hint = (
             f"take a snapshot with camera {' or '.join(ready)} instead" if ready
-            else f"run calib.handeye for {camera}"
+            else "the workcell listing names the shortest way to restore a camera"
         )
-        return f"{frame_id} cannot be lifted: {camera} has no usable hand-eye mount ({why}); {hint}"
+        return f"{frame_id} cannot be lifted: {why}; {hint}"
+
+    def _unmounted(self, role: str) -> str:
+        """Why camera *role* has no usable mount, from its frame diagnosis."""
+        diagnosis = self._frames.diagnosis(role)
+        if diagnosis.status is FrameStatus.MISSING:
+            return f"{role} is not calibrated"
+        return f"{role}'s calibration does not hold ({diagnosis.status.value}: {diagnosis.reason})"
 
     async def relocate(self, obj: LocatedObject) -> LocatedObject:
         """Measure only *obj* where its approved geometry projects in a fresh frame.
@@ -675,7 +687,8 @@ class WorkcellScene:
         table = self._frames.table
         if placed and mount is None:
             raise SkillError(
-                FAILURE_CALIBRATION_MISSING, f"the {role} is not calibrated (run calib.handeye)"
+                FAILURE_CALIBRATION_MISSING,
+                f"{self._unmounted(role)}; the workcell listing names the shortest way to restore it",
             )
         if placed and table is None:
             raise SkillError(

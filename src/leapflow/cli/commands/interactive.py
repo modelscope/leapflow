@@ -1057,6 +1057,9 @@ async def cmd_interactive_daemon(
     # shared session and serializing. --resume keeps the requested id.
     active_session_id = str(resume_id or "") or uuid.uuid4().hex[:16]
     turn_count = 0
+    # The daemon request id of this client's in-flight turn; /cancel targets
+    # exactly it so another TUI sharing leapd is never cancelled.
+    active_turn_request_id = ""
     runtime_model_name = str(getattr(settings, "llm_model", ""))
     runtime_context_length = int(getattr(settings, "llm_context_length", 0) or 0)
     runtime_context_used = 0
@@ -1270,7 +1273,7 @@ async def cmd_interactive_daemon(
         allow_retry: bool = True,
         record_user: bool = True,
     ) -> None:
-        nonlocal turn_count
+        nonlocal turn_count, active_turn_request_id
         from leapflow.daemon.client import DaemonUnavailableError
 
         if record_user:
@@ -1285,12 +1288,15 @@ async def cmd_interactive_daemon(
         retry_error: DaemonUnavailableError | None = None
         saw_real_event = False
         turn_completed = False
+        turn_request_id = uuid.uuid4().hex[:12]
+        active_turn_request_id = turn_request_id
         try:
             async for event in bridge.client.engine_chat(
                 prompt_text,
                 session_id=active_session_id,
                 workspace_root=str(Path.cwd().resolve()),
                 enable_thinking=settings.show_thinking,
+                request_id=turn_request_id,
             ):
                 metadata = event.metadata or {}
                 is_heartbeat = event.type == "status" and metadata.get("heartbeat")
@@ -1336,6 +1342,8 @@ async def cmd_interactive_daemon(
                 )
                 raise
         finally:
+            if active_turn_request_id == turn_request_id:
+                active_turn_request_id = ""
             if turn_completed and renderer.permission_blocked:
                 command = app.block_active_command_in_response(renderer.permission_block_reason)
             elif turn_completed:
@@ -1518,10 +1526,15 @@ async def cmd_interactive_daemon(
             console.system("Queue is paused — use /resume to continue.")
 
     def _request_daemon_cancel() -> None:
+        # Capture now: the cancelled turn's finally may clear it before the RPC runs.
+        request_id = active_turn_request_id
+        if not request_id:
+            return
+
         async def cancel_remote() -> None:
             try:
                 await bridge.call(
-                    lambda current_client: current_client.engine_cancel(),
+                    lambda current_client: current_client.engine_cancel(request_id),
                     description="engine cancel",
                 )
             except Exception as exc:

@@ -16,6 +16,7 @@ from typing import Any, Mapping
 import pytest
 
 from leapflow.hardware.skills import builtin  # noqa: F401 - package import check
+from leapflow.hardware.skills.builtin.calibration import skills as calibration_skills
 from leapflow.hardware.skills.builtin.motion import skills as motion_skills
 from leapflow.hardware.skills.builtin.sequence import skills as sequence_skills
 from leapflow.hardware.skills.digest import plan_digest, run_permit_digest
@@ -132,12 +133,18 @@ async def _until(predicate: Any, timeout_s: float = 2.0) -> None:
 
 
 async def test_list_marks_cartesian_skills_unavailable_until_calibrated(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path, _registry(tmp_path, calibrated=False))
+    runtime = _runtime(
+        tmp_path, _registry(tmp_path, calibrated=False), skills=(*_skills(), *calibration_skills())
+    )
     (cell,) = runtime.list()["workcells"]
     by_id = {skill["skill_id"]: skill for skill in cell["skills"]}
     assert not by_id[SEQUENCE]["available"]
     assert "run calib.tcp" in by_id[SEQUENCE]["reason"]
     assert "run calib.workspace" in by_id[SEQUENCE]["reason"]
+    # The listing names the declared providers in order: the tcp before the workspace.
+    steps = [step.split()[1] for step in by_id[SEQUENCE]["next"]]
+    assert steps.index("calib.tcp") < steps.index("calib.workspace")
+    assert cell["calibration_status"]["tcp"]["status"] == "missing"
     assert by_id["motion.home"]["available"]
     assert by_id["arm.state"]["available"]
     assert cell["calibration"] == {}
@@ -266,11 +273,25 @@ async def test_planning_refusals_are_typed_and_touch_nothing(
 
 
 async def test_uncalibrated_cartesian_plan_names_the_calibration_to_run(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path, _registry(tmp_path, calibrated=False))
+    runtime = _runtime(
+        tmp_path, _registry(tmp_path, calibrated=False), skills=(*_skills(), *calibration_skills())
+    )
     outcome = await runtime.plan(WORKCELL_ID, SEQUENCE, move_by(10))
     assert isinstance(outcome, SkillOutcome)
     assert outcome.failure_code == FAILURE_SKILL_UNAVAILABLE
     assert "calib.tcp" in outcome.message
+    readiness = outcome.result["readiness"]
+    assert not readiness["ready"]
+    assert {blocker["token"] for blocker in readiness["blockers"]} >= {"calib:tcp", "calib:workspace"}
+    assert readiness["next_steps"][0]["skill_id"] == "calib.tcp"
+
+
+async def test_a_refusal_without_a_providing_skill_names_the_record(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path, _registry(tmp_path, calibrated=False))
+    outcome = await runtime.plan(WORKCELL_ID, SEQUENCE, move_by(10))
+    assert isinstance(outcome, SkillOutcome)
+    assert "record tcp.offset" in outcome.message
+    assert outcome.result["readiness"]["next_steps"] == []
 
 
 async def test_a_ref_to_an_unknown_handle_is_refused(tmp_path: Path) -> None:

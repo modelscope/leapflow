@@ -27,6 +27,24 @@ def effect_is_uncertain_on_failure(policy: str) -> bool:
     return str(policy or "") in UNCERTAIN_EFFECT_POLICIES
 
 
+def failed_effect_is_uncertain(result: Mapping[str, Any], policy: str) -> bool:
+    """Return whether this failed *result* may still have taken effect.
+
+    The policy says what a tool could do in general; the result says what this
+    attempt did. A producer that reports ``side_effect_state: "none"`` (a refusal
+    before anything was sent, a dry run) has settled the question, and flagging
+    it anyway tells the model to verify an effect that cannot exist. An explicit
+    ``effect_uncertain`` always flags; any other or malformed state defers to the
+    policy, mirroring ``UnifiedErrorClassifier``'s precedence of producer evidence.
+    """
+    if result.get("effect_uncertain") is True:
+        return True
+    state = result.get("side_effect_state")
+    if isinstance(state, str) and state.strip().lower() == "none":
+        return False
+    return effect_is_uncertain_on_failure(policy)
+
+
 def exit_code_from(result: Any) -> int | None:
     """Return a process exit code from a tool result under either key name.
 
