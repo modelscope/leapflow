@@ -377,7 +377,7 @@ def _parse_motion_collection(data: Mapping[str, Any]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class WorkcellNote:
-    """Why one declaration was rejected."""
+    """Why one declaration was rejected, or what an admitted one should change."""
 
     source: str
     workcell: str
@@ -391,11 +391,17 @@ class WorkcellNote:
 class WorkcellLoadReport:
     admitted: tuple[str, ...] = ()
     rejected: tuple[WorkcellNote, ...] = ()
+    # Admitted declarations that work but degrade a caller (e.g. a TTL too short).
+    advisories: tuple[WorkcellNote, ...] = ()
+
+    def advised(self, workcell: str) -> list[str]:
+        return [note.detail for note in self.advisories if note.workcell == workcell]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "admitted": list(self.admitted),
             "rejected": [note.to_dict() for note in self.rejected],
+            "advisories": [note.to_dict() for note in self.advisories],
         }
 
 
@@ -438,14 +444,24 @@ def admission_problems(
 
 
 def load_workcells(
-    directory: Path, registry: Any, *, checks: Iterable[AdmissionCheck] = ()
+    directory: Path,
+    registry: Any,
+    *,
+    checks: Iterable[AdmissionCheck] = (),
+    advice: Iterable[AdmissionCheck] = (),
 ) -> tuple[dict[str, WorkcellSpec], WorkcellLoadReport]:
-    """Load and admit every ``*.yaml`` in *directory*; rejections are reported, not raised."""
+    """Load and admit every ``*.yaml`` in *directory*; rejections are reported, not raised.
+
+    *advice* rules run on admitted declarations only; what they return is
+    reported as advisories and never refuses the workcell.
+    """
     import yaml
 
     rules = tuple(checks)
+    advisors = tuple(advice)
     admitted: dict[str, WorkcellSpec] = {}
     rejected: list[WorkcellNote] = []
+    advisories: list[WorkcellNote] = []
     paths = sorted(directory.glob("*.yaml")) if directory.is_dir() else []
     for path in paths:
         try:
@@ -464,9 +480,21 @@ def load_workcells(
             rejected.append(WorkcellNote(str(path), spec.workcell_id, "; ".join(problems)))
             continue
         admitted[spec.workcell_id] = replace(spec, actuators=_actuators(spec, registry))
+        advisories.extend(advisory_notes(spec, advisors))
     for note in rejected:
         logger.warning("workcell rejected (%s): %s", note.source, note.detail)
-    return admitted, WorkcellLoadReport(tuple(admitted), tuple(rejected))
+    for note in advisories:
+        logger.warning("workcell %s advisory (%s): %s", note.workcell, note.source, note.detail)
+    return admitted, WorkcellLoadReport(tuple(admitted), tuple(rejected), tuple(advisories))
+
+
+def advisory_notes(spec: WorkcellSpec, advice: Iterable[AdmissionCheck]) -> list[WorkcellNote]:
+    """What each *advice* rule says about the admitted *spec*."""
+    return [
+        WorkcellNote(spec.source, spec.workcell_id, detail)
+        for rule in advice
+        for detail in rule(spec)
+    ]
 
 
 def resolve_declared(spec: WorkcellSpec, registry: Any) -> WorkcellSpec:
@@ -794,6 +822,7 @@ __all__ = [
     "WorkcellNote",
     "WorkcellSpec",
     "admission_problems",
+    "advisory_notes",
     "joint_channels",
     "load_workcells",
     "resolve_declared",

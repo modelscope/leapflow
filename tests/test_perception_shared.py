@@ -212,6 +212,25 @@ def test_a_shared_frame_side_must_fit_one_message(side: float) -> None:
         PerceptionSettings.from_mapping({"snapshot_max_side": side})
 
 
+def test_perception_advises_against_ttls_shorter_than_s2_reasons() -> None:
+    assert PerceptionSettings().advisories() == []
+    short = PerceptionSettings.from_mapping({"memory_ttl_s": 30, "frame_ttl_s": 20})
+    notes = short.advisories()
+    assert any("memory_ttl_s 30s" in note for note in notes)
+    assert any("frame_ttl_s 20s" in note and "default is 180s" in note for note in notes)
+    assert any("shorter than memory_ttl_s" in note for note in notes)
+
+
+async def test_the_listing_and_card_carry_the_workcell_advisories(tmp_path: Path) -> None:
+    tuned = {**SHARED_YAML, "perception": {"memory_ttl_s": 30}}
+    runtime = _runtime(tmp_path, _calibrated(tmp_path, CUP), tuned)
+    (cell,) = runtime.list()["workcells"]
+    (advice,) = cell["advisories"]
+    assert "memory_ttl_s 30s" in advice
+    assert workcell_view(NODE_ID, cell)["advisories"] == [advice]
+    assert runtime.load_report.advised(WORKCELL_ID) == [advice]
+
+
 def test_target_coordinates_scale_to_the_full_frame() -> None:
     frame = SimpleNamespace(width=200, height=150)
     point = PixelTarget("cup", point=(50.0, 37.5))
@@ -619,6 +638,15 @@ async def test_the_listing_names_the_cameras_each_skill_can_serve(tmp_path: Path
     assert next(s for s in card if s["skill_id"] == "perceive.locate")["bindings"] == {
         "camera": ["camera.wrist"]
     }
+
+
+async def test_a_mosaic_snapshot_says_where_each_tile_sits(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path, _wrist_cell(tmp_path), WRIST_YAML)
+    shot = await _read(runtime, "perceive.snapshot", {"with_cameras": ["camera.wrist"]})
+    wrist = shot.result["tiles"][1]
+    assert "Tiles: camera color f" in shot.message
+    assert f"camera.wrist color {wrist['frame']} at x 0-{wrist['width']}" in shot.message
+    assert "that tile's own pixels" in shot.message
 
 
 async def test_a_skill_is_refused_for_the_camera_it_cannot_serve(tmp_path: Path) -> None:

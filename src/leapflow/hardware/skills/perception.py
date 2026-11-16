@@ -87,6 +87,9 @@ _MAD_FLOOR_MM = 2.0  # never trust a spread tighter than the depth noise
 # A shared frame is for S2 to point into, and must fit one LHP message.
 _MIN_SNAPSHOT_SIDE = 64
 _MAX_SNAPSHOT_SIDE = 1280
+# How long S2 commonly looks and reasons between two calls; a remembered frame
+# or id that expires sooner forces a fresh look on nearly every reference.
+S2_REASONING_FLOOR_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,30 @@ class PerceptionSettings:
                     f"{_MAX_SNAPSHOT_SIDE}] pixels"
                 )
         return settings
+
+    def advisories(self) -> list[str]:
+        """Admissible values that will still work against S2, each with its remedy.
+
+        Not admission problems: a short TTL is safe (nothing moves onto a stale
+        position) but makes S2 re-observe constantly and see ids vanish mid-task.
+        """
+        notes: list[str] = []
+        defaults = type(self)()
+        for name, what in (("memory_ttl_s", "located ids"), ("frame_ttl_s", "shared frames")):
+            value = getattr(self, name)
+            if value < S2_REASONING_FLOOR_S:
+                notes.append(
+                    f"perception.{name} {value:g}s is shorter than S2 reasons between calls "
+                    f"(~{S2_REASONING_FLOOR_S:g}s): {what} will expire mid-task and need a fresh "
+                    f"look; the default is {getattr(defaults, name):g}s"
+                )
+        if self.frame_ttl_s < self.memory_ttl_s:
+            notes.append(
+                f"perception.frame_ttl_s {self.frame_ttl_s:g}s is shorter than memory_ttl_s "
+                f"{self.memory_ttl_s:g}s: a shared frame expires before S2 has pointed into it; "
+                "keep the frame TTL at least the id TTL"
+            )
+        return notes
 
 
 # ── Lifting ─────────────────────────────────────────────────────────────────

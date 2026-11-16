@@ -298,6 +298,24 @@ async def test_a_mosaic_point_lifts_in_the_tile_it_lands_in(tmp_path: Path) -> N
     assert "cannot be lifted" in reasons["cup"] and "between tiles" in reasons["gap"]
 
 
+async def test_mosaic_pixels_sent_to_a_tile_frame_name_both_correct_calls(tmp_path: Path) -> None:
+    scene = _scene(_registry(tmp_path), WRIST_ONLY)
+    shot = await scene.snapshot(with_cameras=["camera.wrist"])
+    wrist = shot["tiles"][1]
+    u, v = _cup_top()
+    mosaic_point = PixelTarget("cup", point=(u, v + wrist["y"]))
+    _, (dropped,) = await scene.lift(wrist["frame"], [mosaic_point], coords=COORDS_PIXEL)
+    reason = dropped["reason"]
+    assert f"lies outside {wrist['frame']}" in reason
+    assert f"lift from {shot['frame']} with the same point" in reason
+    assert f"[{round(float(u), 1)}, {round(float(v), 1)}]" in reason
+
+    (lifted,), dropped = await scene.lift(
+        wrist["frame"], [PixelTarget("cup", point=(u, v))], coords=COORDS_PIXEL
+    )
+    assert lifted.camera == "camera.wrist" and not dropped
+
+
 async def test_mosaic_fractions_and_box_spills(tmp_path: Path) -> None:
     scene = _scene(_registry(tmp_path))
     shot = await scene.snapshot(with_cameras=["camera.wrist"])

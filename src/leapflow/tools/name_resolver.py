@@ -110,6 +110,9 @@ class ToolSpec:
     effect_scope: str = "local"
     idempotency_scope: str = "turn"
     execution_policy: str = ""
+    # The object parameter that carries a downstream payload (e.g. a node skill's
+    # ``args``) whose handler owns repairing envelope fields misplaced inside it.
+    payload_parameter: str = ""
 
 
 @dataclass(frozen=True)
@@ -207,6 +210,7 @@ class ToolRegistry:
                     or ("session" if risk_level == "external" else "turn")
                 ),
                 execution_policy=str(metadata.get("execution_policy") or ""),
+                payload_parameter=str(metadata.get("payload_parameter") or ""),
             )
         for name in handlers.keys():
             canonical = str(name).removeprefix("gp_")

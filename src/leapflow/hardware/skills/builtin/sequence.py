@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from leapflow.hardware.skills.geometry import Pose, mat_vec, tool_cone_deg, wrap_axis_deg
-from leapflow.hardware.skills.ports import PATH_DEFAULT, PATH_LINEAR, SkillContext
+from leapflow.hardware.skills.ports import PATH_DEFAULT, PATH_LINEAR, PATH_POINT, SkillContext
 from leapflow.hardware.skills.protocol import (
     EFFECT_ACTUATE,
     FAILURE_CALIBRATION_MISSING,
@@ -152,7 +152,8 @@ _STEP_SCHEMA: Mapping[str, Any] = {
 
 _CARD = (
     "Run a motion program on the arm and gripper, approved once as a whole. Each step "
-    "has an op: move (the arm's default path) or move_linear (straight line) to a TCP "
+    "has an op: move (a free transit: point-to-point when the arm declares it, else the "
+    "arm's default path) or move_linear (straight line) to a TCP "
     "target; move_joints {joint: deg}; gripper (width_mm, or grip open|close; "
     "ref grasp:gN opens to that grasp's open_mm and records the object as held when "
     "the jaws close on it); wait (seconds). A move target is one of: pose {x, y, z, "
@@ -161,9 +162,10 @@ _CARD = (
     "object:oN[.top|.bottom] / grasp:gN.pregrasp|grasp|retreat plus an optional "
     "offset {dx, dy, dz} in the base frame. Omitted angles keep the previous target's "
     "orientation. A move may name path: linear|point to ride that path when the arm "
-    "declares it (move_linear always rides linear); a target whose straight line is "
-    "infeasible from the current configuration, such as one starting on a wrist "
-    "singularity, needs point. A step may declare expect: held (the jaws hold something), "
+    "declares it (move_linear always rides linear); approach and retreat close to an "
+    "object with move_linear, and transit between them with move (a straight line out "
+    "of a wrist singularity is infeasible: move off it first). A step may declare "
+    "expect: held (the jaws hold something), "
     "released (the jaws opened freely), reached (the TCP is at the last target), or "
     "no_contact (the move arrived and the jaws were not pushed); on_fail stop halts "
     "the arm, hold leaves it in place. Plan uses the arm's declared FK to sample every "
@@ -313,13 +315,15 @@ class _Planner:
         return {**entry, "pose": target.to_dict(), "text": f"{verb} {text}"}
 
     def _path(self, index: int, step: Mapping[str, Any]) -> str:
-        """The path this step rides: linear for move_linear, else the named or default one.
+        """The path this step rides: linear for move_linear, else the named or transit one.
 
         A caller that names a path is asking for a shape the arm itself declares, and
         the shape decides whether the firmware can plan the move at all: a straight
         line out of a degenerate configuration (a wrist at j5 = 0, an elbow on its
         limit) has no resolved joint trajectory and is refused, while the same target
-        along ``point`` is well defined.
+        along ``point`` is well defined. An unnamed ``move`` is therefore a transit
+        and rides ``point`` whenever the arm declares it, whatever the arm's own
+        default: the straight line is what ``move_linear`` says explicitly.
         """
         declared = self._ctx.motion.paths
         if step["op"] == OP_MOVE_LINEAR:
@@ -331,7 +335,7 @@ class _Planner:
             return PATH_LINEAR
         named = step.get("path")
         if named is None:
-            return PATH_DEFAULT
+            return PATH_POINT if PATH_POINT in declared else PATH_DEFAULT
         if named not in declared:
             available = ", ".join(declared) or "none"
             raise _invalid(
@@ -687,7 +691,7 @@ class MotionSequence:
 
     spec = SkillSpec(
         skill_id="motion.sequence",
-        version="1.0.0",
+        version="1.1.0",
         card=_CARD,
         args_schema={
             "type": "object",

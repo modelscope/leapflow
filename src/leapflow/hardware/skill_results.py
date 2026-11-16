@@ -56,6 +56,8 @@ FAILURE_PERMIT_ISSUER_UNAVAILABLE = "permit_issuer_unavailable"
 FAILURE_APPROVAL_DENIED = "approval_denied"
 FAILURE_EXECUTE_UNCONFIRMED = "execute_unconfirmed"
 FAILURE_STATUS_UNAVAILABLE = "status_unavailable"
+FAILURE_INVALID_REQUEST = "invalid_request"
+"""An ``hw_skill_run`` parameter itself is wrong -- not the skill's ``args``."""
 
 _RECHECK = "Check hw_skill_status and the arm state before anything else"
 _NO_REPLAY = "The arm may have moved: never repeat this plan; a retry is a new plan."
@@ -105,7 +107,15 @@ _NEXT_STEPS: dict[str, str] = {
         "names, or reach the goal with a skill hw_skill_list shows as available."
     ),
     FAILURE_INVALID_ARGS: (
-        "Fix the arguments against the skill's args_schema (hw_skill_list with skill=<id>)."
+        "Nothing ran. The skill refused its args: the error names each argument it refused "
+        "and what it accepts. Fix those inside args against the skill's args_schema "
+        "(hw_skill_list with skill=<id>) and call again; hw_skill_run's own parameters "
+        "(workcell, skill, dry_run, intent, wait, timeout_s) go beside args, never inside it."
+    ),
+    FAILURE_INVALID_REQUEST: (
+        "Nothing ran. The error names the hw_skill_run parameter at fault (not the skill's "
+        "args): fix that parameter beside args -- workcell and skill are required -- and "
+        "call again."
     ),
     FAILURE_CHECK_FAILED: (
         "A calibration or bring-up check measured out of tolerance (see result.problems). "
@@ -153,6 +163,10 @@ _ALIASES: dict[str, str] = {
 }
 # Codes whose own next step already says what to do about the movement.
 _SELF_EXPLAINING = frozenset({FAILURE_GUARD_FAILED, FAILURE_EXECUTE_UNCONFIRMED})
+# Codes declared to the engine as ``failure_class: "invalid_request"``: the
+# call's shape was refused before anything ran, so the model repairs it rather
+# than reading a feasibility verdict or a failure.
+_INVALID_REQUEST_CODES = frozenset({FAILURE_INVALID_ARGS, FAILURE_INVALID_REQUEST})
 # Steps for codes whose usual step assumes the arm moved, when it did not: a
 # shield that refused the first chunk, or a stop before the first command, is a
 # request to change, not a run to inspect.
@@ -247,7 +261,7 @@ def workcell_view(
             # The argument values this workcell can serve, e.g. which camera is ready.
             card["bindings"] = entry.get("bindings")
         skills.append(card)
-    return {
+    view = {
         "workcell": f"{node_id}/{cell.get('workcell') or ''}",
         "roles": cell.get("roles"),
         "limits": cell.get("limits"),
@@ -257,6 +271,10 @@ def workcell_view(
         "calibration_status": frame_status_view(as_mapping(cell.get("calibration_status"))),
         "skills": skills,
     }
+    if cell.get("advisories"):
+        # Declared tuning that works but will hinder the caller (e.g. ids expiring mid-task).
+        view["advisories"] = list(cell["advisories"])
+    return view
 
 
 def frame_status_view(statuses: Mapping[str, Any]) -> dict[str, Any]:
@@ -370,6 +388,8 @@ def outcome_fields(outcome: Mapping[str, Any]) -> dict[str, Any]:
         fields["error"] = fields["message"]
         if outcome.get("failure_code") == FAILURE_INTERNAL_DEFECT:
             fields["failure_class"] = FAILURE_INTERNAL_DEFECT
+        elif outcome.get("failure_code") in _INVALID_REQUEST_CODES and side_effect == SIDE_EFFECT_NONE:
+            fields["failure_class"] = "invalid_request"
         fields["next_step"] = next_step(outcome.get("failure_code"), side_effect)
         if side_effect != SIDE_EFFECT_NONE:
             fields["effect_uncertain"] = True
@@ -399,6 +419,8 @@ def refusal_result(
     }
     if side_effect_state != SIDE_EFFECT_NONE:
         result["effect_uncertain"] = True
+    elif failure_code in _INVALID_REQUEST_CODES:
+        result.setdefault("failure_class", "invalid_request")
     return result
 
 
@@ -443,6 +465,7 @@ __all__ = [
     "FAILURE_AMBIGUOUS_WORKCELL",
     "FAILURE_APPROVAL_DENIED",
     "FAILURE_EXECUTE_UNCONFIRMED",
+    "FAILURE_INVALID_REQUEST",
     "FAILURE_NODE_UNREACHABLE",
     "FAILURE_NO_SKILL_NODES",
     "FAILURE_PERMIT_ISSUER_UNAVAILABLE",

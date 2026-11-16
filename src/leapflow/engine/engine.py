@@ -41,6 +41,9 @@ from leapflow.engine.context.context_disclosure import (
 )
 from leapflow.engine.context.context_focus import ReferenceResolution, SessionFocusState
 from leapflow.engine.context.reference_resolver import ReferenceResolver
+from leapflow.engine.context.result_budget import (
+    fit_result_to_budget as _truncate_result_for_budget,
+)
 from leapflow.engine.recovery.error_classifier import (
     ErrorCategory,
     ErrorClassifier,
@@ -112,7 +115,6 @@ from leapflow.engine._message_helpers import (
     _EMPTY_RESPONSE_RETRY_PROMPT,
     _EMPTY_RESPONSE_DEGRADED_MESSAGE,
     _FORCED_FINALIZE_PROMPT,
-    _truncate_result_for_budget,
     _tool_args_metadata,
     _tool_result_metadata,
     _is_retryable_unknown_tool_result,

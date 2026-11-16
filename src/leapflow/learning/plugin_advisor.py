@@ -7,7 +7,7 @@ No side effects, no persistence, pure function of (stats, trust).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from leapflow.learning.plugin_stats import PluginUsageTracker
 from leapflow.learning.plugin_trust import PluginTrustLedger, PluginTrustLevel
@@ -33,6 +33,10 @@ class PluginAdvisor:
     ) -> None:
         self._trust_ledger = trust_ledger
         self._usage_tracker = usage_tracker
+
+    def usage_report(self, plugin_id: str) -> List[Dict[str, Any]]:
+        """Per-tool outcome breakdown (failure, refusal, self-repair rates) for a plugin."""
+        return self._usage_tracker.tool_report(plugin_id)
 
     def recommend(self, plugin_id: str) -> Optional[PluginRecommendation]:
         """Compute a recommendation for the given plugin.

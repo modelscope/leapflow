@@ -310,6 +310,9 @@ class SelfManagementPlugin:
                             "reason": rec.reason,
                             "confidence": rec.confidence,
                         }
+                    usage = advisor.usage_report(plugin_id)
+                    if usage:
+                        response["usage"] = usage
             except (ImportError, AttributeError, RuntimeError):
                 pass  # Learning integration not wired — degrade gracefully
 

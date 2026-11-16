@@ -40,12 +40,22 @@ _PYTHON_TRACEBACK_ANGLE_RE = re.compile(
     r'|frozen\b[^>]*|built-in\b[^>]*|ipython[^>]*|cell[^>]*)>'
 )
 _TOOL_AUDIT_LINE_RE = re.compile(
-    r"^\s*(?:·|✓|✗|📁|📄|✍️?|🧠|🧭|💻|🌐|🧩|🔧|❌)\s+"
+    r"^\s*(?:·|✓|✗|⊘|↺|📁|📄|✍️?|🧠|🧭|💻|🌐|🧩|🔧|❌)\s+"
     r"[A-Za-z_][\w.-]*(?:\s|$).*",
     re.MULTILINE,
 )
 _MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
 _JSON_DECODER = json.JSONDecoder()
+
+# How each result tier (``engine.tools.tool_execution.result_tier``) reads in the
+# audit line: (glyph, status style, name style, state label). Only a real failure
+# is red; a refusal that changed nothing is a warning the model acts on, and a
+# call the model or tool reshaped is routine.
+_TIER_PRESENTATION: dict[str, tuple[str, str, str, str]] = {
+    "failed": ("✗", "leap.error", "leap.error", ""),
+    "refused": ("⊘", "leap.warning", "leap.warning", "no effect"),
+    "repaired": ("↺", "leap.muted", "leap.tool_name", "self-repair"),
+}
 
 
 def _is_tool_protocol_payload(value: Any) -> bool:
@@ -263,13 +273,21 @@ def _tool_context_detail(metadata: dict[str, Any] | None) -> str:
     return f"[{' · '.join(tags)}]" if tags else ""
 
 
-def _tool_icon(name: str, *, ok: bool = True) -> str:
-    if not ok:
-        # Use the same subdued "✗" glyph as console.error()/tool_result() instead
-        # of the full-color "❌" emoji: it still reads as a clear failure marker
-        # but renders in the theme's error color rather than a fixed bright red,
-        # so a single tool failure doesn't visually dominate the whole line.
-        return "✗"
+def _result_tier(metadata: dict[str, Any] | None) -> str:
+    """The result tier the engine graded, or one inferred from ``ok`` alone."""
+    tier = _metadata_text(metadata, "result_tier")
+    if tier:
+        return tier
+    return "failed" if metadata and metadata.get("ok", True) is False else "succeeded"
+
+
+def _tool_icon(name: str, *, tier: str = "succeeded") -> str:
+    presentation = _TIER_PRESENTATION.get(tier)
+    if presentation is not None:
+        # Subdued glyphs rather than emoji: they still read as clear markers but
+        # render in the theme's colors, so one failure or refusal doesn't visually
+        # dominate the whole line.
+        return presentation[0]
     if name.startswith("file_list"):
         return "📁"
     if name.startswith("file_read"):
@@ -297,6 +315,9 @@ def _tool_result_detail(metadata: dict[str, Any] | None) -> str:
     if metadata.get("ok") is False:
         exit_code = metadata.get("exit_code")
         state: list[str] = []
+        label = _TIER_PRESENTATION.get(_result_tier(metadata), ("", "", "", ""))[3]
+        if label:
+            state.append(label)
         failure_code = _metadata_text(metadata, "failure_code")
         if failure_code:
             state.append(f"code={failure_code}")
@@ -563,13 +584,15 @@ class StreamRenderer:
         if tool_name and active is not None:
             duration = time.monotonic() - active.started_at
             self._tool_history.append((tool_name, duration))
-            ok = metadata.get("ok", True)
+            tier = _result_tier(metadata)
+            _glyph, status_style, name_style, _label = _TIER_PRESENTATION.get(
+                tier, ("", "leap.tool", "leap.tool_name", "")
+            )
+            detail_style = status_style if tier in {"failed", "refused"} else "leap.tool"
             action_detail = active.detail or _tool_action_detail(metadata)
             result_detail = _tool_result_detail(metadata) or _truncate_detail(output, limit=_TOOL_OUTPUT_LIMIT)
             line = Text()
-            status_style = "leap.tool" if ok else "leap.error"
-            name_style = "leap.tool_name" if ok else "leap.error"
-            line.append(f"  {_tool_icon(tool_name, ok=ok)} ", style=status_style)
+            line.append(f"  {_tool_icon(tool_name, tier=tier)} ", style=status_style)
             line.append(tool_name, style=name_style)
             if action_detail:
                 line.append("  ", style="leap.tool")
@@ -578,10 +601,16 @@ class StreamRenderer:
                 line.append("  ", style="leap.tool")
                 line.append(f"alias={alias_detail}", style="leap.tool")
             if result_detail:
-                line.append(" → ", style="leap.tool" if ok else "leap.error")
-                line.append(result_detail, style="leap.tool" if ok else "leap.error")
+                line.append(" → ", style=detail_style)
+                line.append(result_detail, style=detail_style)
             line.append(f" | {_format_elapsed(duration)}", style="leap.tool")
             self._console.print(line)
+            repair = _metadata_text(metadata, "argument_repair")
+            if repair and metadata.get("ok", True) is not False:
+                repair_line = Text()
+                repair_line.append("    ↳ repaired: ", style="leap.muted")
+                repair_line.append(_truncate_detail(repair, limit=_TOOL_OUTPUT_LIMIT), style="leap.muted")
+                self._console.print(repair_line)
             recovery_hint = _metadata_text(metadata, "recovery_hint")
             recovery_card = getattr(self._console, "permission_recovery_card", None)
             if _is_permission_recovery_metadata(metadata):

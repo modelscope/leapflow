@@ -347,6 +347,43 @@ async def test_dry_run_returns_the_plan_and_moves_nothing(tmp_path: Path, rigs: 
     assert rig.gate.seen == [] and rig.sim.batches == []
 
 
+async def test_envelope_fields_nested_in_args_are_lifted_and_reported(
+    tmp_path: Path, rigs: Any
+) -> None:
+    rig = rigs(tmp_path)
+    nested = {**move_by(10), "workcell": WORKCELL_ID, "skill": SEQUENCE, "dry_run": True}
+    result = await rig.service.hw_skill_run(args=nested)
+    assert result["ok"] and result["dry_run"], result
+    assert set(result["plan"]["args"]) == {"steps"}
+    repair = result["argument_repair"]
+    assert set(repair["lifted"]) == {"workcell", "skill", "dry_run"}
+    assert "beside args" in repair["message"]
+    assert any(record["action"] == "skill_args_repair" for record in rig.audit.records)
+    assert rig.gate.seen == [] and rig.sim.batches == []
+
+
+async def test_a_conflicting_nested_envelope_field_is_refused_not_guessed(
+    tmp_path: Path, rigs: Any
+) -> None:
+    rig = rigs(tmp_path)
+    result = await rig.service.hw_skill_run(
+        **{**MOVE, "args": {**move_by(10), "dry_run": False}}, dry_run=True
+    )
+    assert result["failure_code"] == "invalid_request", result
+    assert "dry_run" in result["error"] and "beside args" in result["error"]
+    assert rig.gate.seen == [] and rig.sim.batches == []
+
+
+async def test_an_unknown_skill_argument_is_left_for_the_node_to_name(
+    tmp_path: Path, rigs: Any
+) -> None:
+    rig = rigs(tmp_path)
+    result = await rig.service.hw_skill_run(**{**MOVE, "args": {**move_by(10), "speed": 5}})
+    assert result["failure_code"] == "invalid_args" and "speed" in result["error"]
+    assert "argument_repair" not in result
+    assert "beside args" in result["next_step"]
+
+
 async def test_a_denied_approval_moves_nothing(tmp_path: Path, rigs: Any) -> None:
     rig = rigs(tmp_path, gate=_Gate(approve=False))
     result = await rig.service.hw_skill_run(**MOVE)
@@ -532,7 +569,7 @@ async def test_an_unobservable_run_falls_to_the_node_deadman(tmp_path: Path, rig
 async def test_invalid_timeout_is_refused(tmp_path: Path, rigs: Any) -> None:
     rig = rigs(tmp_path)
     result = await rig.service.hw_skill_run(**MOVE, timeout_s=10_000)
-    assert result["failure_code"] == "invalid_args" and rig.sim.batches == []
+    assert result["failure_code"] == "invalid_request" and rig.sim.batches == []
 
 
 # ── Result contract ──────────────────────────────────────────────────────────

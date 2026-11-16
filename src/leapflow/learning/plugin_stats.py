@@ -5,19 +5,56 @@ Receives forwarded (tool_name, ok, duration_ms) from TurnUsageTracker
 and maintains bounded, rolling statistics per tool. Cross-turn data survives
 turn resets because PluginUsageTracker is session-scoped (or engine-scoped),
 not turn-scoped.
+
+Each sample carries the result tier the engine graded
+(``engine.tools.tool_execution.result_tier``) and its failure code, so the
+statistics keep apart what ``ok`` alone conflates: a call the model or tool
+reshaped (``repaired``), a request the tool declined without effect
+(``refused``), and a real failure (``failed``). Only real outcomes move trust:
+a correct refusal is the tool working, not evidence against it.
 """
 from __future__ import annotations
 
 import time
-from collections import defaultdict, deque
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional
 
 import logging
 
 from leapflow.learning.plugin_trust import PluginTrustLedger
 
 logger = logging.getLogger(__name__)
+
+# Result tiers, as graded by ``engine.tools.tool_execution.result_tier``.
+TIER_SUCCEEDED = "succeeded"
+TIER_REPAIRED = "repaired"
+TIER_REFUSED = "refused"
+TIER_FAILED = "failed"
+TIER_SKIPPED = "skipped"
+_TIERS = frozenset({TIER_SUCCEEDED, TIER_REPAIRED, TIER_REFUSED, TIER_FAILED, TIER_SKIPPED})
+# How many distinct failure codes a report names per tool, most frequent first.
+_REPORTED_CODES = 5
+
+
+def _tier(ok: bool, tier: str) -> str:
+    """The sample's tier; an absent or unknown one falls back on ``ok``."""
+    return tier if tier in _TIERS else (TIER_SUCCEEDED if ok else TIER_FAILED)
+
+
+def trust_verdict(ok: bool, tier: str) -> Optional[bool]:
+    """Whether one outcome is evidence for (True) or against (False) the tool, or neither.
+
+    A refusal that changed nothing, a call rejected so the model could fix its
+    arguments, and a suppressed duplicate say nothing about whether the tool
+    works; charging them as failures demoted tools for declining bad requests.
+    """
+    graded = _tier(ok, tier)
+    if graded == TIER_FAILED:
+        return False
+    if graded in {TIER_REFUSED, TIER_SKIPPED}:
+        return None
+    return True if ok else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,11 +64,18 @@ class PluginUsageSample:
     timestamp: float
     ok: bool
     duration_ms: float
+    tier: str = ""
+    failure_code: str = ""
 
 
 @dataclass
 class PluginStats:
-    """Aggregated stats for a single plugin."""
+    """Aggregated stats for a single plugin (or tool).
+
+    ``failures`` and ``error_rate`` count real failures only; ``refusals`` and
+    ``repairs`` are reported beside them so a tool that declines many requests
+    does not read as broken, and a model that keeps misshaping calls is visible.
+    """
 
     total_calls: int
     successes: int
@@ -39,6 +83,39 @@ class PluginStats:
     avg_duration_ms: float
     error_rate: float
     p95_duration_ms: float
+    refusals: int = 0
+    repairs: int = 0
+    refusal_rate: float = 0.0
+    repair_rate: float = 0.0
+    failure_codes: Dict[str, int] = field(default_factory=dict)
+
+
+def summarize_samples(samples: Iterable[PluginUsageSample]) -> Optional[PluginStats]:
+    """Aggregate samples into ``PluginStats``; ``None`` when there are none."""
+    rows = list(samples)
+    if not rows:
+        return None
+    total = len(rows)
+    tiers = Counter(_tier(s.ok, s.tier) for s in rows)
+    failures = tiers[TIER_FAILED]
+    durations = sorted(s.duration_ms for s in rows)
+    p95_idx = min(int(total * 0.95), total - 1)
+    codes = Counter(
+        s.failure_code for s in rows if s.failure_code and _tier(s.ok, s.tier) != TIER_SUCCEEDED
+    )
+    return PluginStats(
+        total_calls=total,
+        successes=sum(1 for s in rows if s.ok),
+        failures=failures,
+        avg_duration_ms=round(sum(durations) / total, 2),
+        error_rate=round(failures / total, 4),
+        p95_duration_ms=round(durations[p95_idx], 2),
+        refusals=tiers[TIER_REFUSED],
+        repairs=tiers[TIER_REPAIRED],
+        refusal_rate=round(tiers[TIER_REFUSED] / total, 4),
+        repair_rate=round(tiers[TIER_REPAIRED] / total, 4),
+        failure_codes=dict(codes.most_common(_REPORTED_CODES)),
+    )
 
 
 class PluginUsageTracker:
@@ -71,15 +148,25 @@ class PluginUsageTracker:
         """
         self._quarantine_tracker = tracker
 
-    def record(self, tool_name: str, ok: bool, duration_ms: float) -> None:
+    def record(
+        self,
+        tool_name: str,
+        ok: bool,
+        duration_ms: float,
+        *,
+        tier: str = "",
+        failure_code: str = "",
+    ) -> None:
         """Called by TurnUsageTracker forward. Must be fast (<1μs hot path)."""
-        sample = PluginUsageSample(time.time(), ok, duration_ms)
+        graded = _tier(ok, tier)
+        sample = PluginUsageSample(time.time(), ok, duration_ms, graded, str(failure_code or ""))
         self._samples[tool_name].append(sample)
-        # Forward to trust ledger
-        if self._trust_ledger is not None:
+        verdict = trust_verdict(ok, graded)
+        # Forward to trust ledger: only real outcomes are evidence about the tool.
+        if self._trust_ledger is not None and verdict is not None:
             plugin_id = self._resolve_plugin_id(tool_name)
             if plugin_id:
-                if ok:
+                if verdict:
                     self._trust_ledger.record_success(plugin_id)
                 else:
                     self._trust_ledger.record_failure(plugin_id)
@@ -94,7 +181,7 @@ class PluginUsageTracker:
                 tracker = getattr(self, "_quarantine_tracker", None)
                 if tracker is not None:
                     try:
-                        tracker.record(plugin_id, tool_name, ok)
+                        tracker.record(plugin_id, tool_name, verdict)
                     except Exception:  # noqa: BLE001 - never fail a tool call on it
                         logger.debug("quarantine streak not recorded", exc_info=True)
 
@@ -103,35 +190,45 @@ class PluginUsageTracker:
         tool_names = self._tools_for_plugin(plugin_id)
         if not tool_names:
             return None
-
-        all_samples: list[PluginUsageSample] = []
-        for tool_name in tool_names:
-            if tool_name in self._samples:
-                all_samples.extend(self._samples[tool_name])
-
-        if not all_samples:
-            return None
-
-        total = len(all_samples)
-        successes = sum(1 for s in all_samples if s.ok)
-        failures = total - successes
-        durations = [s.duration_ms for s in all_samples]
-        avg_duration = sum(durations) / total if total else 0.0
-        error_rate = failures / total if total else 0.0
-
-        # p95 duration
-        sorted_durations = sorted(durations)
-        p95_idx = min(int(total * 0.95), total - 1)
-        p95_duration = sorted_durations[p95_idx] if sorted_durations else 0.0
-
-        return PluginStats(
-            total_calls=total,
-            successes=successes,
-            failures=failures,
-            avg_duration_ms=round(avg_duration, 2),
-            error_rate=round(error_rate, 4),
-            p95_duration_ms=round(p95_duration, 2),
+        return summarize_samples(
+            sample
+            for tool_name in tool_names
+            if tool_name in self._samples
+            for sample in self._samples[tool_name]
         )
+
+    def stats_for_tool(self, tool_name: str) -> Optional[PluginStats]:
+        """Aggregate stats for one tool."""
+        samples = self._samples.get(tool_name)
+        return summarize_samples(samples) if samples else None
+
+    def tool_report(self, plugin_id: str) -> List[Dict[str, Any]]:
+        """Per-tool outcome breakdown for a plugin's tools that have samples.
+
+        Self-repair, refusal and failure rates are reported apart, with the
+        most frequent failure codes, so whether a contract fix converged is read
+        from data rather than from an impression that a tool "still errors".
+        """
+        report: List[Dict[str, Any]] = []
+        for tool_name in sorted(self._tools_for_plugin(plugin_id)):
+            stats = self.stats_for_tool(tool_name)
+            if stats is None:
+                continue
+            report.append(
+                {
+                    "tool": tool_name,
+                    "calls": stats.total_calls,
+                    "failure_rate": stats.error_rate,
+                    "refusal_rate": stats.refusal_rate,
+                    "repair_rate": stats.repair_rate,
+                    "failures": stats.failures,
+                    "refusals": stats.refusals,
+                    "repairs": stats.repairs,
+                    "failure_codes": dict(stats.failure_codes),
+                    "p95_duration_ms": stats.p95_duration_ms,
+                }
+            )
+        return report
 
     def _resolve_plugin_id(self, tool_name: str) -> Optional[str]:
         """Map tool_name → plugin_id (lazy-built reverse index)."""
@@ -182,7 +279,7 @@ class PluginUsageTracker:
             "max_samples_per_tool": self._max_samples,
             "samples": {
                 tool_name: [
-                    [round(s.timestamp, 3), s.ok, round(s.duration_ms, 2)]
+                    [round(s.timestamp, 3), s.ok, round(s.duration_ms, 2), s.tier, s.failure_code]
                     for s in list(samples)[-self._max_samples:]
                 ]
                 for tool_name, samples in self._samples.items()
@@ -206,9 +303,13 @@ class PluginUsageTracker:
                 # dropped sample only dilutes signal, while a raise would cost
                 # the whole session its history.
                 try:
-                    timestamp, ok, duration_ms = row
+                    timestamp, ok, duration_ms, *graded = row
+                    tier = str(graded[0]) if graded else ""
+                    code = str(graded[1]) if len(graded) > 1 else ""
                     tracker._samples[str(tool_name)].append(
-                        PluginUsageSample(float(timestamp), bool(ok), float(duration_ms))
+                        PluginUsageSample(
+                            float(timestamp), bool(ok), float(duration_ms), _tier(bool(ok), tier), code
+                        )
                     )
                 except (TypeError, ValueError):
                     continue

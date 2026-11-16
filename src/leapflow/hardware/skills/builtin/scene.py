@@ -150,7 +150,7 @@ class Snapshot:
 
     spec = SkillSpec(
         skill_id="perceive.snapshot",
-        version="1.2.0",
+        version="1.3.0",
         card=(
             "Look through workcell cameras and get one image you can see. camera is the "
             "main view; with_cameras adds others (e.g. ['camera.wrist'], or ['all']) as "
@@ -247,7 +247,7 @@ class Snapshot:
             side_effect_state=SIDE_EFFECT_NONE,
             message=(
                 f"{kind} {shot['frame']} from {source} "
-                f"({shot['width']}x{shot['height']} pixels){unlifted}{situation}"
+                f"({shot['width']}x{shot['height']} pixels){unlifted}{_layout(shot)}{situation}"
             ),
         )
 
@@ -257,11 +257,13 @@ class Lift:
 
     spec = SkillSpec(
         skill_id="perceive.lift",
-        version="1.2.0",
+        version="1.3.0",
         card=(
             "Turn what you point at in a perceive.snapshot image into objects, without "
             "moving. frame is the image's fN, or vN for a mosaic (a target resolves to "
-            "the color or depth tile it lands in; keep a box inside one tile). Each "
+            "the color or depth tile it lands in; keep a box inside one tile). Pixels "
+            "are always the named image's own: vN pixels span the whole mosaic, fN "
+            "pixels only that frame's tile, from its top-left 0,0. Each "
             "target has a label and either a point [u, v] on the object's "
             "surface or a box [x0, y0, x1, y1] around it; coords says whether they are "
             "pixels of the shared image, fractions (0-1) of its sides, or thousandths "
@@ -332,6 +334,24 @@ class Lift:
                 + (f": {listed}" if listed else "")
             ),
         )
+
+
+def _layout(shot: Mapping[str, Any]) -> str:
+    """Where each tile of a mosaic sits, so a point can name the right image."""
+    placed = [tile for tile in shot.get("tiles") or () if isinstance(tile, Mapping)]
+    if not placed:
+        return ""
+    spots = "; ".join(
+        f"{tile.get('camera')} {tile.get('plane')} "
+        + (str(tile["frame"]) if tile.get("frame") else "(look only)")
+        + f" at x {tile.get('x')}-{int(tile.get('x', 0)) + int(tile.get('width', 0))},"
+        f" y {tile.get('y')}-{int(tile.get('y', 0)) + int(tile.get('height', 0))}"
+        for tile in placed
+    )
+    return (
+        f"\nTiles: {spots}. Point into {shot['frame']} with these mosaic pixels, or into a "
+        "tile's fN with that tile's own pixels (its top-left is 0,0)."
+    )
 
 
 def _targets(args: Mapping[str, Any]) -> tuple[PixelTarget, ...]:

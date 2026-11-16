@@ -275,11 +275,43 @@ class SceneViewer:
         if not capture.liftable:
             raise SkillError(FAILURE_CALIBRATION_MISSING, scene._unplaced(handle, capture))
         shown = self.shown(capture)
-        return [
-            (target, capture,
-             target_detection(target, capture.frame, coords, shown.size, shown.window), "")
-            for target in targets
-        ]
+        resolved: list[Resolved] = []
+        for target in targets:
+            outside = self._outside(handle, target, coords, shown.size)
+            if outside:
+                resolved.append((target, None, None, outside))
+                continue
+            resolved.append((target, capture, target_detection(
+                target, capture.frame, coords, shown.size, shown.window), ""))
+        return resolved
+
+    def _outside(
+        self, handle: str, target: PixelTarget, coords: str, size: tuple[int, int]
+    ) -> str:
+        """Why a pixel *target* does not lie in frame *handle* as shared, or ``""``.
+
+        Pixels past the frame's own image are not guessed at: when they land in
+        this frame's tile of a current mosaic they are most likely that mosaic's
+        pixels, and the reason names both ways to say it.
+        """
+        if coords != COORDS_PIXEL:
+            return ""
+        what = "point" if target.point is not None else "box"
+        given = list(target.point if target.point is not None else target.box or ())
+        u, v = given[0], given[1]
+        if 0.0 <= u < size[0] and 0.0 <= v < size[1]:
+            return ""
+        reason = f"{what} {_rounded(given)} lies outside {handle}, which is {size[0]}x{size[1]} pixels as shared"
+        scene = self._scene
+        for view_id, tile in scene._memory.views_of(handle, scene._basis, scene._settings.frame_ttl_s):
+            if tile.contains(u, v):
+                local = [value - (tile.x if i % 2 == 0 else tile.y) for i, value in enumerate(given)]
+                return (
+                    f"{reason}; it lands in {handle}'s {tile.plane} tile of view {view_id} "
+                    f"(placed at {tile.x},{tile.y}), so these look like {view_id} pixels: lift "
+                    f"from {view_id} with the same {what}, or from {handle} with {_rounded(local)}"
+                )
+        return f"{reason}; point with pixels of {handle}'s own image (top-left is 0,0)"
 
     def _resolve_view(
         self, view_id: str, targets: Sequence[PixelTarget], *, coords: str, capture_id: str | None
@@ -660,6 +692,10 @@ def _into_tile(
             "point into its color or depth tile"
         )
     return local, tile, ""
+
+
+def _rounded(values: Sequence[float]) -> list[float]:
+    return [round(float(value), 1) for value in values]
 
 
 def _infrared_channel(context: Any) -> str | None:

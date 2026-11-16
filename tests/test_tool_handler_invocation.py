@@ -100,7 +100,9 @@ class _UsageTracker:
     def __init__(self) -> None:
         self.calls: list[tuple[str, bool, float]] = []
 
-    def record_tool_call(self, name: str, ok: bool, duration_ms: float) -> None:
+    def record_tool_call(
+        self, name: str, ok: bool, duration_ms: float, *, tier: str = "", failure_code: str = ""
+    ) -> None:
         self.calls.append((name, ok, duration_ms))
 
 

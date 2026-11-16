@@ -73,6 +73,60 @@ def failed_effect_is_uncertain(result: Mapping[str, Any], policy: str) -> bool:
     return effect_is_uncertain_on_failure(policy)
 
 
+ResultTier = Literal["succeeded", "repaired", "refused", "failed", "skipped"]
+TIER_SUCCEEDED: ResultTier = "succeeded"
+TIER_REPAIRED: ResultTier = "repaired"
+TIER_REFUSED: ResultTier = "refused"
+TIER_FAILED: ResultTier = "failed"
+TIER_SKIPPED: ResultTier = "skipped"
+
+
+def result_is_control_signal(result: Any) -> bool:
+    """Return whether *result* is execution-control metadata, not an attempt's result."""
+    return isinstance(result, Mapping) and bool(
+        result.get("already_executed")
+        or result.get("duplicate_suppressed")
+        or result.get("execution_skipped")
+    )
+
+
+def result_tier(result: Any) -> ResultTier:
+    """Grade one tool result by what it means for the user and for reliability.
+
+    ``ok: false`` alone conflates three different events, and treating them alike
+    painted every self-corrected call as a red failure and charged a tool's trust
+    for requests it correctly declined:
+
+    - ``repaired``: the call's shape needed fixing. Either it was rejected before
+      running so the model can correct it (``counts_as_failure: false``, or a
+      declared ``failure_class: "invalid_request"`` that claims no uncertain
+      effect), or it ran after the tool repaired it (a non-empty
+      ``argument_repair``).
+    - ``refused``: it failed while the producer reports it changed nothing
+      (``side_effect_state: "none"``, see ``result_reports_no_effect``) -- a
+      feasibility or precondition refusal the model can act on. A declared
+      ``internal_defect`` is never a refusal: the tool's own code broke.
+    - ``failed``: any other failure, where an effect may have landed or nothing
+      says otherwise.
+    - ``skipped``: execution control (a suppressed duplicate, a call skipped after
+      an earlier failure); not an attempt at all.
+    """
+    if not isinstance(result, Mapping):
+        return TIER_SUCCEEDED
+    if result_is_control_signal(result):
+        return TIER_SKIPPED
+    if result.get("ok", True) is not False:
+        return TIER_REPAIRED if result.get("argument_repair") else TIER_SUCCEEDED
+    if result.get("counts_as_failure") is False:
+        return TIER_REPAIRED
+    failure_class = str(result.get("failure_class") or "")
+    if failure_class == "internal_defect":
+        return TIER_FAILED
+    if failure_class == "invalid_request" and result.get("effect_uncertain") is not True:
+        return TIER_REPAIRED
+    return TIER_REFUSED if result_reports_no_effect(result) else TIER_FAILED
+
+
 def exit_code_from(result: Any) -> int | None:
     """Return a process exit code from a tool result under either key name.
 

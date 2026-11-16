@@ -258,6 +258,20 @@ async def test_a_move_may_name_a_path_the_arm_declares(tmp_path: Path) -> None:
     assert move["arm.pose_path"] == "point", "a named path reaches the arm's path channel"
 
 
+async def test_an_unnamed_move_is_a_point_to_point_transit(tmp_path: Path) -> None:
+    # The arm's first declared path is linear; a transit must not inherit it, or a
+    # start on a wrist singularity has no straight line and the firmware refuses it.
+    runtime = _cell(tmp_path, CUP)
+    plan = await _plan(runtime, [{"op": "move", "pose": {"x": 220.0, "y": -90.0, "z": 150.0}}])
+    assert "move point" in plan.summary
+
+    outcome = await _execute(runtime, plan)
+
+    assert outcome.status == STATUS_SUCCEEDED, outcome
+    (move,) = _moves(_sim(runtime))
+    assert move["arm.pose_path"] == "point"
+
+
 # ── Refusals before approval ─────────────────────────────────────────────────
 
 

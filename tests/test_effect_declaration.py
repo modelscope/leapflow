@@ -260,7 +260,7 @@ def test_usage_sink_no_longer_records_outcomes():
 
     source = inspect.getsource(PluginUsageTracker.record)
     assert "record_tool_outcome" not in source
-    assert "tracker.record(plugin_id, tool_name, ok)" in source   # streak feed stays
+    assert "tracker.record(plugin_id, tool_name, verdict)" in source   # streak feed stays
 
 
 # ── the writer half: built-in tools that now declare their effect ─────────────

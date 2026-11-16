@@ -50,6 +50,8 @@ def _render(result: dict[str, Any]) -> None:
     workcells = result["workcells"]
     for workcell_id in workcells["admitted"]:
         print(f"  {_GREEN}\u2713{_RESET} {workcell_id}: admitted")
+    for note in workcells.get("advisories") or ():
+        print(f"  {_YELLOW}!{_RESET} {note['workcell']}: {note['detail']}")
     for note in workcells["rejected"]:
         name = note["workcell"] or Path(note["source"]).name
         print(f"  {_RED}\u2717{_RESET} {name}: {note['detail']}")

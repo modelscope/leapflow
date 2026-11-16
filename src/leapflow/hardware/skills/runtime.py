@@ -105,8 +105,10 @@ from leapflow.hardware.skills.policy_binding import policy_problems
 from leapflow.hardware.skills.vision import CharucoTarget
 from leapflow.hardware.skills.workcell import (
     ROLE_GRIPPER,
+    AdmissionCheck,
     WorkcellLoadReport,
     WorkcellSpec,
+    advisory_notes,
 )
 from leapflow.hardware.skills import workcell_reload
 
@@ -133,8 +135,18 @@ def discover_skills() -> tuple[NodeSkill, ...]:
     return tuple(found)
 
 
+def _perception_advice(spec: WorkcellSpec) -> list[str]:
+    try:
+        return PerceptionSettings.from_mapping(spec.perception).advisories()
+    except ValueError:
+        return []  # an unusable block is an admission problem, reported there
+
+
 class SkillRuntime:
     """Skill catalog, plan cache, and run registry for one node."""
+
+    # Rules an admitted workcell is advised by (never refused): see ``load_workcells``.
+    ADVICE: tuple[AdmissionCheck, ...] = (_perception_advice,)
 
     def __init__(
         self,
@@ -248,7 +260,9 @@ class SkillRuntime:
         for spec in self._workcells.values():
             if workcell and spec.workcell_id != workcell:
                 continue
-            cells.append(cell_listing(self._skills, self._offered(spec), spec, self._frames(spec)))
+            cell = cell_listing(self._skills, self._offered(spec), spec, self._frames(spec))
+            advised = [note.detail for note in advisory_notes(spec, self.ADVICE)]
+            cells.append({**cell, "advisories": advised} if advised else cell)
         return {"workcells": cells, "rejected": self._report.to_dict()["rejected"]}
 
     def _offered(self, spec: WorkcellSpec) -> tuple[str, ...]:

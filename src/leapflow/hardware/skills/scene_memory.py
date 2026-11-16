@@ -241,6 +241,16 @@ class SceneMemory:
             return None
         return entry[0]
 
+    def views_of(
+        self, frame_id: str, basis: Mapping[str, float], ttl_s: float
+    ) -> list[tuple[str, ViewTile]]:
+        """Each current mosaic showing *frame_id* as a liftable tile, newest first."""
+        found = []
+        for view_id in reversed(list(self._views)):
+            tiles = self.recall_view(view_id, basis, ttl_s) or ()
+            found.extend((view_id, tile) for tile in tiles if tile.frame_id == frame_id)
+        return found
+
     def signature(self, camera: str) -> Any:
         """The last frame signature of *camera*, or ``None``."""
         return self._signatures.get(camera)

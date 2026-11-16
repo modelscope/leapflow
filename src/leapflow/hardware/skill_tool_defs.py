@@ -29,12 +29,13 @@ _READ_METADATA: dict[str, Any] = {
     "schema_cost": "low",
 }
 _RUN_ID = {"type": "string", "description": "Run id from hw_skill_run (omit for all runs)"}
+# Envelope fields first and ``args`` last: everything above ``args`` is read by
+# the host, ``args`` alone is the skill's payload (see ``skill_arguments``).
 _RUN_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "workcell": {"type": "string", "description": "<node>/<workcell>"},
         "skill": {"type": "string", "description": "Skill id from hw_skill_list"},
-        "args": {"type": "object", "description": "Arguments per the skill's args_schema"},
         "dry_run": {"type": "boolean", "description": "Plan only; nothing moves"},
         "intent": {
             "type": "string",
@@ -51,6 +52,14 @@ _RUN_SCHEMA: dict[str, Any] = {
             "description": (
                 f"Longest wait before stopping the run (default "
                 f"{DEFAULT_RUN_TIMEOUT_S:g}, max {MAX_RUN_TIMEOUT_S:g})"
+            ),
+        },
+        "args": {
+            "type": "object",
+            "description": (
+                "Only the skill's own arguments, exactly as its args_schema declares them "
+                "(hw_skill_list with skill=<id>). The parameters above are hw_skill_run's "
+                "and go beside args, never inside it."
             ),
         },
     },
@@ -99,6 +108,7 @@ def build_skill_tools(service: "SkillService") -> list[ToolMetadata]:
                 **_WRITE_METADATA,
                 "mutates_state": True,
                 "execution_policy": "external_side_effect",
+                "payload_parameter": "args",
             },
             mutates_state=True,
             execution_policy="external_side_effect",

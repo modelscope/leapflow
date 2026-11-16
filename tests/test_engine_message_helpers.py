@@ -21,7 +21,6 @@ from leapflow.engine._message_helpers import (
     _estimate_prompt_tokens,
     _estimate_text_tokens,
     _extract_json_object,
-    _head_tail_truncate,
     _is_retryable_unknown_tool_result,
     _keywords_from_query,
     _should_stop_after_tool_result,
@@ -33,8 +32,11 @@ from leapflow.engine._message_helpers import (
     _tool_result_counts_as_failure,
     _tool_result_is_control_signal,
     _tool_result_metadata,
-    _truncate_result_for_budget,
     _validate_tool_arguments,
+)
+from leapflow.engine.context.result_budget import (
+    fit_result_to_budget as _truncate_result_for_budget,
+    head_tail_truncate as _head_tail_truncate,
 )
 
 

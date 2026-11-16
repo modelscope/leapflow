@@ -17,6 +17,13 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from leapflow.engine.tools.tool_execution import (
+    TIER_FAILED,
+    TIER_REFUSED,
+    TIER_REPAIRED,
+    TIER_SUCCEEDED,
+)
+
 logger = logging.getLogger(__name__)
 
 # Default number of initial turns excluded from steady-state metrics.
@@ -38,6 +45,10 @@ class TurnUsageSummary:
     tool_calls: int = 0
     tool_successes: int = 0
     tool_failures: int = 0
+    # Graded apart from ``tool_failures`` (see ``tool_execution.result_tier``): a
+    # refusal changed nothing and a repair was a reshaped call, not a failure.
+    tool_refusals: int = 0
+    tool_repairs: int = 0
     compression_applied: bool = False
     provider_name: str = ""
     model: str = ""
@@ -158,6 +169,7 @@ class _ToolCallRecord:
     name: str
     ok: bool
     duration_ms: float
+    tier: str = TIER_SUCCEEDED
 
 
 class TurnUsageTracker:
@@ -258,10 +270,20 @@ class TurnUsageTracker:
         self._plugin_stats_sink = sink
 
     def record_tool_call(
-        self, name: str, success: bool, duration_ms: float
+        self,
+        name: str,
+        success: bool,
+        duration_ms: float,
+        *,
+        tier: str = "",
+        failure_code: str = "",
     ) -> None:
-        """Record a single tool execution."""
-        self._tool_records.append(_ToolCallRecord(name, success, duration_ms))
+        """Record a single tool execution and the result tier it was graded.
+
+        Without a *tier* the call is graded by *success* alone.
+        """
+        tier = tier or (TIER_SUCCEEDED if success else TIER_FAILED)
+        self._tool_records.append(_ToolCallRecord(name, success, duration_ms, tier))
         sink = self._plugin_stats_sink
         if sink is None:
             return
@@ -269,7 +291,7 @@ class TurnUsageTracker:
         # (e.g. one injected by a plugin, or leaked across tests) is contained and
         # logged rather than propagated into the agent loop.
         try:
-            sink.record(name, success, duration_ms)
+            sink.record(name, success, duration_ms, tier=tier, failure_code=failure_code)
         except Exception:  # noqa: BLE001 - stats recording is telemetry, never a gate
             logger.debug("plugin stats sink.record failed", exc_info=True)
 
@@ -287,7 +309,9 @@ class TurnUsageTracker:
             api_calls=self._api_calls,
             tool_calls=len(self._tool_records),
             tool_successes=sum(1 for r in self._tool_records if r.ok),
-            tool_failures=sum(1 for r in self._tool_records if not r.ok),
+            tool_failures=sum(1 for r in self._tool_records if r.tier == TIER_FAILED),
+            tool_refusals=sum(1 for r in self._tool_records if r.tier == TIER_REFUSED),
+            tool_repairs=sum(1 for r in self._tool_records if r.tier == TIER_REPAIRED),
             compression_applied=self._compression_applied,
             provider_name=self._provider_name,
             model=self._model,
@@ -361,6 +385,8 @@ class TurnUsageTracker:
             "api_retries": max(0, s.api_calls - 1),
             "compression_applied": s.compression_applied,
             "tool_failure_rate": round(s.tool_failures / max(s.tool_calls, 1), 3),
+            "tool_refusal_rate": round(s.tool_refusals / max(s.tool_calls, 1), 3),
+            "tool_repair_rate": round(s.tool_repairs / max(s.tool_calls, 1), 3),
             "total_latency_ms": s.latency_ms,
             "total_tokens": s.total_tokens,
             "cache_hit_rate": s.cache_hit_rate,
@@ -379,6 +405,7 @@ class TurnUsageTracker:
             f"[session: tw={stats.token_weighted_hit_rate:.0%} "
             f"steady={stats.steady_state_hit_rate:.0%}] "
             f"api_calls={s.api_calls} tools={s.tool_calls} "
-            f"(ok={s.tool_successes} fail={s.tool_failures}) "
+            f"(ok={s.tool_successes} fail={s.tool_failures} "
+            f"refused={s.tool_refusals} repaired={s.tool_repairs}) "
             f"latency={s.latency_ms}ms provider={s.provider_name}"
         )

@@ -12,10 +12,10 @@ import asyncio
 import json
 import os
 
-from leapflow.engine._message_helpers import (
-    _head_tail_truncate,
-    _truncate_result_for_budget,
-    _validate_tool_arguments,
+from leapflow.engine._message_helpers import _validate_tool_arguments
+from leapflow.engine.context.result_budget import (
+    fit_result_to_budget as _truncate_result_for_budget,
+    head_tail_truncate as _head_tail_truncate,
 )
 from leapflow.tools.name_resolver import ToolSpec
 
@@ -59,6 +59,45 @@ def test_validate_present_but_empty_is_not_missing() -> None:
 
 def test_validate_none_spec_is_skipped() -> None:
     assert _validate_tool_arguments(None, {"anything": 1}) is None
+
+
+def test_validate_names_a_required_key_nested_in_an_object_argument() -> None:
+    spec = _spec("run", {"target", "name"}, {"target", "name", "options"})
+    result = _validate_tool_arguments(spec, {"name": "x", "options": {"target": "t"}})
+    assert result is not None and result["misplaced"] == {"target": "options"}
+    assert "target (inside options)" in result["error"]
+    assert "top level" in result["recovery_hint"]
+    assert result["counts_as_failure"] is False
+
+
+def test_validate_defers_keys_nested_in_the_declared_payload_to_the_handler() -> None:
+    spec = ToolSpec(
+        name="hw_skill_run",
+        parameters=frozenset({"workcell", "skill", "args"}),
+        required=frozenset({"workcell", "skill"}),
+        payload_parameter="args",
+    )
+    nested = {"args": {"workcell": "c", "skill": "s", "steps": []}}
+    assert _validate_tool_arguments(spec, nested) is None
+    # A key missing outright is still the engine's to report.
+    partial = _validate_tool_arguments(spec, {"args": {"workcell": "c"}})
+    assert partial is not None and partial["missing"] == ["skill", "workcell"]
+    assert partial["misplaced"] == {"workcell": "args"}
+
+
+def test_registry_reads_the_payload_parameter_from_tool_metadata() -> None:
+    from leapflow.tools.name_resolver import ToolRegistry
+
+    definition = {
+        "type": "function",
+        "function": {
+            "name": "hw_skill_run",
+            "parameters": {"type": "object", "properties": {"args": {"type": "object"}}},
+            "x_leapflow": {"payload_parameter": "args"},
+        },
+    }
+    registry = ToolRegistry.from_definitions([definition], {})
+    assert registry.specs["hw_skill_run"].payload_parameter == "args"
 
 
 # ── B2: structure-aware truncation ───────────────────────────────────

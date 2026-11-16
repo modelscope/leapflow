@@ -184,7 +184,7 @@ async def test_sequence_plan_is_sealed_digested_and_cached(tmp_path: Path) -> No
     runtime = _runtime(tmp_path, registry)
     plan = await runtime.plan(WORKCELL_ID, SEQUENCE, move_by(100))
     assert isinstance(plan, SkillPlan)
-    assert (plan.workcell, plan.skill_id, plan.version) == (WORKCELL_ID, SEQUENCE, "1.0.0")
+    assert (plan.workcell, plan.skill_id, plan.version) == (WORKCELL_ID, SEQUENCE, "1.1.0")
     assert plan.targets[0].z == pytest.approx(START_FLANGE[2] - TOOL_LENGTH_MM + 100)
     assert plan.limits == {
         "speed_pct": 20.0,
@@ -206,7 +206,7 @@ async def test_sequence_plan_is_sealed_digested_and_cached(tmp_path: Path) -> No
     assert runtime.permit_digest(plan) == run_permit_digest(
         workcell=WORKCELL_ID,
         skill_id=SEQUENCE,
-        version="1.0.0",
+        version="1.1.0",
         plan_digest=plan.digest,
         limits=plan.limits,
     )
@@ -317,7 +317,7 @@ async def test_lift_by_ten_centimetres_moves_the_flange_and_commits(tmp_path: Pa
     assert registry.sim.flange.z == pytest.approx(START_FLANGE[2] + 100, abs=0.01)
     (batch,) = registry.sim.batches
     assert batch[0] == ("arm.speed_pct", 20.0), "speed must precede the motion"
-    assert batch[1] == ("arm.pose_path", "linear"), "the arm's first declared path"
+    assert batch[1] == ("arm.pose_path", "point"), "a move is a point-to-point transit"
     assert [cid for cid, _ in batch[2:]] == ["ee.x", "ee.y", "ee.z", "ee.rx", "ee.ry", "ee.rz"]
     assert registry.sim.halts == 0
 

@@ -87,6 +87,27 @@ def test_policy_binding_an_undeclared_channel_is_refused(tmp_path: Path) -> None
     assert "joint.j7.position" in _rejection(validate_workcells(workcells, devices))
 
 
+def test_shipped_examples_carry_no_advisories() -> None:
+    assert validate_workcells(WORKCELLS, EXAMPLES).workcells.advisories == ()
+
+
+def test_a_short_perception_ttl_is_admitted_with_an_advisory(tmp_path: Path, capsys) -> None:
+    from leapflow.cli.commands.hardware_workcells import _render
+
+    devices, workcells, raw = _copy(tmp_path)
+    raw["perception"]["memory_ttl_s"] = 30
+    _write(workcells, raw)
+
+    report = validate_workcells(workcells, devices)
+
+    assert report.ok and report.workcells.admitted == ("piper_cell",)
+    (note,) = report.workcells.advisories
+    assert note.workcell == "piper_cell"
+    assert "memory_ttl_s 30s" in note.detail and "default is 120s" in note.detail
+    _render(report.to_dict())
+    assert "memory_ttl_s 30s" in capsys.readouterr().out
+
+
 def test_empty_directory_is_not_ok(tmp_path: Path) -> None:
     report = validate_workcells(tmp_path / "missing", EXAMPLES)
 
