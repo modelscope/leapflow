@@ -198,6 +198,19 @@ def _invalid(index: int, message: str) -> SkillError:
     return SkillError(FAILURE_INVALID_ARGS, f"step {index}: {message}")
 
 
+def _joint_channel(name: str, joints: frozenset[str]) -> str:
+    """The joint channel *name* means: itself, or the one channel it names a part of.
+
+    ``j1`` names ``joint.j1.position`` unambiguously, so it is read as that
+    channel; a name matching no channel, or several, comes back unchanged and is
+    refused as unknown. The plan and its approval always show the full channel.
+    """
+    if name in joints:
+        return name
+    matches = [joint for joint in joints if name in joint.split(".")]
+    return matches[0] if len(matches) == 1 else name
+
+
 def _fmt(pose: Pose) -> str:
     return f"({pose.x:.0f}, {pose.y:.0f}, {pose.z:.0f}) mm"
 
@@ -382,13 +395,16 @@ class _Planner:
         raw = step.get("joints") or {}
         if not raw:
             raise _invalid(index, "move_joints needs joints {name: deg}")
-        unknown = sorted(str(name) for name in raw if name not in self._joints)
+        named = {_joint_channel(str(name), self._joints): value for name, value in raw.items()}
+        unknown = sorted(name for name in named if name not in self._joints)
         if unknown:
             raise _invalid(
                 index, f"{', '.join(unknown)} are not joints of this arm ({sorted(self._joints)})"
             )
+        if len(named) != len(raw):
+            raise _invalid(index, "a joint is named twice (by its short and its full name)")
         joints: dict[str, float] = {}
-        for name, value in raw.items():
+        for name, value in named.items():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise _invalid(index, f"joint {name} must be a number")
             if not math.isfinite(float(value)):
@@ -700,7 +716,13 @@ class MotionSequence:
         state = await ctx.motion.state()
         held = _current_hold(ctx, state)
         planner = _Planner(ctx, state)
-        resolved = [planner.resolve(i, step) for i, step in enumerate(steps, 1)]
+        resolved: list[dict[str, Any]] = []
+        for i, step in enumerate(steps, 1):
+            try:
+                resolved.append(planner.resolve(i, step))
+            except SkillError as error:
+                error.result = {**error.result, "step": i}  # which step to change
+                raise
         listed = "; ".join(f"{i}) {_listed(step)}" for i, step in enumerate(resolved, 1))
         speed = args.get("speed_pct")
         envelope = _envelope(state.tcp, planner.targets)

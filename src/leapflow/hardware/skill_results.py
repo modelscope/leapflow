@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from leapflow.hardware.skills.protocol import (
+    EFFECT_READ,
     FAILURE_ARM_NOT_READY,
     FAILURE_CALIBRATION_MISSING,
     FAILURE_CALIBRATION_STALE,
@@ -75,7 +76,9 @@ _NEXT_STEPS: dict[str, str] = {
         "server on the node is running, then plan again."
     ),
     FAILURE_UNREACHABLE: (
-        "The target is outside what the arm can safely reach. When result.reach names how far "
+        "The target is outside what the arm can safely reach. When result.limit names the "
+        "bound a step exceeded (quantity, value, min/max; result.step the step), change that "
+        "step so it stays inside the bound and plan again. When result.reach names how far "
         "the arm gets, tell the user that distance and the limiting joint and offer its "
         "farthest target instead; otherwise tell the user the workcell's reachable range "
         "(hw_skill_list) or choose another target."
@@ -150,6 +153,19 @@ _ALIASES: dict[str, str] = {
 }
 # Codes whose own next step already says what to do about the movement.
 _SELF_EXPLAINING = frozenset({FAILURE_GUARD_FAILED, FAILURE_EXECUTE_UNCONFIRMED})
+# Steps for codes whose usual step assumes the arm moved, when it did not: a
+# shield that refused the first chunk, or a stop before the first command, is a
+# request to change, not a run to inspect.
+_BEFORE_MOTION_STEPS: dict[str, str] = {
+    FAILURE_SHIELD_VIOLATION: (
+        "The safety shield refused the run before anything moved; the error names the limit "
+        "and by how much it was exceeded. Change what caused it (e.g. bring the arm nearer "
+        "the pose the policy starts from with a motion skill, or narrow the request), then "
+        "plan again."
+    ),
+    FAILURE_TIMEOUT: "The run timed out before anything moved. Plan again; nothing to undo.",
+    FAILURE_STOPPED: "The run was stopped before anything moved. Plan again when ready.",
+}
 
 
 class SkillRefusal(Exception):
@@ -171,7 +187,10 @@ def unreachable(node_id: str, exc: BaseException) -> SkillRefusal:
 
 def next_step(failure_code: str | None, side_effect_state: str) -> str:
     """The S2-facing next step for a failed or refused skill run."""
-    code = _ALIASES.get(str(failure_code or ""), str(failure_code or ""))
+    raw = str(failure_code or "")
+    if side_effect_state == SIDE_EFFECT_NONE and raw in _BEFORE_MOTION_STEPS:
+        return _BEFORE_MOTION_STEPS[raw]
+    code = _ALIASES.get(raw, raw)
     step = _NEXT_STEPS.get(code, "")
     if side_effect_state != SIDE_EFFECT_NONE and code not in _SELF_EXPLAINING:
         return f"{step} {_NO_REPLAY}" if step else f"{_RECHECK}. {_NO_REPLAY}"
@@ -340,6 +359,10 @@ def outcome_fields(outcome: Mapping[str, Any]) -> dict[str, Any]:
     }
     if outcome.get("evidence"):
         fields["evidence"] = outcome["evidence"]
+    if outcome.get("effect") == EFFECT_READ:
+        # A READ skill's answer: the engine lets the rest of a tool batch run
+        # after a failed observation, which a refused actuation must not do.
+        fields["observation"] = True
     if status != STATUS_SUCCEEDED:
         # ``error`` and ``failure_class`` are the engine's neutral failure
         # contract: the message is the diagnosis, and a node-side defect is
@@ -399,7 +422,9 @@ def share_frame(result: dict[str, Any], *, consent: bool) -> str:
     result["result"] = payload
     if not consent or not isinstance(image, Mapping):
         return ""
-    label = f"frame {payload.get('frame')}, {payload.get('width')}x{payload.get('height')}"
+    label = str(image.get("label") or "") or (
+        f"frame {payload.get('frame')}, {payload.get('width')}x{payload.get('height')}"
+    )
     result[ATTACHMENTS_FIELD] = [
         {"mime": str(image.get("mime") or ""), "data": str(image.get("data") or ""), "label": label}
     ]

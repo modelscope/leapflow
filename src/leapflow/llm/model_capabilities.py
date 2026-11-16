@@ -87,10 +87,16 @@ _KNOWN_MODELS: List[tuple[str, ModelCapabilities]] = [
     (r"claude-", ModelCapabilities(max_output_tokens=16_384, supports_tools=True,
                                     supports_vision=True, supports_thinking=True,
                                     authoritative=False)),
+    # Vision flags below are hints only: the engine confirms them by probing the
+    # model once (``vision_capability``) before it decides how to show an image.
+    (r"deepseek[\w.\-]*(?:flash|vl|v4|omni)", ModelCapabilities(
+        max_output_tokens=8_192, supports_tools=True, supports_vision=True,
+        supports_thinking=True, authoritative=False)),
     (r"deepseek", ModelCapabilities(max_output_tokens=8_192, supports_tools=True,
                                      supports_thinking=True, authoritative=False)),
-    # Qwen's vision-language and omni lines see images; the family default does not.
-    (r"qwen[\w.\-]*-vl|qwen[\w.\-]*omni|qvq", ModelCapabilities(
+    # Qwen's vision-language and omni lines, and the natively multimodal
+    # generations from 3.5 on, see images; older family members do not.
+    (r"qwen[\w.\-]*-vl|qwen[\w.\-]*omni|qvq|qwen3\.[5-9]|qwen[4-9]", ModelCapabilities(
         max_output_tokens=8_192, supports_tools=True, supports_vision=True,
         supports_thinking=True, authoritative=False)),
     (r"qwen", ModelCapabilities(max_output_tokens=8_192, supports_tools=True,

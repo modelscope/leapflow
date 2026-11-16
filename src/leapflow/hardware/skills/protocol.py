@@ -27,7 +27,7 @@ digests that bind an approval to one plan live in ``digest``.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Mapping
 
 from leapflow.hardware.context import HardwareEffect
@@ -121,6 +121,16 @@ COORDS_PIXEL = "pixel"
 COORDS_UNIT = "unit"
 COORDS_PER_MILLE = "per_mille"
 COORDS = (COORDS_PIXEL, COORDS_UNIT, COORDS_PER_MILLE)
+
+# What one ``perceive.snapshot`` can show: the planes of each camera's row (in
+# that order), how much resolution each tile gets, and how many cameras one
+# image may combine.
+PLANE_COLOR = "color"
+PLANE_DEPTH = "depth"
+PLANE_INFRARED = "infrared"
+PLANES = (PLANE_COLOR, PLANE_DEPTH, PLANE_INFRARED)
+VIEW_DETAILS = ("auto", "overview", "standard", "full")
+MAX_VIEW_CAMERAS = 4
 
 # How far one human approval of an actuating skill reaches. ``session`` lets a
 # consent cover later plans of the same skill on the same workcell in this
@@ -307,7 +317,12 @@ class SkillPlan:
 
 @dataclass(frozen=True)
 class SkillOutcome:
-    """The terminal, typed result of a skill run (or of a plan that could not form)."""
+    """The terminal, typed result of a skill run (or of a plan that could not form).
+
+    ``effect`` is set to ``EFFECT_READ`` on a READ skill's answer -- success or
+    failure -- so the host can tell an observation from a refused actuation, both
+    of which arrive from planning with nothing moved.
+    """
 
     status: str
     failure_code: str | None = None
@@ -315,6 +330,7 @@ class SkillOutcome:
     result: Mapping[str, Any] = field(default_factory=dict)
     evidence: Mapping[str, Any] = field(default_factory=dict)
     message: str = ""
+    effect: str = ""
 
     @property
     def ok(self) -> bool:
@@ -362,6 +378,10 @@ class SkillOutcome:
             status=error.status,
             result=error.result,
         )
+
+    def answered_by(self, spec: "SkillSpec") -> "SkillOutcome":
+        """This outcome as answered from planning by *spec*: tagged when it only read."""
+        return self if spec.runs_leased else replace(self, effect=spec.effect)
 
     def to_dict(self) -> dict[str, Any]:
         return _plain(self)

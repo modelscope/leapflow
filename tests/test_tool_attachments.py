@@ -22,6 +22,7 @@ from leapflow.engine.engine import AgentEngine
 from leapflow.engine.prompt_cache import PrefixCacheOptimizer
 from leapflow.engine.tool_dispatch_engine import ToolDispatchEngine
 from leapflow.engine.tools.execution_trace import ExecutionTrace
+from leapflow.engine.tools import tool_attachments
 from leapflow.engine.tools.tool_attachments import (
     ATTACHMENTS_KEY,
     ToolAttachment,
@@ -43,8 +44,8 @@ def _image(label: str = "frame f1") -> dict[str, str]:
     return {"mime": "image/jpeg", "data": _JPEG, "label": label}
 
 
-def _attachment(call_id: str, label: str = "") -> ToolAttachment:
-    return ToolAttachment(call_id, "hw_skill_run", "image/jpeg", _JPEG, label)
+def _attachment(call_id: str, label: str = "", *, data: str = _JPEG) -> ToolAttachment:
+    return ToolAttachment(call_id, "hw_skill_run", "image/jpeg", data, label)
 
 
 def _images(messages: list[dict[str, Any]]) -> int:
@@ -91,6 +92,7 @@ def test_only_the_newest_tool_images_stay_live() -> None:
 
 
 async def test_a_model_without_vision_gets_a_description() -> None:
+    tool_attachments._DESCRIPTIONS.clear()
     vlm = SimpleNamespace(achat=AsyncMock(return_value=SimpleNamespace(content="A red cube.")))
     messages: list[dict[str, Any]] = []
     await present_attachments(messages, [_attachment("c1")], keep=2, sees_images=False, vlm=vlm)
@@ -100,12 +102,12 @@ async def test_a_model_without_vision_gets_a_description() -> None:
     (sent,), _ = vlm.achat.call_args
     assert sent[0]["content"][1]["type"] == "image_url"
     await present_attachments(messages, [_attachment("c2")], keep=2, sees_images=False)
-    assert "no description is available" in messages[-1]["content"]
+    assert "Description: none available" in messages[-1]["content"]
 
 
 async def test_a_batch_keeps_at_most_the_configured_images() -> None:
     messages: list[dict[str, Any]] = [attachment_message([_attachment("c0")])]
-    batch = [_attachment("c1"), _attachment("c2"), _attachment("c3")]
+    batch = [_attachment(f"c{i}", data=f"{_JPEG}{i}") for i in (1, 2, 3)]
     await present_attachments(messages, batch, keep=2, sees_images=True)
     assert _images(messages) == 2
     assert "1 older image(s)" in messages[-1]["content"][0]["text"]

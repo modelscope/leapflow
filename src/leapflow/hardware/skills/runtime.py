@@ -274,8 +274,10 @@ class SkillRuntime:
         a skill requiring ``share:frames`` is refused without it, whatever the
         workcell declares.
         """
+        read_spec = None  # set once the skill is known to answer from planning
         try:
             spec, skill = self._resolve(workcell, skill_id)
+            read_spec = None if skill.spec.runs_leased else skill.spec
             arguments = validate_args(skill.spec.args_schema, args)
             frames = self._frames(spec)
             offered = [self._skills[sid] for sid in self._offered(spec)]
@@ -288,8 +290,9 @@ class SkillRuntime:
             if reasons:
                 raise SkillError(FAILURE_SKILL_UNAVAILABLE, "; ".join(reasons), result=readiness)
             limits = self._effective_limits(spec, {})
-            if not skill.spec.runs_leased:
-                return await self._run_read(spec, skill, frames, limits, arguments)
+            if read_spec is not None:
+                outcome = await self._run_read(spec, skill, frames, limits, arguments)
+                return outcome.answered_by(read_spec)
             model_basis = await self._generation_basis(spec)
             if skill.spec.uses_motion:
                 ensure_model_use(self._registry, spec, model_basis)
@@ -304,7 +307,8 @@ class SkillRuntime:
             )
             planned = await skill.plan(ctx, arguments)
         except SkillError as error:
-            return SkillOutcome.from_error(error)
+            refused = SkillOutcome.from_error(error)
+            return refused if read_spec is None else refused.answered_by(read_spec)
         except Exception as exc:  # noqa: BLE001 - a skill defect must still answer typed
             logger.error("planning %s raised", skill_id, exc_info=True)
             return SkillOutcome.failed(FAILURE_INTERNAL_DEFECT, f"{type(exc).__name__}: {exc}")

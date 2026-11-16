@@ -1,5 +1,5 @@
 {
-  "fingerprint": "cc3ed6914b4a5fd57a95e81554639e3276ec44dfd820c3ad2fc7e1dcb1e74103",
+  "fingerprint": "9f5435fb1f58c7df297ca0401fdb673de0daf37d342086b68fb706535c610bd5",
   "note": "captured in seed mode",
   "request": {
     "model": "cassette-model",
@@ -26,7 +26,7 @@
       },
       {
         "role": "tool",
-        "content": "{\"ok\": false, \"error\": \"Unknown tool: missing_json_pretty_e2e\", \"error_type\": \"unknown_tool\", \"retryable\": true}",
+        "content": "{\"ok\": false, \"error\": \"Unknown tool: missing_json_pretty_e2e\", \"error_type\": \"unknown_tool\", \"retryable\": true, \"recovery_hint\": \"'missing_json_pretty_e2e' is not a registered tool. Retry once with an exact name from: text_search, text_replace, research_note, gateway_send.\"}",
         "tool_result": true
       },
       {
@@ -35,7 +35,7 @@
       },
       {
         "role": "user",
-        "content": "SYSTEM: Context utilization is high (25,566/32,768 estimated tokens, round 2). Prefer summaries, targeted reads, and final synthesis."
+        "content": "SYSTEM: Context utilization is high (25,607/32,768 estimated tokens, round 2). Prefer summaries, targeted reads, and final synthesis."
       }
     ],
     "tools": [

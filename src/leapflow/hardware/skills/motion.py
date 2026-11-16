@@ -333,7 +333,11 @@ class GovernedMotion:
         box = self._region()
         violation = box.violation(pose.position)
         if violation is not None:
-            raise SkillError(FAILURE_OUT_OF_WORKSPACE, f"target leaves the workspace: {violation}")
+            raise SkillError(
+                FAILURE_OUT_OF_WORKSPACE,
+                f"target leaves the workspace: {violation}",
+                result={"limit": box.exceeded(pose.position)},
+            )
         flange = self.tcp_to_flange(pose)
         for channel_id, value in zip(POSE_CHANNELS, flange.as_tuple()):
             channel = self._arm.channel(channel_id)
@@ -361,6 +365,12 @@ class GovernedMotion:
                 FAILURE_UNREACHABLE,
                 f"tool would tilt {cone:.1f} deg from straight down; "
                 f"the workcell allows {ceiling_deg:.1f}",
+                result={
+                    "limit": {
+                        "quantity": "tool_tilt", "unit": "deg",
+                        "value": round(cone, 1), "max": round(ceiling_deg, 1),
+                    }
+                },
             )
 
     def _region(self) -> WorkspaceBox:

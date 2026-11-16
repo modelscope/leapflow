@@ -830,6 +830,29 @@ class Context:
         )
         return cap_registry
 
+    def _vision_capability_for(self, settings: Settings) -> Any:
+        """The one probe-backed image capability resolver, reconfigured on reload.
+
+        It is kept across reloads so remembered verdicts and in-flight probes
+        survive; only the operator's ``llm.supports_vision`` is re-applied.
+        """
+        from leapflow.llm.vision_capability import (
+            VisionCapability,
+            VisionVerdictStore,
+            verdicts_path,
+        )
+
+        mode = str(getattr(settings, "llm_supports_vision", "auto") or "auto")
+        resolver = getattr(self, "_vision_capability", None)
+        if resolver is None:
+            resolver = VisionCapability(
+                store=VisionVerdictStore(verdicts_path(settings)), mode=mode
+            )
+            self._vision_capability = resolver
+        elif resolver.mode != mode.strip().lower():
+            resolver.configure(mode=mode)
+        return resolver
+
     def _sync_engine_runtime_budget(self, settings: Settings) -> None:
         """Sync engine-visible budgets and model capability metadata from settings."""
         if self.engine is None:
@@ -854,6 +877,7 @@ class Context:
             )
         self.engine.set_tool_result_budget(dynamic_result_budget)
         self.engine.set_model_capabilities(self._build_model_capability_registry(settings))
+        self.engine.set_vision_capability(self._vision_capability_for(settings))
 
         compressor = getattr(self.engine, "_compressor", None)
         if compressor is not None and hasattr(compressor, "reconfigure"):

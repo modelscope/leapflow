@@ -214,6 +214,14 @@ _STATUS_REFINEMENT: Dict[int, _StatusRefinement] = {
     ),
 }
 
+# Words that, beside "image" in a 4xx, mean the image itself was refused: too
+# large, or a modality this endpoint does not accept ("unknown variant
+# `image_url`", "image input is not supported").
+_IMAGE_REFUSAL_WORDS: Tuple[str, ...] = (
+    "large", "size", "support", "unknown variant", "expected", "invalid",
+    "modality", "multimodal", "vision",
+)
+
 # Fallback ranges for codes not in the exact or refinement maps.
 _STATUS_RANGE_CLASSIFICATION: List[Tuple[range, _StatusRefinement]] = [
     # 4xx fallback with message-based refinement
@@ -385,8 +393,9 @@ def _classify_by_status(status: int, msg: str) -> Optional[ErrorCategory]:
         if status in code_range:
             for keywords, category in refinements:
                 if category == ErrorCategory.IMAGE_TOO_LARGE:
-                    # Compound check: "image" AND ("large" or "size")
-                    if "image" in msg and ("large" in msg or "size" in msg):
+                    # Compound check: "image" AND a size or unsupported-input word.
+                    # Either way the recovery is the same: strip images and retry.
+                    if "image" in msg and any(word in msg for word in _IMAGE_REFUSAL_WORDS):
                         return category
                 elif any(kw in msg for kw in keywords):
                     return category

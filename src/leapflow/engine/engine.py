@@ -279,6 +279,8 @@ class AgentEngine:
 
         # Model capability registry (injected by CLI)
         self._model_capabilities: Optional[Any] = None
+        # Evidence-based image capability (VisionCapability, injected by CLI)
+        self._vision_capability: Optional[Any] = None
 
         # Session-level counters (survive per-turn tracker resets)
         self._session_turn_count: int = 0
@@ -779,6 +781,10 @@ class AgentEngine:
     def set_model_capabilities(self, registry: Any) -> None:
         """Inject model capability registry."""
         self._model_capabilities = registry
+
+    def set_vision_capability(self, resolver: Any) -> None:
+        """Inject the resolver that decides by probe whether the model sees images."""
+        self._vision_capability = resolver
 
     def set_doc_store(self, doc_store: Any) -> None:
         """Inject SkillDocStore so SkillMerger can sync SKILL.md on approve."""

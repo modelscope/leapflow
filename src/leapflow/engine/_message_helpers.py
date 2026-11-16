@@ -26,6 +26,7 @@ from leapflow.engine.context.result_budget import (
 from leapflow.engine.tools.tool_execution import (
     exit_code_from,
     failed_effect_is_uncertain,
+    result_is_observation,
 )
 from leapflow.security.permission_failures import (
     is_permission_failure_payload,
@@ -440,10 +441,16 @@ def _should_stop_after_tool_result(tool_name: str, payload: Dict[str, Any]) -> b
     idempotency) into every executed tool result, so a mutating/side-effecting
     tool is identified by its declared policy rather than a hardcoded tool-name
     list. This keeps the safety gate general and free of vendor-specific names.
+
+    A result that declares itself an observation with no effect (see
+    ``result_is_observation``) narrows that policy for its own call: a failed read
+    changed nothing, so the calls after it run against the state they expected.
     """
     if _is_permission_hard_stop_payload(payload):
         return True
     if not _tool_result_counts_as_failure(payload):
+        return False
+    if result_is_observation(payload):
         return False
     return str(payload.get("execution_policy") or "") in _SIDE_EFFECT_STOP_POLICIES
 
@@ -596,21 +603,44 @@ def _build_native_tool_assistant_message(
 
 
 def _extract_recent_tool_failures(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Return recent consecutive tool failure payloads, most recent first."""
+    """Return the trailing run of consecutive tool failures, most recent first.
+
+    The run ends at the latest successful tool result or at the previous
+    turn's final answer, so a failure the model already repaired is never
+    reported as the reason a turn stopped. Results that do not count as a
+    failure (argument-repair prompts, control signals) neither extend nor end
+    the run, and engine-injected user notes are skipped.
+    """
     failures: List[Dict[str, Any]] = []
+    follows_tool_result = False
     for msg in reversed(messages[-24:]):
+        if msg.get("_tool_attachment"):
+            continue  # images a tool returned, not a result of its own
+        role = msg.get("role", "")
         content = str(msg.get("content") or "").strip()
-        if not content:
+        if role == "assistant":
+            # A text-only answer that no tool result follows is the previous
+            # turn's reply: nothing before it belongs to this run.
+            if content and not msg.get("tool_calls") and not follows_tool_result:
+                break
+            follows_tool_result = False
             continue
-        # Strip "Tool result (name):\n" prefix from text-mode tool messages
-        if content.startswith("Tool result (") and ":\n" in content:
+        is_text_mode_result = role == "user" and content.startswith("Tool result (") and ":\n" in content
+        if role != "tool" and not is_text_mode_result:
+            continue
+        follows_tool_result = True
+        if is_text_mode_result:
             content = content.split(":\n", 1)[1].strip()
         try:
             payload = json.loads(content)
         except (json.JSONDecodeError, ValueError):
+            break  # plain-text output is a completed call
+        if not isinstance(payload, dict):
+            break
+        if payload.get("counts_as_failure") is False or _tool_result_is_control_signal(payload):
             continue
-        if not isinstance(payload, dict) or not _tool_result_counts_as_failure(payload):
-            continue
+        if not _tool_result_counts_as_failure(payload):
+            break
         failures.append(payload)
         if len(failures) >= 3:
             break

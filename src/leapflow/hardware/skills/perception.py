@@ -17,7 +17,8 @@ One ``locate`` call:
 Only ``LocatedObject`` geometry leaves this module -- except a frame the
 workcell explicitly shares (``share_frames``) through ``snapshot``, which S2
 may look at and answer with pixels for ``lift``: S2's own grounding, lifted
-here exactly like a locator's.
+here exactly like a locator's. What a snapshot shows -- several cameras,
+depth and infrared planes, overlays, and what changed -- is ``scene_view``'s.
 The live intrinsics must match the ones the hand-eye calibration was measured
 with -- a resolution or profile change otherwise silently shifts every point.
 
@@ -34,8 +35,6 @@ milliseconds on the board without numpy.
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
 import logging
 import math
 from dataclasses import dataclass, fields, replace
@@ -57,11 +56,10 @@ from leapflow.hardware.skills.frames import FrameGraph
 from leapflow.hardware.skills.geometry import Plane, Transform, Vec3, footprint
 from leapflow.hardware.skills.ports import MotionFacade
 from leapflow.hardware.skills.protocol import (
-    COORDS_PER_MILLE,
-    COORDS_UNIT,
     FAILURE_CALIBRATION_MISSING,
     FAILURE_CALIBRATION_STALE,
     FAILURE_DEVICE_FAULT,
+    FAILURE_INVALID_ARGS,
     FAILURE_MODEL_UNAVAILABLE,
     FAILURE_SKILL_UNAVAILABLE,
     FAILURE_TARGET_NOT_FOUND,
@@ -73,9 +71,12 @@ from leapflow.hardware.skills.protocol import (
     SkillError,
 )
 from leapflow.hardware.skills.scene_memory import SceneCapture, SceneMemory
+from leapflow.hardware.skills.scene_view import SceneViewer, ViewRequest, target_detection
 from leapflow.hardware.skills.table_view import base_points, convex_mask, mask_box, table_plane
+from leapflow.hardware.skills.visual_tiles import snapshot_jpeg, snapshot_size
 from leapflow.hardware.skills.workcell import ROLE_CAMERA, WorkcellSpec
 from leapflow.hardware.transport import TransportError
+from leapflow.hardware.vision.group import bounded_capture
 
 logger = logging.getLogger(__name__)
 
@@ -94,12 +95,23 @@ class PerceptionSettings:
 
     ``min_score`` is the floor below which a detection is not reported at all;
     ``locate`` callers may raise it per call. ``point_radius_px`` is the
-    half-width of the window a point's depth is the median of. ``snapshot_*``
-    and ``max_frames`` shape the frames ``snapshot`` shares and remembers.
+    half-width of the window a point's depth is the median of. ``snapshot_*``,
+    ``overview_max_side`` (a tile when many share one image), ``mosaic_max_side``
+    (the whole shared image), and ``max_frames`` shape the frames ``snapshot``
+    shares and remembers; ``change_*`` are the per-cell depth and brightness
+    steps its change report counts as a change.
     ``table_ring_px`` is the band around a box whose depth is the table it
     stands on; a ring reading more than ``max_table_offset_mm`` off the
     calibrated plane is not trusted as that table, and a ring plane tilted more
     than ``max_table_tilt_deg`` from it is read as a pure offset instead.
+
+    ``frame_ttl_s`` is how long a shared frame stays liftable, and
+    ``memory_ttl_s`` how long a located id stays referable. Both are sized for
+    S2, which looks and reasons between calls for tens of seconds; the frame
+    outlives the id because pointing into an image comes first. Neither age can
+    move the arm onto a stale position: a frame carries the camera mount it was
+    taken with, and a run re-observes every object it planned against before it
+    moves (``relocate`` with the workcell's drift limits).
     """
 
     max_points: float = 3000.0
@@ -110,12 +122,17 @@ class PerceptionSettings:
     outlier_k: float = 3.0
     top_quantile: float = 0.95
     min_score: float = 0.3
-    memory_ttl_s: float = 30.0
+    memory_ttl_s: float = 120.0
+    frame_ttl_s: float = 180.0
     jpeg_quality: float = 90.0
     point_radius_px: float = 4.0
     snapshot_max_side: float = 640.0
     snapshot_quality: float = 75.0
-    max_frames: float = 2.0
+    overview_max_side: float = 384.0
+    mosaic_max_side: float = 1280.0
+    change_depth_mm: float = 15.0
+    change_luma: float = 25.0
+    max_frames: float = 8.0
     table_ring_px: float = 16.0
     max_table_offset_mm: float = 30.0
     max_table_tilt_deg: float = 10.0
@@ -136,11 +153,12 @@ class PerceptionSettings:
             raise ValueError("perception.min_depth_mm must be below max_depth_mm")
         if max(settings.jpeg_quality, settings.snapshot_quality) > 100:
             raise ValueError("perception JPEG qualities must be in (0, 100]")
-        if not _MIN_SNAPSHOT_SIDE <= settings.snapshot_max_side <= _MAX_SNAPSHOT_SIDE:
-            raise ValueError(
-                f"perception.snapshot_max_side must be in [{_MIN_SNAPSHOT_SIDE}, "
-                f"{_MAX_SNAPSHOT_SIDE}] pixels"
-            )
+        for name in ("snapshot_max_side", "overview_max_side", "mosaic_max_side"):
+            if not _MIN_SNAPSHOT_SIDE <= getattr(settings, name) <= _MAX_SNAPSHOT_SIDE:
+                raise ValueError(
+                    f"perception.{name} must be in [{_MIN_SNAPSHOT_SIDE}, "
+                    f"{_MAX_SNAPSHOT_SIDE}] pixels"
+                )
         return settings
 
 
@@ -355,42 +373,7 @@ def _median(values: Sequence[float]) -> float:
     return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
-# ── Shared frames ────────────────────────────────────────────────────────────
-
-
-def snapshot_size(frame: RgbdFrame, max_side: float) -> tuple[int, int]:
-    """The ``(width, height)`` a frame is shared at: its longer side at most *max_side*."""
-    scale = min(1.0, max_side / max(frame.width, frame.height))
-    return (max(1, round(frame.width * scale)), max(1, round(frame.height * scale)))
-
-
-def snapshot_jpeg(frame: RgbdFrame, size: tuple[int, int], quality: int) -> str:
-    """The colour image at *size* as base64 JPEG."""
-    from PIL import Image
-
-    image = Image.frombytes("RGB", (frame.width, frame.height), frame.color, "raw", "BGR")
-    if size != (frame.width, frame.height):
-        image = image.resize(size)
-    output = io.BytesIO()
-    image.save(output, format="JPEG", quality=min(100, max(1, quality)))
-    return base64.b64encode(output.getvalue()).decode("ascii")
-
-
-def target_detection(
-    target: PixelTarget, frame: RgbdFrame, coords: str, shared: tuple[int, int]
-) -> Detection:
-    """*target* in full-frame pixels; *shared* is the size the frame was shown at."""
-    if coords == COORDS_UNIT:
-        sx, sy = float(frame.width), float(frame.height)
-    elif coords == COORDS_PER_MILLE:
-        sx, sy = frame.width / 1000.0, frame.height / 1000.0
-    else:
-        sx, sy = frame.width / shared[0], frame.height / shared[1]
-    if target.point is not None:
-        u, v = target.point
-        return Detection(target.label, 1.0, point=(u * sx, v * sy))
-    x0, y0, x1, y1 = target.box  # type: ignore[misc]
-    return Detection(target.label, 1.0, box=(x0 * sx, y0 * sy, x1 * sx, y1 * sy))
+# ── Re-measuring ─────────────────────────────────────────────────────────────
 
 
 def reproject(obj: LocatedObject, capture: SceneCapture) -> Detection:
@@ -451,6 +434,7 @@ class WorkcellScene:
         self._memory = memory
         self._settings = settings
         self._note = note
+        self._viewer = SceneViewer(self)
 
     @property
     def _basis(self) -> dict[str, float]:
@@ -464,60 +448,43 @@ class WorkcellScene:
         found = await self._detect(queries, floor, camera)
         return self._memory.remember(found, self._basis)
 
-    async def snapshot(self, camera: str = ROLE_CAMERA) -> dict[str, Any]:
-        """Share one frame of *camera*; it need not be calibrated to be looked at."""
-        capture = await self._observe(camera, placed=False)
-        frame = capture.frame
-        frame_id = self._memory.remember_frame(
-            capture, self._basis, keep=int(self._settings.max_frames)
-        )
-        width, height = snapshot_size(frame, self._settings.snapshot_max_side)
-        data = await asyncio.to_thread(
-            snapshot_jpeg, frame, (width, height), int(self._settings.snapshot_quality)
-        )
-        self._note(
-            "snapshot",
-            {
-                "frame": frame_id, "camera": camera, "sequence": frame.sequence,
-                "width": width, "height": height, "liftable": capture.liftable,
-            },
-        )
-        shot: dict[str, Any] = {
-            "frame": frame_id,
-            "capture_id": capture.capture_id,
-            "camera": camera,
-            "liftable": capture.liftable,
-            "width": width,
-            "height": height,
-            "observed_at": frame.observed_at,
-            "image": {"mime": "image/jpeg", "data": data},
-        }
-        if not capture.liftable:
-            # Said at the snapshot, not first at a refused lift: which camera to use instead.
-            shot["unliftable"] = self._unplaced(frame_id, capture)
-        return shot
+    async def snapshot(
+        self,
+        camera: str = ROLE_CAMERA,
+        *,
+        with_cameras: Sequence[str] = (),
+        planes: Sequence[str] = ("color",),
+        detail: str = "auto",
+        overlay: bool = True,
+    ) -> dict[str, Any]:
+        """Share *camera* (and *with_cameras*) as one image; none need be calibrated to
+        be looked at. See ``scene_view`` for the planes, overlays, and change report."""
+        try:
+            request = ViewRequest(
+                camera, tuple(with_cameras), tuple(planes), str(detail), bool(overlay)
+            )
+        except ValueError as exc:
+            raise SkillError(FAILURE_INVALID_ARGS, str(exc)) from exc
+        return await self._viewer.snapshot(request)
+
+    async def zoom(
+        self, frame_id: str, box: Sequence[float], *, coords: str, planes: Sequence[str] = ()
+    ) -> dict[str, Any]:
+        """Re-show a window of remembered frame *frame_id* at native resolution."""
+        return await self._viewer.zoom(frame_id, box, coords=coords, planes=planes)
 
     async def lift(
         self, frame_id: str, targets: Sequence[PixelTarget], *, coords: str,
         capture_id: str | None = None,
     ) -> tuple[tuple[LocatedObject, ...], tuple[Mapping[str, str], ...]]:
-        ttl = self._settings.memory_ttl_s
-        capture = self._memory.recall_frame(frame_id, self._basis, ttl)
-        if capture is None or (capture_id is not None and capture.capture_id != capture_id):
-            raise SkillError(
-                FAILURE_TARGET_NOT_FOUND,
-                f"{frame_id} is not a current frame (frames last {ttl:.0f} s, only the "
-                f"newest {int(self._settings.max_frames)} are kept, and a recalibration "
-                "forgets them); take a new snapshot",
-            )
-        if not capture.liftable:
-            raise SkillError(FAILURE_CALIBRATION_MISSING, self._unplaced(frame_id, capture))
-        shown = snapshot_size(capture.frame, self._settings.snapshot_max_side)
+        resolved = self._viewer.resolve(frame_id, targets, coords=coords, capture_id=capture_id)
         lifted: list[LocatedObject] = []
         dropped: list[Mapping[str, str]] = []
-        for target in targets:
+        for target, capture, detection, reason in resolved:
+            if capture is None or detection is None:
+                dropped.append({"label": target.label, "reason": reason})
+                continue
             try:
-                detection = target_detection(target, capture.frame, coords, shown)
                 seen = lift_detection(detection, capture, self._settings)
             except (LookupError, ValueError) as exc:
                 dropped.append({"label": target.label, "reason": str(exc)})
@@ -674,8 +641,14 @@ class WorkcellScene:
         )
         return kept
 
-    async def _observe(self, role: str = ROLE_CAMERA, *, placed: bool = True) -> SceneCapture:
-        """One frame of camera *role*; *placed* also demands its mount and the table."""
+    async def _observe(
+        self, role: str = ROLE_CAMERA, *, placed: bool = True, after_monotonic: float | None = None
+    ) -> SceneCapture:
+        """One frame of camera *role*; *placed* also demands its mount and the table.
+
+        *after_monotonic* asks a source that understands it for a frame newer than
+        that instant (a ``CaptureGroup`` bound); an older source answers with its own.
+        """
         if role.split(".", 1)[0] != ROLE_CAMERA:
             raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"{role!r} is not a camera role")
         camera = self._spec.role(role)
@@ -705,7 +678,10 @@ class WorkcellScene:
             # the same lock may otherwise close the camera between lookup and capture.
             async with self._registry.device_io(camera):
                 source = await self._transport(camera, FrameSource, "an RGB-D camera")
-                frame = await source.capture_rgbd()
+                if after_monotonic is None:
+                    frame = await source.capture_rgbd()
+                else:
+                    frame = await bounded_capture(source.capture_rgbd)(after_monotonic)
         except TransportError as exc:
             raise SkillError(
                 FAILURE_DEVICE_FAULT, f"camera {camera!r} capture failed: {exc}"

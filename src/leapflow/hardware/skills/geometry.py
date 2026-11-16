@@ -271,6 +271,18 @@ class WorkspaceBox:
     def contains(self, point: Sequence[float], *, margin: float = 0.0) -> bool:
         return self.violation(point, margin=margin) is None
 
+    def exceeded(
+        self, point: Sequence[float], *, margin: float = 0.0
+    ) -> dict[str, float | str] | None:
+        """The axis ``violation`` describes, as data a caller can correct against."""
+        for value, (low, high, axis) in zip(point, self._bounds()):
+            if value < low + margin or value > high - margin:
+                return {
+                    "quantity": axis, "unit": "mm", "value": round(float(value), 1),
+                    "min": low + margin, "max": high - margin,
+                }
+        return None
+
     def corners(self) -> tuple[Vec3, ...]:
         return tuple(
             (x, y, z)

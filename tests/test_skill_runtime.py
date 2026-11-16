@@ -48,6 +48,7 @@ from leapflow.hardware.skills.protocol import (
     STATUS_FAILED,
     STATUS_HALTED,
     SkillOutcome,
+    SkillError,
     SkillPlan,
     SkillSpec,
 )
@@ -436,7 +437,47 @@ async def test_a_joint_move_may_not_add_to_the_tilt_it_started_with(tmp_path: Pa
     assert isinstance(outcome, SkillOutcome) and not outcome.ok
     assert outcome.failure_code == FAILURE_UNREACHABLE
     assert "tilt" in outcome.message
+    # The refusal says which limit and which step, so S2 can change the right one;
+    # a joint move's ceiling is the tilt it started from, not the cone.
+    limit = outcome.result["limit"]
+    assert (limit["quantity"], limit["unit"]) == ("tool_tilt", "deg")
+    assert limit["value"] > limit["max"] > 30.0
+    assert outcome.result["step"] == 1
     assert registry.sim.batches == []
+
+
+async def test_a_workspace_refusal_names_the_axis_its_bound_and_the_step(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    program = _steps(_UP, {"op": "move", "relative": {"dz": 300}})
+    outcome = await _runtime(tmp_path, registry).plan(WORKCELL_ID, SEQUENCE, program)
+
+    assert isinstance(outcome, SkillOutcome) and outcome.failure_code == FAILURE_OUT_OF_WORKSPACE
+    limit = outcome.result["limit"]
+    assert (limit["quantity"], limit["unit"]) == ("z", "mm")
+    assert limit["value"] > limit["max"]
+    assert outcome.result["step"] == 2
+
+
+async def test_a_joint_may_be_named_by_its_short_name(tmp_path: Path) -> None:
+    # The live failure: S2 wrote {"j1": 5} and every move_joints was refused.
+    registry = _joint_registry(tmp_path)
+    runtime = _runtime(tmp_path, registry)
+    plan = await runtime.plan(WORKCELL_ID, SEQUENCE, _joint_step("j1", 5.0))
+    assert isinstance(plan, SkillPlan), plan
+    assert plan.basis["steps"][0]["joints"] == {"joint.j1.position": 5.0}
+    run = await _run(runtime, SEQUENCE, _joint_step("j1", 5.0))
+    assert run.outcome is not None and run.outcome.ok, run.outcome
+    assert registry.sim.joints["joint.j1.position"] == pytest.approx(5.0)
+
+
+async def test_a_joint_named_twice_or_not_at_all_is_refused(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path, _joint_registry(tmp_path))
+    twice = _steps({"op": "move_joints", "joints": {"j1": 5.0, "joint.j1.position": 6.0}})
+    unknown = _joint_step("j9", 5.0)
+    for program, words in ((twice, "named twice"), (unknown, "not joints")):
+        outcome = await runtime.plan(WORKCELL_ID, SEQUENCE, program)
+        assert isinstance(outcome, SkillOutcome) and outcome.failure_code == FAILURE_INVALID_ARGS
+        assert words in outcome.message
 
 
 async def test_joint_move_predicts_the_tcp_for_a_following_relative_step(tmp_path: Path) -> None:
@@ -796,7 +837,33 @@ async def test_read_skill_answers_from_plan_without_a_cached_plan(tmp_path: Path
     assert isinstance(outcome, SkillOutcome) and outcome.ok
     assert outcome.result["tcp"]["z"] == pytest.approx(250.0)
     assert outcome.evidence == {"polled": True}
+    assert outcome.effect == EFFECT_READ, "the host lets a batch go on after an observation"
     assert runtime.status() == ()
+
+
+async def test_a_refused_observation_is_tagged_and_a_refused_motion_is_not(tmp_path: Path) -> None:
+    class _Blind:
+        spec = SkillSpec(
+            skill_id="test.blind",
+            version="1",
+            card="Cannot see.",
+            args_schema={"type": "object"},
+            effect=EFFECT_READ,
+        )
+
+        async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
+            return SkillPlan(skill_id="test.blind", args=args, summary="look")
+
+        async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, "no camera")
+
+    runtime = _runtime(tmp_path, _registry(tmp_path), skills=[_Blind(), *_skills()])
+    looked = await runtime.plan(WORKCELL_ID, "test.blind", {})
+    assert isinstance(looked, SkillOutcome) and not looked.ok
+    assert (looked.failure_code, looked.effect) == (FAILURE_SKILL_UNAVAILABLE, EFFECT_READ)
+    moved = await runtime.plan(WORKCELL_ID, SEQUENCE, move_by(300))
+    assert isinstance(moved, SkillOutcome) and moved.failure_code == FAILURE_OUT_OF_WORKSPACE
+    assert moved.effect == "", "a refused actuation must still stop its batch"
 
 
 async def test_record_calibration_is_versioned_and_visible_to_the_next_plan(

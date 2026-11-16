@@ -267,7 +267,8 @@ def test_llm_supports_vision_overrides_the_model_table(monkeypatch, tmp_path) ->
         owner, s
     )
     base = replace(make_settings(str(tmp_path)), llm_model="deepseek-flash")
-    for value, vision in (("auto", False), ("true", True), ("false", False)):
+    # deepseek-flash is natively multimodal: the table hints so (a probe confirms).
+    for value, vision in (("auto", True), ("true", True), ("false", False)):
         settings = replace(base, llm_supports_vision=value)
         registry = Context._build_model_capability_registry(owner, settings)
         assert registry.resolve("deepseek-flash").supports_vision is vision

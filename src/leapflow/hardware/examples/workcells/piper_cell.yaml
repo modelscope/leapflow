@@ -108,7 +108,8 @@ grasp:
 
 perception:
   min_score: 0.3       # candidates below this are not reported at all
-  memory_ttl_s: 30     # how long a located object id stays referable
+  memory_ttl_s: 120    # how long a located object id stays referable
+  frame_ttl_s: 180     # how long a shared snapshot stays liftable
 
 # Policy streaming tuning; the shield's limits come from the device
 # declarations only, so nothing here (or in the model) can widen them.

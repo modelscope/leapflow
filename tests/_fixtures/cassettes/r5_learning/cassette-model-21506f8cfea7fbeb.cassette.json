@@ -1,5 +1,5 @@
 {
-  "fingerprint": "791900c79b1f528f85d4e48c4615fe2c7842422548029339d45861f31ba643bd",
+  "fingerprint": "21506f8cfea7fbebfaa0c748c1dbb82de46f5ad6aec58dc6448ab2b4c3da7aca",
   "note": "captured in seed mode",
   "request": {
     "model": "cassette-model",
@@ -35,7 +35,7 @@
       },
       {
         "role": "user",
-        "content": "Tool result (path):\n{\"ok\": false, \"error\": \"Unknown tool: path\", \"error_type\": \"unknown_tool\", \"retryable\": true}\nSYSTEM: The previous tool call used an unavailable tool name. Original tool: path. Resolution: unknown (no exact canonical tool name match). Suggested canonical tools: assess_compatibility, capability_expand, code_intel, code_search, config_get. Available tools include: assess_compatibility, capability_expand, code_intel, code_search, config_get, config_list, config_set, delegate_task, edit_file, env_info, file_find, file_list. Retry once using an exact canonical tool name from the available list and valid arguments. Do not invent tool names, use aliases, or infer a tool from argument shape; answer without a tool if no exact tool fits."
+        "content": "Tool result (path):\n{\"ok\": false, \"error\": \"Unknown tool: path\", \"error_type\": \"unknown_tool\", \"retryable\": true, \"recovery_hint\": \"'path' is not a registered tool. Retry once with an exact name from: assess_compatibility, capability_expand, code_intel, code_search, config_get.\"}\nSYSTEM: The previous tool call used an unavailable tool name. Original tool: path. Resolution: unknown (no exact canonical tool name match). Suggested canonical tools: assess_compatibility, capability_expand, code_intel, code_search, config_get. Available tools include: assess_compatibility, capability_expand, code_intel, code_search, config_get, config_list, config_set, delegate_task, edit_file, env_info, file_find, file_list. Retry once using an exact canonical tool name from the available list and valid arguments. Do not invent tool names, use aliases, or infer a tool from argument shape; answer without a tool if no exact tool fits."
       }
     ],
     "tools": [

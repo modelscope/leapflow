@@ -19,10 +19,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Protocol, Sequence, runtime_checkable
 
 from leapflow.engine.context.context_compressor import estimate_text_tokens as _estimate_text_tokens
+from leapflow.llm.image_tokens import IMAGE_PART_TYPES, image_part_tokens
 
 logger = logging.getLogger(__name__)
 
-_IMAGE_TOKEN_ESTIMATE = 1600
 _MESSAGE_OVERHEAD_TOKENS = 8
 _TOOL_SCHEMA_OVERHEAD_TOKENS = 12
 _DEFAULT_HEAD_RATIO = 0.55
@@ -212,8 +212,8 @@ class ContextBudgetEstimator:
         if not isinstance(item, dict):
             return self._estimate_value(item)
         part_type = str(item.get("type", ""))
-        if part_type in {"image_url", "input_image", "image"}:
-            return _IMAGE_TOKEN_ESTIMATE
+        if part_type in IMAGE_PART_TYPES:
+            return image_part_tokens(item)
         if part_type == "text":
             return self._estimate_text(str(item.get("text", "")))
         return self._estimate_value(item)
@@ -569,6 +569,22 @@ class ToolEvidenceBuilder:
         for key in ("failure_class", "recoverability", "blocks_approval"):
             if key in result:
                 compact[key] = self._compact_value(result[key])
+        # The recovery contract a tool attaches to its own failure: whether it
+        # counts as a failure at all, whether its effect may already have landed,
+        # and what to change before retrying (``next_step``, plus the measured
+        # ``result`` such as a reach or joint limit). Stripping these left the
+        # model retrying blind and made a self-repairable argument error read as
+        # a real failure in every later scan of the transcript.
+        for key in (
+            "counts_as_failure", "already_executed", "duplicate_suppressed", "execution_skipped",
+            "side_effect_state", "side_effect_uncertain", "effect_uncertain",
+            "recovery_hint", "next_step", "retry_guidance", "observation", "result",
+        ):
+            if key in result:
+                compact[key] = self._compact_value(result[key])
+        message = result.get("message")
+        if message and str(message) != str(result.get("error", "")):
+            compact["message"] = self._head_tail(str(message), self._max_content_chars)
         # Diagnostic output matters MOST on failure: preserve stdout/stderr
         # (head+tail so the tail traceback survives) and the exit code, so the
         # agent can see the actual error (e.g. a Python traceback from a failed

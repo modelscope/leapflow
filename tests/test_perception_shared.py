@@ -301,17 +301,33 @@ async def test_lift_refuses_malformed_targets(tmp_path: Path, target: Mapping[st
 async def test_only_the_newest_frames_can_be_pointed_into(tmp_path: Path) -> None:
     clock = _Clock()
     scene = _scene(_calibrated(tmp_path, CUP), clock=clock)
-    frames = [(await scene.snapshot())["frame"] for _ in range(3)]
-    assert frames == ["f1", "f2", "f3"]
+    keep = int(PerceptionSettings().max_frames)
+    frames = [(await scene.snapshot())["frame"] for _ in range(keep + 1)]
+    assert frames == [f"f{n}" for n in range(1, keep + 2)]
     target = [PixelTarget("cup", point=_cup_top())]
     with pytest.raises(SkillError) as error:
         await scene.lift("f1", target, coords=COORDS_PIXEL)
     assert error.value.failure_code == FAILURE_TARGET_NOT_FOUND
     assert "take a new snapshot" in error.value.message
     assert (await scene.lift("f2", target, coords=COORDS_PIXEL))[0]
-    clock.now += PerceptionSettings().memory_ttl_s + 1.0
+    clock.now += PerceptionSettings().frame_ttl_s + 1.0
     with pytest.raises(SkillError):
-        await scene.lift("f3", target, coords=COORDS_PIXEL)
+        await scene.lift(frames[-1], target, coords=COORDS_PIXEL)
+
+
+async def test_a_frame_outlives_the_time_s2_takes_to_point_into_it(tmp_path: Path) -> None:
+    # S2 looks at the image and reasons before it points; the live failure was a
+    # lift 34 s after its snapshot, refused as an expired frame.
+    clock = _Clock()
+    scene = _scene(_calibrated(tmp_path, CUP), clock=clock)
+    shot = await scene.snapshot()
+    assert shot["liftable_for_s"] == PerceptionSettings().frame_ttl_s
+    clock.now += 90.0
+    (lifted,), _ = await scene.lift(
+        shot["frame"], [PixelTarget("cup", point=_cup_top())], coords=COORDS_PIXEL
+    )
+    clock.now += 60.0
+    assert scene.object(lifted.object_id) == lifted
 
 
 async def test_lifted_ids_live_beside_located_ones_until_the_next_locate(tmp_path: Path) -> None:

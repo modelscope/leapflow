@@ -203,9 +203,9 @@ class ScenePort(Protocol):
 
     Objects and grasps are handles: ``locate`` names every object it found
     ``oN`` and ``remember_grasps`` names candidates ``gN``; later calls refer to
-    them only by those ids. A frame shared with S2 is ``fN``, and what S2 points
-    at in it becomes an object through ``lift``. Nothing here matches labels or
-    breaks ties.
+    them only by those ids. A frame shared with S2 is ``fN`` (a mosaic of several
+    frames ``vN``), and what S2 points at in it becomes an object through ``lift``.
+    Nothing here matches labels or breaks ties.
     """
 
     async def locate(
@@ -214,10 +214,28 @@ class ScenePort(Protocol):
         """Every detection of *queries* in a fresh frame of *camera*, each under a new id."""
         ...
 
-    async def snapshot(self, camera: str = "camera") -> Mapping[str, Any]:
-        """A fresh frame of *camera*, remembered as ``frame`` and shared downscaled as
-        ``image``; ``liftable`` says whether ``lift`` can place what is pointed at in it,
-        and when it cannot, ``unliftable`` says why and which camera could instead."""
+    async def snapshot(
+        self,
+        camera: str = "camera",
+        *,
+        with_cameras: Sequence[str] = (),
+        planes: Sequence[str] = ("color",),
+        detail: str = "auto",
+        overlay: bool = True,
+    ) -> Mapping[str, Any]:
+        """Fresh frames of *camera* and *with_cameras*, each showing *planes*, shared as
+        one ``image`` named ``frame`` (``fN`` for one tile, ``vN`` for a mosaic);
+        ``liftable`` says whether ``lift`` can place what is pointed at in it, and when
+        it cannot, ``unliftable`` says why and which camera could instead. Also reports
+        frame statistics, changes since each camera's previous snapshot, how each
+        remembered object appears in every view, and a ``situation`` summary."""
+        ...
+
+    async def zoom(
+        self, frame_id: str, box: Sequence[float], *, coords: str, planes: Sequence[str] = ()
+    ) -> Mapping[str, Any]:
+        """Window *box* of a remembered frame (or mosaic tile) re-shown at native
+        resolution under a new ``fN`` that keeps the original's age."""
         ...
 
     async def lift(

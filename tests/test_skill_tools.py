@@ -43,6 +43,7 @@ from leapflow.hardware.skill_results import (
     FAILURE_STATUS_UNAVAILABLE,
     FAILURE_WRITES_DISABLED,
     next_step,
+    outcome_fields,
 )
 from leapflow.hardware.skill_tools import SkillService, build_skill_tools
 from leapflow.hardware.skills.builtin.motion import skills as motion_skills
@@ -52,10 +53,12 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_CALIBRATION_STALE,
     FAILURE_LEASE_LOST,
     FAILURE_STOPPED,
+    FAILURE_TIMEOUT,
     FAILURE_UNKNOWN_SKILL,
     FAILURE_UNKNOWN_WORKCELL,
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_NONE,
+    SIDE_EFFECT_PARTIAL,
     SIDE_EFFECT_UNKNOWN,
     STATUS_SUCCEEDED,
 )
@@ -542,6 +545,23 @@ def test_next_step_forbids_replay_only_when_something_may_have_moved() -> None:
     stale = next_step(FAILURE_CALIBRATION_STALE, SIDE_EFFECT_NONE)
     assert "shortest way to restore" in stale and "rather than recalibrating" in stale
     assert next_step("an_unmapped_code", SIDE_EFFECT_NONE).startswith("Nothing moved")
+
+
+@pytest.mark.parametrize("code", ["shield_violation", FAILURE_TIMEOUT, FAILURE_STOPPED])
+def test_a_refusal_before_motion_is_not_reported_as_stopping_partway(code: str) -> None:
+    # The live failure: policy.run refused by the shield before its first chunk
+    # was told it "stopped partway" and sent S2 to re-check a pose nothing moved.
+    before = next_step(code, SIDE_EFFECT_NONE)
+    assert "partway" not in before and "never repeat" not in before
+    assert "before anything moved" in before
+    assert "before anything moved" not in next_step(code, SIDE_EFFECT_PARTIAL)
+
+
+def test_only_a_read_answer_is_marked_as_an_observation() -> None:
+    failed = {"status": "failed", "failure_code": "target_not_found", "side_effect_state": "none"}
+    assert outcome_fields({**failed, "effect": "read"})["observation"] is True
+    assert "observation" not in outcome_fields(failed)
+    assert "observation" not in outcome_fields({**failed, "effect": "actuate"})
 
 
 def test_tool_metadata_gates_run_and_never_gates_stop() -> None:

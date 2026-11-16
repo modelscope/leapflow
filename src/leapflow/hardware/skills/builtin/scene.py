@@ -31,6 +31,9 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_CALIBRATION_MISSING,
     FAILURE_INVALID_ARGS,
     FAILURE_UNREACHABLE,
+    MAX_VIEW_CAMERAS,
+    PLANE_COLOR,
+    PLANES,
     REQUIRE_CALIBRATION,
     REQUIRE_MODEL,
     REQUIRE_ROLE,
@@ -42,6 +45,7 @@ from leapflow.hardware.skills.protocol import (
     SkillOutcome,
     SkillPlan,
     SkillSpec,
+    VIEW_DETAILS,
 )
 
 _WORKSPACE = f"{REQUIRE_CALIBRATION}workspace"
@@ -141,38 +145,109 @@ class Locate:
 
 
 class Snapshot:
-    """Share one downscaled camera frame with S2, remembered for ``perceive.lift``."""
+    """Share camera frames with S2 -- several cameras and planes in one image, with
+    what changed -- remembered for ``perceive.lift``."""
 
     spec = SkillSpec(
         skill_id="perceive.snapshot",
-        version="1.1.0",
+        version="1.2.0",
         card=(
-            "Capture one frame from a workcell camera and return it as an image you "
-            "can see, with its frame id, size in pixels, and whether it is liftable. "
-            "Point into a liftable frame with perceive.lift to turn what you see into "
-            "objects in the arm base frame; a camera without a hand-eye calibration "
-            "still shows the scene but cannot be lifted from. Only the newest few "
-            "frames are kept, and they expire after a short while."
+            "Look through workcell cameras and get one image you can see. camera is the "
+            "main view; with_cameras adds others (e.g. ['camera.wrist'], or ['all']) as "
+            "more rows of the same image, captured together. planes picks what each row "
+            "shows: color, depth (false colour, red=near, blue=far, black=no reading; "
+            "the range is in the tile label), infrared (look only, when the camera has "
+            "it). detail trades resolution for tiles: overview, standard, full, or auto. "
+            "With overlay, remembered objects (oN, red when not where expected), the TCP, "
+            "and the other cameras with where they aim are drawn in. The result names "
+            "the image: fN for one tile, vN for a mosaic (tiles gives each tile's "
+            "position); stats, changes (since each camera's previous snapshot), objects "
+            "(per camera: visible, occluded, moved_or_gone, no_depth, out_of_view), arm, "
+            "sync, and situation (what needs attention, in words). zoom {frame, box} "
+            "re-shows a box of a remembered frame at native resolution as a new fN. "
+            "Point into fN or vN with perceive.lift; a camera without a hand-eye "
+            "calibration shows the scene but cannot be lifted from. Only the newest few "
+            "images are kept, and they expire after a short while."
         ),
-        args_schema={"type": "object", "properties": {"camera": _CAMERA_ARG}},
+        args_schema={
+            "type": "object",
+            "properties": {
+                "camera": _CAMERA_ARG,
+                "with_cameras": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^(all|camera(\\.[a-z0-9_]+)*)$"},
+                    "maxItems": MAX_VIEW_CAMERAS,
+                    "default": [],
+                    "description": "More camera roles in the same image, or ['all'].",
+                },
+                "planes": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(PLANES)},
+                    "minItems": 1,
+                    "maxItems": len(PLANES),
+                    "default": [PLANE_COLOR],
+                },
+                "detail": {"type": "string", "enum": list(VIEW_DETAILS), "default": "auto"},
+                "overlay": {"type": "boolean", "default": True},
+                "zoom": {
+                    "type": "object",
+                    "properties": {
+                        "frame": {"type": "string", "minLength": 1, "maxLength": 16},
+                        "box": {"type": "array", "items": _COORD, "minItems": 4, "maxItems": 4},
+                        "coords": {"type": "string", "enum": list(COORDS), "default": COORDS_PIXEL},
+                    },
+                    "required": ["frame", "box"],
+                    "description": "Re-show box [x0, y0, x1, y1] of a remembered fN instead.",
+                },
+            },
+        },
         effect=EFFECT_READ,
         requires=_SNAPSHOT_REQUIRES,
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
-        return SkillPlan(
-            skill_id=self.spec.skill_id, args=args, summary=f"Share a {args['camera']} frame"
-        )
+        zoom = args.get("zoom")
+        if zoom is not None:
+            summary = f"Zoom into frame {zoom['frame']}"
+        else:
+            cameras = ", ".join([args["camera"], *args.get("with_cameras", ())])
+            summary = f"Share {'/'.join(args.get('planes', ()))} of {cameras}"
+        return SkillPlan(skill_id=self.spec.skill_id, args=args, summary=summary)
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
-        shot = dict(await ctx.scene.snapshot(plan.args["camera"]))
+        args, zoom = plan.args, plan.args.get("zoom")
+        if zoom is not None:
+            box = zoom["box"]
+            if box[2] <= box[0] or box[3] <= box[1]:
+                raise SkillError(
+                    FAILURE_INVALID_ARGS, "zoom.box is [x0, y0, x1, y1] with x0 < x1 and y0 < y1"
+                )
+            shot = dict(await ctx.scene.zoom(
+                zoom["frame"], tuple(box), coords=zoom["coords"], planes=tuple(args["planes"])
+            ))
+        else:
+            shot = dict(await ctx.scene.snapshot(
+                args["camera"],
+                with_cameras=tuple(args["with_cameras"]),
+                planes=tuple(args["planes"]),
+                detail=args["detail"],
+                overlay=args["overlay"],
+            ))
         unlifted = "" if shot.get("liftable") else f"; {shot.get('unliftable') or 'not liftable'}"
+        kind = "View" if str(shot["frame"]).startswith("v") else "Frame"
+        if "zoom_of" in shot:
+            source = f"a zoom into {shot['zoom_of']}"
+        elif "frames" in shot:
+            source = ", ".join(f"{cam} ({entry['frame']})" for cam, entry in shot["frames"].items())
+        else:
+            source = shot["camera"]
+        situation = "".join(f"\n- {line}" for line in shot.get("situation", ()))
         return SkillOutcome.succeeded(
             shot,
             side_effect_state=SIDE_EFFECT_NONE,
             message=(
-                f"Frame {shot['frame']} from {shot['camera']} "
-                f"({shot['width']}x{shot['height']} pixels){unlifted}"
+                f"{kind} {shot['frame']} from {source} "
+                f"({shot['width']}x{shot['height']} pixels){unlifted}{situation}"
             ),
         )
 
@@ -182,16 +257,18 @@ class Lift:
 
     spec = SkillSpec(
         skill_id="perceive.lift",
-        version="1.1.0",
+        version="1.2.0",
         card=(
-            "Turn what you point at in a perceive.snapshot frame into objects, without "
-            "moving. Each target has a label and either a point [u, v] on the object's "
+            "Turn what you point at in a perceive.snapshot image into objects, without "
+            "moving. frame is the image's fN, or vN for a mosaic (a target resolves to "
+            "the color or depth tile it lands in; keep a box inside one tile). Each "
+            "target has a label and either a point [u, v] on the object's "
             "surface or a box [x0, y0, x1, y1] around it; coords says whether they are "
             "pixels of the shared image, fractions (0-1) of its sides, or thousandths "
             "(0-1000). Each lifted target gets an object id with the same fields as "
             "perceive.locate (a point gives a surface point with no size); a target "
-            "with no depth behind it is reported as dropped. Lifted ids live beside "
-            "located ones until the next perceive.locate."
+            "with no depth behind it, or in a look-only tile, is reported as dropped. "
+            "Lifted ids live beside located ones until the next perceive.locate."
         ),
         args_schema={
             "type": "object",

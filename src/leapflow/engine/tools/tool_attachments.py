@@ -13,12 +13,15 @@ trace, or the transcript, and after the batch appends one user message that
 carries the images. That message is volatile: it is never persisted, sits in
 the dynamic tail rather than the cacheable prefix, and older images are
 retired to a text placeholder as newer ones arrive or before compression, so
-a long session holds at most a fixed number of images.
+a long session holds at most a fixed number of images. An image identical to
+one still live is not sent again: the model is pointed at the earlier copy.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Sequence
 
@@ -32,6 +35,11 @@ IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/webp"})
 _MAX_DATA_CHARS = 8_000_000
 _MAX_LABEL_CHARS = 200
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
+# Descriptions are keyed by image content, so a frame shown twice is described once.
+_DESCRIPTION_CACHE_SIZE = 64
+_DESCRIPTIONS: "OrderedDict[str, str]" = OrderedDict()
+# Reasoning models spend tokens before answering even with thinking off.
+_DESCRIPTION_MAX_TOKENS = 600
 
 
 @dataclass(frozen=True)
@@ -50,7 +58,15 @@ class ToolAttachment:
         return f"{self.tool_name} (call {self.tool_call_id}){label}"
 
     def image_part(self) -> Dict[str, Any]:
-        return {"type": "image_url", "image_url": {"url": f"data:{self.mime};base64,{self.data}"}}
+        return {"type": "image_url", "image_url": {"url": self.data_url}}
+
+    @property
+    def data_url(self) -> str:
+        return f"data:{self.mime};base64,{self.data}"
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha1(self.data.encode("ascii", "ignore")).hexdigest()
 
 
 def take_attachments(
@@ -95,11 +111,22 @@ def _attachment(item: Any, *, tool_call_id: str, tool_name: str) -> ToolAttachme
 
 
 def attachment_message(
-    attachments: Sequence[ToolAttachment], *, omitted: int = 0
+    attachments: Sequence[ToolAttachment],
+    *,
+    omitted: int = 0,
+    repeated: Sequence[ToolAttachment] = (),
 ) -> Dict[str, Any]:
-    """The volatile user message showing a batch's images, in call order."""
+    """The volatile user message showing a batch's images, in call order.
+
+    *repeated* are images byte-identical to one already live in the
+    conversation; they are named but not sent again.
+    """
     lines = ["Images returned by the tool calls above (tool results carry text only):"]
     lines.extend(f"- image {i}: {item.reference}" for i, item in enumerate(attachments, 1))
+    lines.extend(
+        f"- {item.reference}: identical to an image already shown above (not repeated)"
+        for item in repeated
+    )
     if omitted:
         lines.append(f"({omitted} older image(s) from this batch were not kept.)")
     parts: List[Dict[str, Any]] = [{"type": "text", "text": "\n".join(lines)}]
@@ -110,13 +137,21 @@ def attachment_message(
 def described_message(
     attachments: Sequence[ToolAttachment], descriptions: Sequence[str]
 ) -> Dict[str, Any]:
-    """The text-only stand-in used when the active model cannot see images."""
+    """The text-only stand-in used when the active model is not shown images."""
     lines = [
-        "The tool calls above returned images, but the active model cannot view images.",
+        "The tool calls above returned images that are not shown to the active model "
+        "(it did not accept image input when checked, or llm.supports_vision is false).",
     ]
+    described = False
     for i, (item, text) in enumerate(zip(attachments, descriptions), 1):
-        body = " ".join(str(text or "").split()) or "no description is available"
-        lines.append(f"- image {i}: {item.reference}. Description: {body}")
+        body = " ".join(str(text or "").split())
+        described = described or bool(body)
+        lines.append(f"- image {i}: {item.reference}. Description: {body or 'none available'}")
+    if not described:
+        lines.append(
+            "If the model does accept images, run `leap config set llm.supports_vision true`; "
+            "otherwise configure a vision model as vlm_model to get descriptions."
+        )
     return _volatile({"role": "user", "content": "\n".join(lines)})
 
 
@@ -192,12 +227,61 @@ async def present_attachments(
         return
     budget = max(0, int(keep))
     if budget and sees_images:
-        shown = list(attachments)[-budget:]
+        shown, omitted, repeated = _plan_images(messages, attachments, budget)
         retire_tool_images(messages, keep=budget - len(shown))
-        messages.append(attachment_message(shown, omitted=len(attachments) - len(shown)))
+        messages.append(attachment_message(shown, omitted=omitted, repeated=repeated))
         return
     descriptions = [await describe_image(vlm, item) for item in attachments]
     messages.append(described_message(attachments, descriptions))
+
+
+def _plan_images(
+    messages: Sequence[Mapping[str, Any]], attachments: Sequence[ToolAttachment], budget: int
+) -> tuple[List[ToolAttachment], int, List[ToolAttachment]]:
+    """The images to send, how many are not kept, and those that repeat a visible copy.
+
+    A repeat only points at a copy that stays visible: one still live after the
+    older images are retired to make room, or the last copy in this batch. A
+    repeat whose earlier copy would be retired is sent again instead.
+    """
+    old = _live_image_urls(messages)
+    last = {item.data_url: index for index, item in enumerate(attachments)}
+    trusted = set(old)
+    while True:
+        fresh = [
+            index for index, item in enumerate(attachments)
+            if last[item.data_url] == index and item.data_url not in trusted
+        ]
+        shown = fresh[-budget:]
+        visible = set(old[: max(0, budget - len(shown))])
+        visible.update(attachments[index].data_url for index in shown)
+        lost = {
+            item.data_url for index, item in enumerate(attachments)
+            if index not in fresh and item.data_url not in visible
+        } & trusted
+        if not lost:
+            break
+        trusted -= lost  # strictly shrinks, so this ends
+    repeated = [
+        item for index, item in enumerate(attachments)
+        if index not in fresh and item.data_url in visible
+    ]
+    return [attachments[i] for i in shown], len(attachments) - len(shown) - len(repeated), repeated
+
+
+def _live_image_urls(messages: Sequence[Mapping[str, Any]]) -> List[str]:
+    """Data URLs of the tool images still live in the conversation, newest first."""
+    urls: List[str] = []
+    for message in reversed(messages):
+        content = message.get("content")
+        if not is_attachment_message(message) or not isinstance(content, list):
+            continue
+        for part in reversed(content):
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                url = (part.get("image_url") or {}).get("url")
+                if isinstance(url, str):
+                    urls.append(url)
+    return urls
 
 
 def model_sees_images(registry: Any, model: str) -> bool:
@@ -215,6 +299,10 @@ async def describe_image(vlm: Any, item: ToolAttachment) -> str:
     """A short VLM description of one attached image, or ``""`` when unavailable."""
     if vlm is None:
         return ""
+    cached = _DESCRIPTIONS.get(item.digest)
+    if cached is not None:
+        _DESCRIPTIONS.move_to_end(item.digest)
+        return cached
     from leapflow.llm.message_builder import build_user_message_multimodal
 
     source = f"{item.tool_name} ({item.label})" if item.label else item.tool_name
@@ -225,11 +313,18 @@ async def describe_image(vlm: Any, item: ToolAttachment) -> str:
     )
     message = build_user_message_multimodal(prompt, images_base64=[item.data], image_mime=item.mime)
     try:
-        reply = await vlm.achat([message], stream=False, enable_thinking=False, max_tokens=200)
+        reply = await vlm.achat(
+            [message], stream=False, enable_thinking=False, max_tokens=_DESCRIPTION_MAX_TOKENS
+        )
     except Exception:  # noqa: BLE001 - a failed description degrades to "unavailable"
         logger.debug("tool image description failed", exc_info=True)
         return ""
-    return str(getattr(reply, "content", "") or "")
+    text = str(getattr(reply, "content", "") or "")
+    if text.strip():
+        _DESCRIPTIONS[item.digest] = text
+        while len(_DESCRIPTIONS) > _DESCRIPTION_CACHE_SIZE:
+            _DESCRIPTIONS.popitem(last=False)
+    return text
 
 
 __all__ = [

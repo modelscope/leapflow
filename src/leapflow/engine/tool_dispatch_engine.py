@@ -574,16 +574,22 @@ class ToolDispatchEngine:
         if not attachments:
             return
         engine = self._engine
-        model = getattr(getattr(engine, "_llm", None), "model", None) or getattr(
-            engine._settings, "llm_model", ""
+        llm = getattr(engine, "_llm", None)
+        model = str(
+            getattr(llm, "model", None) or getattr(engine._settings, "llm_model", "") or ""
         )
+        registry = getattr(engine, "_model_capabilities", None)
+        sees_images = model_sees_images(registry, model)
+        resolver = getattr(engine, "_vision_capability", None)
+        if resolver is not None:
+            sees_images = await resolver.sees_images(
+                llm, model, hint=sees_images, registry=registry
+            )
         await present_attachments(
             messages,
             attachments,
             keep=int(getattr(engine._settings, "agent_tool_images_kept", 2)),
-            sees_images=model_sees_images(
-                getattr(engine, "_model_capabilities", None), str(model or "")
-            ),
+            sees_images=sees_images,
             vlm=getattr(engine, "_vlm", None),
         )
 
