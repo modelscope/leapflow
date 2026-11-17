@@ -36,7 +36,9 @@ class ConfigToolsPlugin:
                 description=(
                     "List LeapFlow's own writable settings (LLM model and endpoint, daemon, memory, "
                     "perception, gateway, …) with current values. Use this to discover the exact "
-                    "key before changing anything. Optionally narrow by `category`. This is the "
+                    "key before changing anything. Call without a category first; narrow using only "
+                    "returned categories or key prefixes, not guessed feature names. If the catalog "
+                    "has no field for the requested feature, report it as unsupported. This is the "
                     "only correct way to inspect LeapFlow configuration \u2014 never read config files "
                     "from disk."
                 ),
@@ -67,7 +69,8 @@ class ConfigToolsPlugin:
                 description=(
                     "Read one LeapFlow setting by key (e.g. 'llm.model', 'llm.base_url', "
                     "'daemon.log_level'), returning its current value, type, scopes, and whether a "
-                    "change needs a daemon restart. There is no 'llm.provider' key: provider behavior "
+                    "change needs a daemon restart. Discover unfamiliar keys with config_list rather "
+                    "than guessing them. There is no 'llm.provider' key: provider behavior "
                     "is inferred from the OpenAI-compatible 'llm.base_url'. Never read LeapFlow config "
                     "files from disk — use this."
                 ),

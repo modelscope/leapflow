@@ -127,18 +127,18 @@ async def config_list_handler(args: Dict[str, Any]) -> Dict[str, Any]:
     try:
         service = _service()
         views = service.list_fields(category)
+        categories = sorted({view.category for view in service.list_fields(None)})
     except Exception as exc:  # noqa: BLE001 - surfaced as a tool failure, not a crash
         logger.debug("config_list failed", exc_info=True)
         return {"ok": False, "error": f"Could not read the config catalog: {exc}", "retryable": False}
 
-    categories = sorted({view.category for view in service.list_fields(None)})
     if category and not views:
-        return {
-            "ok": False,
-            "error": f"No config fields in category {category!r}.",
-            "available_categories": categories,
-            "retryable": True,
-        }
+        return _input_failure(
+            f"No config fields in category {category!r}.",
+            "config_unknown_category",
+            next_step="Call config_list without a category, then use a returned category or key prefix.",
+            available_categories=categories,
+        )
 
     truncated = len(views) > limit
     return {
@@ -158,7 +158,7 @@ async def config_get_handler(args: Dict[str, Any]) -> Dict[str, Any]:
     """Return one config field with its value and semantics."""
     key = str(args.get("key") or "").strip()
     if not key:
-        return {"ok": False, "error": "config_get requires 'key'.", "retryable": True}
+        return _input_failure("config_get requires 'key'.", "config_key_required")
 
     try:
         service = _service()
@@ -227,9 +227,9 @@ async def config_set_handler(args: Dict[str, Any]) -> Dict[str, Any]:
     """Write one config field through ConfigService."""
     key = str(args.get("key") or "").strip()
     if not key:
-        return {"ok": False, "error": "config_set requires 'key'.", "retryable": True}
+        return _input_failure("config_set requires 'key'.", "config_key_required")
     if "value" not in args:
-        return {"ok": False, "error": "config_set requires 'value'.", "retryable": True}
+        return _input_failure("config_set requires 'value'.", "config_value_required")
     scope = str(args.get("scope") or "profile").strip() or "profile"
 
     try:
@@ -301,14 +301,44 @@ async def config_set_handler(args: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _input_failure(
+    error: str,
+    failure_code: str,
+    *,
+    next_step: str = "Use config_list to discover the supported keys and their value types before retrying.",
+    **details: Any,
+) -> Dict[str, Any]:
+    """Reject malformed discovery requests without charging the plugin's trust.
+
+    These requests never execute a write. Keep ok=False so callers must correct
+    the input; the existing result-tier contract records them as input repairs,
+    not successes or implementation failures.
+    """
+    return {
+        "ok": False,
+        "error": error,
+        "error_type": "invalid_arguments",
+        "failure_class": "invalid_request",
+        "failure_code": failure_code,
+        "side_effect_state": "none",
+        "retryable": True,
+        "next_step": next_step,
+        **details,
+    }
+
+
 def _unknown_key_payload(key: str, error: ValueError) -> Dict[str, Any]:
     """Return an actionable, catalog-backed response for an unknown config key."""
-    payload: Dict[str, Any] = {
-        "ok": False,
-        "error": str(error),
-        "retryable": True,
-        "did_you_mean": _suggest(key),
-    }
+    payload = _input_failure(
+        str(error),
+        "config_unknown_key",
+        next_step=(
+            "This key is not in the config catalog. Call config_list without a category "
+            "and use only returned keys. If no field supports the request, report that "
+            "limitation instead of guessing more keys or editing config files."
+        ),
+        did_you_mean=_suggest(key),
+    )
     if str(key).strip().lower().startswith("llm."):
         payload["llm_connection"] = {
             "keys": list(_LLM_CONNECTION_KEYS),

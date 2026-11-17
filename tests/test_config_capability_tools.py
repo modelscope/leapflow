@@ -246,6 +246,123 @@ def test_unknown_llm_provider_explains_the_endpoint_based_contract(cfg_home, han
     assert "llm.provider is not a setting" in connection["provider_selection"]
 
 
+@pytest.mark.parametrize("category", [
+    "Reasoning", "Thinking", "Prompt", "Streaming", "System", "Vision",
+    "Workspace", "Trust", "Credentials",
+])
+def test_rejected_categories_retain_catalog_guidance_in_context(cfg_home, category) -> None:
+    """Replay the incident's rejected filters through the real evidence pipeline."""
+    from leapflow.engine.context.context_control import LongTaskContextController, ToolEvidenceBuilder
+    from leapflow.engine.tools.tool_execution import result_tier
+    from leapflow.learning.plugin_stats import PluginUsageTracker, trust_verdict
+
+    args = {"category": category}
+    result = asyncio.run(config_tools.config_list_handler(args))
+    evidence = LongTaskContextController(ToolEvidenceBuilder()).compact_tool_result(
+        "config_list", args, result,
+    )
+
+    assert evidence["ok"] is False
+    assert evidence["failure_class"] == "invalid_request"
+    assert evidence["failure_code"] == "config_unknown_category"
+    assert evidence["available_categories"]
+    assert all(item in result["available_categories"] for item in evidence["available_categories"])
+    assert "without a category" in evidence["next_step"]
+    assert evidence["side_effect_state"] == "none"
+    tier = result_tier(evidence)
+    assert tier == "repaired"
+    assert trust_verdict(False, tier) is None
+    tracker = PluginUsageTracker()
+    tracker.record("config_list", False, 1.0, tier=tier, failure_code=evidence["failure_code"])
+    restored = PluginUsageTracker.load_state(tracker.to_state())
+    stats = restored.stats_for_tool("config_list")
+    assert stats.failures == 0 and stats.successes == 0 and stats.repairs == 1
+    assert stats.failure_codes == {"config_unknown_category": 1}
+
+
+@pytest.mark.parametrize("key", [
+    "llm.enable_thinking", "llm.thinking", "llm.reasoning_effort", "llm.extra_body",
+    "llm.extra_params", "llm.reasoning", "llm.thinking_budget", "verbose.thinking",
+    "agent.thinking", "llm.chat_template_kwargs", "llm.reasoning_enabled",
+])
+def test_rejected_keys_retain_recovery_contract_in_context(cfg_home, key) -> None:
+    """An unsupported feature remains unsupported, not a plugin defect or success."""
+    from leapflow.engine.context.context_control import LongTaskContextController, ToolEvidenceBuilder
+    from leapflow.engine.tools.tool_execution import result_tier
+
+    args = {"key": key}
+    result = asyncio.run(config_tools.config_get_handler(args))
+    evidence = LongTaskContextController(ToolEvidenceBuilder()).compact_tool_result(
+        "config_get", args, result,
+    )
+
+    assert evidence["ok"] is False and evidence["retryable"] is True
+    assert evidence["failure_code"] == "config_unknown_key"
+    assert evidence["did_you_mean"] == result["did_you_mean"]
+    assert evidence["side_effect_state"] == "none"
+    assert "instead of guessing" in evidence["next_step"]
+    assert result_tier(evidence) == "repaired"
+    if "llm_connection" in result:
+        assert evidence["llm_connection"] == result["llm_connection"]
+
+
+@pytest.mark.parametrize("tool_name,args,code", [
+    ("config_get", {}, "config_key_required"),
+    ("config_set", {}, "config_key_required"),
+    ("config_set", {"key": "llm.model"}, "config_value_required"),
+    ("config_set", {"key": "llm.modle", "value": "unused"}, "config_unknown_key"),
+])
+def test_config_input_rejections_do_not_reach_approval(cfg_home, tool_name, args, code) -> None:
+    from leapflow.engine.tools.tool_execution import result_tier
+
+    gate = _AllowGate()
+    config_tools.set_config_approval_gate(gate)
+    handler = getattr(config_tools, tool_name + "_handler")
+    result = asyncio.run(handler(args))
+
+    assert result["ok"] is False
+    assert result["failure_code"] == code
+    assert result_tier(result) == "repaired"
+    assert gate.actions == []
+
+
+def test_config_catalog_failure_stays_a_real_failure(cfg_home, monkeypatch) -> None:
+    """The recovery metadata must not hide real failures in the second catalog read."""
+    from leapflow.engine.tools.tool_execution import result_tier
+
+    class _BrokenCatalog:
+        def list_fields(self, category):
+            if category is None:
+                raise OSError("catalog unavailable")
+            return ()
+
+    monkeypatch.setattr(config_tools, "_service", lambda: _BrokenCatalog())
+    result = asyncio.run(config_tools.config_list_handler({"category": "Runtime"}))
+
+    assert result["ok"] is False and result["retryable"] is False
+    assert "catalog unavailable" in result["error"]
+    assert result_tier(result) == "failed"
+
+
+def test_config_error_hints_remain_bounded() -> None:
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
+
+    result = {
+        "ok": False,
+        "error": "Unknown config key",
+        "did_you_mean": ["k" * 2000] * 100,
+        "available_categories": ["c" * 2000] * 100,
+        "llm_connection": {"next_step": "n" * 2000},
+    }
+    evidence = ToolEvidenceBuilder(max_content_chars=240, max_items=3).build(
+        "config_get", {"key": "unknown"}, result,
+    )
+
+    assert len(evidence["did_you_mean"]) < len(result["did_you_mean"])
+    assert len(evidence["available_categories"]) < len(result["available_categories"])
+    assert len(evidence["llm_connection"]["next_step"]) < 2000
+
+
 def test_config_tool_schema_discloses_the_llm_endpoint_contract() -> None:
     """The model must learn the public keys before choosing an LLM endpoint."""
     from leapflow.plugins.tool_plugins.config_tools import ConfigToolsPlugin

@@ -7,8 +7,9 @@ interactions get long-task resilience without exposing a separate user mode.
 
 Size note (>800-line registered exception per AGENTS.md): context
 accounting, overflow prevention, exploration-ledger tracking, and
-tool-result compaction share the same budget ledger; separating them would
-duplicate accounting state the governance depends on.
+tool-result compaction (including bounded recovery guidance) share the same
+budget ledger; separating them would duplicate accounting state the
+governance depends on.
 """
 from __future__ import annotations
 
@@ -560,7 +561,10 @@ class ToolEvidenceBuilder:
         # Preserve structured repair/recovery hints so the model can self-correct
         # in-turn: invalid_arguments -> missing/accepted_parameters; edit_file
         # anchor errors -> match_count; code_search -> error_type; etc.
-        for key in ("error_type", "retryable", "missing", "accepted_parameters", "required", "match_count", "failure_code"):
+        for key in (
+            "error_type", "retryable", "missing", "accepted_parameters", "required",
+            "match_count", "failure_code", "did_you_mean", "available_categories", "llm_connection",
+        ):
             if key in result:
                 compact[key] = self._compact_value(result[key])
         # Classification markers decide whether the turn hard-stops and which
