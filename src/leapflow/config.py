@@ -342,6 +342,7 @@ class Settings:
     hardware_skills_planning_timeout_s: float = 30.0
     hardware_skills_planning_max_bytes: int = 262144
     hardware_skills_planning_cancel_grace_s: float = 0.5
+    hardware_skills_planning_auto_variants: bool = True
     # Every executed skill run is recorded as an episode under the profile's
     # hardware/episodes at this rate (0 disables recording); recording is skipped
     # when the disk has less than the free-space floor left.
@@ -744,6 +745,8 @@ class Settings:
     )
     guardrail_max_repeats: int = 3
     guardrail_max_consecutive_same: int = 8
+    # Multiplexed tools carry distinct operations/programs under one name.
+    guardrail_argument_scoped_tools: tuple[str, ...] = ("hw_skill_run",)
     guardrail_stagnation_window: int = 10
     guardrail_min_success_rate: float = 0.2
     guardrail_max_calls_per_turn: int = 50
@@ -1597,7 +1600,12 @@ def _build_settings_from_env(
 
     planning_defaults = PlanningSettings()
     hardware_planning = PlanningSettings(**{
-        name: type(default)(os.getenv(f"LEAPFLOW_HARDWARE_SKILLS_PLANNING_{name.upper()}", str(default)))
+        name: (
+            os.getenv(f"LEAPFLOW_HARDWARE_SKILLS_PLANNING_{name.upper()}", str(default))
+            .strip().lower() in ("1", "true", "yes", "on")
+            if isinstance(default, bool) else
+            type(default)(os.getenv(f"LEAPFLOW_HARDWARE_SKILLS_PLANNING_{name.upper()}", str(default)))
+        )
         for name, default in vars(planning_defaults).items()
     })
     hardware_skills_episode_fps = float(
@@ -1669,6 +1677,8 @@ def _build_settings_from_env(
     )
     guardrail_max_repeats = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_REPEATS", "3"))
     guardrail_max_consecutive_same = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_CONSECUTIVE_SAME", "8"))
+    guardrail_argument_scoped_tools = tuple(name.strip() for name in os.getenv(
+        "LEAPFLOW_GUARDRAIL_ARGUMENT_SCOPED_TOOLS", "hw_skill_run").split(",") if name.strip())
     guardrail_stagnation_window = int(os.getenv("LEAPFLOW_GUARDRAIL_STAGNATION_WINDOW", "10"))
     guardrail_min_success_rate = float(os.getenv("LEAPFLOW_GUARDRAIL_MIN_SUCCESS_RATE", "0.2"))
     guardrail_max_calls_per_turn = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_CALLS_PER_TURN", "50"))
@@ -2181,6 +2191,7 @@ def _build_settings_from_env(
         approval_bypass=approval_bypass,
         guardrail_max_repeats=guardrail_max_repeats,
         guardrail_max_consecutive_same=guardrail_max_consecutive_same,
+        guardrail_argument_scoped_tools=guardrail_argument_scoped_tools,
         guardrail_stagnation_window=guardrail_stagnation_window,
         guardrail_min_success_rate=guardrail_min_success_rate,
         guardrail_max_calls_per_turn=guardrail_max_calls_per_turn,

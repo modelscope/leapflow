@@ -1917,6 +1917,7 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.skills_speed_pct_max",
         "hardware.skills_max_duration_s",
         "hardware.skills_plan_ttl_s",
+        "hardware.skills_planning_auto_variants",
         "hardware.skills_planning_workers",
         "hardware.skills_planning_max_candidates",
         "hardware.skills_planning_max_jobs",

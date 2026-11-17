@@ -243,7 +243,7 @@ _UP = {"op": "move", "relative": {"dz": 10}}
         (WORKCELL_ID, SEQUENCE, _steps({"op": "move", "relative": {"dz": True}}), FAILURE_INVALID_ARGS),
         (WORKCELL_ID, SEQUENCE, _steps({"op": "fly"}), FAILURE_INVALID_ARGS),
         (WORKCELL_ID, SEQUENCE, _steps(), FAILURE_INVALID_ARGS),
-        (WORKCELL_ID, SEQUENCE, _steps({"op": "move", "pose": {"x": 250, "y": 0}}), FAILURE_INVALID_ARGS),
+        (WORKCELL_ID, SEQUENCE, _steps({"op": "move", "pose": {}}), FAILURE_INVALID_ARGS),
         (WORKCELL_ID, SEQUENCE, _steps({"op": "move"}), FAILURE_INVALID_ARGS),
         (WORKCELL_ID, SEQUENCE, _steps({**_UP, "width_mm": 3}), FAILURE_INVALID_ARGS),
         (WORKCELL_ID, SEQUENCE, _steps({**_UP, "expect": "released"}), FAILURE_INVALID_ARGS),

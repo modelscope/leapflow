@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import replace
 from typing import Any, Mapping, Sequence
 
 from leapflow.hardware.skills.builtin._sequence_planner import prepare as prepare_sequence
@@ -285,7 +286,7 @@ class MotionSequence:
 
     spec = SkillSpec(
         skill_id="motion.sequence",
-        version="1.4.0",
+        version="1.5.0",
         card=CARD,
         args_schema={
             "type": "object",
@@ -315,6 +316,43 @@ class MotionSequence:
             [job], deadline=time.monotonic() + ctx.planning_settings.timeout_s)
         prepared.check_scene(ctx)
         return result[0].value
+
+    def alternatives(self, ctx: SkillContext, args: Mapping[str, Any], *, limit: int) -> Sequence[Mapping[str, Any]]:
+        """Substitute one grasp handle consistently; never invent geometry or yaw."""
+        handles = {step['ref'].partition(':')[2].partition('.')[0]
+                   for step in args['steps'] if step.get('ref', '').startswith('grasp:')}
+        # Mixed-grasp programs may encode distinct tasks; do not guess equivalence.
+        if len(handles) != 1 or limit <= 0:
+            return ()
+        handle = next(iter(handles))
+        original = ctx.scene.grasp(handle)
+        entries = []
+        for sibling in ctx.scene.grasps(original.object_id):
+            if sibling.grasp_id == handle:
+                continue
+            steps = []
+            for step in args['steps']:
+                entry = dict(step)
+                ref = entry.get('ref', '')
+                if ref.partition(':')[0] == 'grasp' and ref.partition(':')[2].partition('.')[0] == handle:
+                    _, dot, point = ref.partition('.')
+                    entry['ref'] = f'grasp:{sibling.grasp_id}' + (dot + point if dot else '')
+                steps.append(entry)
+            entries.append({'id': f'{handle}-to-{sibling.grasp_id}', 'args': {**args, 'steps': steps}})
+            if len(entries) >= limit:
+                break
+        return entries
+
+    async def confirm(self, ctx: SkillContext, plan: SkillPlan) -> SkillPlan:
+        """Dry-run/live previews observe without changing the approved snapshot."""
+        checks = []
+        for oid, data in plan.basis['objects'].items():
+            obj = LocatedObject.from_mapping(data)
+            seen = await ctx.scene.relocate(obj, commit=False)
+            check_drift(ctx.workcell.freshness, obj, seen)
+            checks.append({'object_id': oid, 'camera': seen.camera, 'state': 'confirmed',
+                           'table_offset_mm': seen.table_offset_mm})
+        return replace(plan, basis={**plan.basis, 'object_recheck': {'read_only': True, 'checks': checks}})
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
         fresh = ctx.workcell.freshness

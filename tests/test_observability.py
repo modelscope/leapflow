@@ -113,8 +113,34 @@ async def test_relocate_uses_alternative_without_grounding_or_replacing_identity
     registry.devices['second'].boxes = [replace(CUP, height=100.)]
     with pytest.raises(SkillError) as error:
         await scene.relocate(fresh)
-    assert error.value.failure_code == 'target_not_found'
+    assert error.value.failure_code == 'observation_insufficient'
     assert scene.object(obj.object_id) == fresh
+
+
+@pytest.mark.parametrize('offset', [-20.5, -11.2, 20.5])
+async def test_viewed_table_offset_preserves_relocate_and_survey_geometry(tmp_path, offset):
+    from tests._harness.skill_stubs import TABLE_Z
+    registry = _calibrated(tmp_path, CUP)
+    registry.devices[CAMERA_ID].table_z = TABLE_Z + offset
+    scene = accurate(_scene(registry, spec=_spec(observation={'enabled': True})))
+    (obj,) = await scene.locate(['cup'])
+    assert obj.table_offset_mm == pytest.approx(offset, abs=1.)
+    capture = await scene.capture()
+    evidence = scene._observations.analyze(obj, capture)
+    assert evidence.support >= .85 and evidence.extent_supported
+    confirmed = await scene.relocate(obj, commit=False)
+    assert scene.object(obj.object_id) == obj
+    assert confirmed.center == pytest.approx(obj.center, abs=3.)
+    fitted = await scene._observations.measure(obj, (capture,))
+    assert fitted.height == pytest.approx(obj.height, abs=3.)
+    assert fitted.center == pytest.approx(obj.center, abs=3.)
+    fresh = await scene.relocate(fitted)
+    assert fresh.object_id == obj.object_id
+    assert fresh.center == pytest.approx(obj.center, abs=3.)
+    registry.devices[CAMERA_ID].boxes = []
+    with pytest.raises(SkillError) as error:
+        await scene.relocate(fresh)
+    assert error.value.failure_code == 'target_not_found'
 
 
 async def test_historical_cloud_cannot_certify_a_missing_live_target(tmp_path):

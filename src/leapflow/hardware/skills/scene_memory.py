@@ -215,6 +215,11 @@ class SceneMemory:
             return None
         return entry[0]
 
+    def grasps(self, object_id: str, basis: Mapping[str, float], ttl_s: float) -> tuple[GraspCandidate, ...]:
+        """Live sibling proposals, never regenerated or renamed by planning."""
+        return tuple(g for g, seen_at in self._grasps.values()
+                     if g.object_id == object_id and self._valid(seen_at, basis, ttl_s))
+
     def remember_frame(
         self,
         capture: SceneCapture,

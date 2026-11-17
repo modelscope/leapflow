@@ -72,8 +72,10 @@ _NEXT_STEPS: dict[str, str] = {
         "Offer that to the user, run it, then plan again."
     ),
     FAILURE_TARGET_NOT_FOUND: (
-        "The id expired or the object is gone. Locate again and use the new ids, or ask the "
-        "user to point the object out."
+        "The id is no longer current, or fresh depth shows the object moved/disappeared. "
+        "Read result.observation and the error to distinguish them. Observe again and replan "
+        "with current ids, or ask the user to point the object out; never replace an expired "
+        "reference with guessed literal coordinates."
     ),
     FAILURE_MODEL_UNAVAILABLE: (
         "The node's perception model did not answer. Ask the user to check that the model "
@@ -86,7 +88,9 @@ _NEXT_STEPS: dict[str, str] = {
         "binds and use the reported reach when choosing another target. arm.state and "
         "hw_skill_list publish posture-specific height bands in reach; the workspace box "
         "alone does not guarantee reach. Use the bands to choose hover heights, then check "
-        "the actual posture/path with a new plan."
+        "the actual posture/path with a new plan. When batch_planning is advertised, submit "
+        "complete task-equivalent grasp:gN / rz path alternatives as candidates in one "
+        "hw_skill_run call (respect its max_candidates), so the node ranks all feasible paths."
     ),
     FAILURE_GRASP_INFEASIBLE: (
         "No grasp fits the measured object geometry and gripper opening; this is not an "
@@ -96,7 +100,7 @@ _NEXT_STEPS: dict[str, str] = {
         "or gripper limits to force a grasp."
     ),
     FAILURE_OBSERVATION_INSUFFICIENT: (
-        "Measurement is insufficient, not proof of unreachability. Read result.observation "
+        "Measurement is insufficient, not proof the object is gone or unreachable. Read result.observation "
         "for unsupported dimensions, camera conflicts, or unknown accuracy. A fresh passive "
         "auto-camera locate or a governed perceive.survey can gather evidence. If observation "
         "remains insufficient, request perceive.snapshot with all cameras where frame sharing "

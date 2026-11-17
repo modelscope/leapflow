@@ -553,6 +553,11 @@ class WorkcellScene:
             raise SkillError(FAILURE_TARGET_NOT_FOUND, self._forgotten(grasp_id))
         return found
 
+    def grasps(self, object_id: str) -> tuple[GraspCandidate, ...]:
+        """Current task-equivalent proposals for one still-referable object."""
+        self.object(object_id)
+        return self._memory.grasps(object_id, self._basis, self._settings.memory_ttl_s)
+
     def _forgotten(self, handle: str) -> str:
         ttl = self._settings.memory_ttl_s
         return (
@@ -586,17 +591,14 @@ class WorkcellScene:
             return f"{role} is not calibrated"
         return f"{role}'s calibration does not hold ({diagnosis.status.value}: {diagnosis.reason})"
 
-    async def relocate(self, obj: LocatedObject) -> LocatedObject:
+    async def relocate(self, obj: LocatedObject, *, commit: bool = True) -> LocatedObject:
         """Measure only *obj* where its approved geometry projects in a fresh frame.
 
         Freshness must never run grounding again: another same-label detection is
         not the candidate the operator approved. The caller's drift check catches
-        movement within the projected region; missing depth means the candidate left.
+        movement within the projected region; missing depth is an uncertain view.
         """
-        return await self._remeasure(obj)
-
-    async def _remeasure(self, obj: LocatedObject) -> LocatedObject:
-        return await self._observations.relocate(obj)
+        return await self._observations.relocate(obj, commit=commit)
 
     def observation(self, obj: LocatedObject, grasp: GraspCandidate | None = None) -> Mapping[str, Any]:
         report = self._observations.report(obj)

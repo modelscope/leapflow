@@ -250,14 +250,22 @@ class _Planner:
         )
 
     def _absolute(self, index: int, pose: Mapping[str, Any]) -> Pose:
-        x, y, z = float(pose["x"]), float(pose["y"]), float(pose["z"])
+        if not any(axis in pose for axis in ('x', 'y', 'z', 'rx', 'ry', 'rz')):
+            raise _invalid(index, 'pose needs at least one coordinate or angle; use relative for offsets')
+        previous = self._previous
+        if previous is None and not all(axis in pose for axis in ('x', 'y', 'z')):
+            raise _invalid(index, 'a partial pose needs a known previous TCP target')
+        x, y, z = (float(pose[axis]) if axis in pose else float(getattr(previous, axis))
+                   for axis in ('x', 'y', 'z'))
         if pose["frame"] == "table":
             table = self._ctx.frames.table
             if table is None:
                 raise SkillError(FAILURE_CALIBRATION_MISSING,
                     f"step {index}: a table-frame pose needs the table calibrated "
                     "(calib.workspace with table_z or table_points)")
-            z += table.height(x, y)
+            # Omitted z preserves absolute height, not an implicit table offset.
+            if 'z' in pose:
+                z += table.height(x, y)
         return Pose(x, y, z, *self._orientation(index, pose))
 
     def _relative(self, index: int, rel: Mapping[str, Any]) -> Pose:

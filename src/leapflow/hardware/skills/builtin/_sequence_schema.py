@@ -65,7 +65,7 @@ STEP_SCHEMA: Mapping[str, Any] = {
                 "rz": _ANGLE,
                 "frame": {"type": "string", "enum": ["base", "table"], "default": "base"},
             },
-            "required": ["x", "y", "z"],
+            "minProperties": 1,
         },
         "relative": {
             "type": "object",
@@ -105,8 +105,10 @@ CARD = (
     "arm's default path) or move_linear (straight line) to a TCP "
     "target; move_joints {joint: deg}; gripper (width_mm, or grip open|close; "
     "ref grasp:gN opens to that grasp's open_mm and records the object as held when "
-    "the jaws close on it); wait (seconds). A move target is one of: pose {x, y, z, "
-    "rx?, ry?, rz?} in mm/deg (frame base, or table: z above the table surface); "
+    "the jaws close on it); wait (seconds). A move target is one of: pose {x?, y?, z?, "
+    "rx?, ry?, rz?} in mm/deg (frame base, or table: supplied z above the table surface); "
+    "omitted coordinates retain the previous TCP target (omitted z stays at its absolute height). "
+    "A partial pose must supply at least one coordinate or angle; use relative for offsets. "
     "relative {dx, dy, dz, frame base|tool} from the previous target; or ref "
     "object:oN[.top|.bottom] / grasp:gN.pregrasp|grasp|retreat plus an optional "
     "offset {dx, dy, dz} in the base frame. Omitted angles keep the previous target's "
@@ -128,6 +130,12 @@ CARD = (
     "result.problems, with each step's bound or farthest reachable pose (and rotation in "
     "degrees), so rewrite all reported steps before planning again. Linear continuity is "
     "tested by subdivision, not by treating every large sample jump as a branch switch. "
+    "When reach or posture is uncertain, or after unreachable, submit complete task-equivalent "
+    "grasp:gN / rz alternatives as hw_skill_run candidates (within batch_planning.limits.max_candidates). "
+    "The node evaluates and ranks them in parallel without LLM calls. An infeasible single-grasp "
+    "program may automatically try live sibling proposals; its preview discloses the substitution "
+    "and only that approved selection executes. Dry-run and pre-approval planning read-only recheck "
+    "referenced objects; occlusion or missing depth is observation_insufficient, not proof of disappearance. "
     "Execute repeats the workspace check "
     "from fresh joint state and refuses when the tool or a referenced object moved."
 )

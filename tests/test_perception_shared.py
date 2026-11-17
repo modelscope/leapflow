@@ -435,6 +435,41 @@ async def test_a_lifted_point_over_an_emptied_table_preserves_target_identity(tm
     assert scene.observation(lifted)['verdict'] != 'sufficient'
 
 
+@pytest.mark.parametrize('offset', [-20.5, -11.2])
+async def test_legacy_offset_box_remains_visible_and_readonly_confirm_does_not_refresh(tmp_path: Path, offset: float) -> None:
+    registry = _calibrated(tmp_path, CUP)
+    registry.devices[CAMERA_ID].table_z = TABLE_Z + offset
+    clock = _Clock()
+    scene = _scene(registry, clock=clock)
+    (obj,) = await scene.locate(['cup'])
+    before = dict(scene._memory._objects)
+    reports = dict(scene._memory._observations)
+    clock.now += 5
+    checked = await scene.relocate(obj, commit=False)
+    assert checked.center == pytest.approx(obj.center, abs=3.)
+    assert scene._memory._objects == before and scene._memory._observations == reports
+    shot = await scene.snapshot()
+    assert shot['objects'][0]['views']['camera']['state'] == 'visible'
+    assert len(registry.devices[LOCATOR_ID].requests) == 1
+
+
+async def test_missing_depth_is_uncertain_not_a_missing_object(tmp_path: Path) -> None:
+    from dataclasses import replace
+    registry = _calibrated(tmp_path, CUP)
+    scene = _scene(registry)
+    (obj,) = await scene.locate(['cup'])
+    capture = await scene.capture()
+    blind = replace(capture, frame=replace(capture.frame, depth=bytes(len(capture.frame.depth))))
+    async def capture_blind(role='camera'):
+        return blind
+    scene.capture = capture_blind
+    with pytest.raises(SkillError) as error:
+        await scene.relocate(obj, commit=False)
+    assert error.value.failure_code == 'observation_insufficient'
+    assert error.value.result['observation']['attempts'][0]['state'] == 'no_depth'
+    assert scene.object(obj.object_id) == obj
+
+
 # ── Host side: the image channel ─────────────────────────────────────────────
 
 

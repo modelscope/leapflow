@@ -236,6 +236,33 @@ def test_daemon_serve_applies_daemon_log_level(monkeypatch, tmp_path) -> None:
     assert applied == [settings]
 
 
+def test_planning_settings_config_chain(monkeypatch, tmp_path) -> None:
+    """Every planner default has a Settings field, with Boolean env parsing and catalog metadata."""
+    from leapflow.config import Settings, _build_settings_from_env
+    from leapflow.config_service import _build_field_specs
+    from leapflow.hardware.skills.planning import PlanningSettings
+    from leapflow.hardware.skills.runtime_settings import SkillRuntimeSettings
+
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "home"))
+    for name in vars(PlanningSettings()):
+        monkeypatch.delenv(f"LEAPFLOW_HARDWARE_SKILLS_PLANNING_{name.upper()}", raising=False)
+    built = _build_settings_from_env()
+    assert SkillRuntimeSettings.from_settings(built).planning == PlanningSettings()
+    specs = _build_field_specs()
+    for name, default in vars(PlanningSettings()).items():
+        attribute = f"hardware_skills_planning_{name}"
+        assert getattr(Settings, attribute) == default
+        assert getattr(built, attribute) == default
+        assert specs[f"hardware.skills_planning_{name}"].setting_name == attribute
+    for raw, expected in (("false", False), ("OFF", False), ("0", False),
+                          ("no", False), (" true ", True), ("YES", True),
+                          ("1", True), ("on", True)):
+        monkeypatch.setenv("LEAPFLOW_HARDWARE_SKILLS_PLANNING_AUTO_VARIANTS", raw)
+        loaded = _build_settings_from_env()
+        assert loaded.hardware_skills_planning_auto_variants is expected
+        assert SkillRuntimeSettings.from_settings(loaded).planning.auto_variants is expected
+
+
 def test_node_log_config_chain(monkeypatch, tmp_path) -> None:
     """hardware.node_log_* flows env -> Settings and is discoverable in the catalog."""
     from leapflow.config import _build_settings_from_env

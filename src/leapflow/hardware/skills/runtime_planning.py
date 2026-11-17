@@ -10,11 +10,12 @@ from typing import Any, Awaitable, Mapping, Sequence, TYPE_CHECKING, TypeVar
 from leapflow.hardware.skills.admission import ensure_model_use
 from leapflow.hardware.skills.args import validate_args
 from leapflow.hardware.skills.planning import (
-    Deadline, Evaluation, PreparedPlanning, PreparedPlanningSkill, Selection,
+    Deadline, Evaluation, PlanConfirmationSkill, PlanningAlternativesSkill,
+    PreparedPlanning, PreparedPlanningSkill, Selection,
     candidates, encoded, no_selection,
 )
 from leapflow.hardware.skills.protocol import (
-    FAILURE_INTERNAL_DEFECT, FAILURE_PLAN_STALE,
+    FAILURE_INTERNAL_DEFECT, FAILURE_OUT_OF_WORKSPACE, FAILURE_PLAN_STALE, FAILURE_UNREACHABLE,
     FAILURE_SKILL_UNAVAILABLE, FAILURE_TIMEOUT, REQUIRE_SHARE, SHARE_FRAMES,
     SkillError, SkillOutcome, SkillPlan,
 )
@@ -69,6 +70,43 @@ async def evaluate(runtime: SkillRuntime, skill: PreparedPlanningSkill, ctx: Run
             raise SkillError(result.value.failure_code, result.value.message)
     ctx.note("planning_snapshot", {"state_reads": prepared.state_reads})
     return tuple(results), prepared
+
+
+async def plan_single(runtime: SkillRuntime, skill: PreparedPlanningSkill, ctx: RunContext,
+                      arguments: Mapping[str, Any], *, deadline: float) -> tuple[Any, PreparedPlanning]:
+    """Try the request first; bounded plugin variants require no additional LLM call."""
+    evaluated, prepared = await evaluate(runtime, skill, ctx, [arguments], deadline=deadline)
+    original = evaluated[0].value
+    settings = runtime._settings.planning
+    if (not settings.auto_variants or not isinstance(skill, PlanningAlternativesSkill)
+            or not isinstance(original, SkillOutcome)
+            or original.failure_code not in {FAILURE_UNREACHABLE, FAILURE_OUT_OF_WORKSPACE}):
+        return original, prepared
+    offered = skill.alternatives(ctx, arguments, limit=settings.max_candidates - 1)
+    if not offered:
+        return original, prepared
+    raw = [{'id': 'requested', 'args': arguments}, *offered]
+    settings.check_size(raw)
+    entries = candidates(raw, settings)
+    values = [validate_args(skill.spec.args_schema, a) for _, a in entries]
+    started = time.monotonic()
+    evaluated, prepared = await evaluate(runtime, skill, ctx, values, deadline=deadline)
+    selected, report = _report(entries, evaluated, range(len(entries)), Selection(), started, prepared.state_reads)
+    report['automatic'] = True
+    report['trigger'] = original.failure_code
+    if selected is None:
+        return replace(original, result={**original.result, 'batch': report}), prepared
+    plan = evaluated[selected].value
+    return replace(plan, summary=f'{plan.summary} Automatic alternative: {entries[selected][0]} (requested path infeasible).',
+                   basis={**plan.basis, 'batch': report,
+                          'substituted': {'selected_id': entries[selected][0], 'reason': original.failure_code}}), prepared
+
+
+async def confirm(skill: Any, ctx: RunContext, plan: SkillPlan, *, deadline: float) -> SkillPlan:
+    if isinstance(skill, PlanConfirmationSkill):
+        plan = await skill.confirm(ctx, plan)
+    Deadline(deadline).check()
+    return plan
 
 
 async def check_basis(runtime: SkillRuntime, spec: Any, frames: Any,
@@ -184,6 +222,12 @@ async def plan_batch(runtime: SkillRuntime, workcell: str, skill_id: str, raw: A
             return BatchPlanningResult(no_selection(), report)
         value = results[indices[selected]].value
         planned = replace(value, basis={**value.basis, "batch": report})
+        planned = await asyncio.wait_for(confirm(skill, ctx, planned, deadline=deadline),
+                                         timeout=max(0, deadline - time.monotonic()))
+        await asyncio.wait_for(check_basis(runtime, spec, frames, model_basis),
+                               timeout=max(0, deadline - time.monotonic()))
+        if prepared is not None:
+            prepared.check_scene(ctx)
         sealed = runtime._seal(spec, skill, planned, frames, model_basis=model_basis,
                                        result_budget=settings, deadline=deadline)
         return BatchPlanningResult(sealed, report)

@@ -329,6 +329,11 @@ _FIELD_DESCRIPTIONS = {
         "update_s (2), solve_s (30), rss_bytes (536870912). Values may tighten, never expand "
         "these ceilings. Socket location is profile-layout-owned. Requires node restart."
     ),
+    "hardware.skills_planning_auto_variants": (
+        "Allow plugin-declared equivalent sibling programs after unreachable/out-of-workspace "
+        "single planning failures (default true). Selection is disclosed and still requires "
+        "verification, approval, freshness, and execution gates. Requires node restart."
+    ),
     "hardware.skills_planning_workers": (
         "Pure planning worker count (0: CPU-aware automatic, at most two by default). "
         "Explicit counts are bounded by available CPUs and admitted jobs. Requires node restart."

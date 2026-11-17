@@ -174,6 +174,23 @@ class TestConfigSetUnset:
         cfg._settings_instance = None
         assert not ViewPriorSettings.from_json(cfg.get_settings().hardware_view_priors).enabled
 
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_auto_variants_config_roundtrip(self, config_env, monkeypatch, enabled: bool) -> None:
+        import leapflow.config as cfg
+        from leapflow.hardware.skills.runtime_settings import SkillRuntimeSettings
+
+        _, svc = config_env
+        monkeypatch.delenv("LEAPFLOW_HARDWARE_SKILLS_PLANNING_AUTO_VARIANTS", raising=False)
+        result = svc.set("hardware.skills_planning_auto_variants", str(enabled).lower())
+        assert result.ok
+        assert any("restart" in warning for warning in result.warnings)
+        data = yaml.safe_load(result.path.read_text("utf-8"))
+        assert data["hardware"]["skills_planning_auto_variants"] is enabled
+        cfg._settings_instance = None
+        assert SkillRuntimeSettings.from_settings(cfg.get_settings()).planning.auto_variants is enabled
+        with pytest.raises(ValueError, match="Expected boolean"):
+            svc.set("hardware.skills_planning_auto_variants", "maybe")
+
     def test_set_rejects_unsupported_scope(self, config_env) -> None:
         _, svc = config_env
         with pytest.raises(ValueError, match="does not support scope"):

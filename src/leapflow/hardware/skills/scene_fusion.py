@@ -27,6 +27,7 @@ from leapflow.hardware.rgbd import RgbdFrame
 from leapflow.hardware.skills.geometry import Plane, Transform, Vec3, dot
 from leapflow.hardware.skills.protocol import LocatedObject
 from leapflow.hardware.skills.scene_memory import FrameView, SceneCapture
+from leapflow.hardware.skills.table_view import as_seen
 from leapflow.hardware.skills.visual_change import ChangeReport, FrameStats
 from leapflow.hardware.skills.visual_tiles import Mark
 
@@ -91,7 +92,8 @@ def fuse(
         to_camera, frame = mount.inverse(), view.capture.frame
         drawn: list[Mark] = []
         for obj in objects:
-            state, box, pixel, numbers = presence(obj, frame, to_camera, settings)
+            projected = as_seen(obj, frame, mount, view.capture.table, settings, camera=view.camera)
+            state, box, pixel, numbers = presence(projected, frame, to_camera, settings)
             entry = {"state": state, **numbers}
             shown = None if pixel is None else view.to_shown(*pixel)
             if shown is not None:

@@ -292,11 +292,12 @@ class ScenePort(Protocol):
         """A remembered object; raises ``target_not_found`` when unknown or aged out."""
         ...
 
-    async def relocate(self, obj: LocatedObject) -> LocatedObject:
+    async def relocate(self, obj: LocatedObject, *, commit: bool = True) -> LocatedObject:
         """Measure *obj* again only where its approved geometry projects.
 
         This never grounds by label or selects another candidate; it raises when
         the approved candidate can no longer be measured in a fresh frame.
+        With commit=False no object, grasp, or observation memory is changed.
         """
         ...
 
@@ -309,6 +310,10 @@ class ScenePort(Protocol):
 
     def grasp(self, grasp_id: str) -> GraspCandidate:
         """A remembered grasp; raises ``target_not_found`` when unknown or aged out."""
+        ...
+
+    def grasps(self, object_id: str) -> tuple[GraspCandidate, ...]:
+        """Live task-equivalent proposals for one object, in publication order."""
         ...
 
     @property

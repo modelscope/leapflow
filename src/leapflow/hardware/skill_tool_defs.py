@@ -55,7 +55,7 @@ _RUN_SCHEMA: dict[str, Any] = {
             ),
         },
         "candidates": {
-            "type": "array", "minItems": 1, "maxItems": 32,
+            "type": "array", "minItems": 1, "maxItems": 8,
             "items": {"type": "object", "required": ["id", "args"],
                       "additionalProperties": False,
                       "properties": {"id": {"type": "string", "minLength": 1, "maxLength": 64},
@@ -123,10 +123,12 @@ def build_skill_tools(service: "SkillService") -> list[ToolMetadata]:
                 "Run a node skill on a workcell (a perception query, a motion program, a "
                 "policy). The node plans the run; an actuating plan is shown to the user for "
                 "approval, then the node executes it while the host keeps its lease alive. Use "
-                "dry_run to see the plan without moving. A failed run whose side_effect_state "
+                "dry_run to see the plan with read-only reference rechecks, without moving. A failed run whose side_effect_state "
                 "is not 'none' must never be repeated: the next attempt is a new plan. "
-                "For advertised batch_planning, submit task-equivalent candidates in one call; "
-                "the node validates and ranks them without another model call, executing only the selected plan."
+                "When reach/posture is uncertain or after unreachable, use advertised batch_planning: "
+                "submit complete task-equivalent grasp:gN / rz alternatives as candidates (at most 8, "
+                "or the node's lower max_candidates) in one call. The node validates and ranks them "
+                "without another model call, executing only the approved selected plan."
             ),
             parameters_schema=dict(_RUN_SCHEMA),
             handler=service.hw_skill_run,

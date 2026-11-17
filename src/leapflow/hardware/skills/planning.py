@@ -41,8 +41,11 @@ class PlanningSettings:
     timeout_s: float = 30.0
     max_bytes: int = 256 * 1024
     cancel_grace_s: float = 0.5
+    auto_variants: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.auto_variants) is not bool:
+            raise ValueError('planning auto_variants must be boolean')
         for name, low, high in (("workers", 0, 32), ("max_candidates", 1, 32),
                                 ("max_jobs", 1, 128), ("max_bytes", 1024, 512 * 1024)):
             value = getattr(self, name)
@@ -155,6 +158,18 @@ class PreparedPlanning:
 @runtime_checkable
 class PreparedPlanningSkill(Protocol):
     async def prepare(self, ctx: SkillContext, args: Sequence[Mapping[str, Any]]) -> PreparedPlanning: ...
+
+
+@runtime_checkable
+class PlanningAlternativesSkill(Protocol):
+    """Plugin-owned task-equivalent alternatives, offered only after infeasibility."""
+    def alternatives(self, ctx: SkillContext, args: Mapping[str, Any], *, limit: int) -> Sequence[Mapping[str, Any]]: ...
+
+
+@runtime_checkable
+class PlanConfirmationSkill(Protocol):
+    """Read-only live checks before publication, repeated at execution."""
+    async def confirm(self, ctx: SkillContext, plan: SkillPlan) -> SkillPlan: ...
 
 
 @dataclass(frozen=True)

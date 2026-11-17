@@ -602,3 +602,78 @@ async def test_grasp_propose_plans_for_a_lifted_object_without_a_locator(
     assert grasp["open_mm"] == pytest.approx(min(70.0, CUP_WIDTH + 15.0), abs=4.0)
     assert grasp["score"] == 1.0 and alongside["score"] == 0.5
     assert grasp["grasp"]["z"] == pytest.approx(TABLE_Z + 25.0, abs=3.0)
+
+
+@pytest.mark.parametrize('batch', [False, True])
+@pytest.mark.parametrize('offset', [-20.5, -11.2])
+async def test_preview_rechecks_offset_object_without_memory_mutation(tmp_path: Path, batch: bool, offset: float) -> None:
+    runtime = _cell(tmp_path, CUP)
+    _camera(runtime).table_z = TABLE_Z + offset
+    await _located_and_proposed(runtime)
+    memory = runtime._scenes[WORKCELL_ID]
+    before = dict(memory._objects)
+    reports = dict(memory._observations)
+    args = {'steps': PICK}
+    plan = (await runtime.plan_batch(WORKCELL_ID, SEQUENCE, [{'id': 'pick', 'args': args}],
+                                    {'require_verified': False})).selected if batch else await runtime.plan(WORKCELL_ID, SEQUENCE, args)
+    assert isinstance(plan, SkillPlan), plan
+    assert plan.basis['object_recheck']['read_only']
+    assert plan.basis['object_recheck']['checks'][0]['state'] == 'confirmed'
+    assert memory._objects == before and memory._observations == reports
+    runtime.discard_plan(plan.digest)
+    _camera(runtime).boxes = []
+    refused = (await runtime.plan_batch(WORKCELL_ID, SEQUENCE, [{'id': 'pick', 'args': args}],
+                                       {'require_verified': False})).selected if batch else await runtime.plan(WORKCELL_ID, SEQUENCE, args)
+    assert refused.failure_code == 'target_not_found'
+    assert refused.side_effect_state == SIDE_EFFECT_NONE
+    assert runtime._plans == {} and _sim(runtime).batches == []
+
+
+async def test_partial_pose_preserves_omitted_axes_and_table_z_is_applied_once(tmp_path: Path) -> None:
+    runtime = _cell(tmp_path, CUP)
+    plan = await _plan(runtime, [
+        {'op': 'move', 'pose': {'x': 220, 'y': 0, 'z': 140, 'rx': 180, 'ry': 0, 'rz': 10}},
+        {'op': 'move', 'pose': {'z': 100, 'frame': 'table'}},
+        {'op': 'move', 'pose': {'x': 230, 'frame': 'table'}},
+        {'op': 'move', 'pose': {'rz': 20}},
+    ])
+    assert plan.targets[1].position == (220, 0, TABLE_Z+100)
+    assert plan.targets[2].position == (230, 0, TABLE_Z+100)
+    assert plan.targets[3].position == plan.targets[2].position
+    assert plan.targets[3].rz == 20
+    for pose in ({}, {'frame': 'table'}):
+        result = await _refusal(runtime, [{'op': 'move', 'pose': pose}])
+        assert result.failure_code == FAILURE_INVALID_ARGS
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+async def test_automatic_sibling_substitution_is_disclosed_and_configurable(tmp_path: Path, enabled: bool) -> None:
+    from dataclasses import replace
+    from leapflow.hardware.skills.planning import Evaluation
+    runtime = _cell(tmp_path, CUP)
+    await _located_and_proposed(runtime)
+    memory = runtime._scenes[WORKCELL_ID]
+    first, stamp = memory._grasps['g1']
+    memory._grasps['g1'] = (replace(first, grasp=first.grasp.translated(1000, 0, 0)), stamp)
+    runtime._settings = replace(runtime._settings, planning=replace(runtime._settings.planning, auto_variants=enabled))
+    delegate = runtime._calculations
+    class VerifiedSimulation:
+        async def evaluate(self, jobs, *, deadline):
+            values = await delegate.evaluate(jobs, deadline=deadline)
+            return tuple(Evaluation(v.value, v.metrics, isinstance(v.value, SkillPlan), v.evidence) for v in values)
+        async def close(self):
+            await delegate.close()
+    runtime._calculations = VerifiedSimulation()
+    args = {'steps': PICK}
+    result = await runtime.plan(WORKCELL_ID, SEQUENCE, args)
+    if not enabled:
+        assert result.failure_code == FAILURE_OUT_OF_WORKSPACE
+        assert runtime._plans == {}
+        return
+    assert isinstance(result, SkillPlan), result
+    assert result.basis['batch']['automatic'] and result.basis['batch']['evidence']['llm_calls'] == 0
+    assert result.basis['substituted']['selected_id'] == 'g1-to-g2'
+    assert 'Automatic alternative' in result.summary
+    assert all('g1' not in step.get('ref', '') for step in result.args['steps'])
+    assert args['steps'][0]['ref'] == 'grasp:g1'
+    assert _sim(runtime).batches == [] and len(runtime._plans) == 1

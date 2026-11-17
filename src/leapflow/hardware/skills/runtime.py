@@ -46,6 +46,7 @@ Why this file exceeds 800 lines: stop/late-landing ownership and the single
 execution path share mutable run state that must not be split. Catalog RPC
 orchestration also snapshots registry/frame state here before offloading only
 the pure reach-envelope calculation, preserving snapshot and lifecycle ownership.
+Plugin alternatives and read-only confirmation are delegated to runtime_planning.
 """
 
 from __future__ import annotations
@@ -370,10 +371,11 @@ class SkillRuntime:
                 recording=lambda: self._settings.episodes.enabled,
             )
             if isinstance(skill, PreparedPlanningSkill):
-                evaluated, prepared = await runtime_planning.evaluate(self, skill, ctx, [arguments], deadline=deadline)
-                planned = evaluated[0].value
+                planned, prepared = await runtime_planning.plan_single(self, skill, ctx, arguments, deadline=deadline)
             else:
                 planned = await skill.plan(ctx, arguments)
+            if isinstance(planned, SkillPlan):
+                planned = await runtime_planning.confirm(skill, ctx, planned, deadline=deadline)
         except asyncio.TimeoutError:
             return SkillOutcome.failed(FAILURE_TIMEOUT, "planning deadline exceeded; nothing executed")
         except SkillError as error:

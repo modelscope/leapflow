@@ -2331,6 +2331,7 @@ class Context:
                     stagnation_window=settings.guardrail_stagnation_window,
                     min_success_rate=settings.guardrail_min_success_rate,
                     max_consecutive_same=settings.guardrail_max_consecutive_same,
+                    argument_scoped_tools=settings.guardrail_argument_scoped_tools,
                     max_calls_per_turn=settings.guardrail_max_calls_per_turn,
                 )
                 logger.debug("Tool loop guardrails enabled")

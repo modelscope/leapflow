@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from leapflow.hardware.skills.observability import ObservationReport, ObservationSettings, ViewEvidence
 from leapflow.hardware.skills.protocol import (
-    FAILURE_DEVICE_FAULT, FAILURE_TARGET_NOT_FOUND, LocatedObject, SkillError,
+    FAILURE_DEVICE_FAULT, FAILURE_OBSERVATION_INSUFFICIENT, FAILURE_TARGET_NOT_FOUND, LocatedObject, SkillError,
 )
 from leapflow.hardware.skills.scene_memory import SceneCapture
+from leapflow.hardware.skills.table_view import as_seen, mask_box, rebased, table_plane
 from leapflow.hardware.vision.group import CaptureGroup
 
 if TYPE_CHECKING:
@@ -55,7 +56,8 @@ class SceneObservations:
     def analyze(self, obj: LocatedObject, capture: SceneCapture) -> ViewEvidence:
         """Sample the projected top surface at a fixed normalized grid density."""
         frame = capture.frame
-        mount, _ = capture.placement()
+        mount, table = capture.placement()
+        obj = as_seen(obj, frame, mount, table, self.scene._settings, camera=capture.camera)
         to_camera = mount.inverse()
         settings = self.settings
         side = max(2, int(math.sqrt(settings.samples)))
@@ -169,9 +171,10 @@ class SceneObservations:
         self.scene._memory.remember_observation(obj, report, self.scene._basis)
         self.scene._note('observation', report.to_dict(self.settings))
 
-    async def relocate(self, obj: LocatedObject) -> LocatedObject:
-        """A nearer surface never becomes the approved object's new geometry."""
-        from leapflow.hardware.skills.perception import describe, lift_detection, lift_mask, reproject
+    async def relocate(self, obj: LocatedObject, *, commit: bool = True) -> LocatedObject:
+        """Remeasure without grounding; read-only confirmation never refreshes memory."""
+        from leapflow.hardware.skills.perception import lift_detection, reproject
+        from leapflow.hardware.skills.scene_fusion import presence
         scene = self.scene
         roles = tuple(dict.fromkeys((obj.camera, *self.roles())))
         attempts = []
@@ -179,24 +182,20 @@ class SceneObservations:
             try:
                 capture = await scene.capture(role)
                 evidence = await self.evidence(obj, capture)
-                attempts.append(evidence)
-                from leapflow.hardware.skills.scene_fusion import presence
-                state, _, _, _ = presence(obj, capture.frame, capture.placement()[0].inverse(), scene._settings)
-                if state != 'visible' or evidence.nearer > 0 or evidence.support <= 0:
+                mount, table = capture.placement()
+                projected = as_seen(obj, capture.frame, mount, table, scene._settings, camera=role)
+                state, _, _, depths = presence(projected, capture.frame, mount.inverse(), scene._settings)
+                attempts.append(replace(evidence, state=state,
+                    reason=f"presence={state}; expected_mm={depths.get('expected_mm')}; measured_mm={depths.get('measured_mm')}"))
+                if state != 'visible':
                     continue
-                detection = reproject(obj, capture)
-                if detection.mask is not None:
-                    mount, table = capture.placement()
-                    points = lift_mask(detection.mask, capture.frame, mount, table, scene._settings)
-                    if len(points) < scene._settings.min_points:
-                        continue
-                    allowance = evidence.error_mm or self.settings.depth_error_mm
-                    if any(p[2] > obj.center[2]+obj.height/2+allowance for p in points):
-                        continue
-                    seen = replace(describe(points, table, label=obj.label, score=obj.score,
-                        observed_at=capture.frame.observed_at, top_quantile=scene._settings.top_quantile), camera=role)
-                else:
-                    seen = lift_detection(detection, capture, scene._settings)
+                if self.settings.enabled and (evidence.nearer > 0 or evidence.support <= 0):
+                    continue
+                detection = reproject(projected, capture)
+                seen = lift_detection(detection, capture, scene._settings)
+                if seen.height > obj.height + self.settings.disagreement_mm:
+                    attempts[-1] = replace(attempts[-1], reason='remeasured top exceeds association tolerance')
+                    continue
             except (LookupError, ValueError) as exc:
                 attempts.append(ViewEvidence(role, '', 'unavailable', reason=str(exc)))
                 continue
@@ -208,15 +207,20 @@ class SceneObservations:
             moved = replace(seen, object_id=obj.object_id, source=obj.source, geometry=obj.geometry)
             if self.settings.enabled and math.dist(moved.center, obj.center) > self.settings.disagreement_mm:
                 continue
-            scene._memory.update(moved, scene._basis)
-            # Earlier views describe the old geometry; never certify the new fit
-            # with evidence measured against a different extent.
-            self.record(moved, (await self.evidence(moved, capture),), attempts=attempts)
+            if commit:
+                scene._memory.update(moved, scene._basis)
+                # Earlier views describe the old geometry; never certify the new fit
+                # with evidence measured against a different extent.
+                self.record(moved, (await self.evidence(moved, capture),), attempts=attempts)
             return moved
-        self.record(obj, attempts)
-        raise SkillError(FAILURE_TARGET_NOT_FOUND,
-                         f'{obj.object_id} cannot be measured in any calibrated view; observe again and replan',
-                         result={'observation': self.report(obj).to_dict(self.settings),
+        report = ObservationReport(obj.object_id, tuple(attempts), attempts=tuple(attempts))
+        if commit:
+            self.record(obj, attempts)
+        gone = any(v.state == 'moved_or_gone' for v in attempts) and not any(v.state == 'visible' for v in attempts)
+        detail = 'moved or disappeared from its measured position' if gone else 'cannot be measured reliably (occlusion, missing depth, or measurement disagreement)'
+        raise SkillError(FAILURE_TARGET_NOT_FOUND if gone else FAILURE_OBSERVATION_INSUFFICIENT,
+                         f'{obj.object_id} {detail}; observe again and replan',
+                         result={'observation': report.to_dict(self.settings),
                                  'next': ['perceive.survey', 'perceive.snapshot with_cameras=[all]']})
 
     async def measure(self, obj: LocatedObject, captures: Sequence[SceneCapture], *,
@@ -248,11 +252,13 @@ class SceneObservations:
             if evidence.support <= 0 or evidence.nearer > 0:
                 continue
             try:
-                detection = reproject(search, capture)
                 mount, table = capture.placement()
+                projected = as_seen(search, capture.frame, mount, table, scene._settings, camera=capture.camera)
+                detection = reproject(projected, capture)
                 if detection.mask is None:
                     continue
-                points = lift_mask(detection.mask, capture.frame, mount, table, scene._settings)
+                viewed = table_plane(mask_box(detection.mask), capture.frame, mount, table, scene._settings) or table
+                points = rebased(lift_mask(detection.mask, capture.frame, mount, viewed, scene._settings), viewed, table)
                 # Never turn a previously unknown higher/nearer surface into the object.
                 top = obj.center[2] + obj.height/2
                 allowance = evidence.error_mm or settings.depth_error_mm
@@ -283,7 +289,7 @@ class SceneObservations:
                         conflict=True, attempts=attempts)
             return obj
         fresh = replace(fitted, object_id=obj.object_id, source=obj.source,
-                        camera=obj.camera, geometry=obj.geometry)
+                        camera=obj.camera, geometry=obj.geometry, table_offset_mm=obj.table_offset_mm)
         scene._memory.update(fresh, scene._basis, invalidate_grasps=True)
         # Historic captures improve the fit, but never authorize an absent live target.
         views = [await self.evidence(fresh, c) for c in latest]
@@ -309,9 +315,12 @@ class SceneObservations:
                 try:
                     obj = lift_detection(detection, capture, scene._settings)
                     mount, table = capture.placement()
-                    points = (lift_mask(detection.mask, capture.frame, mount, table, scene._settings)
-                              if detection.mask is not None else lift_box(detection.box, capture.frame, mount, table, scene._settings)
-                              if detection.box is not None else [])
+                    box = mask_box(detection.mask) if detection.mask is not None else detection.box
+                    viewed = table_plane(box, capture.frame, mount, table, scene._settings) if box is not None else None
+                    viewed = viewed or table
+                    points = rebased(lift_mask(detection.mask, capture.frame, mount, viewed, scene._settings)
+                              if detection.mask is not None else lift_box(detection.box, capture.frame, mount, viewed, scene._settings)
+                              if detection.box is not None else [], viewed, table)
                     detected.append((obj, points, await self.evidence(obj, capture)))
                 except LookupError:
                     continue
@@ -334,7 +343,7 @@ class SceneObservations:
                     if merged and capture.table is not None:
                         fitted = describe(merged, capture.table, label=old.label, score=max(old.score, obj.score),
                                           observed_at=max(old.observed_at, obj.observed_at), top_quantile=scene._settings.top_quantile)
-                        old = replace(fitted, camera=old.camera, geometry=old.geometry)
+                        old = replace(fitted, camera=old.camera, geometry=old.geometry, table_offset_mm=old.table_offset_mm)
                     groups[i] = (old, merged, views + [evidence], cameras | {role})
                 else:
                     nearby = [i for i, (old, _, _, cameras) in enumerate(groups)

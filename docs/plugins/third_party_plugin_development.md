@@ -49,6 +49,16 @@ config, gateway dispatch) plus the Tool Capability Contract in
 
 Additionally, `FrameStore` (`perception/storage/frame_store.py`) is a `@runtime_checkable` Protocol for pluggable frame persistence backends.
 
+Node skills may implement `PreparedPlanningSkill` (`hardware/skills/planning.py`) to
+prepare immutable jobs for bounded parallel evaluation. Two optional, runtime-checkable
+extensions keep domain decisions in the plugin: `PlanningAlternativesSkill.alternatives`
+offers bounded task-equivalent programs after an infeasible single request;
+`PlanConfirmationSkill.confirm` performs read-only live checks before a selected plan
+is sealed. `PlanningSettings.auto_variants` defaults to true; no alternative executes
+without the normal approval, permit, freshness, and lease gates. `ScenePort.grasps`
+returns live sibling proposals, while `relocate(commit=False)` measures without
+refreshing object, grasp, or observation memory.
+
 **When to use each:**
 
 - **ToolPlugin** — You want the LLM agent to invoke your functionality as a tool call (most common).
