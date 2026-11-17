@@ -102,10 +102,12 @@ safety:
   max_force_n: 30.0
   emergency_decel_s: 0.2
   notes: >-
-    halt() maps to pyAgxArm electronic_emergency_stop() (a damped stop).
-    Resume (reset()) is a separate governed write on arm.enable; disable()
-    releases torque and drops the arm, so neither is ever part of a halt.
-    Nothing in software brakes the joints without power: unplugging the
+    halt() holds the arm in place under power: the joints it reports are sent
+    back as its joint target and watched for halt_verify_s. It never calls
+    electronic_emergency_stop() (a raised arm descends under it), reset() or
+    disable() (both release the drives and the arm falls). Torque is released
+    only by a governed arm.enable, and only as transport.config.torque_release
+    allows. Nothing in software brakes the joints without power: unplugging the
     aviation plug is the vendor's emergency stop and drops the arm at once
     (manual p49-50), so it is never a routine stop. IP22 (p3) means splash
     resistance, not washdown.
@@ -159,6 +161,22 @@ transport:
     # the drives released -- the arm sags away and later commands find a posture
     # nobody commanded. This observation window must outlast that.
     enable_settle_s: 1.0
+    # A halt holds the arm at its current joints. It counts as verified when
+    # they stay within halt_hold_tolerance_deg for halt_verify_s; a drift is
+    # reported as an unverified stop, never hidden. halt_latch: "motion" latches
+    # only a halt that interrupted motion (later targets are refused until a
+    # governed arm.enable=1); "always" latches every halt.
+    halt_latch: "motion"
+    halt_verify_s: 0.5
+    halt_hold_tolerance_deg: 2.0
+    # Whether a governed action may release the drives (arm.enable=0, or
+    # resuming the firmware's own latched stop, which is a reset()): "refuse"
+    # never does -- support the arm and use the operator tool -- while "at_rest"
+    # allows it only while every joint named in rest_joints_deg (j1..j6, null
+    # for a joint gravity cannot move) is within rest_tolerance_deg.
+    torque_release: "refuse"
+    # rest_joints_deg: [null, 0.0, 0.0, null, null, null]
+    # rest_tolerance_deg: 5.0
     # Bus and firmware facts this declaration cannot own:
     # - CAN is 2.0B at 1000 kbit/s with Motorola (MSB) byte order (p49). A wrong
     #   bitrate shows up as total silence, not as bad frames.
@@ -470,11 +488,13 @@ channels:
     representation: "state"
     effect: "configure"
     description: >-
-      Energize (1) or release (0) all motors. Energize first resumes a latched
-      emergency stop (reset()), enables every motor and enters CAN control,
-      under one approval; this is the only resume path. Release (disable())
-      drops torque and the arm can fall; neither direction is ever part of a
-      halt.
+      Energize (1) or release (0) all motors. Energize resumes a latched halt,
+      and the firmware's own latched stop (reset(), which releases the drives
+      for a moment), enables every motor and enters CAN control, under one
+      approval; this is the only resume path. Release (disable()) drops torque
+      and the arm can fall. Any step that releases torque is refused unless
+      transport.config.torque_release allows it for the arm's current posture;
+      neither direction is ever part of a halt.
     envelope:
       declared: true
       allowed_values: [0, 1]

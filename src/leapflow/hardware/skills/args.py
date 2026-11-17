@@ -11,7 +11,8 @@ Supported keywords: ``type`` (``object``, ``number``, ``integer``, ``string``,
 ``boolean``, ``array``), ``properties``, ``required``, ``additionalProperties``
 (default false at every level: an unknown argument is a mistake, not an
 extension), ``default``, ``enum``, ``minimum``, ``maximum``, ``items``,
-``minItems``, ``maxItems``, ``minLength``, ``maxLength``.
+``minItems``, ``maxItems``, ``minLength``, ``maxLength``, ``maxProperties``.
+``additionalProperties`` may also declare a value schema.
 """
 
 from __future__ import annotations
@@ -38,6 +39,10 @@ def _check_object(path: str, schema: Mapping[str, Any], value: Any) -> dict[str,
     if not isinstance(value, Mapping):
         raise _invalid(f"argument {path!r} must be an object")
     supplied = dict(value)
+    if any(not isinstance(k, str) or not k for k in supplied):
+        raise _invalid(f"argument {path!r} requires nonempty string keys")
+    if len(supplied) > schema.get('maxProperties', math.inf):
+        raise _invalid(f"argument {path!r} exceeds its property budget")
     prefix = f"{path}." if path else ""
     where = f" in {path!r}" if path else ""
     properties: Mapping[str, Any] = schema.get("properties") or {}
@@ -57,8 +62,10 @@ def _check_object(path: str, schema: Mapping[str, Any], value: Any) -> dict[str,
     missing = [name for name in schema.get("required") or () if name not in result]
     if missing:
         raise _invalid(f"missing required argument(s) {', '.join(missing)}{where}")
+    additional = schema.get('additionalProperties')
     for name in set(supplied) - set(properties):
-        result[name] = supplied[name]
+        result[name] = (_check(f'{prefix}{name}', additional, supplied[name])
+                        if isinstance(additional, Mapping) else supplied[name])
     return result
 
 

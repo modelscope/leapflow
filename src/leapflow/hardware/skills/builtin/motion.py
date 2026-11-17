@@ -8,6 +8,7 @@ human approves once.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Mapping
 
 from leapflow.hardware.skills.geometry import Pose
@@ -41,12 +42,14 @@ class ArmStatus:
 
     spec = SkillSpec(
         skill_id="arm.state",
-        version="1.1.0",
+        version="1.2.0",
         card=(
             "Read the arm without moving it: the tool centre point and flange poses in "
             "the arm base frame (mm, deg), joint positions (deg), gripper width (mm), "
             "whether the arm is enabled, the calibrated workspace box, and the table "
-            "plane when measured."
+            "plane when measured. result.reach gives sampled top-down height bands, "
+            "separate from the safety box; use these to choose hover heights, then "
+            "plan motion.sequence to check the actual posture/path."
         ),
         args_schema={"type": "object", "properties": {}},
         effect=EFFECT_READ,
@@ -60,12 +63,15 @@ class ArmStatus:
         state = await ctx.motion.state()
         workspace = ctx.frames.workspace
         table = ctx.frames.table
+        reach = await asyncio.to_thread(ctx.motion.reach_envelope)
+        reach = {**reach, "kinematics_verified": ctx.motion.reach_tracker(state).verified}
         return SkillOutcome.succeeded(
             {
                 **state.to_dict(),
                 "tcp_calibrated": "tcp" in ctx.frames.versions,
                 "workspace": None if workspace is None else workspace.to_dict(),
                 "table": None if table is None else table.to_dict(),
+                "reach": reach,
             },
             side_effect_state=SIDE_EFFECT_NONE,
             message=f"The tool is at {_fmt(state.tcp)}",

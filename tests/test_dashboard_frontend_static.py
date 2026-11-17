@@ -8,7 +8,11 @@ the symptom a reader saw, because that is what must never come back.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 _STATIC = Path(__file__).parents[1] / "src" / "leapflow" / "dashboard" / "static"
 _APP_JS = _STATIC / "app.js"
@@ -245,3 +249,87 @@ def test_a_failed_preview_start_keeps_its_reason_on_screen() -> None:
     assert "if (!ready.value) { stop(); return; }" not in src
     failed = src[src.index("function failed() {"):]
     assert failed.index("stop(true);") < failed.index("}"), "failed() must preserve the status"
+
+
+# ════════════════════════════════════════════════════════════════
+# Preview: a re-render tore down the stream it was reporting on
+# ════════════════════════════════════════════════════════════════
+
+
+def test_a_rerender_keeps_a_running_preview_alive() -> None:
+    """Every ``monitor.finding`` toasted and refetched the view, and ``render`` released
+    every preview on the way -- so a hardware notice closed the very camera it reported
+    on, in the same millisecond. That read as a rate limit ending the stream; it was the
+    notification. A live panel is carried into the new tree instead.
+    """
+    src = _app()
+    body = src[src.index("function render(spec) {"):src.index("function toast(finding) {")]
+    assert "disposePreviews(true)" in body, "render() must not release a live preview"
+    assert "disposePreviews();" not in body
+    assert "carried.set(entry.key, entry)" in body
+    # A panel the new spec no longer asks for is still stopped, so a dropped lens cannot
+    # leave a socket and a device lease attached to a detached card.
+    assert "if (entry.reused) return;" in body
+    assert "_carryPreviews.get(previewKey)" in src
+    assert "isLive: () => running || starting" in src
+
+
+def test_preview_lifecycle_executes_across_notification_rerenders() -> None:
+    """Execute the shipped lifecycle, not just assert that keep-alive text exists.
+
+    DOM rendering is the boundary stub; the real registry, disposal and render
+    functions decide whether to close the stream and release its viewer.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the frontend lifecycle execution probe")
+    src = _app()
+    dispose = src[src.index("function disposePreviews("):src.index("function renderViewError(")]
+    render = src[src.index("function render(spec) {"):src.index("function toast(finding) {")]
+    script = """
+const assert = require('node:assert/strict');
+const _previews = new Set();
+let _carryPreviews = null, _evolutionLiveControllers = [], figSeq = 0, tblSeq = 0;
+const rootEl = {innerHTML: '', appendChild() {}};
+const document = {title: ''};
+const el = () => ({}), esc = x => x, t = x => x;
+function renderNode(node) {
+  if (node.fail) throw new Error('render failed');
+  const entry = _carryPreviews.get(node.key);
+  if (entry) { entry.reused = true; return entry.dom; }
+  return {};
+}
+""" + dispose + render + """
+function preview(key, live) {
+  const entry = {key, dom: {}, stops: 0, isLive: () => live,
+                 stop() { this.stops += 1; }};
+  _previews.add(entry);
+  return entry;
+}
+const color = preview('color', true);
+const depth = preview('depth', true);
+const idle = preview('idle', false);
+const same = {root: [{key: 'color'}, {key: 'depth'}]};
+// Findings, watch transitions, reconnect and resync all call the same renderer.
+for (let event = 0; event < 4; event += 1) render(same);
+assert.equal(color.stops, 0);
+assert.equal(depth.stops, 0);
+assert.equal(idle.stops, 1);
+assert.equal(_previews.size, 2);
+render({root: [{key: 'color'}]});
+assert.equal(color.stops, 0);
+assert.equal(depth.stops, 1);
+render({root: []});
+render({root: []});
+assert.equal(color.stops, 1);
+assert.equal(_previews.size, 0);
+const orphan = preview('orphan', true);
+assert.throws(() => render({root: [{fail: true}]}), /render failed/);
+assert.equal(orphan.stops, 1);
+assert.equal(_carryPreviews, null);
+assert.equal(_previews.size, 0);
+"""
+    result = subprocess.run(
+        [node, "-"], input=script, text=True, capture_output=True, timeout=10, check=False,
+    )
+    assert result.returncode == 0, result.stderr

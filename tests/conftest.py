@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, List, Optional
 
 import pytest
+import pytest_asyncio
 
 from leapflow.config import Settings
 from leapflow.layout import build_layout
@@ -186,6 +187,24 @@ class StubLLM(LLMProvider):
 # ═══════════════════════════════════════════════════════════════════
 # Reusable pytest fixtures
 # ═══════════════════════════════════════════════════════════════════
+
+
+@pytest_asyncio.fixture
+async def close_skill_runtimes(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
+    """Test-owned runtimes dispose their reusable processes before the loop closes."""
+    from leapflow.hardware.skills.runtime import SkillRuntime
+
+    instances = []
+    original = SkillRuntime.__init__
+
+    def initialize(self: Any, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs)
+        instances.append(self)
+
+    monkeypatch.setattr(SkillRuntime, "__init__", initialize)
+    yield
+    for runtime in reversed(instances):
+        await runtime.close()
 
 
 @pytest.fixture

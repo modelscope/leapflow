@@ -39,6 +39,7 @@ class HardwareContextPlugin:
         self._teardown_registered: bool = False
         self._hardware_trust_gate: Any = None
         self._event_bus: Any = None
+        self._view_priors: Any = None
 
         # LHPGateway: bridges hardware state to/from LLM context.
         self._lhp_gateway: Any = None
@@ -112,6 +113,7 @@ class HardwareContextPlugin:
             "effect_scope",
             "session_id",
             "event_bus",
+            "hardware_view_priors",
         ]
 
     def bind_runtime(self, **deps: Any) -> None:
@@ -154,6 +156,10 @@ class HardwareContextPlugin:
             self._teardown_registered = False
         if "event_bus" in deps:
             self._event_bus = deps.get("event_bus")
+        if "hardware_view_priors" in deps:
+            self._view_priors = deps.get("hardware_view_priors")
+            if self._skill_service is not None:
+                self._skill_service.set_view_priors(self._view_priors)
 
         if registry_changed:
             # The previous manager may own a live heartbeat task; stash it so
@@ -570,6 +576,7 @@ class HardwareContextPlugin:
                 audit_log=audit_log,
                 session_id=self._session_id,
                 share_frames=bool(getattr(self._registry.settings, "share_frames", False)),
+                view_priors=self._view_priors,
             )
         return build_skill_tools(self._skill_service)
 

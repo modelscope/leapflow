@@ -25,7 +25,7 @@ flange report has been checked.
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from typing import Callable, Sequence
 
 from leapflow.hardware.skills.adapt.spec import IkSettings
 from leapflow.hardware.skills.geometry import (
@@ -87,6 +87,8 @@ def solve_ik(
     seed: Sequence[float],
     limits: Limits,
     settings: IkSettings,
+    *,
+    checkpoint: Callable[[], None] | None = None,
 ) -> tuple[float, ...]:
     """Joints (deg) that put the flange at *target*; raises ``ValueError`` if none converge."""
     if not isinstance(chain, KinematicModel):
@@ -98,6 +100,8 @@ def solve_ik(
     weight = settings.rotation_weight_mm
     damping = settings.damping * settings.damping
     for _ in range(max(1, int(settings.max_iterations))):
+        if checkpoint is not None:
+            checkpoint()
         current = chain.transform(q)
         mm, deg = _miss(target, current)
         if mm <= settings.tolerance_mm and deg <= settings.tolerance_deg:

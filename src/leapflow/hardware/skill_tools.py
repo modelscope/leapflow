@@ -25,13 +25,21 @@ language label, outside the approval; ``hw_skill_label`` records S2's own
 verification of a finished run as the episode's success label.
 
 Result shaping (failure codes, next steps, views) lives in ``skill_results.py``; the
-tool definitions in ``skill_tool_defs.py``.
+tool definitions in ``skill_tool_defs.py``; the envelope/``args`` split and its
+repair in ``skill_arguments.py``.
+
+Size note (over 800 lines): the run path and the lease mechanics it owns
+(renewal, bounded polling, stop-on-loss) must share one ``_HostRun`` and one
+connection table; splitting them would hand a run's lease to a second object
+that can outlive the service which renews it. Observation learning is delegated
+through a rebound Protocol; it does not acquire connections or own leases here.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
@@ -40,10 +48,19 @@ from leapflow.hardware.lhp.authority import WRITE_MODE_OBSERVE_ONLY, WRITE_MODE_
 from leapflow.hardware.lhp.client import SocketLhpClient
 from leapflow.hardware.lhp.permit import PERMIT_PARAM
 from leapflow.hardware.lhp.protocol import CAP_SKILL_V1, LhpRemoteError
+from leapflow.hardware.skill_arguments import (
+    PAYLOAD_FIELD,
+    RunRequest,
+    declared_arguments,
+    misplaced_fields,
+    routing,
+    split_request,
+)
 from leapflow.hardware.skill_results import (
     FAILURE_AMBIGUOUS_WORKCELL,
     FAILURE_APPROVAL_DENIED,
     FAILURE_EXECUTE_UNCONFIRMED,
+    FAILURE_INVALID_REQUEST,
     FAILURE_NO_SKILL_NODES,
     FAILURE_PERMIT_ISSUER_UNAVAILABLE,
     FAILURE_PLAN_UNVERIFIED,
@@ -81,6 +98,7 @@ from leapflow.hardware.skills.protocol import (
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_UNKNOWN,
 )
+from leapflow.hardware.view_priors import ViewPriorPort
 from leapflow.hardware.write_governor import WriteGovernanceRequest, WriteGovernor
 from leapflow.security.actions import ActionDescriptor
 
@@ -104,7 +122,8 @@ class SkillNodeClient(Protocol):
 
     async def connect(self) -> Mapping[str, Any]: ...
 
-    async def request(self, method: str, params: Mapping[str, Any] | None = None) -> Any: ...
+    async def request(self, method: str, params: Mapping[str, Any] | None = None,
+                      *, timeout_s: float | None = None) -> Any: ...
 
     async def close(self) -> None: ...
 
@@ -166,6 +185,7 @@ class SkillService:
         client_factory: ClientFactory | None = None,
         lease_s: float = DEFAULT_LEASE_S,
         share_frames: bool = False,
+        view_priors: ViewPriorPort | None = None,
     ) -> None:
         self._fleet = fleet_manager
         self._governor = WriteGovernor(gate=gate, audit_log=audit_log)
@@ -175,6 +195,7 @@ class SkillService:
         self._lease_s = float(lease_s)
         # The host half of camera-frame consent; a node also needs its workcell's.
         self._share_frames = bool(share_frames)
+        self._view_priors = view_priors
         self._links: dict[str, _Link] = {}
         self._runs: dict[str, _HostRun] = {}
         self._background: set[asyncio.Task[Any]] = set()
@@ -182,6 +203,10 @@ class SkillService:
     def set_gate(self, gate: Any) -> None:
         """Late-bind the approval gate (daemon ``install_gate`` path)."""
         self._governor.set_gate(gate)
+
+    def set_view_priors(self, priors: ViewPriorPort | None) -> None:
+        """Rebind optional ranking without replacing live run-lease ownership."""
+        self._view_priors = priors
 
     async def close(self) -> None:
         """Stop renewing and drop every connection; nodes halt runs whose lease lapses."""
@@ -244,48 +269,110 @@ class SkillService:
         ``approved_plan`` is a complete previously verified preview. It skips
         re-planning but never approval, permit issuance or node cache/freshness
         checks. An expired or consumed preview fails without replacing it.
+
+        Envelope fields nested inside ``args`` are lifted out where the skill's
+        schema makes that unambiguous (``skill_arguments``); the result says so.
         """
-        skill = str(kwargs.get("skill") or "").strip()
+        workcell, skill = routing(kwargs)
         try:
-            args = kwargs.get("args") or {}
-            if not isinstance(args, Mapping):
-                raise SkillRefusal(FAILURE_INVALID_ARGS, "args must be an object")
             if not skill:
-                raise SkillRefusal(FAILURE_INVALID_ARGS, "skill is required")
-            timeout_s = _timeout(kwargs.get("timeout_s"))
-            target = await self._resolve(str(kwargs.get("workcell") or "").strip())
-            approved = kwargs.get("approved_plan")
-            if approved is not None:
-                if not isinstance(approved, Mapping) or approved.get("args") != dict(args):
-                    raise SkillRefusal(FAILURE_PLAN_UNVERIFIED, "approved plan arguments differ from request")
-                saved = dict(approved)
-                planned = {
-                    "plan": saved, "consent": "each_run",
-                    "permit_digest": run_permit_digest(
-                        workcell=str(saved.get("workcell") or ""),
-                        skill_id=str(saved.get("skill_id") or ""),
-                        version=str(saved.get("version") or ""),
-                        plan_digest=str(saved.get("digest") or ""),
-                        limits=as_mapping(saved.get("limits")),
-                    ),
-                }
-            else:
-                planned = as_mapping(
-                    await self._request(
-                        target.node_id,
-                        target.link,
-                        "skill.plan",
-                        {
-                            "workcell": target.workcell,
-                            "skill": skill,
-                            "args": dict(args),
-                            "share_frames": self._share_frames,
-                        },
-                    )
+                raise SkillRefusal(FAILURE_INVALID_REQUEST, "skill is required (see hw_skill_list)")
+            target = await self._resolve(workcell)
+            declared = None
+            if misplaced_fields(kwargs.get(PAYLOAD_FIELD)):
+                listed = await self._request(
+                    target.node_id, target.link, "skill.list", {"workcell": target.workcell}
                 )
+                declared = declared_arguments(as_mapping(listed), skill)
+            request = split_request(kwargs, declared)
+            planned = await self._plan(target, request, kwargs.get("approved_plan"))
         except SkillRefusal as refusal:
             return refusal_result(refusal.failure_code, refusal.message, skill=skill)
+        result = await self._run(target, request, planned)
+        if "batch" in planned:
+            result["batch"] = dict(as_mapping(planned["batch"]))
+        if request.lifted:
+            result["argument_repair"] = request.repair_view()
+            logger.info("hw_skill_run %s: lifted %s out of args", skill, ", ".join(request.lifted))
+            self._audit_record(
+                "skill_args_repair", target.qualified, skill, f"lifted {', '.join(request.lifted)}"
+            )
+        return result
+
+    async def _plan(
+        self, target: _Target, request: RunRequest, approved: Any
+    ) -> Mapping[str, Any]:
+        """The node's plan reply, or the re-bound reply of a previously verified preview."""
+        if request.candidates is not None:
+            return await self._plan_batch(target, request)
+        if approved is None:
+            if (self._view_priors is not None and request.skill == "perceive.survey"
+                    and request.args.get("mode", "passive") == "active"
+                    and "priors" not in request.args and "prior_scope" not in request.args):
+                request.args.update(await self._view_priors.hints(target.qualified))
+            return as_mapping(
+                await self._request(
+                    target.node_id,
+                    target.link,
+                    "skill.plan",
+                    {
+                        "workcell": target.workcell,
+                        "skill": request.skill,
+                        "args": dict(request.args),
+                        "share_frames": self._share_frames,
+                    },
+                )
+            )
+        if not isinstance(approved, Mapping) or approved.get("args") != request.args:
+            raise SkillRefusal(FAILURE_PLAN_UNVERIFIED, "approved plan arguments differ from request")
+        saved = dict(approved)
+        return {
+            "plan": saved, "consent": "each_run",
+            "permit_digest": run_permit_digest(
+                workcell=str(saved.get("workcell") or ""),
+                skill_id=str(saved.get("skill_id") or ""),
+                version=str(saved.get("version") or ""),
+                plan_digest=str(saved.get("digest") or ""),
+                limits=as_mapping(saved.get("limits")),
+            ),
+        }
+
+    async def _plan_batch(self, target: _Target, request: RunRequest) -> Mapping[str, Any]:
+        listed = as_mapping(await self._request(
+            target.node_id, target.link, "skill.list", {"workcell": target.workcell}))
+        capability: Mapping[str, Any] = {}
+        for cell in listed.get("workcells") or ():
+            for entry in as_mapping(cell).get("skills") or ():
+                if as_mapping(entry).get("skill_id") == request.skill:
+                    capability = as_mapping(as_mapping(entry).get("batch_planning"))
+        if capability.get("supported") is not True:
+            raise SkillRefusal(FAILURE_SKILL_UNSUPPORTED, "node/skill does not advertise batch planning")
+        from leapflow.hardware.skills.planning import PlanningSettings, Selection, candidates
+        from leapflow.hardware.skills.protocol import SkillError
+        try:
+            settings = PlanningSettings(**dict(as_mapping(capability.get("limits"))))
+            candidates(request.candidates, settings)
+            Selection.from_mapping(request.selection)
+            settings.check_size({"candidates": request.candidates, "selection": request.selection})
+        except (SkillError, ValueError, TypeError) as exc:
+            raise SkillRefusal(FAILURE_INVALID_REQUEST, str(exc)) from exc
+        return as_mapping(await self._request(
+            target.node_id, target.link, "skill.plan",
+            {"workcell": target.workcell, "skill": request.skill,
+             "candidates": request.candidates, "selection": request.selection,
+             "share_frames": self._share_frames}, timeout_s=settings.timeout_s + 5.0))
+
+    async def _run(
+        self, target: _Target, request: RunRequest, planned: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Answer a READ outcome, or verify, approve, start and follow the plan."""
+        skill = request.skill
         if "outcome" in planned:  # a READ skill's result, or a refusal to plan
+            outcome = as_mapping(planned['outcome'])
+            if self._view_priors is not None and skill == 'perceive.survey':
+                self._view_priors.record_decision(target.node_id, target.workcell,
+                    str(as_mapping(outcome.get('result')).get('observation_scope', '')),
+                    'planning', outcome, uuid.uuid4().hex)
             result = outcome_result(target.qualified, skill, as_mapping(planned["outcome"]))
             shared = share_frame(result, consent=self._share_frames)
             if shared:
@@ -301,12 +388,14 @@ class SkillService:
             return refusal_result(
                 FAILURE_PLAN_UNVERIFIED, problem, workcell=target.qualified, skill=skill
             )
+        if self._view_priors is not None and skill == "perceive.survey":
+            self._view_priors.expect_scope(target.qualified, str(as_mapping(plan.get("basis")).get("observation_scope", "")))
         base = {
             "workcell": target.qualified,
             "skill": skill,
             "plan": plan_view(plan, str(planned.get("consent") or "")),
         }
-        if bool(kwargs.get("dry_run")):
+        if request.dry_run:
             return {
                 "ok": True,
                 "dry_run": True,
@@ -316,12 +405,20 @@ class SkillService:
             }
         gated = await self._approve(target, plan, base)
         if isinstance(gated, dict):
+            if self._view_priors is not None and skill == 'perceive.survey':
+                self._view_priors.record_decision(target.node_id, target.workcell,
+                    str(as_mapping(plan.get('basis')).get('observation_scope', '')),
+                    'approval', gated, str(plan['digest']))
             return gated
-        intent = str(kwargs.get("intent") or "").strip()[:MAX_INTENT_CHARS]
+        intent = request.intent[:MAX_INTENT_CHARS]
         started = await self._start(target, gated, permit_digest, base, intent)
         if isinstance(started, dict):
+            if self._view_priors is not None and skill == 'perceive.survey':
+                self._view_priors.record_decision(target.node_id, target.workcell,
+                    str(as_mapping(plan.get('basis')).get('observation_scope', '')),
+                    'admission', started, str(plan['digest']))
             return started
-        if not bool(kwargs.get("wait", True)):
+        if not request.wait:
             return {
                 "ok": True,
                 **base,
@@ -330,7 +427,7 @@ class SkillService:
                 "side_effect_state": SIDE_EFFECT_UNKNOWN,
                 "next_step": "Follow it with hw_skill_status; stop it with hw_skill_stop.",
             }
-        return await self._finish(target, started, _skill_ref(gated), base, timeout_s)
+        return await self._finish(target, started, _skill_ref(gated), base, request.timeout_s)
 
     async def hw_skill_status(self, **kwargs: Any) -> dict[str, Any]:
         """Runs on the node that owns ``run_id``, or every run on every node."""
@@ -692,7 +789,7 @@ class SkillService:
         """``node/cell`` names its node; a bare ``cell`` must match on exactly one node."""
         node_id, _, cell = workcell.rpartition("/")
         if not cell:
-            raise SkillRefusal(FAILURE_INVALID_ARGS, "workcell is required (see hw_skill_list)")
+            raise SkillRefusal(FAILURE_INVALID_REQUEST, "workcell is required (see hw_skill_list)")
         nodes = self._nodes()
         if not nodes:
             raise SkillRefusal(FAILURE_NO_SKILL_NODES, "no hardware node is registered")
@@ -738,9 +835,12 @@ class SkillService:
         return links
 
     @staticmethod
-    async def _request(node_id: str, link: _Link, method: str, params: Mapping[str, Any]) -> Any:
+    async def _request(node_id: str, link: _Link, method: str, params: Mapping[str, Any],
+                       *, timeout_s: float | None = None) -> Any:
         """A request whose failure means nothing moved: raised as a NONE refusal."""
         try:
+            if timeout_s is not None:
+                return await link.client.request(method, params, timeout_s=timeout_s)
             return await link.client.request(method, params)
         except _WIRE_ERRORS as exc:
             raise unreachable(node_id, exc) from exc
@@ -750,6 +850,8 @@ class SkillService:
     def _view(self, node_id: str, run: Mapping[str, Any]) -> dict[str, Any]:
         """``run_view`` plus host knowledge; an ended run stops being tracked."""
         view = run_view(node_id, run)
+        if self._view_priors is not None:
+            self._view_priors.record_run(node_id, run)
         tracked = self._runs.get(str(run.get("run_id") or ""))
         if tracked is None:
             return view
@@ -799,18 +901,6 @@ def _skill_ref(descriptor: ActionDescriptor) -> str:
 def _cancel(task: asyncio.Task[Any] | None) -> None:
     if task is not None and not task.done():
         task.cancel()
-
-
-def _timeout(raw: Any) -> float:
-    if raw is None:
-        return DEFAULT_RUN_TIMEOUT_S
-    try:
-        value = float(raw)
-    except (TypeError, ValueError) as exc:
-        raise SkillRefusal(FAILURE_INVALID_ARGS, "timeout_s must be a number") from exc
-    if not 0 < value <= MAX_RUN_TIMEOUT_S:
-        raise SkillRefusal(FAILURE_INVALID_ARGS, f"timeout_s must be in (0, {MAX_RUN_TIMEOUT_S:g}]")
-    return value
 
 
 __all__ = [

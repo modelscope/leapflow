@@ -38,6 +38,27 @@ def _stub_engine(
     return engine
 
 
+def test_argument_scoped_domination_distinguishes_hardware_programs() -> None:
+    from leapflow.config import Settings
+    from leapflow.engine.tools.tool_guardrails import DominationGuard, RepetitionGuard
+    guard = DominationGuard(max_consecutive_same=8, argument_scoped_tools=Settings.guardrail_argument_scoped_tools)
+    def history(distinct: bool, name: str = 'hw_skill_run'):
+        messages = []
+        for i in range(8):
+            args = {'workcell': 'sim/cell', 'skill': 'motion.sequence',
+                    'args': {'steps': [{'op': 'wait', 'seconds': i if distinct else 1}]}}
+            messages.append({'role': 'assistant', 'tool_calls': [{'id': str(i), 'function': {
+                'name': name, 'arguments': json.dumps(args)}}]})
+            messages.append({'role': 'tool', 'tool_call_id': str(i), 'content': json.dumps({'ok': False, 'failure_code': 'unreachable'})})
+        return messages
+    assert not guard.check(history(True)).violated
+    assert not guard.check(history(True, 'gp_hw_skill_run')).violated
+    assert guard.check(history(False)).violated
+    assert guard.check(history(True, 'other_tool')).violated
+    assert RepetitionGuard().check(history(False)).severity == 'halt'
+    assert not RepetitionGuard().check(history(True)).violated
+
+
 # ── _format_tool_catalog ─────────────────────────────────────────────
 
 

@@ -306,18 +306,28 @@ class DominationGuard:
     Prevents the agent from fixating on a single tool when multiple are available.
     """
 
-    def __init__(self, *, max_consecutive_same: int = 5) -> None:
+    def __init__(self, *, max_consecutive_same: int = 5,
+                 argument_scoped_tools: tuple[str, ...] = ()) -> None:
         self._threshold = max_consecutive_same
+        self._argument_scoped = frozenset(argument_scoped_tools)
 
     def check(self, history: List[Dict[str, Any]]) -> GuardrailViolation:
-        recent_tools: List[str] = []
+        recent_tools: List[tuple[str, str]] = []
         for msg in history:
             if msg.get("role") == "assistant":
                 for tc in (msg.get("tool_calls") or []):
                     fn = tc.get("function", {})
                     name = fn.get("name", "")
                     if name:
-                        recent_tools.append(name)
+                        scope = ''
+                        if name.removeprefix('gp_') in self._argument_scoped:
+                            raw = fn.get('arguments', {})
+                            try:
+                                args = json.loads(raw) if isinstance(raw, str) else raw
+                            except (TypeError, ValueError):
+                                args = raw
+                            scope = json.dumps(args, sort_keys=True, default=str, separators=(',', ':'))
+                        recent_tools.append((name, scope))
 
         if len(recent_tools) < self._threshold:
             return GuardrailViolation(violated=False)
@@ -326,7 +336,7 @@ class DominationGuard:
         if len(set(tail)) == 1:
             return GuardrailViolation(
                 violated=True,
-                reason=f"Tool '{tail[0]}' used {self._threshold} times consecutively",
+                reason=f"Tool '{tail[0][0]}' used {self._threshold} times consecutively with the same operation scope",
                 severity="warning",
                 suggestion="Consider using a different tool or providing the answer directly.",
             )
@@ -404,12 +414,13 @@ class CompositeGuardrail:
         stagnation_window: int = 10,
         min_success_rate: float = 0.2,
         max_consecutive_same: int = 5,
+        argument_scoped_tools: tuple[str, ...] = (),
         max_calls_per_turn: int = 50,
     ) -> None:
         self._guards: List[ToolLoopGuard] = guards or [
             RepetitionGuard(max_repeats=max_repeats),
             StagnationGuard(window=stagnation_window, min_success_rate=min_success_rate),
-            DominationGuard(max_consecutive_same=max_consecutive_same),
+            DominationGuard(max_consecutive_same=max_consecutive_same, argument_scoped_tools=argument_scoped_tools),
             TurnCapGuard(max_calls=max_calls_per_turn),
         ]
 

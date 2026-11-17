@@ -41,7 +41,7 @@ from leapflow.hardware.context import (
 from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
 from leapflow.hardware.risk import build_risk_classifier
 from leapflow.hardware.tools import HardwareTools, build_hardware_tools
-from leapflow.hardware.transport import SIDE_EFFECT_NONE
+from leapflow.hardware.transport import SIDE_EFFECT_NONE, TransportStatus
 from leapflow.hardware.transports.mcp import set_mcp_client_provider
 from leapflow.security.actions import ActionDescriptor, ActionKind
 from leapflow.security.approval import ApprovalDecision, SessionAwareGate
@@ -799,6 +799,21 @@ async def test_t3_unverified_context_blocks_writes_by_default() -> None:
 
 
 @pytest.mark.asyncio
+async def test_t3_a_demoted_write_names_its_rule_and_the_operator_remedy() -> None:
+    """Read-only is never a dead end: the refusal says which rule and what lifts it."""
+    bench = Bench(liquid_handler_context(verified=False))
+    described = await bench.tools.hw_describe(device_id="fluent_p1")
+    assert [note["rule"] for note in described["admission_notes"]] == ["V7"]
+    result = await bench.tools.hw_dispense(device_id="fluent_p1", channel_id="aspirate", value=10.0)
+    assert result["failure_code"] == "channel_not_writable"
+    assert "V7" in result["error"] and "leap hw verify fluent_p1" in result["error"]
+    assert result["admission_notes"][0]["remedy_command"] == "leap hw verify fluent_p1"
+    request = result["interaction_request"]
+    assert request["suggested_actions"][0]["command"] == "leap hw verify fluent_p1"
+    assert result["side_effect_state"] == "none"
+
+
+@pytest.mark.asyncio
 async def test_t3_unverified_context_says_so_in_its_reference() -> None:
     bench = Bench(liquid_handler_context(verified=False))
     described = await bench.tools.hw_describe(device_id="fluent_p1")
@@ -1194,6 +1209,34 @@ async def test_estop_reports_when_the_device_cannot_halt() -> None:
     result = await bench.tools.hw_estop(device_id="bench_node")
     assert result["ok"] is False
     assert result["halted"] is False
+
+
+@pytest.mark.asyncio
+async def test_estop_reports_and_audits_what_the_stop_physically_did(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """"Sent" is not "stopped": the effect and its verification reach the caller and the log."""
+    bench = Bench(bench_node_context(),
+                  audit_log=HardwareAuditLog(tmp_path / "hardware-audit.ndjson"))
+    held = await bench.tools.hw_estop(device_id="bench_node")
+    assert held["ok"] is True and held["stop_effect"] == "hold"
+    assert "warning" not in held
+
+    transport = await bench.transport("bench_node")
+
+    async def unverified_halt() -> TransportStatus:
+        return TransportStatus(connected=True, halt_supported=True, detail="drifted",
+                               stop_effect="hold", stop_verified=False)
+
+    monkeypatch.setattr(transport, "halt", unverified_halt)
+    drifting = await bench.tools.hw_estop(device_id="bench_node")
+    assert drifting["stop_verified"] is False
+    assert "physical emergency stop" in drifting["warning"]
+
+    entries = [entry for entry in HardwareAuditLog(tmp_path / "hardware-audit.ndjson")
+               .read_entries() if entry.action == "estop"]
+    assert [entry.outcome for entry in entries] == ["ok", "unverified"]
+    assert entries[-1].value == {"stop_effect": "hold", "stop_verified": False}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1869,10 +1912,18 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.fleet_nodes",
         "hardware.alert_policies",
         "hardware.advisory_limits",
+        "hardware.view_priors",
         "hardware.skills_enabled",
         "hardware.skills_speed_pct_max",
         "hardware.skills_max_duration_s",
         "hardware.skills_plan_ttl_s",
+        "hardware.skills_planning_auto_variants",
+        "hardware.skills_planning_workers",
+        "hardware.skills_planning_max_candidates",
+        "hardware.skills_planning_max_jobs",
+        "hardware.skills_planning_timeout_s",
+        "hardware.skills_planning_max_bytes",
+        "hardware.skills_planning_cancel_grace_s",
         "hardware.skills_halt_timeout_s",
         "hardware.skills_stop_grace_s",
         "hardware.skills_dispatch_settle_s",
@@ -1881,6 +1932,10 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.share_frames",
         "hardware.calibration_worker_enabled",
         "hardware.calibration_worker_budgets",
+        "hardware.node_log_file",
+        "hardware.node_log_max_mb",
+        "hardware.node_log_backups",
+        "hardware.node_log_level",
     }
     for key in keys:
         view = service.describe(key)

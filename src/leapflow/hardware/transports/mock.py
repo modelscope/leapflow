@@ -33,6 +33,8 @@ from leapflow.hardware.transport import (
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_UNKNOWN,
+    STOP_EFFECT_HOLD,
+    STOP_EFFECT_NONE,
     Reading,
     TransportError,
     TransportStatus,
@@ -109,8 +111,12 @@ class MockTransport:
                 connected=self._connected,
                 halt_supported=False,
                 detail="halt not supported by this device",
+                stop_effect=STOP_EFFECT_NONE,
             )
-        return TransportStatus(connected=self._connected, halt_supported=True, detail="halted")
+        return TransportStatus(
+            connected=self._connected, halt_supported=True, detail="halted",
+            stop_effect=STOP_EFFECT_HOLD,
+        )
 
     # ── Data plane ──
 

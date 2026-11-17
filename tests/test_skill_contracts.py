@@ -29,6 +29,7 @@ from leapflow.hardware.skills.builtin.motion import skills as motion_skills
 from leapflow.hardware.skills.builtin.policy import skills as policy_skills
 from leapflow.hardware.skills.builtin.scene import skills as scene_skills
 from leapflow.hardware.skills.builtin.sequence import skills as sequence_skills
+from leapflow.hardware.skills.builtin.survey import skills as survey_skills
 from leapflow.hardware.skills.digest import plan_digest, run_permit_digest
 from leapflow.hardware.skills.geometry import (
     Pose,
@@ -63,6 +64,9 @@ _ALLOWED = {
     # Typed frame diagnoses (statuses, accuracies): pure contract values, no device.
     "leapflow.hardware.skills.frame_status",
 }
+# A builtin skill may split itself into private sibling modules (``_name.py``);
+# each of them is held to this same rule by the test below.
+_BUILTIN_PRIVATE = "leapflow.hardware.skills.builtin._"
 # The adapter is pure embodiment math: declarations in, vectors out. It knows no
 # workcell, transport, or binding, so training-side converters can import it alone.
 # PIL is the node's existing lazy JPEG codec (observation images only).
@@ -93,9 +97,12 @@ def _imports(path: Path) -> set[str]:
 def test_builtin_skills_import_only_the_skill_contract_and_stdlib(path: Path) -> None:
     for module in _imports(path):
         top = module.split(".")[0]
-        assert module in _ALLOWED or top in sys.stdlib_module_names or top == "__future__", (
-            f"{path.name} imports {module}; skills reach devices only through SkillContext"
-        )
+        assert (
+            module in _ALLOWED
+            or module.startswith(_BUILTIN_PRIVATE)
+            or top in sys.stdlib_module_names
+            or top == "__future__"
+        ), f"{path.name} imports {module}; skills reach devices only through SkillContext"
 
 
 @pytest.mark.parametrize("path", sorted((_SKILLS / "adapt").glob("*.py")), ids=lambda p: p.name)
@@ -114,6 +121,7 @@ def _builtin_skills() -> tuple[NodeSkill, ...]:
     return (
         *motion_skills(),
         *sequence_skills(),
+        *survey_skills(),
         *calibration_skills(),
         *camera_skills(),
         *readiness_skills(),

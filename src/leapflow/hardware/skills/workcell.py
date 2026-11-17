@@ -108,6 +108,7 @@ WORKCELL_FIELDS = frozenset(
         "grasp",
         "grasp_verify",
         "perception",
+        "observation",
         "policy",
         "policies",
         "calibration_target",
@@ -183,6 +184,7 @@ class WorkcellSpec:
     grasp: Mapping[str, Any] = field(default_factory=dict)
     grasp_verify: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_GRASP_VERIFY))
     perception: Mapping[str, float] = field(default_factory=dict)
+    observation: Mapping[str, Any] = field(default_factory=dict)
     policy: Mapping[str, float] = field(default_factory=dict)
     policies: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     calibration_target: Mapping[str, Any] = field(default_factory=dict)
@@ -253,6 +255,7 @@ class WorkcellSpec:
             "grasp": {**dict(self.grasp), "planner": self.grasp_planner},
             "grasp_verify": dict(self.grasp_verify),
             "perception": dict(self.perception),
+            "observation": dict(self.observation),
             "policy": dict(self.policy),
             "policies": {name: dict(decl) for name, decl in self.policies.items()},
             "calibration_target": dict(self.calibration_target),
@@ -311,6 +314,7 @@ class WorkcellSpec:
                 grasp=_parse_grasp(data.get("grasp") or {}),
                 grasp_verify=_parse_grasp_verify(data.get("grasp_verify") or {}),
                 perception=_float_map(data.get("perception") or {}, "perception"),
+                observation=_parse_observation(data.get("observation") or {}),
                 policy=_float_map(data.get("policy") or {}, "policy"),
                 policies=_parse_policies(data.get("policies") or {}),
                 calibration_target=_mapping(
@@ -330,6 +334,12 @@ class WorkcellSpec:
             raise
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkcellError(f"workcell {workcell_id!r}: {exc}") from exc
+
+
+def _parse_observation(raw: Mapping[str, Any]) -> dict[str, Any]:
+    from leapflow.hardware.skills.observability import ObservationSettings
+    ObservationSettings.from_mapping(raw)
+    return dict(raw)
 
 
 def _parse_bridge(data: Mapping[str, Any], **bindings: Any) -> dict[str, Any]:
@@ -377,7 +387,7 @@ def _parse_motion_collection(data: Mapping[str, Any]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class WorkcellNote:
-    """Why one declaration was rejected."""
+    """Why one declaration was rejected, or what an admitted one should change."""
 
     source: str
     workcell: str
@@ -391,11 +401,17 @@ class WorkcellNote:
 class WorkcellLoadReport:
     admitted: tuple[str, ...] = ()
     rejected: tuple[WorkcellNote, ...] = ()
+    # Admitted declarations that work but degrade a caller (e.g. a TTL too short).
+    advisories: tuple[WorkcellNote, ...] = ()
+
+    def advised(self, workcell: str) -> list[str]:
+        return [note.detail for note in self.advisories if note.workcell == workcell]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "admitted": list(self.admitted),
             "rejected": [note.to_dict() for note in self.rejected],
+            "advisories": [note.to_dict() for note in self.advisories],
         }
 
 
@@ -438,14 +454,24 @@ def admission_problems(
 
 
 def load_workcells(
-    directory: Path, registry: Any, *, checks: Iterable[AdmissionCheck] = ()
+    directory: Path,
+    registry: Any,
+    *,
+    checks: Iterable[AdmissionCheck] = (),
+    advice: Iterable[AdmissionCheck] = (),
 ) -> tuple[dict[str, WorkcellSpec], WorkcellLoadReport]:
-    """Load and admit every ``*.yaml`` in *directory*; rejections are reported, not raised."""
+    """Load and admit every ``*.yaml`` in *directory*; rejections are reported, not raised.
+
+    *advice* rules run on admitted declarations only; what they return is
+    reported as advisories and never refuses the workcell.
+    """
     import yaml
 
     rules = tuple(checks)
+    advisors = tuple(advice)
     admitted: dict[str, WorkcellSpec] = {}
     rejected: list[WorkcellNote] = []
+    advisories: list[WorkcellNote] = []
     paths = sorted(directory.glob("*.yaml")) if directory.is_dir() else []
     for path in paths:
         try:
@@ -464,9 +490,21 @@ def load_workcells(
             rejected.append(WorkcellNote(str(path), spec.workcell_id, "; ".join(problems)))
             continue
         admitted[spec.workcell_id] = replace(spec, actuators=_actuators(spec, registry))
+        advisories.extend(advisory_notes(spec, advisors))
     for note in rejected:
         logger.warning("workcell rejected (%s): %s", note.source, note.detail)
-    return admitted, WorkcellLoadReport(tuple(admitted), tuple(rejected))
+    for note in advisories:
+        logger.warning("workcell %s advisory (%s): %s", note.workcell, note.source, note.detail)
+    return admitted, WorkcellLoadReport(tuple(admitted), tuple(rejected), tuple(advisories))
+
+
+def advisory_notes(spec: WorkcellSpec, advice: Iterable[AdmissionCheck]) -> list[WorkcellNote]:
+    """What each *advice* rule says about the admitted *spec*."""
+    return [
+        WorkcellNote(spec.source, spec.workcell_id, detail)
+        for rule in advice
+        for detail in rule(spec)
+    ]
 
 
 def resolve_declared(spec: WorkcellSpec, registry: Any) -> WorkcellSpec:
@@ -543,6 +581,36 @@ def _gripper_problems(role: str, gripper: Any, spec: WorkcellSpec) -> list[str]:
         )
     if declared is not None and spec.gripper_spec["min_hold_width_mm"] >= declared:
         problems.append("gripper_spec.min_hold_width_mm must be below max_width_mm")
+    problems.extend(_gripper_band_problems(gripper, spec))
+    return problems
+
+
+def _gripper_band_problems(gripper: Any, spec: WorkcellSpec) -> list[str]:
+    """Widths judged against the position tolerance must be on the right side of it.
+
+    A release margin inside the tolerance can never be told apart from still
+    holding, so every ``released`` guard would be refused; a stall band at or
+    beyond it reads jaws still creeping toward their target as stopped short.
+    """
+    tolerance = gripper.channel(GRIPPER_POSITION).envelope.tolerance
+    if not (isinstance(tolerance, (int, float)) and tolerance > 0):
+        return []  # reported above
+    problems: list[str] = []
+    margin = spec.gripper_spec.get(
+        "release_margin_mm",
+        spec.freshness.get("hold_tolerance_mm", DEFAULT_FRESHNESS["hold_tolerance_mm"]),
+    )
+    if margin <= tolerance:
+        problems.append(
+            f"gripper_spec.release_margin_mm {margin:g} must exceed the {GRIPPER_POSITION} "
+            f"tolerance {tolerance:g} (a smaller opening cannot be told from still holding)"
+        )
+    band = spec.gripper_spec.get("stall_band_mm")
+    if band is not None and band >= tolerance:
+        problems.append(
+            f"gripper_spec.stall_band_mm {band:g} must be below the {GRIPPER_POSITION} "
+            f"tolerance {tolerance:g} (wider reads creeping jaws as stopped)"
+        )
     return problems
 
 
@@ -794,6 +862,7 @@ __all__ = [
     "WorkcellNote",
     "WorkcellSpec",
     "admission_problems",
+    "advisory_notes",
     "joint_channels",
     "load_workcells",
     "resolve_declared",

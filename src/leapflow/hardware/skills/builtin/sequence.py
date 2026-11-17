@@ -20,9 +20,13 @@ model must never be trusted with:
   tool left its planned start, the held object changed, or a referenced object
   drifted beyond the workcell's declared ``freshness`` tolerances.
 - **Guards.** A step may declare what must hold after it (``held``,
-  ``released``, ``reached``, ``no_contact``). A failed guard ends the program:
-  ``on_fail: stop`` halts the arm, ``hold`` leaves it where it is. Either way
-  the outcome names the step and what was observed.
+  ``released``, ``reached``, ``no_contact``). A failed guard ends the program
+  with the arm held where it is: ``on_fail: hold`` (the default) fails the
+  run, ``stop`` also halts it, which latches the arm in place until it is
+  re-enabled. Neither releases torque. A guard is checked for satisfiability
+  at plan: a ``released`` the jaws can never confirm is refused before
+  approval (``_sequence_guards.ReleaseRule``). The outcome names the step,
+  what it targeted and what was observed.
 - **Holding.** Closing on a referenced grasp or object records it as held;
   opening releases it; a held width that drifts beyond the declared tolerance
   forgets it -- so the next plan starts from what the jaws report.
@@ -32,18 +36,40 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
-from typing import Any, Mapping
+from dataclasses import replace
+from typing import Any, Mapping, Sequence
 
-from leapflow.hardware.skills.geometry import Pose, mat_vec, tool_cone_deg, wrap_axis_deg
-from leapflow.hardware.skills.ports import PATH_DEFAULT, PATH_LINEAR, SkillContext
+from leapflow.hardware.skills.builtin._sequence_planner import prepare as prepare_sequence
+from leapflow.hardware.skills.builtin._observation_gate import require_observation
+from leapflow.hardware.skills.ports import PreparedPlanning
+
+from leapflow.hardware.skills.builtin._sequence_guards import (
+    ReleaseRule,
+    check_drift,
+    current_hold,
+)
+from leapflow.hardware.skills.builtin._sequence_schema import (
+    CARD,
+    EXPECT_HELD,
+    EXPECT_NO_CONTACT,
+    EXPECT_REACHED,
+    EXPECT_RELEASED,
+    ON_FAIL_HOLD,
+    ON_FAIL_STOP,
+    OP_GRIPPER,
+    OP_MOVE_JOINTS,
+    OP_WAIT,
+    OPS,
+    POSE_OPS,
+    SPEED_ARG,
+    STEP_SCHEMA,
+)
+from leapflow.hardware.skills.geometry import Pose
+from leapflow.hardware.skills.ports import SkillContext
 from leapflow.hardware.skills.protocol import (
     EFFECT_ACTUATE,
-    FAILURE_CALIBRATION_MISSING,
     FAILURE_GUARD_FAILED,
-    FAILURE_INVALID_ARGS,
     FAILURE_PLAN_STALE,
-    FAILURE_SKILL_UNAVAILABLE,
     REQUIRE_CALIBRATION,
     REQUIRE_ROLE,
     SIDE_EFFECT_PARTIAL,
@@ -60,469 +86,12 @@ from leapflow.hardware.skills.protocol import (
     SkillSpec,
 )
 
-OP_MOVE = "move"
-OP_MOVE_LINEAR = "move_linear"
-OP_MOVE_JOINTS = "move_joints"
-OP_GRIPPER = "gripper"
-OP_WAIT = "wait"
-OPS = (OP_MOVE, OP_MOVE_LINEAR, OP_MOVE_JOINTS, OP_GRIPPER, OP_WAIT)
-
-EXPECT_HELD = "held"
-EXPECT_RELEASED = "released"
-EXPECT_REACHED = "reached"
-EXPECT_NO_CONTACT = "no_contact"
-ON_FAIL_STOP = "stop"
-ON_FAIL_HOLD = "hold"
-
-_POSE_OPS = frozenset({OP_MOVE, OP_MOVE_LINEAR})
-_COMMON = frozenset({"op", "expect", "on_fail"})
-_FIELDS: Mapping[str, frozenset[str]] = {
-    OP_MOVE: frozenset({"pose", "relative", "ref", "offset", "speed_pct", "path"}),
-    OP_MOVE_LINEAR: frozenset({"pose", "relative", "ref", "offset", "speed_pct"}),
-    OP_MOVE_JOINTS: frozenset({"joints", "speed_pct"}),
-    OP_GRIPPER: frozenset({"width_mm", "grip", "ref", "effort"}),
-    OP_WAIT: frozenset({"seconds"}),
-}
-_EXPECTS: Mapping[str, frozenset[str]] = {
-    OP_MOVE: frozenset({EXPECT_HELD, EXPECT_REACHED, EXPECT_NO_CONTACT}),
-    OP_MOVE_LINEAR: frozenset({EXPECT_HELD, EXPECT_REACHED, EXPECT_NO_CONTACT}),
-    OP_MOVE_JOINTS: frozenset({EXPECT_HELD, EXPECT_REACHED, EXPECT_NO_CONTACT}),
-    OP_GRIPPER: frozenset({EXPECT_HELD, EXPECT_RELEASED, EXPECT_REACHED}),
-    OP_WAIT: frozenset({EXPECT_HELD, EXPECT_REACHED}),
-}
-_OBJECT_POINTS = ("", "top", "bottom")
-_GRASP_POINTS = ("pregrasp", "grasp", "retreat")
-
-_SPEED_ARG = {
-    "type": "number",
-    "minimum": 1,
-    "maximum": 100,
-    "description": "Speed, percent of the arm maximum; capped by the run's limit.",
-}
-_ANGLE = {"type": "number", "minimum": -180, "maximum": 180}
-_OFFSET = {"type": "number", "minimum": -1000, "maximum": 1000, "default": 0.0}
-_STEP_SCHEMA: Mapping[str, Any] = {
-    "type": "object",
-    "properties": {
-        "op": {"type": "string", "enum": list(OPS)},
-        "pose": {
-            "type": "object",
-            "properties": {
-                "x": {"type": "number"},
-                "y": {"type": "number"},
-                "z": {"type": "number"},
-                "rx": _ANGLE,
-                "ry": _ANGLE,
-                "rz": _ANGLE,
-                "frame": {"type": "string", "enum": ["base", "table"], "default": "base"},
-            },
-            "required": ["x", "y", "z"],
-        },
-        "relative": {
-            "type": "object",
-            "properties": {
-                "dx": _OFFSET,
-                "dy": _OFFSET,
-                "dz": _OFFSET,
-                "frame": {"type": "string", "enum": ["base", "tool"], "default": "base"},
-            },
-        },
-        "ref": {"type": "string", "minLength": 3, "maxLength": 40},
-        # A path name is checked against the arm's declared arm.pose_path in _path();
-        # the schema only has to let the key through.
-        "path": {"type": "string", "minLength": 1},
-        "offset": {
-            "type": "object",
-            "properties": {"dx": _OFFSET, "dy": _OFFSET, "dz": _OFFSET},
-        },
-        "joints": {"type": "object", "additionalProperties": True},
-        "width_mm": {"type": "number", "minimum": 0},
-        "grip": {"type": "string", "enum": ["open", "close"]},
-        "effort": {"type": "number", "minimum": 0},
-        "seconds": {"type": "number", "minimum": 0},
-        "speed_pct": _SPEED_ARG,
-        "expect": {
-            "type": "string",
-            "enum": [EXPECT_HELD, EXPECT_RELEASED, EXPECT_REACHED, EXPECT_NO_CONTACT],
-        },
-        "on_fail": {"type": "string", "enum": [ON_FAIL_STOP, ON_FAIL_HOLD], "default": "stop"},
-    },
-    "required": ["op"],
-}
-
-_CARD = (
-    "Run a motion program on the arm and gripper, approved once as a whole. Each step "
-    "has an op: move (the arm's default path) or move_linear (straight line) to a TCP "
-    "target; move_joints {joint: deg}; gripper (width_mm, or grip open|close; "
-    "ref grasp:gN opens to that grasp's open_mm and records the object as held when "
-    "the jaws close on it); wait (seconds). A move target is one of: pose {x, y, z, "
-    "rx?, ry?, rz?} in mm/deg (frame base, or table: z above the table surface); "
-    "relative {dx, dy, dz, frame base|tool} from the previous target; or ref "
-    "object:oN[.top|.bottom] / grasp:gN.pregrasp|grasp|retreat plus an optional "
-    "offset {dx, dy, dz} in the base frame. Omitted angles keep the previous target's "
-    "orientation. A move may name path: linear|point to ride that path when the arm "
-    "declares it (move_linear always rides linear); a target whose straight line is "
-    "infeasible from the current configuration, such as one starting on a wrist "
-    "singularity, needs point. A step may declare expect: held (the jaws hold something), "
-    "released (the jaws opened freely), reached (the TCP is at the last target), or "
-    "no_contact (the move arrived and the jaws were not pushed); on_fail stop halts "
-    "the arm, hold leaves it in place. Plan uses the arm's declared FK to sample every "
-    "joint path and refuses any tool target outside the workspace, and solves every move "
-    "with IK inside the joint limits: an unreachable one is refused with the farthest "
-    "reachable target, so rewrite the program to it; execute repeats the workspace check "
-    "from fresh joint state and refuses when the tool or a referenced object moved."
-)
-
-
-@dataclass(frozen=True)
-class _Ref:
-    kind: str  # "object" or "grasp"
-    handle: str
-    point: str
-
-
-def _parse_ref(text: str, *, index: int) -> _Ref:
-    kind, _, rest = text.partition(":")
-    handle, _, point = rest.partition(".")
-    points = _OBJECT_POINTS if kind == "object" else _GRASP_POINTS if kind == "grasp" else ()
-    if not handle or (point not in points and not (kind == "grasp" and point == "")):
-        raise _invalid(
-            index,
-            f"ref {text!r} must be object:<id>[.top|.bottom] or "
-            "grasp:<id>[.pregrasp|.grasp|.retreat]",
-        )
-    return _Ref(kind, handle, point)
-
-
-def _invalid(index: int, message: str) -> SkillError:
-    return SkillError(FAILURE_INVALID_ARGS, f"step {index}: {message}")
-
-
-def _joint_channel(name: str, joints: frozenset[str]) -> str:
-    """The joint channel *name* means: itself, or the one channel it names a part of.
-
-    ``j1`` names ``joint.j1.position`` unambiguously, so it is read as that
-    channel; a name matching no channel, or several, comes back unchanged and is
-    refused as unknown. The plan and its approval always show the full channel.
-    """
-    if name in joints:
-        return name
-    matches = [joint for joint in joints if name in joint.split(".")]
-    return matches[0] if len(matches) == 1 else name
-
 
 def _fmt(pose: Pose) -> str:
     return f"({pose.x:.0f}, {pose.y:.0f}, {pose.z:.0f}) mm"
 
 
-def _listed(step: Mapping[str, Any]) -> str:
-    """A step as the approver reads it: what it does, and what guards it."""
-    expect = step["expect"]
-    if not expect:
-        return str(step["text"])
-    reaction = "halt" if step["on_fail"] == ON_FAIL_STOP else "hold"
-    return f"{step['text']} [expect {expect}, else {reaction}]"
-
-
-def _envelope(start: Pose, targets: list[Pose]) -> dict[str, float]:
-    """The space the program sweeps, so one approval sees how far it goes."""
-    poses = [start, *targets]
-    return {
-        "z_min_mm": round(min(pose.z for pose in poses), 1),
-        "z_max_mm": round(max(pose.z for pose in poses), 1),
-        "tilt_max_deg": round(max(tool_cone_deg(pose) for pose in targets), 1) if targets else 0.0,
-    }
-
-
-def _envelope_text(envelope: Mapping[str, float], speed: float | None) -> str:
-    text = (
-        f"Tool z spans {envelope['z_min_mm']:.0f}-{envelope['z_max_mm']:.0f} mm; "
-        f"it tilts at most {envelope['tilt_max_deg']:.0f} deg from straight down"
-    )
-    return text + ("." if speed is None else f"; speed capped at {speed:.0f}%.")
-
-
-# ── Plan ─────────────────────────────────────────────────────────────────────
-
-
-class _Planner:
-    """Resolves steps in order, tracking predicted TCP and joint targets."""
-
-    def __init__(self, ctx: SkillContext, state: ArmState) -> None:
-        self._ctx = ctx
-        self._start = state
-        self._previous: Pose | None = state.tcp
-        self._joints = frozenset(state.joints)
-        self._joint_state: dict[str, float] | None = dict(state.joints)
-        self._kinematics_checked = False
-        self.reach = ctx.motion.reach_tracker(state)
-        self.objects: dict[str, LocatedObject] = {}
-        self.grasps: dict[str, GraspCandidate] = {}
-        self.targets: list[Pose] = []
-
-    def resolve(self, index: int, step: Mapping[str, Any]) -> dict[str, Any]:
-        op = step["op"]
-        extra = sorted(set(step) - _COMMON - _FIELDS[op])
-        if extra:
-            raise _invalid(index, f"{', '.join(extra)} do(es) not apply to op {op}")
-        expect = step.get("expect", "")
-        if expect and expect not in _EXPECTS[op]:
-            raise _invalid(index, f"expect {expect} does not apply to op {op}")
-        resolved: dict[str, Any] = {"op": op, "expect": expect, "on_fail": step["on_fail"]}
-        if "speed_pct" in step:
-            resolved["speed_pct"] = float(step["speed_pct"])
-        if op in _POSE_OPS:
-            resolved.update(self._move(index, step))
-        elif op == OP_MOVE_JOINTS:
-            resolved.update(self._move_joints(index, step))
-        elif op == OP_GRIPPER:
-            resolved.update(self._gripper(index, step))
-        else:
-            resolved.update(self._wait(index, step))
-        if expect == EXPECT_REACHED and self._previous is None:
-            raise _invalid(index, "expect reached needs a known TCP target")
-        return resolved
-
-    def _move(self, index: int, step: Mapping[str, Any]) -> dict[str, Any]:
-        given = [name for name in ("pose", "relative", "ref") if name in step]
-        if len(given) != 1:
-            raise _invalid(index, "a move needs exactly one of pose, relative, ref")
-        if "offset" in step and "ref" not in step:
-            raise _invalid(index, "offset only applies to a ref target")
-        path = self._path(index, step)
-        entry: dict[str, Any] = {"path": path}
-        if "pose" in step:
-            target = self._absolute(index, step["pose"])
-            text = f"to {_fmt(target)}"
-        elif "relative" in step:
-            target = self._relative(index, step["relative"])
-            rel = step["relative"]
-            text = (
-                f"by ({rel['dx']:+.0f}, {rel['dy']:+.0f}, {rel['dz']:+.0f}) mm "
-                f"({rel['frame']} frame) to {_fmt(target)}"
-            )
-        else:
-            target, entry["object"], entry["grasp"] = self._referenced(index, step)
-            text = f"to {step['ref']} at {_fmt(target)}"
-        self._ctx.motion.check_target(target)
-        self.reach.move(target, linear=self._linear(path), label=f"step {index}")
-        self._previous = target
-        self._joint_state = None
-        self.targets.append(target)
-        verb = "move" if path == PATH_DEFAULT else f"move {path}"
-        return {**entry, "pose": target.to_dict(), "text": f"{verb} {text}"}
-
-    def _path(self, index: int, step: Mapping[str, Any]) -> str:
-        """The path this step rides: linear for move_linear, else the named or default one.
-
-        A caller that names a path is asking for a shape the arm itself declares, and
-        the shape decides whether the firmware can plan the move at all: a straight
-        line out of a degenerate configuration (a wrist at j5 = 0, an elbow on its
-        limit) has no resolved joint trajectory and is refused, while the same target
-        along ``point`` is well defined.
-        """
-        declared = self._ctx.motion.paths
-        if step["op"] == OP_MOVE_LINEAR:
-            if PATH_LINEAR not in declared:
-                raise SkillError(
-                    FAILURE_SKILL_UNAVAILABLE,
-                    f"step {index}: this arm declares no linear path (arm.pose_path)",
-                )
-            return PATH_LINEAR
-        named = step.get("path")
-        if named is None:
-            return PATH_DEFAULT
-        if named not in declared:
-            available = ", ".join(declared) or "none"
-            raise _invalid(
-                index, f"path {named!r} is not declared by this arm (declared: {available})"
-            )
-        return str(named)
-
-    def _linear(self, path: str) -> bool:
-        """Whether *path* rides a straight line, the arm's first declared path for default."""
-        if path == PATH_DEFAULT:
-            path = next(iter(self._ctx.motion.paths), PATH_DEFAULT)
-        return path == PATH_LINEAR
-
-    def _orientation(self, index: int, data: Mapping[str, Any]) -> tuple[float, float, float]:
-        previous = self._previous
-        if previous is None and not all(axis in data for axis in ("rx", "ry", "rz")):
-            raise _invalid(index, "after move_joints a target must give rx, ry and rz")
-        return tuple(  # type: ignore[return-value]
-            float(data[axis]) if axis in data else float(getattr(previous, axis))
-            for axis in ("rx", "ry", "rz")
-        )
-
-    def _absolute(self, index: int, pose: Mapping[str, Any]) -> Pose:
-        x, y, z = float(pose["x"]), float(pose["y"]), float(pose["z"])
-        if pose["frame"] == "table":
-            table = self._ctx.frames.table
-            if table is None:
-                raise SkillError(
-                    FAILURE_CALIBRATION_MISSING,
-                    f"step {index}: a table-frame pose needs the table calibrated "
-                    "(calib.workspace with table_z or table_points)",
-                )
-            z += table.height(x, y)
-        return Pose(x, y, z, *self._orientation(index, pose))
-
-    def _relative(self, index: int, rel: Mapping[str, Any]) -> Pose:
-        previous = self._previous
-        if previous is None:
-            raise _invalid(index, "a relative move cannot follow move_joints")
-        offset = (float(rel["dx"]), float(rel["dy"]), float(rel["dz"]))
-        delta = mat_vec(previous.rotation, offset) if rel["frame"] == "tool" else offset
-        return previous.translated(*delta)
-
-    def _referenced(self, index: int, step: Mapping[str, Any]) -> tuple[Pose, str, str]:
-        ref = _parse_ref(step["ref"], index=index)
-        offset = step.get("offset") or {"dx": 0.0, "dy": 0.0, "dz": 0.0}
-        if ref.kind == "grasp":
-            if not ref.point:
-                raise _invalid(index, "a move to a grasp names .pregrasp, .grasp or .retreat")
-            grasp = self.grasp(ref.handle)
-            base = grasp.waypoint(ref.point)
-            target = base.translated(offset["dx"], offset["dy"], offset["dz"])
-            return target, grasp.object_id, grasp.grasp_id
-        obj = self.object(ref.handle)
-        z = {"": obj.center[2], "top": obj.top_z, "bottom": obj.bottom_z}[ref.point]
-        x, y = obj.center[0] + offset["dx"], obj.center[1] + offset["dy"]
-        orientation = self._orientation(index, {})
-        return Pose(x, y, z + offset["dz"], *orientation), obj.object_id, ""
-
-    def _move_joints(self, index: int, step: Mapping[str, Any]) -> dict[str, Any]:
-        raw = step.get("joints") or {}
-        if not raw:
-            raise _invalid(index, "move_joints needs joints {name: deg}")
-        named = {_joint_channel(str(name), self._joints): value for name, value in raw.items()}
-        unknown = sorted(name for name in named if name not in self._joints)
-        if unknown:
-            raise _invalid(
-                index, f"{', '.join(unknown)} are not joints of this arm ({sorted(self._joints)})"
-            )
-        if len(named) != len(raw):
-            raise _invalid(index, "a joint is named twice (by its short and its full name)")
-        joints: dict[str, float] = {}
-        for name, value in named.items():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise _invalid(index, f"joint {name} must be a number")
-            if not math.isfinite(float(value)):
-                raise _invalid(index, f"joint {name} must be finite")
-            joints[str(name)] = float(value)
-        if not self._kinematics_checked:
-            self._ctx.motion.check_kinematics(self._start)
-            self._kinematics_checked = True
-        target = self._ctx.motion.check_joints(joints, self._joint_state)
-        if self._joint_state is None:
-            self._joint_state = dict(joints)
-        else:
-            self._joint_state.update(joints)
-        self.reach.joints_moved(joints, target)
-        self._previous = target
-        self.targets.append(target)
-        return {
-            "joints": joints,
-            "pose": target.to_dict(),
-            "text": f"move {len(joints)} joint(s) to TCP {_fmt(target)}",
-        }
-
-    def _gripper(self, index: int, step: Mapping[str, Any]) -> dict[str, Any]:
-        if not self._ctx.workcell.role("gripper"):
-            raise SkillError(FAILURE_SKILL_UNAVAILABLE, "this workcell binds no gripper")
-        if ("width_mm" in step) == ("grip" in step):
-            raise _invalid(index, "a gripper step needs exactly one of width_mm, grip")
-        widest = float(self._ctx.workcell.gripper_spec["max_width_mm"])
-        obj_id = grasp_id = ""
-        grasp: GraspCandidate | None = None
-        if "ref" in step:
-            ref = _parse_ref(step["ref"], index=index)
-            if ref.point:
-                raise _invalid(index, "a gripper ref names a handle only (grasp:g1, object:o2)")
-            if ref.kind == "grasp":
-                grasp = self.grasp(ref.handle)
-                obj_id, grasp_id = grasp.object_id, grasp.grasp_id
-            else:
-                obj_id = self.object(ref.handle).object_id
-        if "width_mm" in step:
-            width = float(step["width_mm"])
-            text = f"set the gripper to {width:.0f} mm"
-        elif step["grip"] == "open":
-            width = grasp.open_mm if grasp is not None else widest
-            text = f"open the gripper to {width:.0f} mm"
-        else:
-            width, text = 0.0, "close the gripper"
-        if width > widest:
-            raise _invalid(index, f"width {width:.0f} mm exceeds the gripper's {widest:.0f} mm")
-        if obj_id:
-            text += f" on {grasp_id or obj_id}"
-        entry: dict[str, Any] = {"width_mm": width, "object": obj_id, "grasp": grasp_id}
-        if "effort" in step:
-            entry["effort"] = float(step["effort"])
-        return {**entry, "text": text}
-
-    def _wait(self, index: int, step: Mapping[str, Any]) -> dict[str, Any]:
-        if "seconds" not in step:
-            raise _invalid(index, "wait needs seconds")
-        seconds = float(step["seconds"])
-        longest = float(self._ctx.limits["max_wait_s"])
-        if seconds > longest:
-            raise _invalid(index, f"wait {seconds:g} s exceeds the workcell's {longest:g} s")
-        return {"seconds": seconds, "text": f"wait {seconds:g} s"}
-
-    def object(self, object_id: str) -> LocatedObject:
-        if object_id not in self.objects:
-            self.objects[object_id] = self._ctx.scene.object(object_id)
-        return self.objects[object_id]
-
-    def grasp(self, grasp_id: str) -> GraspCandidate:
-        if grasp_id not in self.grasps:
-            grasp = self._ctx.scene.grasp(grasp_id)
-            self.grasps[grasp_id] = grasp
-            self.object(grasp.object_id)
-        return self.grasps[grasp_id]
-
-
-def _current_hold(ctx: SkillContext, state: ArmState) -> HeldObject | None:
-    """The held object, forgetting it when the jaws no longer report its width."""
-    held = ctx.scene.held
-    if held is None or state.gripper_mm is None:
-        return held
-    if abs(state.gripper_mm - held.width_mm) <= ctx.workcell.freshness["hold_tolerance_mm"]:
-        return held
-    ctx.scene.release()
-    ctx.note(
-        "hold_forgotten",
-        {
-            "object_id": held.obj.object_id,
-            "held_mm": round(held.width_mm, 1),
-            "gripper_mm": round(state.gripper_mm, 1),
-        },
-    )
-    return None
-
-
 # ── Execute ──────────────────────────────────────────────────────────────────
-
-
-def _check_drift(fresh: Mapping[str, float], planned: LocatedObject, seen: LocatedObject) -> None:
-    planar = math.hypot(seen.center[0] - planned.center[0], seen.center[1] - planned.center[1])
-    height = abs(seen.top_z - planned.top_z)
-    problems = []
-    if planar > fresh["drift_planar_mm"]:
-        problems.append(f"moved {planar:.0f} mm")
-    if height > fresh["drift_height_mm"]:
-        problems.append(f"its top changed {height:.0f} mm")
-    if min(planned.length - planned.width, seen.length - seen.width) > fresh["yaw_defined_mm"]:
-        turned = abs(wrap_axis_deg(seen.yaw_deg - planned.yaw_deg))
-        if turned > fresh["drift_yaw_deg"]:
-            problems.append(f"turned {turned:.0f} deg")
-    if problems:
-        raise SkillError(
-            FAILURE_PLAN_STALE,
-            f"{planned.object_id} ({planned.label}) {', '.join(problems)} since planning; "
-            "locate and plan again",
-        )
 
 
 class _Run:
@@ -551,6 +120,7 @@ class _Run:
         self._gripped: GripperResult | None = None
         self._released: bool | None = None
         self._release_from: float | None = None
+        self._release_at: float | None = None
         self.log: list[dict[str, Any]] = []
 
     async def step(self, index: int, step: Mapping[str, Any]) -> None:
@@ -559,7 +129,8 @@ class _Run:
         self._gripped = None
         self._released = None
         self._release_from = None
-        if op in _POSE_OPS:
+        self._release_at = None
+        if op in POSE_OPS:
             target = Pose.from_mapping(step["pose"])
             moved = await self._ctx.motion.move_tcp(
                 target, speed_pct=self._speed(step), path=step["path"]
@@ -577,15 +148,28 @@ class _Run:
             self._observed(await self._ctx.motion.state())
         if op == OP_GRIPPER and step["expect"] == EXPECT_REACHED:
             self._observed(await self._ctx.motion.state())
-        self.log.append(
-            {
-                "step": index,
-                "op": op,
-                "tcp": self.state.tcp.to_dict(1),
-                "gripper_mm": None if self.jaw is None else round(self.jaw, 1),
-            }
-        )
+        self.log.append(self._entry(index, op))
         self._guard(index, step, before)
+
+    def _entry(self, index: int, op: str) -> dict[str, Any]:
+        """One step as it ran: what it aimed at, where it ended, and how far apart."""
+        entry: dict[str, Any] = {
+            "step": index,
+            "op": op,
+            "tcp": self.state.tcp.to_dict(1),
+            "gripper_mm": None if self.jaw is None else round(self.jaw, 1),
+        }
+        gripped = self._gripped
+        if gripped is not None:
+            entry["target_mm"] = round(gripped.target_mm, 1)
+            entry["error_mm"] = round(gripped.width_mm - gripped.target_mm, 2)
+            entry["blocked"] = gripped.blocked
+            if self._release_at is not None:
+                entry["release_at_mm"] = round(self._release_at, 1)
+        elif op != OP_WAIT and self._target is not None:
+            entry["target"] = self._target.to_dict(1)
+            entry["error_mm"] = round(self.state.tcp.distance_mm(self._target), 2)
+        return entry
 
     def _speed(self, step: Mapping[str, Any]) -> float | None:
         run = self._plan.limits.get("speed_pct")
@@ -603,7 +187,7 @@ class _Run:
             return
         if abs(self.jaw - self._grip) > self._tolerance:
             self._grip = None
-            _current_hold(self._ctx, state)
+            current_hold(self._ctx, state)
 
     async def _gripper(self, step: Mapping[str, Any]) -> None:
         effort = step.get("effort")
@@ -613,7 +197,12 @@ class _Run:
         self._gripped = result
         self.jaw = result.width_mm
         self._release_from = held_width
-        released = held_width is not None and result.width_mm > held_width + self._tolerance
+        self._release_at = (
+            None
+            if held_width is None
+            else ReleaseRule.of(self._ctx).threshold(held_width, result.target_mm)
+        )
+        released = self._release_at is not None and result.width_mm >= self._release_at
         self._released = released or (held_width is None and not result.blocked)
         scene = self._ctx.scene
         if released:
@@ -641,13 +230,14 @@ class _Run:
         raise SkillError(
             FAILURE_GUARD_FAILED,
             f"step {index} ({step['text']}): expected {expect}, but {failure}; the arm "
-            + ("was halted" if stop else "holds its position"),
+            + ("was halted in place" if stop else "holds its position"),
             side_effect_state=SIDE_EFFECT_PARTIAL,
             status=STATUS_HALTED if stop else STATUS_FAILED,
             result={
                 "guard": expect,
                 "tcp": self.state.tcp.to_dict(1),
                 "gripper_mm": None if self.jaw is None else round(self.jaw, 1),
+                "observed": self.log[-1],
             },
         )
 
@@ -664,8 +254,17 @@ class _Run:
             if self._released:
                 return None
             if self._release_from is not None and jaw is not None:
-                needed = self._release_from + self._tolerance
-                return f"the jaws opened only to {jaw:.1f} mm; release requires more than {needed:.1f}"
+                needed = self._release_at
+                if needed is None:
+                    target = "its target" if gripped is None else f"{gripped.target_mm:.1f} mm"
+                    return (
+                        f"opening to {target} cannot release the {self._release_from:.1f} mm "
+                        "hold: the jaws would not clear it by more than their tolerance"
+                    )
+                return (
+                    f"the jaws opened only to {jaw:.1f} mm; "
+                    f"release requires at least {needed:.1f}"
+                )
             if gripped is not None and gripped.blocked:
                 return f"the jaws stopped at {gripped.width_mm:.1f} mm of {gripped.target_mm:.1f}"
             return "release was not confirmed"
@@ -687,13 +286,13 @@ class MotionSequence:
 
     spec = SkillSpec(
         skill_id="motion.sequence",
-        version="1.0.0",
-        card=_CARD,
+        version="1.5.0",
+        card=CARD,
         args_schema={
             "type": "object",
             "properties": {
-                "steps": {"type": "array", "items": _STEP_SCHEMA, "minItems": 1, "maxItems": 64},
-                "speed_pct": _SPEED_ARG,
+                "steps": {"type": "array", "items": STEP_SCHEMA, "minItems": 1, "maxItems": 64},
+                "speed_pct": SPEED_ARG,
             },
             "required": ["steps"],
         },
@@ -705,55 +304,68 @@ class MotionSequence:
         ),
     )
 
-    async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
-        steps = args["steps"]
-        most = int(ctx.limits["max_steps"])
-        if len(steps) > most:
-            raise SkillError(
-                FAILURE_INVALID_ARGS,
-                f"{len(steps)} steps exceed this workcell's limit of {most}; split the program",
-            )
-        state = await ctx.motion.state()
-        held = _current_hold(ctx, state)
-        planner = _Planner(ctx, state)
-        resolved: list[dict[str, Any]] = []
-        for i, step in enumerate(steps, 1):
-            try:
-                resolved.append(planner.resolve(i, step))
-            except SkillError as error:
-                error.result = {**error.result, "step": i}  # which step to change
-                raise
-        listed = "; ".join(f"{i}) {_listed(step)}" for i, step in enumerate(resolved, 1))
-        speed = args.get("speed_pct")
-        envelope = _envelope(state.tcp, planner.targets)
-        reach = planner.reach.to_dict()
-        checked = (
-            "Reach checked with the arm's kinematics."
-            if reach["verified"]
-            else f"Reach not verified: {reach['detail'].rstrip('.')}."
-        )
-        return SkillPlan(
-            skill_id=self.spec.skill_id,
-            args=args,
-            summary=(
-                f"Run {len(resolved)} step(s) from {_fmt(state.tcp)}: {listed}. "
-                f"{_envelope_text(envelope, speed)} {checked}"
-            ),
-            targets=tuple(planner.targets),
-            limits={} if speed is None else {"speed_pct": float(speed)},
-            basis={
-                "start": state.tcp.to_dict(),
-                "held": "" if held is None else held.obj.object_id,
-                "objects": {oid: obj.to_dict() for oid, obj in planner.objects.items()},
-                "grasps": {gid: grasp.to_dict() for gid, grasp in planner.grasps.items()},
-                "steps": resolved,
-                "envelope": envelope,
-                "reach": reach,
-            },
-        )
+    async def prepare(self, ctx: SkillContext, args: Sequence[Mapping[str, Any]]) -> PreparedPlanning:
+        return await prepare_sequence(ctx, self.spec.skill_id, args)
+
+    async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan | SkillOutcome:
+        prepared = await self.prepare(ctx, [args])
+        job = prepared.jobs[0]
+        if isinstance(job, SkillOutcome):
+            return job
+        result = await ctx.calculations.evaluate(
+            [job], deadline=time.monotonic() + ctx.planning_settings.timeout_s)
+        prepared.check_scene(ctx)
+        return result[0].value
+
+    def alternatives(self, ctx: SkillContext, args: Mapping[str, Any], *, limit: int) -> Sequence[Mapping[str, Any]]:
+        """Substitute one grasp handle consistently; never invent geometry or yaw."""
+        handles = {step['ref'].partition(':')[2].partition('.')[0]
+                   for step in args['steps'] if step.get('ref', '').startswith('grasp:')}
+        # Mixed-grasp programs may encode distinct tasks; do not guess equivalence.
+        if len(handles) != 1 or limit <= 0:
+            return ()
+        handle = next(iter(handles))
+        original = ctx.scene.grasp(handle)
+        entries = []
+        for sibling in ctx.scene.grasps(original.object_id):
+            if sibling.grasp_id == handle:
+                continue
+            steps = []
+            for step in args['steps']:
+                entry = dict(step)
+                ref = entry.get('ref', '')
+                if ref.partition(':')[0] == 'grasp' and ref.partition(':')[2].partition('.')[0] == handle:
+                    _, dot, point = ref.partition('.')
+                    entry['ref'] = f'grasp:{sibling.grasp_id}' + (dot + point if dot else '')
+                steps.append(entry)
+            entries.append({'id': f'{handle}-to-{sibling.grasp_id}', 'args': {**args, 'steps': steps}})
+            if len(entries) >= limit:
+                break
+        return entries
+
+    async def confirm(self, ctx: SkillContext, plan: SkillPlan) -> SkillPlan:
+        """Dry-run/live previews observe without changing the approved snapshot."""
+        checks = []
+        for oid, data in plan.basis['objects'].items():
+            obj = LocatedObject.from_mapping(data)
+            seen = await ctx.scene.relocate(obj, commit=False)
+            check_drift(ctx.workcell.freshness, obj, seen)
+            checks.append({'object_id': oid, 'camera': seen.camera, 'state': 'confirmed',
+                           'table_offset_mm': seen.table_offset_mm})
+        return replace(plan, basis={**plan.basis, 'object_recheck': {'read_only': True, 'checks': checks}})
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
         fresh = ctx.workcell.freshness
+        objects: dict[str, LocatedObject] = {}
+        for oid, data in plan.basis["objects"].items():
+            planned = LocatedObject.from_mapping(data)
+            seen = await ctx.scene.relocate(planned)
+            check_drift(fresh, planned, seen)
+            objects[oid] = seen
+        for data in plan.basis['grasps'].values():
+            grasp = GraspCandidate.from_mapping(data)
+            require_observation(ctx, objects[grasp.object_id], grasp)
+        # Read the start after observation I/O, immediately before exact execution.
         state = await ctx.motion.state()
         start = Pose.from_mapping(plan.basis["start"])
         moved_mm, moved_deg = state.tcp.distance_mm(start), state.tcp.rotation_to_deg(start)
@@ -763,15 +375,16 @@ class MotionSequence:
                 f"the tool moved {moved_mm:.1f} mm / {moved_deg:.1f} deg since planning; "
                 "plan again",
             )
-        held = _current_hold(ctx, state)
+        for name, tolerance in plan.basis.get("start_joint_tolerances", {}).items():
+            expected = plan.basis.get("start_joints", {}).get(name)
+            actual = state.joints.get(name)
+            if (expected is None or actual is None or not math.isfinite(actual)
+                    or abs(actual - expected) > tolerance):
+                raise SkillError(FAILURE_PLAN_STALE,
+                                 f"starting joint {name} changed or is missing; plan again")
+        held = current_hold(ctx, state)
         if ("" if held is None else held.obj.object_id) != plan.basis["held"]:
             raise SkillError(FAILURE_PLAN_STALE, "what the gripper holds changed since planning")
-        objects: dict[str, LocatedObject] = {}
-        for oid, data in plan.basis["objects"].items():
-            planned = LocatedObject.from_mapping(data)
-            seen = await ctx.scene.relocate(planned)
-            _check_drift(fresh, planned, seen)
-            objects[oid] = seen
         run = _Run(ctx, plan, objects, state)
         for index, step in enumerate(plan.basis["steps"], 1):
             try:

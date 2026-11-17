@@ -29,12 +29,13 @@ _READ_METADATA: dict[str, Any] = {
     "schema_cost": "low",
 }
 _RUN_ID = {"type": "string", "description": "Run id from hw_skill_run (omit for all runs)"}
+# Envelope fields first and ``args`` last: everything above ``args`` is read by
+# the host, ``args`` alone is the skill's payload (see ``skill_arguments``).
 _RUN_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "workcell": {"type": "string", "description": "<node>/<workcell>"},
         "skill": {"type": "string", "description": "Skill id from hw_skill_list"},
-        "args": {"type": "object", "description": "Arguments per the skill's args_schema"},
         "dry_run": {"type": "boolean", "description": "Plan only; nothing moves"},
         "intent": {
             "type": "string",
@@ -51,6 +52,38 @@ _RUN_SCHEMA: dict[str, Any] = {
             "description": (
                 f"Longest wait before stopping the run (default "
                 f"{DEFAULT_RUN_TIMEOUT_S:g}, max {MAX_RUN_TIMEOUT_S:g})"
+            ),
+        },
+        "candidates": {
+            "type": "array", "minItems": 1, "maxItems": 8,
+            "items": {"type": "object", "required": ["id", "args"],
+                      "additionalProperties": False,
+                      "properties": {"id": {"type": "string", "minLength": 1, "maxLength": 64},
+                                     "args": {"type": "object"}}},
+            "description": "Task-equivalent complete independent programs, evaluated together; only one selected plan executes. Requires advertised batch_planning; cannot combine with args or approved_plan.",
+        },
+        "selection": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "require_verified": {"type": "boolean", "default": True},
+                "order": {"type": "array", "minItems": 1, "maxItems": 5,
+                          "items": {"oneOf": [{"type": "string"},
+                              {"type": "object", "required": ["metric"], "additionalProperties": False,
+                               "properties": {"metric": {"type": "string"},
+                                              "direction": {"type": "string", "enum": ["min", "max"]}}}]}},
+            },
+            "description": "Lexicographic advertised metrics, default joint_margin max, joint_travel min, tcp_distance_mm min. Verified candidates rank first.",
+        },
+        "approved_plan": {
+            "type": "object",
+            "description": "Reuse the exact full selected preview plan with its exact args; still requires approval and freshness. Expired/consumed plans refuse without replanning; incompatible with candidates.",
+        },
+        "args": {
+            "type": "object",
+            "description": (
+                "Only the skill's own arguments, exactly as its args_schema declares them "
+                "(hw_skill_list with skill=<id>). The parameters above are hw_skill_run's "
+                "and go beside args, never inside it."
             ),
         },
     },
@@ -90,8 +123,12 @@ def build_skill_tools(service: "SkillService") -> list[ToolMetadata]:
                 "Run a node skill on a workcell (a perception query, a motion program, a "
                 "policy). The node plans the run; an actuating plan is shown to the user for "
                 "approval, then the node executes it while the host keeps its lease alive. Use "
-                "dry_run to see the plan without moving. A failed run whose side_effect_state "
-                "is not 'none' must never be repeated: the next attempt is a new plan."
+                "dry_run to see the plan with read-only reference rechecks, without moving. A failed run whose side_effect_state "
+                "is not 'none' must never be repeated: the next attempt is a new plan. "
+                "When reach/posture is uncertain or after unreachable, use advertised batch_planning: "
+                "submit complete task-equivalent grasp:gN / rz alternatives as candidates (at most 8, "
+                "or the node's lower max_candidates) in one call. The node validates and ranks them "
+                "without another model call, executing only the approved selected plan."
             ),
             parameters_schema=dict(_RUN_SCHEMA),
             handler=service.hw_skill_run,
@@ -99,6 +136,7 @@ def build_skill_tools(service: "SkillService") -> list[ToolMetadata]:
                 **_WRITE_METADATA,
                 "mutates_state": True,
                 "execution_policy": "external_side_effect",
+                "payload_parameter": "args",
             },
             mutates_state=True,
             execution_policy="external_side_effect",

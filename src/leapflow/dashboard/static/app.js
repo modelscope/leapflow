@@ -468,14 +468,26 @@
     return url.toString();
   }
 
-  const _previewCleanup = new Set();
+  // Every mounted preview panel: { key, card, stop, isLive }. A device lease and an open
+  // socket belong to the panel, not to the page's current render pass. The board rebuilds
+  // its whole tree for each arriving finding, watch transition and resync, so without this
+  // registry a notification ended a stream the user had started -- the notice and the
+  // closed preview were one event, which is what made it read as a rate limit closing it.
+  const _previews = new Set();
+  let _carryPreviews = null;
 
-  function disposePreviews() {
-    _previewCleanup.forEach((stop) => { try { stop(); } catch (_) {} });
-    _previewCleanup.clear();
+  function disposePreviews(keepLive) {
+    _previews.forEach((entry) => {
+      if (keepLive && entry.isLive()) return;
+      _previews.delete(entry);
+      try { entry.stop(); } catch (_) {}
+    });
   }
 
   function renderViewError(error) {
+    // No render() follows a failed fetch, so a live preview would otherwise survive as a
+    // detached card holding a socket and a device lease nobody can see or stop.
+    disposePreviews();
     rootEl.innerHTML = "";
     const card = el("div", "card view-error");
     card.appendChild(el("div", "card-title", esc(t("Failed to load view"))));
@@ -1443,6 +1455,15 @@
 
   function renderMediaPreview(node) {
     const p = node.props || {};
+    // What this panel previews, independent of layout. A live panel with the same identity
+    // is re-adopted into the re-rendered tree: its socket, canvas, chosen profile and a
+    // pending consent prompt all stay attached to the element the user is looking at.
+    const previewKey = [p.device, p.channel, p.representation || ""].join("\u0000");
+    const carried = _carryPreviews ? _carryPreviews.get(previewKey) : null;
+    if (carried && !carried.reused) {
+      carried.reused = true;
+      return carried.card;
+    }
     // A picture only for a declared frame; every other previewable shape is a live scalar
     // meter. Keyed on the declared representation, never on a device class: the props used
     // to carry "camera"/"microphone", so a level source that was not a microphone rendered
@@ -1695,7 +1716,7 @@
         if (running) { stop(); void start(); }
       });
     }
-    _previewCleanup.add(stop);
+    _previews.add({ key: previewKey, card, stop, isLive: () => running || starting });
     card.appendChild(stage);
     card.appendChild(consentSlot);
     card.appendChild(status);
@@ -1987,13 +2008,34 @@
   }
 
   function render(spec) {
-    disposePreviews();
-    _evolutionLiveControllers = [];
-    rootEl.innerHTML = "";
-    figSeq = 0; tblSeq = 0;
-    (spec.root || []).forEach((n) => rootEl.appendChild(renderNode(n)));
-    if (!(spec.root || []).length) rootEl.appendChild(el("div", "empty", esc(t("No content yet."))));
-    document.title = spec.title ? spec.title + " \u00b7 LeapBoard" : "LeapBoard";
+    // A running preview is carried into the new tree instead of torn down. The board
+    // re-renders on every finding, watch transition, resync and reconnect; each of those
+    // used to release the device and close the stream the user was watching.
+    const carried = new Map();
+    _previews.forEach((entry) => {
+      if (!entry.isLive()) return;
+      entry.reused = false;
+      carried.set(entry.key, entry);
+    });
+    _carryPreviews = carried;
+    try {
+      disposePreviews(true);
+      _evolutionLiveControllers = [];
+      rootEl.innerHTML = "";
+      figSeq = 0; tblSeq = 0;
+      (spec.root || []).forEach((n) => rootEl.appendChild(renderNode(n)));
+      if (!(spec.root || []).length) rootEl.appendChild(el("div", "empty", esc(t("No content yet."))));
+      document.title = spec.title ? spec.title + " \u00b7 LeapBoard" : "LeapBoard";
+    } finally {
+      _carryPreviews = null;
+      // A preview the new spec no longer asks for has nowhere to live; stop it rather than
+      // leaving a socket and a device lease attached to a detached card.
+      carried.forEach((entry) => {
+        if (entry.reused) return;
+        _previews.delete(entry);
+        try { entry.stop(); } catch (_) {}
+      });
+    }
   }
 
   function toast(finding) {
@@ -2133,7 +2175,7 @@
     });
   }
 
-  window.addEventListener("pagehide", disposePreviews);
+  window.addEventListener("pagehide", () => disposePreviews());
   applyLocale();
   fetchView();
   connectWS();

@@ -88,14 +88,14 @@ leapspace = [
 # motion/response solves; no SciPy/OpenCV dependency is needed by these methods.
 leapcalib = ["numpy>=1.24"]
 # Lightweight opt-in preview encoder; no policy-learning or ROS dependencies.
-vision = ["numpy>=1.24", "opencv-python>=4.8"]
+vision = ["numpy>=1.24", "opencv-python>=4.8,<5"]
 robot = [
     "torch>=2.0",
     "torchvision>=0.15",
     "safetensors>=0.4",
     "huggingface-hub>=0.20",
     "numpy>=1.24",
-    "opencv-python>=4.8",
+    "opencv-python>=4.8,<5",
     "pyserial>=3.5",
     "Pillow>=10.0",
 ]
@@ -143,9 +143,13 @@ builtin_frame_lifecycle = "leapflow.hardware.skills.builtin.frame_lifecycle:skil
 builtin_grasp_verify = "leapflow.hardware.skills.builtin.grasp_verify:skills"
 builtin_grasp_cycle = "leapflow.hardware.skills.builtin.grasp_cycle:skills"
 builtin_scene = "leapflow.hardware.skills.builtin.scene:skills"
+builtin_survey = "leapflow.hardware.skills.builtin.survey:skills"
 builtin_sequence = "leapflow.hardware.skills.builtin.sequence:skills"
 builtin_policy = "leapflow.hardware.skills.builtin.policy:skills"
 builtin_episode = "leapflow.hardware.skills.builtin.episode:skills"
+
+[project.entry-points."leapflow.hardware.view_planners"]
+ring = "leapflow.hardware.skills.view_planner:RingViewPlanner"
 
 [build-system]
 requires = ["setuptools>=68.0"]
@@ -171,7 +175,7 @@ include = ["leapflow*", "leapspace*", "leapcalib*", "benchmarks*"]
 # non-identifier `task-001`). Auto-discovery already ships each task's
 # action.py; this keeps its config.yaml beside it so an installed example task
 # stays runnable rather than half-packaged.
-"leapspace.app_space.tasks.task-001" = ["*.yaml"]
+"leapspace.app_space" = ["tasks/*/*.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -49,6 +49,8 @@ class SkillRun:
     stop_code: str = FAILURE_STOPPED
     halted: bool = False
     halt_mark: int = 0  # batches landed when the run was halted
+    stops: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """Per actuator, what its halt physically did (``stop_effect``, verification)."""
     motion: GovernedMotion | None = field(default=None, repr=False)
     task: asyncio.Task[None] | None = field(default=None, repr=False)
 
@@ -62,7 +64,7 @@ class SkillRun:
         return self.halted and self.motion is not None and self.motion.landed > self.halt_mark
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "run_id": self.run_id,
             "workcell": self.plan.workcell,
             "skill_id": self.plan.skill_id,
@@ -77,6 +79,35 @@ class SkillRun:
             "stop_reason": self.stop_reason,
             "outcome": None if self.outcome is None else self.outcome.to_dict(),
         }
+        if self.stops:
+            payload["stops"] = {device: dict(stop) for device, stop in self.stops.items()}
+        return payload
+
+    def record_stop(self, device_id: str, status: Any, *, error: str = "") -> dict[str, Any]:
+        """Keep what one actuator's halt did; no status means the stop is unconfirmed.
+
+        ``stop_effect`` stays ``""`` when the transport did not say (or the halt
+        never returned), because guessing ``hold`` is the claim an operator must
+        never be handed without evidence.
+        """
+        stop: dict[str, Any] = {"stop_effect": "", "stop_verified": False,
+                                "halt_delivered": False, "detail": error}
+        if status is not None:
+            stop = {
+                "stop_effect": str(getattr(status, "stop_effect", "") or ""),
+                "stop_verified": getattr(status, "stop_verified", None),
+                "halt_delivered": bool(getattr(status, "halt_delivered", False)),
+                "detail": str(getattr(status, "detail", "") or ""),
+            }
+        self.stops[device_id] = stop
+        return stop
+
+    def with_stops(self, outcome: SkillOutcome) -> SkillOutcome:
+        """*outcome* carrying the run's stop record, so episodes and the host see it."""
+        if not self.stops:
+            return outcome
+        return replace(outcome, evidence={**dict(outcome.evidence), "stops": {
+            device: dict(stop) for device, stop in self.stops.items()}})
 
 
 def merge_outcome(

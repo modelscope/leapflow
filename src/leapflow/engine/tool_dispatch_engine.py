@@ -23,12 +23,17 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from leapflow.llm.message_builder import build_user_message_text
 from leapflow.engine.context.context_disclosure import build_capability_manifests
+from leapflow.engine.context.result_budget import (
+    fit_result_to_budget as _truncate_result_for_budget,
+)
 from leapflow.engine.tools.execution_trace import ExecutionMode, ExecutionTrace
 from leapflow.engine.tools.tool_concurrency import ToolCall as ConcurrentToolCall
 from leapflow.engine.tools.tool_execution import (
+    TIER_FAILED,
     TaskCompletionTracker,
     ToolExecutionLedger,
     execution_policy_for,
+    result_tier,
 )
 from leapflow.engine.tools.tool_guardrails import FailureFingerprint
 from leapflow.engine.tools.tool_attachments import (
@@ -43,7 +48,6 @@ from leapflow.engine.recovery.failure_envelope import Recoverability
 from leapflow.tools.name_resolver import ToolResolution
 from leapflow.engine._tool_helpers import _default_tool_registry, _normalize_tool_call
 from leapflow.engine._message_helpers import (
-    _truncate_result_for_budget,
     _tool_result_counts_as_failure,
     _tool_result_is_control_signal,
     _annotate_uncertain_effect,
@@ -1046,6 +1050,7 @@ class ToolDispatchEngine:
                     "tool_args_invalid: tool=%s missing=%s", tool_name, invalid_args.get("missing")
                 )
                 self._annotate_argument_repair_repeat(tool_name, invalid_args)
+                self._record_usage(tool_name, invalid_args, 0.0)
                 return invalid_args
         session_id = self._engine._current_session_id or "ephemeral"
         turn_id = self._engine._current_turn_id or f"turn-{self._engine._session_turn_count}"
@@ -1260,19 +1265,33 @@ class ToolDispatchEngine:
                 return registry.unknown_result(missing_resolution)
         except asyncio.TimeoutError:
             duration = (time.perf_counter() - t0) * 1000
-            self._engine._usage_tracker.record_tool_call(name, False, duration)
+            self._engine._usage_tracker.record_tool_call(
+                name, False, duration, tier=TIER_FAILED, failure_code="timeout"
+            )
             return {"ok": False, "error": f"Tool '{name}' timed out after {timeout:.0f}s"}
         except Exception as e:
             duration = (time.perf_counter() - t0) * 1000
-            self._engine._usage_tracker.record_tool_call(name, False, duration)
+            self._engine._usage_tracker.record_tool_call(
+                name, False, duration, tier=TIER_FAILED, failure_code=type(e).__name__
+            )
             error_msg = redact_sensitive_text(str(e), force=True)
             return {"ok": False, "error": error_msg}
 
         duration = (time.perf_counter() - t0) * 1000
-        is_ok = not (isinstance(result, dict) and not result.get("ok", True))
-        self._engine._usage_tracker.record_tool_call(name, is_ok, duration)
+        self._record_usage(name, result, duration)
 
         return self._post_process_tool_result(name, result)
+
+    def _record_usage(self, name: str, result: Any, duration_ms: float) -> None:
+        """Record one call's graded outcome for per-tool statistics and trust."""
+        is_ok = not (isinstance(result, dict) and not result.get("ok", True))
+        code = ""
+        if isinstance(result, dict) and not is_ok:
+            code = str(result.get("failure_code") or result.get("error_type") or "")
+        self._engine._usage_tracker.record_tool_call(
+            name, is_ok, duration_ms, tier=result_tier(result), failure_code=code
+        )
+
     @staticmethod
     def _post_process_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
         """Apply security post-processing to tool results."""

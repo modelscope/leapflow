@@ -25,14 +25,18 @@ from leapflow.hardware.drivers._piper_motion import (
 )
 from leapflow.hardware.drivers.piper import PiperArmTransport
 from leapflow.hardware.registry import _DEVICE_ID_ALLOWED
+from leapflow.hardware.drivers._piper_halt import HoldSpec, TorqueReleasePolicy
 from leapflow.hardware.transport import (
-    SIDE_EFFECT_COMMITTED, SIDE_EFFECT_NONE, SIDE_EFFECT_UNKNOWN, TransportError,
+    SIDE_EFFECT_COMMITTED, SIDE_EFFECT_NONE, SIDE_EFFECT_UNKNOWN, STOP_EFFECT_DEVICE_LATCHED,
+    STOP_EFFECT_HOLD, STOP_EFFECT_NONE, TransportError,
 )
 
 _EXAMPLE = Path(__file__).parents[1] / "src/leapflow/hardware/examples/piper_arm.yaml"
 _BASE_CONFIG = {"can_name": "can0", "robot": "piper_x", "firmware_profile": "v189",
-                "enable_timeout_s": .12, "enable_settle_s": .02, "mode_switch_timeout_s": .12}
+                "enable_timeout_s": .12, "enable_settle_s": .02, "mode_switch_timeout_s": .12,
+                "halt_verify_s": .05}
 _SEED_JOINTS = [10., 20., -30., 40., 50., -160.]
+_AT_REST = {"torque_release": "at_rest", "rest_joints_deg": [None, 20., -30., None, None, None]}
 _SEED_POSE = [200., 0., 300., 179., 0., 90.]
 
 
@@ -396,7 +400,11 @@ def test_warmup_timeout_disconnects(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize("config", [{"sdk_interface": "v2"}, {"mode_switch": "direct"},
     {"default_effort_n_m": .5}, {"crash_protection_levels": [1] * 6}, {"robot": "nero"},
-    {"pose_move_mode": "circular"}, {"stale_after_s": float("nan")}, {"warmup_timeout_s": 0}])
+    {"pose_move_mode": "circular"}, {"stale_after_s": float("nan")}, {"warmup_timeout_s": 0},
+    {"halt_latch": "never"}, {"halt_hold_tolerance_deg": 0}, {"torque_release": "always"},
+    {"torque_release": "at_rest"}, {"rest_joints_deg": [0, 0]}, {"rest_tolerance_deg": -1},
+    {"torque_release": "at_rest", "rest_joints_deg": [None] * 6},
+    {"rest_joints_deg": [0, "low", 0, 0, 0, 0]}])
 def test_invalid_or_retired_config_fails_closed(config: dict) -> None:
     with pytest.raises(TransportError) as error:
         PiperArmTransport(config)
@@ -404,8 +412,9 @@ def test_invalid_or_retired_config_fails_closed(config: dict) -> None:
 
 
 def test_governed_enable_reset_enable_can_order_and_disable(monkeypatch: pytest.MonkeyPatch) -> None:
-    transport, arm, _ = _open_transport(monkeypatch)
-    asyncio.run(transport.halt())
+    """An arm resting where the profile declares may resume a latched stop and be released."""
+    transport, arm, _ = _open_transport(monkeypatch, _AT_REST)
+    arm.arm_status = 1  # the physical button latched the firmware stop
     arm.events.clear()
     result = _write(transport, "arm.enable", 1)
     assert result.ok and result.side_effect_state == SIDE_EFFECT_COMMITTED
@@ -418,6 +427,39 @@ def test_governed_enable_reset_enable_can_order_and_disable(monkeypatch: pytest.
     assert _write(transport, "arm.enable", 5).failure_code == "invalid_value"
 
 
+@pytest.mark.parametrize("overrides", [{}, {**_AT_REST, "rest_joints_deg": [None, 0., 0., None, None, None]}])
+def test_torque_is_never_released_from_a_raised_arm(monkeypatch: pytest.MonkeyPatch,
+                                                   overrides: dict) -> None:
+    """Resuming a latched stop and arm.enable=0 both let go of the drives; a raised arm falls.
+
+    By default software never does that, and with a declared rest it does so
+    only while the arm demonstrably rests there. The refusal is decided before
+    any frame, so nothing reached the arm.
+    """
+    transport, arm, _ = _open_transport(monkeypatch, overrides)
+    arm.arm_status = 1
+    result = _write(transport, "arm.enable", 1)
+    assert not result.ok and result.side_effect_state == SIDE_EFFECT_NONE
+    assert result.failure_code == "piper_torque_release_refused"
+    assert not arm.reset_calls and not arm.enable_calls
+    arm.arm_status = 0
+    assert _write(transport, "arm.enable", 1).ok
+    result = _write(transport, "arm.enable", 0)
+    assert result.failure_code == "piper_torque_release_refused"
+    assert result.side_effect_state == SIDE_EFFECT_NONE and not arm.disable_calls
+    assert "rest" in (result.error or "")
+
+
+def test_torque_release_policy_names_the_joints_away_from_rest() -> None:
+    policy = TorqueReleasePolicy.from_config(_AT_REST)
+    assert policy.refusal(_SEED_JOINTS, "x") == ""
+    assert policy.refusal([10., 20., -40., 40., 50., -160.], "x")
+    away = policy.refusal([0., 50., -30., 0., 0., 0.], "arm.enable=0")
+    assert "joint.j2.position at 50.0" in away and "j3" not in away
+    assert "no joint feedback" in policy.refusal(None, "x")
+    assert TorqueReleasePolicy().refusal(_SEED_JOINTS, "x").startswith("x releases")
+
+
 def test_idle_enable_never_resets(monkeypatch: pytest.MonkeyPatch) -> None:
     transport, arm, _ = _open_transport(monkeypatch)
     assert _write(transport, "arm.enable", 1).ok
@@ -427,9 +469,9 @@ def test_idle_enable_never_resets(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize("fault,code", [("refuse_enable", "piper_enable_refused"),
     ("refuse_reset", "piper_resume_refused"), ("ignore_mode", "piper_mode_switch_refused")])
 def test_enable_confirmation_failure_is_committed(monkeypatch: pytest.MonkeyPatch, fault: str, code: str) -> None:
-    transport, arm, _ = _open_transport(monkeypatch)
+    transport, arm, _ = _open_transport(monkeypatch, _AT_REST)
     if fault == "refuse_reset":
-        asyncio.run(transport.halt())
+        arm.arm_status = 1
     setattr(arm, fault, True)
     result = _write(transport, "arm.enable", 1)
     assert not result.ok and result.side_effect_state == SIDE_EFFECT_COMMITTED
@@ -722,8 +764,10 @@ def test_batch_failure_aborts_remaining_gripper(monkeypatch: pytest.MonkeyPatch)
 
 def test_halt_and_close_never_disable_or_reset(monkeypatch: pytest.MonkeyPatch) -> None:
     transport, arm, _ = _open_transport(monkeypatch)
-    assert "resume" in asyncio.run(transport.halt()).detail
-    assert arm.estop_calls == 1 and not arm.disable_calls and not arm.reset_calls
+    halt = asyncio.run(transport.halt())
+    assert halt.halt_delivered and halt.stop_effect == STOP_EFFECT_NONE and halt.stop_verified
+    assert "standby" in halt.detail and not arm.joint_calls and not arm.mode_calls
+    assert not arm.estop_calls and not arm.disable_calls and not arm.reset_calls
     assert not asyncio.run(transport.close()).connected
     assert not asyncio.run(transport.close()).connected
     assert arm.disconnect_calls == 1
@@ -936,6 +980,89 @@ def test_slow_vendor_send_does_not_block_event_loop(monkeypatch: pytest.MonkeyPa
         await asyncio.sleep(.04)
         assert not task.done()
         halt = await transport.halt()
-        assert halt.halt_supported and arm.estop_calls == 1
+        assert halt.halt_supported and not arm.estop_calls
+        assert halt.stop_effect == STOP_EFFECT_HOLD and halt.metadata["latched"]
         await task
     asyncio.run(run())
+
+
+def test_a_halt_holds_a_driven_arm_in_place_under_power(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop means hold: the arm's own joints become its target; nothing lets it sag.
+
+    The software emergency stop lets a raised arm descend and a reset or
+    disable drops it, so a halt reaches neither -- it re-targets the reported
+    joints in the CAN control the arm is already in and watches them stay.
+    """
+    transport, arm, _ = _open_transport(monkeypatch)
+    assert _write(transport, "joint.j1.position", 12.5).ok
+    arm.joints = joints_to_sdk([11., 20., -30., 40., 50., -160.])  # mid-way, still moving
+    arm.events.clear()
+    halt = asyncio.run(transport.halt())
+    assert arm.events == ["joint"] and arm.mode_feedback == 1
+    assert arm.joint_calls[-1] == pytest.approx(joints_to_sdk([11., 20., -30., 40., 50., -160.]))
+    assert halt.halt_delivered and halt.stop_effect == STOP_EFFECT_HOLD and halt.stop_verified
+    assert halt.metadata["hold_joints_deg"] == pytest.approx([11., 20., -30., 40., 50., -160.])
+    assert not (arm.estop_calls or arm.disable_calls or arm.reset_calls or arm.gripper.calls)
+
+
+def test_a_halt_that_interrupted_motion_latches_until_a_governed_enable(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+    assert _write(transport, "joint.j1.position", 12.5).ok
+    halt = asyncio.run(transport.halt())  # motion_status 1: the arm had not arrived
+    assert halt.metadata["latched"] and "arm.enable=1" in halt.detail
+    calls = list(arm.joint_calls)
+    for channel, value in (("joint.j2.position", 15), ("gripper.position", 30)):
+        refused = _write(transport, channel, value)
+        assert refused.failure_code == "piper_halted" and refused.side_effect_state == SIDE_EFFECT_NONE
+    assert arm.joint_calls == calls and not arm.gripper.calls
+    assert _write(transport, "arm.enable", 1).ok and not arm.reset_calls
+    assert _write(transport, "joint.j2.position", 15).ok
+
+
+def test_a_halt_of_an_arrived_arm_holds_without_latching(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+    assert _write(transport, "joint.j1.position", 12.5).ok
+    arm.motion_status = 0
+    halt = asyncio.run(transport.halt())
+    assert halt.stop_effect == STOP_EFFECT_HOLD and not halt.metadata["latched"]
+    assert _write(transport, "joint.j2.position", 15).ok
+    latched = _open_transport(monkeypatch, {"halt_latch": "always"})
+    latched[1].motion_status = 0
+    assert asyncio.run(latched[0].halt()).metadata["latched"]
+
+
+def test_a_hold_that_drifts_is_reported_unverified(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hold counts only when observed; a sagging arm is reported, not assumed held."""
+    transport, arm, _ = _open_transport(monkeypatch)
+    assert _write(transport, "joint.j1.position", 12.5).ok
+    original = arm.move_j
+    def sag(joints: list[float]) -> None:
+        original(joints)
+        arm.joints = joints_to_sdk([10., 14., -30., 40., 50., -160.])
+    monkeypatch.setattr(arm, "move_j", sag)
+    halt = asyncio.run(transport.halt())
+    assert halt.stop_effect == STOP_EFFECT_HOLD and halt.stop_verified is False
+    assert halt.metadata["drift_deg"] == pytest.approx(6.)
+    assert "moved 6.00 deg" in halt.detail
+
+
+def test_a_halt_never_touches_a_firmware_stop_or_a_silent_arm(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.arm_status = 1
+    halt = asyncio.run(transport.halt())
+    assert halt.stop_effect == STOP_EFFECT_DEVICE_LATCHED and halt.halt_delivered
+    arm.arm_status, arm.joints = 0, None
+    halt = asyncio.run(transport.halt())
+    assert halt.stop_effect == STOP_EFFECT_NONE and not halt.halt_delivered
+    assert halt.stop_verified is False and "physical emergency-stop" in halt.detail
+    assert not (arm.joint_calls or arm.mode_calls or arm.estop_calls or arm.reset_calls)
+
+
+def test_hold_spec_latch_policy() -> None:
+    motion = HoldSpec()
+    assert motion.latches(in_flight=True, arrived=True)
+    assert motion.latches(in_flight=False, arrived=False)
+    assert motion.latches(in_flight=False, arrived=None)
+    assert not motion.latches(in_flight=False, arrived=True)
+    assert HoldSpec(latch="always").latches(in_flight=False, arrived=True)

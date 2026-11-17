@@ -44,8 +44,23 @@ from tests._harness.cassette_proxy import (
     store_for,
     tool_call,
 )
-from tests._harness.journey import Journey, JourneyFactory, JourneyPhaseError
+from typing import TYPE_CHECKING, Any
+
 from tests._harness.leapd import Leapd, await_for, hermetic_env, start_leapd
+
+if TYPE_CHECKING:
+    from tests._harness.journey import Journey, JourneyFactory, JourneyPhaseError
+
+
+def __getattr__(name: str) -> Any:
+    # Read-only edge benchmarks use the calculation harness without pytest.
+    # Journey-only dependencies load when a caller actually asks for a journey.
+    if name in {"Journey", "JourneyFactory", "JourneyPhaseError"}:
+        from tests._harness import journey
+        value = getattr(journey, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "LIVE",

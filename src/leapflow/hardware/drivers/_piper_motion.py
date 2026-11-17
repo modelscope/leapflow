@@ -20,11 +20,20 @@ side-effect verdicts, while this module owns the vendor-facing encoding:
 
   A hold is a *commitment* -- "the arm is where I told it to be" -- and it is
   only true while this driver still owns the arm's posture. Anything that ends
-  that ownership (a governed enable or reset, a disable, an emergency stop, a
-  closed link) voids it through ``disown``. The distinction is not cosmetic: a
+  that ownership (a governed enable or reset, a disable, a halt, a closed link)
+  voids it through ``disown``. The distinction is not cosmetic: a
   joint frame read while the arm was being energised is a measurement of a
   transition, not a command, and holding it moved an axis the caller had never
   named by 2.2 degrees.
+- **Halt preemption.** A halt must not wait behind the command it stops, and a
+  command that was already on its way must not land after the halt. Every
+  write captures the *halt generation* when it starts; every frame it emits is
+  emitted under a short emit lock that re-checks that generation, so a halt
+  (which bumps it under the same lock) cleanly cuts off whatever was in
+  flight: frames already out stay out, none follow. A halt can also *latch*:
+  while latched, no target frame (arm or gripper) is emitted until a governed
+  resume clears it. Only the emission is serialised; the long waits (mode
+  confirmation, status windows) never hold the emit lock.
 - **Control-mode entry.** The firmware executes host commands only in CAN
   control mode. ``set_speed_percent`` sends the mode frame that selects CAN;
   ``enter_can`` repeats it until ``ctrl_mode`` feedback confirms, so a dropped
@@ -58,7 +67,8 @@ import logging
 import math
 import threading
 import time
-from typing import Any, Callable, Iterable, Sequence
+from contextlib import contextmanager
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from leapflow.hardware.arm_status import (
     ARM_STATUS_NORMAL,
@@ -114,6 +124,7 @@ MOVE_MODE_P = 0x00
 MOVE_MODE_J = 0x01
 MOVE_MODE_L = 0x02
 MOVE_MODE_NAMES: dict[int, str] = {MOVE_MODE_P: "p", MOVE_MODE_J: "j", MOVE_MODE_L: "l"}
+MOTION_STATUS_ARRIVED = 0x00
 
 # One firmware request may be silently dropped before the SDK's fps estimate is
 # positive, so the budget is spent on several short requests, paced so a reply
@@ -259,6 +270,12 @@ def arm_status(robot: Any) -> int | None:
     return as_int(attr(status_feedback(robot), "arm_status"))
 
 
+def motion_arrived(robot: Any) -> bool | None:
+    """Whether the firmware reports the last target reached; None without feedback."""
+    code = as_int(attr(status_feedback(robot), "motion_status"))
+    return None if code is None else code == MOTION_STATUS_ARRIVED
+
+
 def move_mode_name(value: Any) -> str:
     """The declared name of a raw motion mode, naming an unassigned code explicitly."""
     mode = as_int(value)
@@ -354,27 +371,62 @@ class TargetRefused(TransportError):
     """
 
 
+class MotionPreempted(TransportError):
+    """A halt took the arm while this command was on its way; its target was not sent.
+
+    Raised before the target frame, so the command's own effect never reached
+    the arm. The halt that preempted it decides where the arm is now.
+    """
+
+
+class MotionHalted(TransportError):
+    """A latched halt holds the arm; no target may move it until a governed resume."""
+
+
 class PiperMotion:
     """Serialized motion-command state for one arm.
 
     Every method that touches the arm is blocking and runs on a worker thread.
     The lock spans mode entry, vector fill, send, and cache advance, so
     concurrent writers can neither interleave vectors nor race a mode switch.
+    A halt never takes that lock: it takes only the emit lock, which every
+    frame emission holds for the duration of one vendor call (see the module
+    docstring, "Halt preemption").
     """
 
     def __init__(self, *, speed_pct: int, pose_path: str, mode_timeout_s: float = 0.6) -> None:
         if pose_path not in POSE_PATHS:
             raise ValueError(f"pose_path must be one of {list(POSE_PATHS)}, got {pose_path!r}")
         self._lock = threading.Lock()
+        self._emit_lock = threading.Lock()
         self._speed_pct = min(100, max(1, int(speed_pct)))
         self._speed_sent = False
         self._pose_path = pose_path
         self._mode_timeout_s = max(0.1, float(mode_timeout_s))
         self._epoch = 0
+        # Bumped only by a halt: a command that started under an older
+        # generation was overtaken by that halt and must emit nothing more.
+        self._generation = 0
+        self._halted = ""
         # The vector last *sent* in one space, with the control epoch it was
         # sent in. Empty until a command is sent; ``disown`` bumps the epoch
         # so a vector from before a discontinuity can never be held again.
         self._held: dict[str, tuple[int, list[float]]] = {}
+
+    @property
+    def mode_timeout_s(self) -> float:
+        """The budget for the firmware to confirm one control- or move-mode frame."""
+        return self._mode_timeout_s
+
+    @property
+    def generation(self) -> int:
+        """The halt generation a command must capture when it starts."""
+        return self._generation
+
+    @property
+    def halted(self) -> str:
+        """Why a latched halt holds the arm; ``""`` when no halt is latched."""
+        return self._halted
 
     @property
     def speed_pct(self) -> int:
@@ -403,7 +455,7 @@ class PiperMotion:
         """Void the held vectors: this driver no longer owns where the arm is.
 
         Called at every control discontinuity -- enable, reset, disable,
-        emergency stop, closed link. Deliberately does not take the motion
+        halt, closed link. Deliberately does not take the motion
         lock, because ``halt`` must never wait behind an in-flight send; a send
         stamps the vector it writes with the epoch it started in, so a bump
         that lands mid-send leaves that vector void instead of trusted.
@@ -411,6 +463,65 @@ class PiperMotion:
         """
         self._epoch += 1
         logger.info("piper: held command vector dropped after %s", reason)
+
+    @contextmanager
+    def preempt(self, reason: str, *, latch: str = "") -> Iterator[None]:
+        """Take the arm from every command in flight; the body emits the halt's own frames.
+
+        Holds the emit lock for the body, so no frame of an overtaken command
+        can interleave with the halt's frames or follow them. Waiting for the
+        lock costs at most one vendor call, never a command's mode or status
+        windows, which run outside it. A non-empty ``latch`` is engaged in the
+        same critical section, so no command can start a target between the
+        halt's frames and the latch.
+        """
+        with self._emit_lock:
+            self._generation += 1
+            self.disown(reason)
+            if latch:
+                self._halted = latch
+                logger.warning("piper: halt latched (%s); targets refused until a governed "
+                               "resume", latch)
+            yield
+
+    def resume(self) -> None:
+        """Clear a latched halt; called only after a governed enable succeeded."""
+        with self._emit_lock:
+            if self._halted:
+                logger.info("piper: latched halt (%s) cleared by a governed enable", self._halted)
+            self._halted = ""
+
+    def halted_error(self) -> MotionHalted:
+        """The typed refusal for a target sent while a halt is latched."""
+        return MotionHalted(
+            f"the arm is holding in place after {self._halted or 'a halt'}; no target is sent "
+            "until a governed arm.enable=1 resumes motion",
+            failure_code="piper_halted",
+        )
+
+    def emit_target(self, generation: int, call: Callable[..., Any], *args: Any,
+                    **kwargs: Any) -> Any:
+        """Emit one target frame unless a halt overtook or latched it."""
+        return self._emit(generation, call, *args, target=True, **kwargs)
+
+    def _emit(self, generation: int, call: Callable[..., Any], *args: Any,
+              target: bool = False, **kwargs: Any) -> Any:
+        """Run one vendor call under the emit lock, refusing it once a halt intervened.
+
+        Mode frames are only refused when a halt overtook their command; a
+        latched halt refuses *targets*, so a governed enable can still select
+        CAN control while the arm holds.
+        """
+        with self._emit_lock:
+            if generation != self._generation:
+                raise MotionPreempted(
+                    "a halt took the arm while this command was on its way; its target was "
+                    "not sent and the arm holds where the halt found it",
+                    failure_code="piper_preempted",
+                )
+            if target and self._halted:
+                raise self.halted_error()
+            return call(*args, **kwargs)
 
     def send(
         self,
@@ -420,6 +531,7 @@ class PiperMotion:
         targets: list[tuple[int, float]],
         *, validate: Callable[[], None] | None = None,
         hold: Callable[[str, int, float], float] | None = None,
+        generation: int | None = None,
     ) -> list[float] | None:
         """Send one full hold vector in ``space``; None when nothing could be held.
 
@@ -440,8 +552,16 @@ class PiperMotion:
         from an arm that is merely slow to arrive. The same is true of the
         posture itself, so the firmware's answer to it is read before the send
         may be reported as executed.
+
+        ``generation`` is the halt generation the caller captured when its
+        write started (the current one when omitted): a halt since then
+        raises ``MotionPreempted`` before the target, and a latched halt raises
+        ``MotionHalted`` before any frame.
         """
         with self._lock:
+            gen = self._generation if generation is None else generation
+            if self._halted:
+                raise self.halted_error()
             epoch = self._epoch
             held = self._held.get(space)
             committed = held[1] if held is not None and held[0] == epoch else None
@@ -463,16 +583,16 @@ class PiperMotion:
                 if validate is not None:
                     validate()
                 if ctrl_mode(robot) != CTRL_MODE_CAN or not self._speed_sent:
-                    self._enter_can(robot)
-                self._assert_move_mode(robot, space)
+                    self._enter_can(robot, gen)
+                self._assert_move_mode(robot, space, gen)
                 if validate is not None:
                     validate()
                 if space == SPACE_JOINT:
-                    robot.move_j(joints_to_sdk(snapshot))
+                    self.emit_target(gen, robot.move_j, joints_to_sdk(snapshot))
                 elif self._pose_path == POSE_PATH_POINT:
-                    robot.move_p(pose_to_sdk(snapshot))
+                    self.emit_target(gen, robot.move_p, pose_to_sdk(snapshot))
                 else:
-                    robot.move_l(pose_to_sdk(snapshot))
+                    self.emit_target(gen, robot.move_l, pose_to_sdk(snapshot))
                 self._confirm_target(robot, space, snapshot)
             except BaseException:
                 self._held.clear()
@@ -526,10 +646,10 @@ class PiperMotion:
     def enter_can(self, robot: Any) -> None:
         """Select CAN control (carrying the staged speed), verified, unconditionally."""
         with self._lock:
-            self._enter_can(robot)
+            self._enter_can(robot, self._generation)
 
-    def ensure_can(self, robot: Any) -> None:
-        """Enter CAN control only when the arm reports something else.
+    def ensure_can(self, robot: Any, generation: int | None = None) -> bool:
+        """Enter CAN control only when the arm reports something else; True when it did.
 
         A gripper write does not go through the motion path, so it needs the
         same guarantee: outside CAN control the firmware drops the frame while
@@ -537,14 +657,16 @@ class PiperMotion:
         untouched, so an energized arm is never disturbed.
         """
         with self._lock:
-            if ctrl_mode(robot) != CTRL_MODE_CAN:
-                self._enter_can(robot)
+            if ctrl_mode(robot) == CTRL_MODE_CAN:
+                return False
+            self._enter_can(robot, self._generation if generation is None else generation)
+            return True
 
-    def _enter_can(self, robot: Any) -> None:
+    def _enter_can(self, robot: Any, generation: int) -> None:
         deadline = time.monotonic() + self._mode_timeout_s
         while True:
             self._speed_sent = False
-            robot.set_speed_percent(self._speed_pct)
+            self._emit(generation, robot.set_speed_percent, self._speed_pct)
             self._speed_sent = True
             window = min(deadline, time.monotonic() + _MODE_RETRY_S)
             while time.monotonic() < window:
@@ -560,7 +682,7 @@ class PiperMotion:
                     failure_code="piper_mode_switch_refused",
                 )
 
-    def _assert_move_mode(self, robot: Any, space: str) -> None:
+    def _assert_move_mode(self, robot: Any, space: str, generation: int) -> None:
         """Put the firmware in the mode these targets belong to, confirmed by feedback.
 
         The speed frame parks the firmware in move mode UNKNOWN, and the SDK's
@@ -572,7 +694,7 @@ class PiperMotion:
         name, expected = sdk_move_mode(space, self._pose_path)
         deadline = time.monotonic() + self._mode_timeout_s
         while True:
-            robot.set_motion_mode(name)
+            self._emit(generation, robot.set_motion_mode, name)
             window = min(deadline, time.monotonic() + _MODE_RETRY_S)
             while time.monotonic() < window:
                 time.sleep(_MODE_POLL_S)
@@ -598,7 +720,10 @@ __all__ = [
     "MOVE_MODE_L",
     "MOVE_MODE_NAMES",
     "MOVE_MODE_P",
+    "MOTION_STATUS_ARRIVED",
     "HoldRefused",
+    "MotionHalted",
+    "MotionPreempted",
     "POSE_CHANNELS",
     "POSE_PATHS",
     "SPACE_CHANNELS",
@@ -612,6 +737,7 @@ __all__ = [
     "enable_flag",
     "enable_status",
     "firmware_version",
+    "motion_arrived",
     "motion_space",
     "motion_spaces",
     "move_mode",

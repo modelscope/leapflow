@@ -212,6 +212,25 @@ def test_a_shared_frame_side_must_fit_one_message(side: float) -> None:
         PerceptionSettings.from_mapping({"snapshot_max_side": side})
 
 
+def test_perception_advises_against_ttls_shorter_than_s2_reasons() -> None:
+    assert PerceptionSettings().advisories() == []
+    short = PerceptionSettings.from_mapping({"memory_ttl_s": 30, "frame_ttl_s": 20})
+    notes = short.advisories()
+    assert any("memory_ttl_s 30s" in note for note in notes)
+    assert any("frame_ttl_s 20s" in note and "default is 180s" in note for note in notes)
+    assert any("shorter than memory_ttl_s" in note for note in notes)
+
+
+async def test_the_listing_and_card_carry_the_workcell_advisories(tmp_path: Path) -> None:
+    tuned = {**SHARED_YAML, "perception": {"memory_ttl_s": 30}}
+    runtime = _runtime(tmp_path, _calibrated(tmp_path, CUP), tuned)
+    (cell,) = runtime.list()["workcells"]
+    (advice,) = cell["advisories"]
+    assert "memory_ttl_s 30s" in advice
+    assert workcell_view(NODE_ID, cell)["advisories"] == [advice]
+    assert runtime.load_report.advised(WORKCELL_ID) == [advice]
+
+
 def test_target_coordinates_scale_to_the_full_frame() -> None:
     frame = SimpleNamespace(width=200, height=150)
     point = PixelTarget("cup", point=(50.0, 37.5))
@@ -399,16 +418,56 @@ async def test_a_lifted_box_is_measured_again_where_it_was(tmp_path: Path) -> No
     with pytest.raises(SkillError) as error:
         await scene.relocate(again)
     assert error.value.failure_code == FAILURE_TARGET_NOT_FOUND
-    assert "lift it again" in error.value.message
+    assert "observe again and replan" in error.value.message
+    assert "perceive.snapshot with_cameras=[all]" in error.value.result['next']
+    assert scene.object(lifted.object_id) == again
 
 
-async def test_a_lifted_point_over_an_emptied_table_falls_to_the_table(tmp_path: Path) -> None:
+async def test_a_lifted_point_over_an_emptied_table_preserves_target_identity(tmp_path: Path) -> None:
     registry = _calibrated(tmp_path, CUP)
     scene = _scene(registry)
     lifted = await _lift_cup(scene, PixelTarget("cup", point=_cup_top()))
     registry.devices[CAMERA_ID].boxes = []
-    gone = await scene.relocate(lifted)
-    assert gone.center[2] == pytest.approx(TABLE_Z, abs=2.0)  # the drift check sees it left
+    with pytest.raises(SkillError) as error:
+        await scene.relocate(lifted)
+    assert error.value.failure_code == FAILURE_TARGET_NOT_FOUND
+    assert scene.object(lifted.object_id) == lifted
+    assert scene.observation(lifted)['verdict'] != 'sufficient'
+
+
+@pytest.mark.parametrize('offset', [-20.5, -11.2])
+async def test_legacy_offset_box_remains_visible_and_readonly_confirm_does_not_refresh(tmp_path: Path, offset: float) -> None:
+    registry = _calibrated(tmp_path, CUP)
+    registry.devices[CAMERA_ID].table_z = TABLE_Z + offset
+    clock = _Clock()
+    scene = _scene(registry, clock=clock)
+    (obj,) = await scene.locate(['cup'])
+    before = dict(scene._memory._objects)
+    reports = dict(scene._memory._observations)
+    clock.now += 5
+    checked = await scene.relocate(obj, commit=False)
+    assert checked.center == pytest.approx(obj.center, abs=3.)
+    assert scene._memory._objects == before and scene._memory._observations == reports
+    shot = await scene.snapshot()
+    assert shot['objects'][0]['views']['camera']['state'] == 'visible'
+    assert len(registry.devices[LOCATOR_ID].requests) == 1
+
+
+async def test_missing_depth_is_uncertain_not_a_missing_object(tmp_path: Path) -> None:
+    from dataclasses import replace
+    registry = _calibrated(tmp_path, CUP)
+    scene = _scene(registry)
+    (obj,) = await scene.locate(['cup'])
+    capture = await scene.capture()
+    blind = replace(capture, frame=replace(capture.frame, depth=bytes(len(capture.frame.depth))))
+    async def capture_blind(role='camera'):
+        return blind
+    scene.capture = capture_blind
+    with pytest.raises(SkillError) as error:
+        await scene.relocate(obj, commit=False)
+    assert error.value.failure_code == 'observation_insufficient'
+    assert error.value.result['observation']['attempts'][0]['state'] == 'no_depth'
+    assert scene.object(obj.object_id) == obj
 
 
 # ── Host side: the image channel ─────────────────────────────────────────────
@@ -619,6 +678,15 @@ async def test_the_listing_names_the_cameras_each_skill_can_serve(tmp_path: Path
     assert next(s for s in card if s["skill_id"] == "perceive.locate")["bindings"] == {
         "camera": ["camera.wrist"]
     }
+
+
+async def test_a_mosaic_snapshot_says_where_each_tile_sits(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path, _wrist_cell(tmp_path), WRIST_YAML)
+    shot = await _read(runtime, "perceive.snapshot", {"with_cameras": ["camera.wrist"]})
+    wrist = shot.result["tiles"][1]
+    assert "Tiles: camera color f" in shot.message
+    assert f"camera.wrist color {wrist['frame']} at x 0-{wrist['width']}" in shot.message
+    assert "that tile's own pixels" in shot.message
 
 
 async def test_a_skill_is_refused_for_the_camera_it_cannot_serve(tmp_path: Path) -> None:

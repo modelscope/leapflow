@@ -1782,6 +1782,22 @@ def render_plugin_payload(console: "LeapConsole", payload: dict[str, Any]) -> No
             info.append(f"Tools ({len(tools)}):")
             for t in tools:
                 info.append(f"\n  - {t.get('name')}: {t.get('description', '')[:50]}")
+        usage = payload.get("usage") or []
+        if usage:
+            # Real failures, feasibility refusals and self-repairs are read apart:
+            # only the first says the tool is broken.
+            info.append("\nUsage (fail / refused / repaired):")
+            for row in usage:
+                codes = ", ".join(
+                    f"{code}×{count}" for code, count in (row.get("failure_codes") or {}).items()
+                )
+                info.append(
+                    f"\n  - {row.get('tool')}: {row.get('calls', 0)} calls, "
+                    f"{float(row.get('failure_rate') or 0):.0%} / "
+                    f"{float(row.get('refusal_rate') or 0):.0%} / "
+                    f"{float(row.get('repair_rate') or 0):.0%}"
+                    + (f" — {codes}" if codes else "")
+                )
         console.print(Panel(info, title=str(payload.get("plugin_id") or "Plugin"), border_style="cyan"))
         return
 

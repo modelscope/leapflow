@@ -48,6 +48,7 @@ from leapflow.hardware.skills.workcell_reload import matches
 from leapflow.hardware.skills.episodes import MAX_INTENT_CHARS, MAX_LABEL_NOTE_CHARS
 from leapflow.hardware.skills.protocol import (
     FAILURE_DEVICE_BUSY,
+    FAILURE_INVALID_ARGS,
     FAILURE_LEASE_LOST,
     FAILURE_PLAN_UNKNOWN,
     FAILURE_WRITE_REFUSED,
@@ -153,21 +154,36 @@ class SkillMethods:
         return {"reload": self._runtime.commit_workcell_reload(prepared)}
 
     async def list(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        return self._runtime.list(optional_str(params, "workcell"))
+        return await self._runtime.list_async(optional_str(params, "workcell"))
 
     async def plan(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        planned = await self._runtime.plan(
-            require_str(params, "workcell"),
-            require_str(params, "skill"),
-            optional_mapping(params, "args"),
-            share_frames=optional_bool(params, "share_frames"),
-        )
+        batch: dict[str, Any] = {}
+        if "candidates" in params:
+            if "args" in params or "approved_plan" in params:
+                return _outcome(SkillOutcome.failed(FAILURE_INVALID_ARGS,
+                    "candidates cannot be combined with args or approved_plan"))
+            result = await self._runtime.plan_batch(
+                require_str(params, "workcell"), require_str(params, "skill"),
+                params["candidates"], params.get("selection"),
+                share_frames=optional_bool(params, "share_frames"))
+            planned = result.selected
+            batch = {"batch": dict(result.report)}
+        else:
+            if "selection" in params:
+                return _outcome(SkillOutcome.failed(FAILURE_INVALID_ARGS, "selection requires candidates"))
+            planned = await self._runtime.plan(
+                require_str(params, "workcell"),
+                require_str(params, "skill"),
+                optional_mapping(params, "args"),
+                share_frames=optional_bool(params, "share_frames"),
+            )
         if isinstance(planned, SkillOutcome):
-            return _outcome(planned)
+            return {**_outcome(planned), **batch}
         return {
             "plan": planned.to_dict(),
             "permit_digest": self._runtime.permit_digest(planned),
             "consent": self._runtime.consent(planned),
+            **batch,
         }
 
     async def execute(self, params: Mapping[str, Any]) -> dict[str, Any]:

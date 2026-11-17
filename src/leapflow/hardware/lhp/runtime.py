@@ -241,6 +241,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--verbose", action="store_true", help="Log at DEBUG level")
     parser.add_argument(
+        "--log-file",
+        default="",
+        help="Append and size-rotate the node log at this path (config hardware.node_log_file)",
+    )
+    parser.add_argument(
         "--write-mode",
         default="",
         help=(
@@ -260,10 +265,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s %(name)s: %(message)s",
-    )
+    from leapflow.config import load_config
+    from leapflow.logging_setup import init_node_logging
+
+    init_node_logging(load_config(), log_file=args.log_file, verbose=args.verbose)
     node_id, token = resolve_endpoint_args(args.node_id, args.token)
     write_mode = _resolve_write_mode(args.write_mode)
     if not is_valid_device_id(node_id):

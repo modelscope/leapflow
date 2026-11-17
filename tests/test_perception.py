@@ -52,6 +52,7 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_CALIBRATION_MISSING,
     FAILURE_CALIBRATION_STALE,
     FAILURE_DEVICE_FAULT,
+    FAILURE_GRASP_INFEASIBLE,
     FAILURE_INVALID_ARGS,
     FAILURE_MODEL_UNAVAILABLE,
     FAILURE_SKILL_UNAVAILABLE,
@@ -63,6 +64,7 @@ from leapflow.hardware.skills.protocol import (
     SkillOutcome,
 )
 from leapflow.hardware.skills.runtime import SkillRuntime, SkillRuntimeSettings
+from leapflow.hardware.skills.planning import PlanningSettings, encoded
 from leapflow.hardware.skills.workcell import (
     WorkcellError,
     WorkcellSpec,
@@ -81,6 +83,8 @@ from tests._harness.skill_stubs import (
     perception_registry,
     write_workcell,
 )
+
+pytestmark = pytest.mark.usefixtures("close_skill_runtimes")
 
 CUP = SimBox("cup", center=(300.0, 20.0), length=60.0, width=30.0, height=50.0)
 
@@ -307,14 +311,24 @@ async def test_top_down_turns_the_short_way_and_never_dips_below_the_table() -> 
 
 async def test_top_down_offers_nothing_wider_than_the_gripper() -> None:
     wide = _object(length=100.0, width=68.0)
-    assert await _PLANNER.candidates(wide, table=_TABLE, current=_HOME) == ()
+    with pytest.raises(SkillError) as refusal:
+        await _PLANNER.candidates(wide, table=_TABLE, current=_HOME)
+    assert refusal.value.failure_code == FAILURE_GRASP_INFEASIBLE
+    fit = refusal.value.result["fit"]
+    assert fit["measured_width_mm"] == 68.0
+    assert fit["max_object_width_mm"] == 66.0
+    assert fit["available_slack_mm"] == 2.0
+    assert "camera.wrist" in refusal.value.message
 
 
 async def test_top_down_tuning_comes_from_the_declaration() -> None:
     tuned = TopDownPlanner(
         {"max_width_mm": 70.0}, TopDownSettings.from_mapping({"min_slack_mm": 50.0})
     )
-    assert await tuned.candidates(_object(), table=_TABLE, current=_HOME) == ()
+    with pytest.raises(SkillError) as refusal:
+        await tuned.candidates(_object(), table=_TABLE, current=_HOME)
+    assert refusal.value.failure_code == FAILURE_GRASP_INFEASIBLE
+    assert refusal.value.result["fit"]["cause"] == "opening_margin"
     square = TopDownPlanner(
         {"max_width_mm": 70.0}, TopDownSettings.from_mapping({"round_tolerance_mm": 40.0})
     )
@@ -556,6 +570,24 @@ async def test_grasps_are_named_per_object_and_expire_with_a_new_locate(tmp_path
         scene.grasp("g3")
 
 
+async def test_grasp_publication_validation_is_atomic(tmp_path: Path) -> None:
+    scene = _scene(_calibrated(tmp_path, CUP))
+    (cup,) = await scene.locate(["cup"])
+    proposed = await _PLANNER.candidates(cup, table=_TABLE, current=_HOME)
+    first = scene.remember_grasps(cup, proposed)
+    validated = []
+
+    def refuse(named: tuple[GraspCandidate, ...]) -> None:
+        validated.extend(named)
+        raise SkillError(FAILURE_INVALID_ARGS, "response exceeds budget")
+
+    with pytest.raises(SkillError, match="budget"):
+        scene.remember_grasps(cup, proposed, validate=refuse)
+    assert [g.grasp_id for g in validated] == ["g3", "g4"]
+    assert all(scene.grasp(g.grasp_id) == g for g in first)
+    assert scene.remember_grasps(cup, proposed[:1])[0].grasp_id == "g3"
+
+
 async def test_holding_takes_the_object_off_the_table(tmp_path: Path) -> None:
     scene = _scene(_calibrated(tmp_path, CUP))
     (cup,) = await scene.locate(["cup"])
@@ -679,6 +711,25 @@ async def test_locate_then_propose_shares_one_scene_across_runs(tmp_path: Path) 
     assert registry.devices[CAMERA_ID].captures == 1  # propose recalled o1
 
 
+async def test_grasp_response_budget_uses_exact_outcome_without_consuming_handles(tmp_path: Path) -> None:
+    registry = _calibrated(tmp_path, CUP)
+    runtime = _runtime(tmp_path, registry, PERCEPTION_WORKCELL_YAML, skills=scene_skills())
+    assert (await _read(runtime, "perceive.locate", {"queries": ["cup"]})).ok
+    first = await _read(runtime, "grasp.propose", {"object": "o1", "top_k": 1})
+    assert first.ok
+    size = len(encoded({"outcome": first.to_dict()}).encode("utf-8"))
+    assert size >= 1024
+    runtime._settings = replace(runtime._settings, planning=PlanningSettings(max_bytes=size - 1))
+    refused = await _read(runtime, "grasp.propose", {"object": "o1", "top_k": 1})
+    assert refused.failure_code == FAILURE_INVALID_ARGS
+    runtime._settings = replace(runtime._settings, planning=PlanningSettings(max_bytes=size))
+    second = await _read(runtime, "grasp.propose", {"object": "o1", "top_k": 1})
+    assert second.ok, second
+    assert second.result["grasps"][0]["grasp_id"] == "g2"
+    assert len(encoded({"outcome": second.to_dict()}).encode("utf-8")) <= size
+    assert registry.sim.batches == []
+
+
 async def test_propose_refuses_a_forgotten_id_and_an_ungraspable_object(tmp_path: Path) -> None:
     wide = SimBox("tray", center=(300.0, 0.0), length=100.0, width=68.0, height=20.0)
     registry = _calibrated(tmp_path, wide)
@@ -687,8 +738,9 @@ async def test_propose_refuses_a_forgotten_id_and_an_ungraspable_object(tmp_path
     assert unknown.failure_code == FAILURE_TARGET_NOT_FOUND
     assert (await _read(runtime, "perceive.locate", {"queries": ["tray"]})).ok
     refused = await _read(runtime, "grasp.propose", {"object": "o1"})
-    assert refused.failure_code == "unreachable"
-    assert "proposed no reachable grasp" in refused.message
+    assert refused.failure_code == FAILURE_GRASP_INFEASIBLE
+    assert refused.result["fit"]["measured_width_mm"] > refused.result["fit"]["max_object_width_mm"]
+    assert "gripper opening needs" in refused.message
 
 
 async def test_perception_skills_are_unavailable_without_the_camera_calibration(

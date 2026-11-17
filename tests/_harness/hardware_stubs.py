@@ -205,6 +205,8 @@ class StubNodeRegistry:
                 halt_supported=status.halt_supported,
                 halt_delivered=status.halt_delivered,
                 detail=status.detail or "closed by the stop",
+                stop_effect=status.stop_effect,
+                stop_verified=status.stop_verified,
             )
         return status
 

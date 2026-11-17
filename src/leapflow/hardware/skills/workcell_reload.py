@@ -14,7 +14,9 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_DEVICE_BUSY, FAILURE_PLAN_STALE, FAILURE_SKILL_UNAVAILABLE,
     FAILURE_UNKNOWN_WORKCELL, SkillOutcome,
 )
-from leapflow.hardware.skills.workcell import WorkcellLoadReport, WorkcellSpec, load_workcells
+from leapflow.hardware.skills.workcell import (
+    WorkcellLoadReport, WorkcellSpec, advisory_notes, load_workcells,
+)
 
 if TYPE_CHECKING:
     from leapflow.hardware.skills.runtime import SkillRuntime
@@ -38,7 +40,7 @@ def load(runtime: SkillRuntime) -> tuple[dict[str, WorkcellSpec], WorkcellLoadRe
     return load_workcells(directory, runtime._registry, checks=(
         runtime._grasp_problems, runtime._perception_problems,
         runtime._vision_problems, runtime._policy_problems,
-    ))
+    ), advice=runtime.ADVICE)
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,9 @@ def commit(runtime: SkillRuntime, prepared: PreparedReload) -> dict[str, Any]:
         del runtime._plans[key]
     runtime._scenes.pop(prepared.workcell, None)
     runtime._workcells[prepared.workcell] = prepared.candidate
-    runtime._report = WorkcellLoadReport(tuple(runtime._workcells), runtime._report.rejected)
+    report = runtime._report
+    advisories = tuple(note for note in report.advisories if note.workcell != prepared.workcell)
+    advisories += tuple(advisory_notes(prepared.candidate, runtime.ADVICE))
+    runtime._report = WorkcellLoadReport(tuple(runtime._workcells), report.rejected, advisories)
     return {**prepared.to_dict(), "applied": True, "invalidated_plans": len(invalidated),
             "node_session_unchanged": runtime._node_session_id == prepared.node_session_id}

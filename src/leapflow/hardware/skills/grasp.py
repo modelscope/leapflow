@@ -30,6 +30,7 @@ from leapflow.hardware.skills.scene_memory import SceneCapture
 from leapflow.hardware.skills.ports import GraspPlanner
 from leapflow.hardware.skills.protocol import (
     FAILURE_INVALID_ARGS,
+    FAILURE_GRASP_INFEASIBLE,
     FAILURE_SKILL_UNAVAILABLE,
     GraspCandidate,
     LocatedObject,
@@ -157,6 +158,25 @@ class TopDownPlanner:
             candidate = self._candidate(obj, table, current, across_yaw, across, score)
             if candidate is not None:
                 found.append(candidate)
+        if not found:
+            slack = self._settings.min_slack_mm
+            margin = self._settings.open_margin_mm
+            opening = min(self._max_width, obj.width + margin)
+            raise SkillError(
+                FAILURE_GRASP_INFEASIBLE,
+                f"{obj.object_id} ({obj.label}) measures {obj.width:.1f} mm across its narrow "
+                f"side; the {self._max_width:.1f} mm gripper opening needs {slack:.1f} mm "
+                f"clearance (supported width at most {self._max_width - slack:.1f} mm, "
+                f"configured opening margin {margin:.1f} mm). Re-measure with a suitable "
+                "camera, such as camera.wrist when available, before proposing again",
+                result={"fit": {
+                    "measured_width_mm": obj.width, "max_width_mm": self._max_width,
+                    "min_slack_mm": slack, "open_margin_mm": margin,
+                    "planned_open_mm": opening, "available_slack_mm": opening - obj.width,
+                    "max_object_width_mm": self._max_width - slack,
+                    "cause": "opening_margin" if margin < slack else "object_width",
+                }},
+            )
         return tuple(found)
 
     def _candidate(

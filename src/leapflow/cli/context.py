@@ -1530,6 +1530,12 @@ class Context:
 
         return _emit
 
+    def _publish_hardware_observation(self, event: Any) -> None:
+        """Resolve the live registry after a hardware plugin replacement."""
+        registry = getattr(self, "_hardware_registry", None)
+        if registry is not None:
+            registry.publish_event(event)
+
     def _bind_hardware_persistence(self, registry: Any) -> None:
         """Point the reading store at session-scoped, layout-owned paths.
 
@@ -1616,10 +1622,28 @@ class Context:
             )
             self._hardware_trust_gate = None
 
+        registry.set_event_emitter(self._hardware_event_emitter())
+        priors = getattr(self, "_hardware_view_priors", None)
+        if priors is None:
+            try:
+                from leapflow.hardware.view_priors import ViewPriorSettings
+                from leapflow.hardware.view_prior_learning import ViewPriorLearning
+                from leapflow.storage.view_prior_store import ViewPriorStore
+                from leapflow.monitor.signal_noise import SignalNoiseConfig, SignalNoiseGate
+
+                priors = ViewPriorLearning(
+                    ViewPriorStore(self._db_holder, ViewPriorSettings.from_json(self.settings.hardware_view_priors)),
+                    self.event_bus, self._publish_hardware_observation, self._run_deferred_db,
+                    SignalNoiseGate(SignalNoiseConfig.from_settings(self.settings)),
+                )
+                self._hardware_view_priors = priors
+            except Exception:
+                logger.warning("Observation learning unavailable; survey remains unlearned", exc_info=True)
         _get_tool_registry().bind_runtime(
             hardware_registry=registry,
             hardware_approval_gate=self._approval_orchestrator,
             hardware_trust_gate=self._hardware_trust_gate,
+            hardware_view_priors=priors,
         )
         report = registry.report
         logger.info(
@@ -2307,6 +2331,7 @@ class Context:
                     stagnation_window=settings.guardrail_stagnation_window,
                     min_success_rate=settings.guardrail_min_success_rate,
                     max_consecutive_same=settings.guardrail_max_consecutive_same,
+                    argument_scoped_tools=settings.guardrail_argument_scoped_tools,
                     max_calls_per_turn=settings.guardrail_max_calls_per_turn,
                 )
                 logger.debug("Tool loop guardrails enabled")
@@ -3989,6 +4014,11 @@ class Context:
                 await registry.close_all()
             except Exception:
                 logger.warning("Hardware teardown failed", exc_info=True)
+
+        priors = getattr(self, "_hardware_view_priors", None)
+        if priors is not None:
+            await priors.close()
+            self._hardware_view_priors = None
 
         # Drain the deferred-DB executor first so no worker thread touches the
         # shared DuckDB connection while stores below persist/close it.

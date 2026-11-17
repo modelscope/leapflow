@@ -152,6 +152,12 @@ _FIELD_DESCRIPTIONS = {
         "Scanners that transmit or leave the host are opt-in and must be named here. "
         "Providers run at startup, so a change needs a daemon restart."
     ),
+    "hardware.view_priors": (
+        "JSON rank-only observation learning policy: enabled (default false), ttl_s, "
+        "max_age_s, duration_scale_s, lookup_timeout_s, max_events, max_pending. Learns only filtered "
+        "survey signals; exact node/workcell configuration scope is mandatory. "
+        "Never changes safety or approval. Requires a daemon restart."
+    ),
     "hardware.fleet_nodes": (
         "JSON array of named LHP edge nodes. Connections and heartbeat supervision are "
         "assembled at startup, so a change needs a daemon restart."
@@ -323,6 +329,34 @@ _FIELD_DESCRIPTIONS = {
         "update_s (2), solve_s (30), rss_bytes (536870912). Values may tighten, never expand "
         "these ceilings. Socket location is profile-layout-owned. Requires node restart."
     ),
+    "hardware.skills_planning_auto_variants": (
+        "Allow plugin-declared equivalent sibling programs after unreachable/out-of-workspace "
+        "single planning failures (default true). Selection is disclosed and still requires "
+        "verification, approval, freshness, and execution gates. Requires node restart."
+    ),
+    "hardware.skills_planning_workers": (
+        "Pure planning worker count (0: CPU-aware automatic, at most two by default). "
+        "Explicit counts are bounded by available CPUs and admitted jobs. Requires node restart."
+    ),
+    "hardware.skills_planning_max_candidates": (
+        "Maximum complete alternatives in one batch request (1–32, default 8). Requires node restart."
+    ),
+    "hardware.skills_planning_max_jobs": (
+        "Maximum outstanding pure jobs, including queued and running jobs (1–128, default 16). "
+        "Requires node restart."
+    ),
+    "hardware.skills_planning_timeout_s": (
+        "End-to-end planning budget including preparation and queue time (0–600 seconds, "
+        "exclusive of zero; default 30). Requires node restart."
+    ),
+    "hardware.skills_planning_max_bytes": (
+        "Request/result and private worker payload ceiling (1024–524288 bytes, default 262144). "
+        "Requires node restart."
+    ),
+    "hardware.skills_planning_cancel_grace_s": (
+        "Cooperative cancellation grace before terminating a pure compute worker (0–5 seconds, "
+        "exclusive of zero; default 0.5). Requires node restart."
+    ),
     "hardware.skills_enabled": (
         "Comma-separated patterns (fnmatch) of node skills a hardware node offers; empty "
         "offers every discovered skill. Read when the node starts, so a change needs a "
@@ -345,6 +379,25 @@ _FIELD_DESCRIPTIONS = {
         "Longest one actuator's halt call may take when a run is stopped or fails before "
         "the node logs it as failed. Read when the node starts, so a change needs a node "
         "restart."
+    ),
+    "hardware.node_log_file": (
+        "File the LHP edge node (`leap hw serve`) appends its log to and rotates itself, "
+        "so a restart keeps earlier runs and the disk stays bounded; empty logs to stderr "
+        "only. `--log-file` overrides it. Read when the node starts, so a change needs a "
+        "node restart."
+    ),
+    "hardware.node_log_level": (
+        "Verbosity of the edge node's log (default INFO, so halts, stops, and run "
+        "lifecycle are kept as field evidence). Read when the node starts, so a change "
+        "needs a node restart."
+    ),
+    "hardware.node_log_max_mb": (
+        "Size at which the edge node rotates its log file; 0 disables rotation. Read "
+        "when the node starts, so a change needs a node restart."
+    ),
+    "hardware.node_log_backups": (
+        "Rotated edge-node log files kept beside the active one. Read when the node "
+        "starts, so a change needs a node restart."
     ),
     "hardware.skills_stop_grace_s": (
         "How long a stopped skill may unwind on its own before the node cancels it. Read "
@@ -587,6 +640,7 @@ _SECTION_CATEGORIES = {
 _VALUE_HINTS = {
     "runtime.log_level": "DEBUG|INFO|WARNING|ERROR",
     "daemon.log_level": "DEBUG|INFO|WARNING|ERROR",
+    "hardware.node_log_level": "DEBUG|INFO|WARNING|ERROR",
     "mcp.approval_mode": "mutating_only|always|off",
     "hardware.unverified_policy": "deny_write|prompt|allow",
     "hardware.devices_dir": "absolute path, or empty for the profile default",
@@ -832,6 +886,10 @@ class ConfigService:
         if spec.secret:
             return self._set_secret_backed_field(spec, str(value), scope=scope)
         coerced = _coerce_value(value, spec.value_type)
+        if normalized.startswith("hardware.skills_planning_"):
+            from leapflow.hardware.skills.planning import PlanningSettings
+
+            PlanningSettings(**{normalized.removeprefix("hardware.skills_planning_"): coerced})
         path = self._path_for_spec(spec, scope)
         data = _read_yaml(path)
         section = dict(data.get(spec.section) or {})

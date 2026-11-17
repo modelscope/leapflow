@@ -56,6 +56,7 @@ from prompt_toolkit.widgets import TextArea
 
 from leapflow.cli.tui_app.approval_modal import ApprovalModal
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus, command_key
+from leapflow.cli.tui_app.display_clock import DisplayClock
 from leapflow.cli.tui_app.history import SecretAwareFileHistory
 from leapflow.cli.tui_app.input import build_completer
 from leapflow.cli.tui_app.paste import (
@@ -63,7 +64,7 @@ from leapflow.cli.tui_app.paste import (
     PasteHeuristics,
     PasteStore,
 )
-from leapflow.cli.tui_app.render_guard import install_wide_glyph_guard
+from leapflow.cli.tui_app.render_guard import install_render_guard
 from leapflow.cli.tui_app.status import StatusBar
 from leapflow.cli.tui_app.theme import Theme
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest
@@ -72,9 +73,9 @@ if TYPE_CHECKING:
     from leapflow.cli.tui_app.console import LeapConsole
 
 _HISTORY_FILENAME = "history"
-_REFRESH_INTERVAL_S = 0.5
 _PASTE_COMPACTOR_ATTR = "_leapflow_paste_compactor_installed"
 _PLACEHOLDER_CURSOR_SPACER = "  "
+_STREAMING_INPUT_CAP = 4
 
 InputHandler = Callable[[str], Union[Awaitable[None], None]]
 ControlHandler = Callable[[str], bool]
@@ -273,9 +274,17 @@ class LeapApp:
         self._history_path = history_path
 
         self._input_area = self._build_input_area(commands, config_fields, board_templates)
+        self._display_clock = DisplayClock(
+            lambda: not self._agent_running or bool(self._input_area.buffer.text)
+        )
+        self._status.use_display_clock(self._display_clock.now)
         self._app = self._build_application()
 
     # ── Public state properties ──────────────────────────────────────
+
+    def invalidate(self) -> None:
+        """Request a redraw for an external status or notification update."""
+        self._invalidate()
 
     @property
     def agent_running(self) -> bool:
@@ -872,14 +881,17 @@ class LeapApp:
     def _effective_input_cap(self, lines: int) -> int:
         """Max visible input rows for the current run-state.
 
-        While a task streams output, hold a small, stable cap: a dynamic or large
-        reserved region reshapes the scroll region under ``patch_stdout`` on
-        every redraw and can crash the terminal (macOS Terminal in particular).
-        Adaptive, content-sized sizing resumes once the task finishes (idle),
-        when the input area is the sole owner of the TTY.
+        While a task streams output the reserved region stays bounded: an
+        unbounded region reshapes the scroll region under ``patch_stdout`` and
+        can crash the terminal (macOS Terminal in particular). That bound is a
+        cap, not a fixed height -- the draft still sizes the region up to it, so
+        a long draft never silently scrolls out of its own box while a task
+        runs, and the ``up N more input rows hidden`` hint tells the user when
+        the draft outgrows the cap. Adaptive sizing resumes once the task
+        finishes (idle), when the input area is the sole owner of the TTY.
         """
         if self._agent_running:
-            return 4
+            return _STREAMING_INPUT_CAP
         return _compute_input_cap(lines)
 
     def _input_hidden_rows(self) -> int:
@@ -901,18 +913,18 @@ class LeapApp:
         )]
 
     def _input_height(self) -> Dimension:
-        """Content-sized input height, capped to the terminal size when idle.
+        """Content-sized input height, bounded by the current run-state cap.
 
-        While a task streams output the height is pinned to a small, stable
-        region (min=1, max=4, preferred=1) so the reserved bottom area does not
-        thrash the scroll region under ``patch_stdout`` mid-stream — a cause of
-        terminal crashes. When idle the height tracks wrapped content up to an
-        adaptive cap; a one-line draft still renders as a single row.
+        The reserved rows always track the wrapped draft up to the effective
+        cap, so what the user typed stays visible in both modes -- a one-line
+        draft renders as a single row, a draft that wraps keeps its rows. A
+        run-state that pinned the region to a single row instead made every
+        wrapped draft scroll inside that box: the prompt and all earlier rows
+        disappeared, the cursor could not follow the text, and the overflow
+        hint stayed silent because it measured against the cap.
         """
         terminal = shutil.get_terminal_size((80, 24))
         cap = self._effective_input_cap(terminal.lines)
-        if self._agent_running:
-            return Dimension(min=1, max=cap, preferred=1)
         preferred = min(cap, max(1, self._input_visual_rows(terminal.columns)))
         return Dimension(min=1, max=cap, preferred=preferred)
 
@@ -1019,16 +1031,23 @@ class LeapApp:
         except ImportError:
             pass
 
-        # Must precede the first render: Terminal.app crashes when a redraw
-        # overwrites part of a wide (CJK) glyph. See render_guard.
-        install_wide_glyph_guard()
+        # Must precede the first render: protect wide glyphs and make redundant
+        # invalidations emit nothing (including cursor hide/show). See render_guard.
+        if not install_render_guard():
+            raise RuntimeError(
+                "Cannot start the TUI safely with this prompt_toolkit renderer. "
+                "Reinstall LeapFlow with its supported dependencies."
+            )
         return Application(
             layout=layout,
             key_bindings=self._build_keybindings(),
             style=self._build_style(),
             full_screen=False,
             mouse_support=False,
-            refresh_interval=_REFRESH_INTERVAL_S,
+            # IME marked text is terminal-local, even when our buffer is empty.
+            # Never repaint on a timer: real input, status and output events own
+            # invalidation. Elapsed displays advance on those events instead.
+            refresh_interval=None,
             erase_when_done=True,
             **cursor_kwargs,
         )
@@ -1262,7 +1281,7 @@ class LeapApp:
             return []
         elapsed = ""
         if self._tool_start_time > 0:
-            dt = time.monotonic() - self._tool_start_time
+            dt = max(0.0, self._display_clock.now() - self._tool_start_time)
             if dt >= 60:
                 m, s = int(dt // 60), int(dt % 60)
                 elapsed = f"  ({m:02d}m{s:02d}s)"

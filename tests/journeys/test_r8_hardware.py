@@ -32,7 +32,9 @@ Replay determinism is the load-bearing design constraint, and two facts shape it
   *non-streaming* channel are pure functions of the YAML (``sequence`` is 1,
   ``observed_at`` is scrubbed as an epoch), so those are safe to script.
 
-So the model only ever touches the static ``setpoint`` and ``homed`` channels.
+The model touches static ``setpoint``/``homed`` channels and one simulated
+multi-candidate sequence. Its selected digest-bound plan is also checked directly
+on the node, independently of the model-facing result budget.
 Persistence of the streaming channel's durable windows is verified through the
 daemon's board digest (``storage.windows_written``, ``counts.series``), which
 reads ``channel_history()`` — the identical data path that populates
@@ -43,7 +45,9 @@ the daemon-exclusive DuckDB file (2.1 LocalConnectionHolder migration).
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
+from contextlib import AsyncExitStack
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -53,6 +57,9 @@ import pytest
 from tests._harness.cassette_proxy import answer, scripted, tool_call
 from tests._harness.journey import JourneyFactory
 from tests._harness.leapd import await_for
+from tests._harness.planning import placement
+from tests._harness.skill_stubs import ARM_ID, SEQUENCE, WORKCELL_ID, move_by
+from leapflow.hardware.lhp.server import LhpNodeServer, WRITE_MODE_TRUSTED_V1
 
 SUBJECT_PATHS = (
     "src/leapflow/hardware/",
@@ -202,8 +209,18 @@ def _detail(events: list[Any], tool_name: str) -> Any:
 async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
     devices_dir = Path(tempfile.mkdtemp(prefix="lfj-r8dev-"))
     (devices_dir / f"{DEVICE_ID}.yaml").write_text(DEVICE_YAML, encoding="utf-8")
+    stack = AsyncExitStack()
     try:
-        journey = journeys(
+        registry, runtime = await stack.enter_async_context(placement(devices_dir / "planning"))
+        # Build the declaration-only advisory before the journey's fixed transport budget.
+        # Cold catalog transport/lifecycle is covered by test_production_planning.
+        await runtime.list_async(WORKCELL_ID)
+        node = LhpNodeServer(registry, node_id="r8_planning", skill_runtime=runtime,
+                             write_mode=WRITE_MODE_TRUSTED_V1)
+        host, port = await node.start(host="127.0.0.1", port=0)
+        stack.push_async_callback(node.stop)
+        # Startup fetches the actual socket declaration; keep its owner loop responsive.
+        journey = await asyncio.to_thread(lambda: journeys(
             "r8_hardware",
             script=scripted(
                 # Phase 1: discover
@@ -226,6 +243,18 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
                 # Phase 5: actuate with approval (homed=true)
                 tool_call("hw_actuate", device_id=DEVICE_ID, channel_id=SETPOINT, value=65.0),
                 answer("Commanded the setpoint through the approval path."),
+                # One response supplies task-equivalent programs ending 5 mm above start.
+                tool_call("hw_skill_run", workcell=f"r8_planning/{WORKCELL_ID}", skill=SEQUENCE,
+                          candidates=[
+                              {"id": "detour", "args": {"steps": [
+                                  {"op": "move", "relative": {"dz": 10}},
+                                  {"op": "move", "relative": {"dz": -5}}]}},
+                              {"id": "direct", "args": move_by(5)},
+                              {"id": "outside", "args": {"steps": [
+                                  {"op": "move", "relative": {"dz": 1000}},
+                                  {"op": "move", "relative": {"dz": -995}}]}},
+                          ], selection={"order": ["tcp_distance_mm"]}),
+                answer("Executed exactly the selected simulated sequence through approval."),
             ),
             deadline_s=90.0,
             max_llm_calls=15,
@@ -239,6 +268,9 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
                 # hw_list output is part of the recorded conversation, so an ambient
                 # second device would invalidate the cassette on every new runner.
                 "LEAPFLOW_HARDWARE_PROVIDERS": "yaml",
+                "LEAPFLOW_HARDWARE_FLEET_NODES": json.dumps([
+                    {"node_id": "r8_planning", "endpoint": f"tcp://{host}:{port}"}
+                ]),
                 # Memory prefetch injects a "## Recent Context" block into the
                 # system prompt from the profile's signal store, and that store
                 # picks up ambient desktop events (a focus switch to loginwindow)
@@ -257,7 +289,7 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
                 # journey's wall-clock budget.
                 "LEAPFLOW_HARDWARE_DOWNSAMPLE_INTERVAL_S": "1",
             },
-        )
+        ))
         workspace = journey.workspace("bench")
         client = journey.client(timeout_s=120.0)
 
@@ -399,6 +431,32 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
             counts = payload.get("counts") or {}
             assert int(counts.get("series") or 0) >= 1, counts
 
+        with journey.phase("batch: one planning round selects and approves one simulated program"):
+            before = journey.proxy.stats.call_count
+            transport = registry.get_open_transport(ARM_ID)
+            assert not transport.write_log
+            events = await _drive_with_auto_approval(
+                client,
+                "On r8_planning/piper_cell, supply task-equivalent complete alternatives that "
+                "end 5 mm above the current TCP. Select by TCP distance and execute one.",
+                session_id=SESSION, workspace=str(workspace),
+            )
+            detail = _detail(events, "hw_skill_run")
+            assert _completed_ok(events, "hw_skill_run"), {
+                key: detail.get(key) for key in ("failure_code", "error_preview", "side_effect_state")
+            }
+            assert sum(e.type == "tool_complete" and e.content == "hw_skill_run" for e in events) == 1
+            assert journey.proxy.stats.call_count - before == 2  # alternatives + final answer
+            assert sum(e.type == "approval_request" for e in events) == 1
+            assert sum(name == "ee.z" for name, _ in transport.write_log) == 1
+            (run,) = runtime.status()
+            report = run.plan.basis["batch"]
+            assert report["selected_id"] == "direct"
+            assert [c["status"] for c in report["candidates"]] == ["feasible", "feasible", "refused"]
+            assert report["evidence"]["state_reads"] == 1 and report["evidence"]["llm_calls"] == 0
+            assert run.outcome.ok and not runtime._plans
+
         journey.finish()
     finally:
+        await stack.aclose()
         shutil.rmtree(devices_dir, ignore_errors=True)

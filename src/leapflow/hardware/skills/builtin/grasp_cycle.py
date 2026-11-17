@@ -9,6 +9,7 @@ from dataclasses import replace
 from typing import Any, Mapping
 
 from leapflow.hardware.skills.geometry import Pose
+from leapflow.hardware.skills.builtin._observation_gate import require_observation
 from leapflow.hardware.skills.ports import SkillContext
 from leapflow.hardware.skills.protocol import (
     CONSENT_EACH_RUN,
@@ -71,6 +72,7 @@ class GraspCycle:
         evidence = ctx.grasp_verification.qualification()
         grasp = ctx.scene.grasp(args["grasp_id"])
         obj = ctx.scene.object(grasp.object_id)
+        require_observation(ctx, obj, grasp)
         state = await ctx.motion.state()
         if ctx.scene.held is not None:
             raise SkillError(
@@ -150,6 +152,7 @@ class GraspCycle:
             ):
                 raise SkillError(FAILURE_PLAN_STALE, "approved object moved before the cycle")
             grasp = GraspCandidate.from_mapping(plan.basis["grasp"])
+            require_observation(ctx, seen, grasp)
             samples = int(plan.args.get("samples", 3))
             force = float(plan.basis["qualification"]["command_force_n"])
             stage = "open"

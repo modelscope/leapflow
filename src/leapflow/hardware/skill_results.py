@@ -23,11 +23,13 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_DEVICE_BUSY,
     FAILURE_ESTOPPED,
     FAILURE_GUARD_FAILED,
+    FAILURE_GRASP_INFEASIBLE,
     FAILURE_INTERNAL_DEFECT,
     FAILURE_INVALID_ARGS,
     FAILURE_LEASE_LOST,
     FAILURE_MODEL_UNAVAILABLE,
     FAILURE_OUT_OF_WORKSPACE,
+    FAILURE_OBSERVATION_INSUFFICIENT,
     FAILURE_PLAN_STALE,
     FAILURE_PLAN_UNKNOWN,
     FAILURE_SHIELD_VIOLATION,
@@ -56,6 +58,8 @@ FAILURE_PERMIT_ISSUER_UNAVAILABLE = "permit_issuer_unavailable"
 FAILURE_APPROVAL_DENIED = "approval_denied"
 FAILURE_EXECUTE_UNCONFIRMED = "execute_unconfirmed"
 FAILURE_STATUS_UNAVAILABLE = "status_unavailable"
+FAILURE_INVALID_REQUEST = "invalid_request"
+"""An ``hw_skill_run`` parameter itself is wrong -- not the skill's ``args``."""
 
 _RECHECK = "Check hw_skill_status and the arm state before anything else"
 _NO_REPLAY = "The arm may have moved: never repeat this plan; a retry is a new plan."
@@ -68,20 +72,39 @@ _NEXT_STEPS: dict[str, str] = {
         "Offer that to the user, run it, then plan again."
     ),
     FAILURE_TARGET_NOT_FOUND: (
-        "The id expired or the object is gone. Locate again and use the new ids, or ask the "
-        "user to point the object out."
+        "The id is no longer current, or fresh depth shows the object moved/disappeared. "
+        "Read result.observation and the error to distinguish them. Observe again and replan "
+        "with current ids, or ask the user to point the object out; never replace an expired "
+        "reference with guessed literal coordinates."
     ),
     FAILURE_MODEL_UNAVAILABLE: (
         "The node's perception model did not answer. Ask the user to check that the model "
         "server on the node is running, then plan again."
     ),
     FAILURE_UNREACHABLE: (
-        "The target is outside what the arm can safely reach. When result.limit names the "
-        "bound a step exceeded (quantity, value, min/max; result.step the step), change that "
-        "step so it stays inside the bound and plan again. When result.reach names how far "
-        "the arm gets, tell the user that distance and the limiting joint and offer its "
-        "farthest target instead; otherwise tell the user the workcell's reachable range "
-        "(hw_skill_list) or choose another target."
+        "Rewrite every step in result.problems, not just result.step. "
+        "result.limit names the exceeded bound; result.reach names reachable distance/rotation, "
+        "farthest pose and limiting joint (z_max_mm for a top-down lift). Tell the user what "
+        "binds and use the reported reach when choosing another target. arm.state and "
+        "hw_skill_list publish posture-specific height bands in reach; the workspace box "
+        "alone does not guarantee reach. Use the bands to choose hover heights, then check "
+        "the actual posture/path with a new plan. When batch_planning is advertised, submit "
+        "complete task-equivalent grasp:gN / rz path alternatives as candidates in one "
+        "hw_skill_run call (respect its max_candidates), so the node ranks all feasible paths."
+    ),
+    FAILURE_GRASP_INFEASIBLE: (
+        "No grasp fits the measured object geometry and gripper opening; this is not an "
+        "arm-reach failure. Compare result.fit measured_width_mm, max_width_mm and "
+        "min_slack_mm. Re-measure with a suitable camera (camera.wrist when available), "
+        "then propose again with the new object id; never override measured dimensions "
+        "or gripper limits to force a grasp."
+    ),
+    FAILURE_OBSERVATION_INSUFFICIENT: (
+        "Measurement is insufficient, not proof the object is gone or unreachable. Read result.observation "
+        "for unsupported dimensions, camera conflicts, or unknown accuracy. A fresh passive "
+        "auto-camera locate or a governed perceive.survey can gather evidence. If observation "
+        "remains insufficient, request perceive.snapshot with all cameras where frame sharing "
+        "is allowed, or ask the user to clear the view; never invent geometry or widen limits."
     ),
     FAILURE_PLAN_STALE: "Plan again with hw_skill_run; the new plan needs a new approval.",
     FAILURE_GUARD_FAILED: (
@@ -105,7 +128,15 @@ _NEXT_STEPS: dict[str, str] = {
         "names, or reach the goal with a skill hw_skill_list shows as available."
     ),
     FAILURE_INVALID_ARGS: (
-        "Fix the arguments against the skill's args_schema (hw_skill_list with skill=<id>)."
+        "Nothing ran. The skill refused its args: the error names each argument it refused "
+        "and what it accepts. Fix those inside args against the skill's args_schema "
+        "(hw_skill_list with skill=<id>) and call again; hw_skill_run's own parameters "
+        "(workcell, skill, dry_run, intent, wait, timeout_s) go beside args, never inside it."
+    ),
+    FAILURE_INVALID_REQUEST: (
+        "Nothing ran. The error names the hw_skill_run parameter at fault (not the skill's "
+        "args): fix that parameter beside args -- workcell and skill are required -- and "
+        "call again."
     ),
     FAILURE_CHECK_FAILED: (
         "A calibration or bring-up check measured out of tolerance (see result.problems). "
@@ -153,6 +184,10 @@ _ALIASES: dict[str, str] = {
 }
 # Codes whose own next step already says what to do about the movement.
 _SELF_EXPLAINING = frozenset({FAILURE_GUARD_FAILED, FAILURE_EXECUTE_UNCONFIRMED})
+# Codes declared to the engine as ``failure_class: "invalid_request"``: the
+# call's shape was refused before anything ran, so the model repairs it rather
+# than reading a feasibility verdict or a failure.
+_INVALID_REQUEST_CODES = frozenset({FAILURE_INVALID_ARGS, FAILURE_INVALID_REQUEST})
 # Steps for codes whose usual step assumes the arm moved, when it did not: a
 # shield that refused the first chunk, or a stop before the first command, is a
 # request to change, not a run to inspect.
@@ -235,6 +270,8 @@ def workcell_view(
             card["args_schema"] = entry.get("args_schema")
         else:
             card["args"] = args_signature(as_mapping(entry.get("args_schema")))
+        if entry.get("batch_planning"):
+            card["batch_planning"] = entry["batch_planning"]
         card["available"] = bool(entry.get("available"))
         if not card["available"]:
             card["reason"] = entry.get("reason")
@@ -247,16 +284,21 @@ def workcell_view(
             # The argument values this workcell can serve, e.g. which camera is ready.
             card["bindings"] = entry.get("bindings")
         skills.append(card)
-    return {
+    view = {
         "workcell": f"{node_id}/{cell.get('workcell') or ''}",
         "roles": cell.get("roles"),
         "limits": cell.get("limits"),
         "gripper_spec": cell.get("gripper_spec"),
+        "reach": cell.get("reach") or {},
         "calibration": cell.get("calibration"),
         "calibration_stale": cell.get("calibration_stale") or {},
         "calibration_status": frame_status_view(as_mapping(cell.get("calibration_status"))),
         "skills": skills,
     }
+    if cell.get("advisories"):
+        # Declared tuning that works but will hinder the caller (e.g. ids expiring mid-task).
+        view["advisories"] = list(cell["advisories"])
+    return view
 
 
 def frame_status_view(statuses: Mapping[str, Any]) -> dict[str, Any]:
@@ -370,6 +412,8 @@ def outcome_fields(outcome: Mapping[str, Any]) -> dict[str, Any]:
         fields["error"] = fields["message"]
         if outcome.get("failure_code") == FAILURE_INTERNAL_DEFECT:
             fields["failure_class"] = FAILURE_INTERNAL_DEFECT
+        elif outcome.get("failure_code") in _INVALID_REQUEST_CODES and side_effect == SIDE_EFFECT_NONE:
+            fields["failure_class"] = "invalid_request"
         fields["next_step"] = next_step(outcome.get("failure_code"), side_effect)
         if side_effect != SIDE_EFFECT_NONE:
             fields["effect_uncertain"] = True
@@ -399,6 +443,8 @@ def refusal_result(
     }
     if side_effect_state != SIDE_EFFECT_NONE:
         result["effect_uncertain"] = True
+    elif failure_code in _INVALID_REQUEST_CODES:
+        result.setdefault("failure_class", "invalid_request")
     return result
 
 
@@ -443,6 +489,7 @@ __all__ = [
     "FAILURE_AMBIGUOUS_WORKCELL",
     "FAILURE_APPROVAL_DENIED",
     "FAILURE_EXECUTE_UNCONFIRMED",
+    "FAILURE_INVALID_REQUEST",
     "FAILURE_NODE_UNREACHABLE",
     "FAILURE_NO_SKILL_NODES",
     "FAILURE_PERMIT_ISSUER_UNAVAILABLE",

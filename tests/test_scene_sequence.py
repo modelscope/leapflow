@@ -183,7 +183,7 @@ async def test_a_composed_pick_resolves_grasp_handles_and_records_the_hold(
     assert _sim(runtime).batches == []  # planning never moves
 
     # One approval covers the whole program, so it shows each guard and the swept space.
-    assert "[expect held, else halt]" in plan.summary
+    assert "[expect held, else hold]" in plan.summary
     envelope = plan.basis["envelope"]
     assert envelope["z_min_mm"] == pytest.approx(grasp.z, abs=0.1)
     assert envelope["z_max_mm"] >= pregrasp.z
@@ -224,22 +224,73 @@ async def test_a_composed_place_releases_and_forgets_the_hold(tmp_path: Path) ->
     assert located.result["held"] is None
 
 
-async def test_release_guard_preserves_hold_until_width_confirms_release(tmp_path: Path) -> None:
+async def test_an_opening_the_jaws_reach_releases_a_hold_and_logs_its_error(
+    tmp_path: Path,
+) -> None:
     runtime = _cell(tmp_path, CUP)
     await _located_and_proposed(runtime)
     await _execute(runtime, await _plan(runtime, PICK))
-    step = {
-        "op": "gripper",
-        "width_mm": CUP_WIDTH + 4.0,
-        "expect": "released",
-        "on_fail": "hold",
-    }
+    step = {"op": "gripper", "width_mm": CUP_WIDTH + 4.0, "expect": "released"}
+
+    outcome = await _execute(runtime, await _plan(runtime, [step]))
+
+    # The threshold is capped where the jaws can get (target - tolerance), so an
+    # opening narrower than held + margin still confirms its release.
+    assert outcome.status == STATUS_SUCCEEDED, outcome
+    assert outcome.result["held"] is None
+    (entry,) = outcome.result["steps"]
+    assert entry["target_mm"] == pytest.approx(CUP_WIDTH + 4.0)
+    assert entry["error_mm"] == pytest.approx(0.0, abs=0.5)
+    assert entry["blocked"] is False
+    assert CUP_WIDTH < entry["release_at_mm"] <= CUP_WIDTH + 4.0
+
+
+async def test_a_release_no_width_can_confirm_is_refused_before_approval(tmp_path: Path) -> None:
+    runtime = _cell(tmp_path, CUP)
+    await _located_and_proposed(runtime)
+    await _execute(runtime, await _plan(runtime, PICK))
+    step = {"op": "gripper", "width_mm": CUP_WIDTH + 0.8, "expect": "released"}
+
+    refused = await _refusal(runtime, [step])
+
+    assert refused.failure_code == FAILURE_INVALID_ARGS
+    assert "cannot confirm a release" in refused.message
+    assert refused.result["release_needs_mm"] == pytest.approx(CUP_WIDTH + 1.0)
+    assert refused.result["step"] == 1
+    assert _gripper_targets(_sim(runtime))[-1] == 0.0, "nothing moved after the pick"
+
+
+async def test_a_release_predicted_from_a_planned_grasp_is_checked_at_plan(tmp_path: Path) -> None:
+    runtime = _cell(tmp_path, CUP)
+    g1 = (await _located_and_proposed(runtime)).result["grasps"][0]
+    program = [*PICK, {"op": "gripper", "width_mm": g1["width_mm"], "expect": "released"}]
+
+    refused = await _refusal(runtime, program)
+
+    assert refused.failure_code == FAILURE_INVALID_ARGS
+    assert refused.result["step"] == len(program)
+    assert _sim(runtime).batches == []
+
+
+@pytest.mark.parametrize("on_fail,status", [("hold", STATUS_FAILED), ("stop", STATUS_HALTED)])
+async def test_release_guard_preserves_hold_until_width_confirms_release(
+    tmp_path: Path, on_fail: str, status: str
+) -> None:
+    runtime = _cell(tmp_path, CUP)
+    await _located_and_proposed(runtime)
+    await _execute(runtime, await _plan(runtime, PICK))
+    _sim(runtime).jammed_open_mm = CUP_WIDTH + 2.0  # something wedged in the jaws
+    step = {"op": "gripper", "width_mm": 50.0, "expect": "released", "on_fail": on_fail}
 
     outcome = await _execute(runtime, await _plan(runtime, [step]))
 
     assert outcome.failure_code == FAILURE_GUARD_FAILED
-    assert outcome.status == STATUS_FAILED
-    assert "release requires more than 35.0" in outcome.message
+    assert outcome.status == status
+    assert "release requires at least 35.0" in outcome.message
+    assert ("halted in place" if on_fail == "stop" else "holds its position") in outcome.message
+    observed = outcome.result["observed"]
+    assert observed["target_mm"] == 50.0 and observed["blocked"] is True
+    assert observed["error_mm"] == pytest.approx(CUP_WIDTH + 2.0 - 50.0, abs=0.01)
     located = await _read(runtime, "perceive.locate", {"queries": ["cup"]})
     assert located.result["held"]["object"]["object_id"] == "o1"
 
@@ -256,6 +307,20 @@ async def test_a_move_may_name_a_path_the_arm_declares(tmp_path: Path) -> None:
     assert outcome.status == STATUS_SUCCEEDED, outcome
     (move,) = _moves(_sim(runtime))
     assert move["arm.pose_path"] == "point", "a named path reaches the arm's path channel"
+
+
+async def test_an_unnamed_move_is_a_point_to_point_transit(tmp_path: Path) -> None:
+    # The arm's first declared path is linear; a transit must not inherit it, or a
+    # start on a wrist singularity has no straight line and the firmware refuses it.
+    runtime = _cell(tmp_path, CUP)
+    plan = await _plan(runtime, [{"op": "move", "pose": {"x": 220.0, "y": -90.0, "z": 150.0}}])
+    assert "move point" in plan.summary
+
+    outcome = await _execute(runtime, plan)
+
+    assert outcome.status == STATUS_SUCCEEDED, outcome
+    (move,) = _moves(_sim(runtime))
+    assert move["arm.pose_path"] == "point"
 
 
 # ── Refusals before approval ─────────────────────────────────────────────────
@@ -537,3 +602,78 @@ async def test_grasp_propose_plans_for_a_lifted_object_without_a_locator(
     assert grasp["open_mm"] == pytest.approx(min(70.0, CUP_WIDTH + 15.0), abs=4.0)
     assert grasp["score"] == 1.0 and alongside["score"] == 0.5
     assert grasp["grasp"]["z"] == pytest.approx(TABLE_Z + 25.0, abs=3.0)
+
+
+@pytest.mark.parametrize('batch', [False, True])
+@pytest.mark.parametrize('offset', [-20.5, -11.2])
+async def test_preview_rechecks_offset_object_without_memory_mutation(tmp_path: Path, batch: bool, offset: float) -> None:
+    runtime = _cell(tmp_path, CUP)
+    _camera(runtime).table_z = TABLE_Z + offset
+    await _located_and_proposed(runtime)
+    memory = runtime._scenes[WORKCELL_ID]
+    before = dict(memory._objects)
+    reports = dict(memory._observations)
+    args = {'steps': PICK}
+    plan = (await runtime.plan_batch(WORKCELL_ID, SEQUENCE, [{'id': 'pick', 'args': args}],
+                                    {'require_verified': False})).selected if batch else await runtime.plan(WORKCELL_ID, SEQUENCE, args)
+    assert isinstance(plan, SkillPlan), plan
+    assert plan.basis['object_recheck']['read_only']
+    assert plan.basis['object_recheck']['checks'][0]['state'] == 'confirmed'
+    assert memory._objects == before and memory._observations == reports
+    runtime.discard_plan(plan.digest)
+    _camera(runtime).boxes = []
+    refused = (await runtime.plan_batch(WORKCELL_ID, SEQUENCE, [{'id': 'pick', 'args': args}],
+                                       {'require_verified': False})).selected if batch else await runtime.plan(WORKCELL_ID, SEQUENCE, args)
+    assert refused.failure_code == 'target_not_found'
+    assert refused.side_effect_state == SIDE_EFFECT_NONE
+    assert runtime._plans == {} and _sim(runtime).batches == []
+
+
+async def test_partial_pose_preserves_omitted_axes_and_table_z_is_applied_once(tmp_path: Path) -> None:
+    runtime = _cell(tmp_path, CUP)
+    plan = await _plan(runtime, [
+        {'op': 'move', 'pose': {'x': 220, 'y': 0, 'z': 140, 'rx': 180, 'ry': 0, 'rz': 10}},
+        {'op': 'move', 'pose': {'z': 100, 'frame': 'table'}},
+        {'op': 'move', 'pose': {'x': 230, 'frame': 'table'}},
+        {'op': 'move', 'pose': {'rz': 20}},
+    ])
+    assert plan.targets[1].position == (220, 0, TABLE_Z+100)
+    assert plan.targets[2].position == (230, 0, TABLE_Z+100)
+    assert plan.targets[3].position == plan.targets[2].position
+    assert plan.targets[3].rz == 20
+    for pose in ({}, {'frame': 'table'}):
+        result = await _refusal(runtime, [{'op': 'move', 'pose': pose}])
+        assert result.failure_code == FAILURE_INVALID_ARGS
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+async def test_automatic_sibling_substitution_is_disclosed_and_configurable(tmp_path: Path, enabled: bool) -> None:
+    from dataclasses import replace
+    from leapflow.hardware.skills.planning import Evaluation
+    runtime = _cell(tmp_path, CUP)
+    await _located_and_proposed(runtime)
+    memory = runtime._scenes[WORKCELL_ID]
+    first, stamp = memory._grasps['g1']
+    memory._grasps['g1'] = (replace(first, grasp=first.grasp.translated(1000, 0, 0)), stamp)
+    runtime._settings = replace(runtime._settings, planning=replace(runtime._settings.planning, auto_variants=enabled))
+    delegate = runtime._calculations
+    class VerifiedSimulation:
+        async def evaluate(self, jobs, *, deadline):
+            values = await delegate.evaluate(jobs, deadline=deadline)
+            return tuple(Evaluation(v.value, v.metrics, isinstance(v.value, SkillPlan), v.evidence) for v in values)
+        async def close(self):
+            await delegate.close()
+    runtime._calculations = VerifiedSimulation()
+    args = {'steps': PICK}
+    result = await runtime.plan(WORKCELL_ID, SEQUENCE, args)
+    if not enabled:
+        assert result.failure_code == FAILURE_OUT_OF_WORKSPACE
+        assert runtime._plans == {}
+        return
+    assert isinstance(result, SkillPlan), result
+    assert result.basis['batch']['automatic'] and result.basis['batch']['evidence']['llm_calls'] == 0
+    assert result.basis['substituted']['selected_id'] == 'g1-to-g2'
+    assert 'Automatic alternative' in result.summary
+    assert all('g1' not in step.get('ref', '') for step in result.args['steps'])
+    assert args['steps'][0]['ref'] == 'grasp:g1'
+    assert _sim(runtime).batches == [] and len(runtime._plans) == 1

@@ -117,6 +117,8 @@ LHP_V2_CAPABILITIES: tuple[str, ...] = (*LHP_V1_CAPABILITIES, "read_frame", "rel
 # v2 optional capability tokens negotiated at hello.
 CAP_PERMIT_V1 = "permit.v1"
 CAP_CONTROL_V1 = "control.v1"
+CAP_SKILL_PLAN_CANCEL_V1 = "skill.plan.cancel.v1"
+"""Connection-scoped pure planning cancellation; never cancels actuator writes."""
 CAP_SKILL_V1 = "skill.v1"
 """Node-local skills: the node plans and executes whole tasks under one run permit."""
 CAP_FRAME_FRESHNESS_V1 = "frame.freshness.v1"
@@ -130,6 +132,7 @@ own clock, which can only make the bound stricter by the link latency.
 SKILL_METHODS: tuple[str, ...] = (
     "skill.list",
     "skill.plan",
+    "skill.plan.cancel",
     "skill.execute",
     "skill.status",
     "skill.stop",
@@ -251,6 +254,7 @@ __all__ = [
     "CAP_CONTROL_V1",
     "CAP_FRAME_FRESHNESS_V1",
     "CAP_SKILL_V1",
+    "CAP_SKILL_PLAN_CANCEL_V1",
     "CAP_PERMIT_V1",
     "ERR_BAD_REQUEST",
     "ERR_CONNECTION_CLOSED",

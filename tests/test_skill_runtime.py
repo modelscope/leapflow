@@ -68,7 +68,7 @@ from tests._harness.skill_stubs import (
     write_workcell,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("close_skill_runtimes")]
 
 # Piper X downward-facing fixture inside the existing calibrated box/cone.
 _SAFE_JOINTS = (0.0, 80.0, -55.0, 69.99, 10.0, 0.0)
@@ -184,7 +184,7 @@ async def test_sequence_plan_is_sealed_digested_and_cached(tmp_path: Path) -> No
     runtime = _runtime(tmp_path, registry)
     plan = await runtime.plan(WORKCELL_ID, SEQUENCE, move_by(100))
     assert isinstance(plan, SkillPlan)
-    assert (plan.workcell, plan.skill_id, plan.version) == (WORKCELL_ID, SEQUENCE, "1.0.0")
+    assert (plan.workcell, plan.skill_id, plan.version) == (WORKCELL_ID, SEQUENCE, sequence_skills()[0].spec.version)
     assert plan.targets[0].z == pytest.approx(START_FLANGE[2] - TOOL_LENGTH_MM + 100)
     assert plan.limits == {
         "speed_pct": 20.0,
@@ -199,6 +199,10 @@ async def test_sequence_plan_is_sealed_digested_and_cached(tmp_path: Path) -> No
         "reach_step_mm": 10.0,
         "reach_joint_step_deg": 10.0,
         "reach_joint_margin_deg": 1.0,
+        "reach_continuity_rounds": 4.0,
+        "reach_refine_rounds": 6.0,
+        "reach_envelope_step_mm": 20.0,
+        "reach_envelope_yaw_samples": 8.0,
     }
     assert set(plan.basis["calibration"]) == {"tcp", "workspace"}
     assert plan.digest == plan_digest(plan)
@@ -206,7 +210,7 @@ async def test_sequence_plan_is_sealed_digested_and_cached(tmp_path: Path) -> No
     assert runtime.permit_digest(plan) == run_permit_digest(
         workcell=WORKCELL_ID,
         skill_id=SEQUENCE,
-        version="1.0.0",
+        version=sequence_skills()[0].spec.version,
         plan_digest=plan.digest,
         limits=plan.limits,
     )
@@ -239,7 +243,7 @@ _UP = {"op": "move", "relative": {"dz": 10}}
         (WORKCELL_ID, SEQUENCE, _steps({"op": "move", "relative": {"dz": True}}), FAILURE_INVALID_ARGS),
         (WORKCELL_ID, SEQUENCE, _steps({"op": "fly"}), FAILURE_INVALID_ARGS),
         (WORKCELL_ID, SEQUENCE, _steps(), FAILURE_INVALID_ARGS),
-        (WORKCELL_ID, SEQUENCE, _steps({"op": "move", "pose": {"x": 250, "y": 0}}), FAILURE_INVALID_ARGS),
+        (WORKCELL_ID, SEQUENCE, _steps({"op": "move", "pose": {}}), FAILURE_INVALID_ARGS),
         (WORKCELL_ID, SEQUENCE, _steps({"op": "move"}), FAILURE_INVALID_ARGS),
         (WORKCELL_ID, SEQUENCE, _steps({**_UP, "width_mm": 3}), FAILURE_INVALID_ARGS),
         (WORKCELL_ID, SEQUENCE, _steps({**_UP, "expect": "released"}), FAILURE_INVALID_ARGS),
@@ -317,7 +321,7 @@ async def test_lift_by_ten_centimetres_moves_the_flange_and_commits(tmp_path: Pa
     assert registry.sim.flange.z == pytest.approx(START_FLANGE[2] + 100, abs=0.01)
     (batch,) = registry.sim.batches
     assert batch[0] == ("arm.speed_pct", 20.0), "speed must precede the motion"
-    assert batch[1] == ("arm.pose_path", "linear"), "the arm's first declared path"
+    assert batch[1] == ("arm.pose_path", "point"), "a move is a point-to-point transit"
     assert [cid for cid, _ in batch[2:]] == ["ee.x", "ee.y", "ee.z", "ee.rx", "ee.ry", "ee.rz"]
     assert registry.sim.halts == 0
 
@@ -531,12 +535,19 @@ async def test_closing_on_nothing_fails_expect_held_and_names_the_step(tmp_path:
     assert registry.sim.halts == 0, "on_fail: hold leaves the arm where it is"
 
 
-async def test_a_stop_guard_halts_the_arm(tmp_path: Path) -> None:
+async def test_a_stop_guard_halts_the_arm_in_place(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
-    run = await _run(_runtime(tmp_path, registry), SEQUENCE, grip("close", expect="held"))
+    run = await _run(
+        _runtime(tmp_path, registry), SEQUENCE, grip("close", expect="held", on_fail="stop")
+    )
     assert run.outcome is not None
     assert (run.outcome.failure_code, run.outcome.status) == (FAILURE_GUARD_FAILED, STATUS_HALTED)
     assert registry.sim.halts == 1
+    # The outcome says what the halt physically did, not merely that it was sent.
+    stops = run.outcome.evidence["stops"]
+    assert {stop["stop_effect"] for stop in stops.values()} == {"hold"}
+    assert all(stop["stop_verified"] is True for stop in stops.values())
+    assert run.to_dict()["stops"] == stops
 
 
 async def test_opening_reaches_the_declared_width_and_is_released(tmp_path: Path) -> None:

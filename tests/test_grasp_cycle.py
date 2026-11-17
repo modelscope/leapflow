@@ -247,6 +247,63 @@ async def test_governed_gripper_uses_same_boundary_for_arrival_and_blocked(targe
         assert clock[0] == 0.0
 
 
+class _CreepingJaws(SimArmTransport):
+    """Jaws that advance *creep_mm* toward their target on every width read."""
+
+    def __init__(self, creep_mm: float, **kwargs):
+        super().__init__(**kwargs)
+        self.creep_mm = creep_mm
+
+    def _advance(self) -> None:  # the jaws move only as fast as they creep
+        return None
+
+    def _value(self, channel_id):
+        if channel_id != "gripper.position":
+            return super()._value(channel_id)
+        width = self.gripper_mm
+        self.gripper_mm = min(self.gripper_target, width + self.creep_mm)
+        return width
+
+
+async def _creep_to(target: float, creep_mm: float, gripper_spec: dict):
+    clock = [0.0]
+    registry = SkillNodeRegistry(_CreepingJaws(creep_mm, gripper_mm=67.5))
+    spec = WorkcellSpec.from_mapping({
+        "workcell": "jaw_test", "roles": {"arm": ARM_ID, "gripper": ARM_ID},
+        "gripper_spec": {"max_width_mm": 69.5, **gripper_spec},
+    })
+
+    async def pause(delay):
+        clock[0] += delay
+
+    facade = GovernedMotion(
+        registry=registry, gate=NodeWriteGate(registry, clock=lambda: clock[0]),
+        spec=spec, frames=FrameGraph(spec, {}, None, {}), limits=spec.limits,
+        cancel=asyncio.Event(), deadline=60.0, clock=lambda: clock[0], sleep=pause, poll_s=0.1,
+    )
+    return facade, await facade.gripper(target)
+
+
+# The Piper gripper declares tolerance 0.5 mm and settling 0.3 s (three 0.1 s polls),
+# so the default stall band is 0.1 mm of progress per settling window.
+@pytest.mark.parametrize("creep_mm,blocked", [(0.05, False), (0.02, True)])
+async def test_governed_gripper_waits_out_jaws_still_creeping_toward_the_target(
+    creep_mm, blocked
+):
+    """Jaws moving less than the tolerance per settling window have not stopped short."""
+    facade, result = await _creep_to(69.5, creep_mm, {})
+    tolerance = facade.gripper_tolerance_mm
+    assert tolerance == 0.5
+    assert result.blocked is blocked
+    if not blocked:
+        assert result.width_mm >= 69.5 - tolerance
+
+
+async def test_a_declared_stall_band_overrides_the_default_fraction():
+    _, result = await _creep_to(69.5, 0.05, {"stall_band_mm": 0.2})
+    assert result.blocked is True, "0.15 mm per settling window is inside the 0.2 mm band"
+
+
 @pytest.mark.parametrize(
     "actual,target,tolerance",
     [(math.nan, 10.0, 0.5), (math.inf, 10.0, 0.5), (10.0, math.inf, 0.5),

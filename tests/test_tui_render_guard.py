@@ -1,5 +1,5 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Regression tests for the wide-glyph render guard and secret-aware history.
+"""Regression tests for terminal-safe rendering and secret-aware history.
 
 macOS Terminal.app crashed (SIGBUS in its wide-glyph split routine) when the
 TUI redraw overwrote part of a CJK glyph still on screen. The guard must make
@@ -10,6 +10,9 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import Counter
+from os import terminal_size
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from prompt_toolkit import Application
@@ -28,7 +31,8 @@ from leapflow.cli.tui_app.history import SecretAwareFileHistory, contains_secret
 from leapflow.cli.tui_app.render_guard import (
     blank_undrawable_wide_glyphs,
     erase_misaligned_wide_tails,
-    install_wide_glyph_guard,
+    frame_unchanged,
+    install_render_guard,
 )
 
 _CSI = re.compile(r"\x1b\[([?0-9;]*)([ -/]*)([@-~])")
@@ -187,7 +191,34 @@ def unguarded_renderer(monkeypatch: pytest.MonkeyPatch) -> None:
 def guarded_renderer(monkeypatch: pytest.MonkeyPatch) -> None:
     current = renderer_module._output_screen_diff
     monkeypatch.setattr(renderer_module, "_output_screen_diff", getattr(current, "__wrapped__", current))
-    assert install_wide_glyph_guard() is True
+    assert install_render_guard() is True
+
+
+@pytest.mark.parametrize("guarded", [False, True], ids=["hazard-control", "guarded"])
+async def test_unchanged_redraw_emits_cursor_toggles_only_without_guard(unguarded_renderer, guarded: bool) -> None:
+    from tests.test_tui_command_queue import _wait_for
+
+    if guarded:
+        assert install_render_guard()
+    sink = _Sink()
+    output = Vt100_Output(sink, lambda: Size(rows=24, columns=80), term="xterm-256color", enable_cpr=False)
+    with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
+        app = Application(layout=Layout(TextArea(text="中文 draft", multiline=True)))
+        task = asyncio.create_task(app.run_async())
+        try:
+            await _wait_for(lambda: app.renderer._last_screen is not None)
+            baseline = len(sink.chunks)
+            app._redraw()
+            emitted = "".join(sink.chunks[baseline:])
+            if guarded:
+                assert emitted == ""
+            else:
+                assert "\x1b[?25l" in emitted
+                assert "\x1b[?25h" in emitted
+        finally:
+            if app.is_running:
+                app.exit()
+            await task
 
 
 @pytest.mark.parametrize("columns", [40, 61, 80])
@@ -278,9 +309,9 @@ def test_install_is_idempotent_and_refuses_unknown_renderer(monkeypatch: pytest.
     original = getattr(current, "__wrapped__", current)
     monkeypatch.setattr(renderer_module, "_output_screen_diff", original)
 
-    assert install_wide_glyph_guard() is True
+    assert install_render_guard() is True
     guarded = renderer_module._output_screen_diff
-    assert install_wide_glyph_guard() is True
+    assert install_render_guard() is True
     assert renderer_module._output_screen_diff is guarded
     assert guarded.__wrapped__ is original
 
@@ -288,7 +319,7 @@ def test_install_is_idempotent_and_refuses_unknown_renderer(monkeypatch: pytest.
         return None
 
     monkeypatch.setattr(renderer_module, "_output_screen_diff", unexpected)
-    assert install_wide_glyph_guard() is False
+    assert install_render_guard() is False
     assert renderer_module._output_screen_diff is unexpected
 
 
@@ -301,6 +332,209 @@ def test_leap_app_installs_guard_before_first_render(monkeypatch: pytest.MonkeyP
     _make_app()
 
     assert getattr(renderer_module._output_screen_diff, render_guard._GUARD_MARKER, False)
+
+
+def test_leap_app_refuses_to_render_without_safety_guard(monkeypatch) -> None:
+    from leapflow.cli.tui_app import app as app_module
+    from tests.test_tui_command_queue import _make_app
+
+    monkeypatch.setattr(app_module, "install_render_guard", lambda: False)
+    with pytest.raises(RuntimeError, match="Cannot start the TUI safely"):
+        _make_app()
+
+
+def test_display_clock_holds_and_catches_up_without_changing_measurements() -> None:
+    from leapflow.cli.tui_app.display_clock import DisplayClock
+    from leapflow.cli.tui_app.status import StatusBar
+
+    state = SimpleNamespace(time=100.0, hold=False)
+    clock = DisplayClock(lambda: state.hold, source=lambda: state.time)
+    status = StatusBar()
+    status._session_start = state.time
+    status.use_display_clock(clock.now)
+    state.time = 105.0
+    before = status()
+    state.hold = True
+    assert clock.now() == 105.0
+    state.time = 165.0
+    assert status() == before
+    status.update(context_used=100, context_max=1000)
+    assert status() != before  # Real metrics must not freeze with the clock.
+    assert clock.now() == 105.0
+    state.hold = False
+    assert clock.now() == 165.0
+    assert "1m" in "".join(text for _, text in status())
+    state.hold = True
+    assert clock.now() == 165.0  # A fresh draft gets a fresh snapshot.
+
+
+@pytest.mark.parametrize("change", ["text", "style", "cursor", "visibility", "height", "escape"])
+def test_frame_comparison_preserves_real_changes(change: str) -> None:
+    previous = _row_screen({0: "中文 abc"}, 20)
+    screen = _row_screen({0: "中文 abc"}, 20)
+    size = Size(rows=24, columns=20)
+    current = target = Point(x=7, y=0)
+    assert frame_unchanged(screen, previous, target, current, size)
+    if change == "text":
+        screen.data_buffer[0][5] = _CHAR_CACHE["x", ""]
+    elif change == "style":
+        screen.data_buffer[0][5] = _CHAR_CACHE["a", "bold"]
+    elif change == "cursor":
+        target = Point(x=6, y=0)
+    elif change == "visibility":
+        screen.show_cursor = False
+    elif change == "height":
+        screen.height += 1
+    else:
+        screen.zero_width_escapes[0][5] = "\x1b]8;;https://example.com\x1b\\"
+    assert not frame_unchanged(screen, previous, target, current, size)
+
+
+def test_frame_comparison_handles_sparse_defaults_without_mutation() -> None:
+    blank = _CHAR_CACHE[" ", "bold"]
+    previous, screen = Screen(default_char=blank), Screen(default_char=blank)
+    previous.height = screen.height = 1
+    previous.data_buffer[0][0] = blank
+    assert frame_unchanged(screen, previous, Point(0, 0), Point(0, 0), Size(rows=24, columns=20))
+    assert not screen.data_buffer
+    assert not screen.zero_width_escapes
+
+
+@pytest.mark.parametrize("is_done,previous_width,has_previous", [(True, 20, True), (False, 19, True), (False, 20, False)])
+def test_guard_does_not_skip_exit_resize_or_initial_render(is_done, previous_width, has_previous) -> None:
+    original = Mock(return_value=(Point(0, 0), None))
+    previous = _row_screen({0: "abc"}, 20)
+    screen = _row_screen({0: "abc"}, 20)
+    window = object()
+    app = SimpleNamespace(layout=SimpleNamespace(current_window=window))
+    screen.set_cursor_position(window, Point(0, 0))
+    render_guard._wrap(original)(
+        app, _RecordingOutput(), screen, Point(0, 0), None,
+        previous if has_previous else None, None, is_done, False,
+        {}, {}, Size(rows=24, columns=20), previous_width,
+    )
+    original.assert_called_once()
+
+
+@pytest.mark.parametrize("columns", [40, 61, 80, 120])
+@pytest.mark.parametrize(
+    "running,draft",
+    [(False, ""), (False, _DRAFT * 16), (True, _DRAFT * 16), (True, "")],
+    ids=["idle-empty", "idle-draft", "running-draft", "running-empty"],
+)
+async def test_real_tui_is_quiet_without_events_and_keeps_input_responsive(
+    tmp_path, monkeypatch, guarded_renderer, columns: int, running: bool, draft: str,
+) -> None:
+    from leapflow.cli.tui_app import app as app_module
+    from leapflow.cli.tui_app.app import LeapApp
+    from leapflow.cli.tui_app.status import StatusBar
+    from leapflow.cli.tui_app.theme import _LIGHT, resolve_theme
+    from tests.test_tui_command_queue import _FakeConsole, _wait_for
+
+    size = Size(rows=48, columns=columns)
+    monkeypatch.setattr(app_module.shutil, "get_terminal_size", lambda fallback=(80, 24): terminal_size((size.columns, size.rows)))
+    sink = _Sink()
+    output = Vt100_Output(sink, lambda: size, term="xterm-256color", enable_cpr=False)
+    with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
+        status = StatusBar()
+        app = LeapApp(console=_FakeConsole(), theme=resolve_theme(_LIGHT, terminal_bg="#FFFFFF"), status=status, history_path=tmp_path / "history")
+        app._agent_running = running
+        if running:
+            app.spinner_text = "Waiting for tool"
+        task = asyncio.create_task(app._app.run_async())
+        try:
+            await _wait_for(lambda: app._app.renderer._last_screen is not None)
+            assert app._app.refresh_interval is None
+            # Unbracketed phrase commits. Simulate pauses between phrases without
+            # spending human typing time in CI; bulk paste is tested separately.
+            for offset in range(0, len(draft), 29):
+                app._reset_paste_fragment_window()
+                pipe.send_text(draft[offset:offset + 29])
+                expected_text = draft[:offset + 29]
+                await _wait_for(lambda: app._input_area.buffer.text == expected_text)
+            assert not app._paste_store.has_blocks
+            await asyncio.sleep(0.05)  # Drain suggestion/completion invalidations.
+            baseline = "".join(sink.chunks)
+            await asyncio.sleep(1.05)  # More than two of the old refresh ticks.
+            assert "".join(sink.chunks) == baseline
+            if draft or not running:
+                for _ in range(5):
+                    app._app._redraw()  # Redundant notifications must emit zero bytes.
+                assert "".join(sink.chunks) == baseline
+            status.update(context_used=123, context_max=1000)
+            app.invalidate()
+            await _wait_for(lambda: "".join(sink.chunks) != baseline)
+            assert app._input_area.buffer.text == draft
+            pipe.send_text("a")
+            await _wait_for(lambda: app._input_area.buffer.text == draft + "a")
+            pipe.send_text("\x1b[D中\x7f")  # Move and edit inside the long draft.
+            await _wait_for(lambda: app._input_area.buffer.cursor_position == len(draft))
+            await asyncio.sleep(0.05)
+            assert app._input_area.buffer.text == draft + "a"
+            model = _TerminalModel(columns)
+            model.feed("".join(sink.chunks))
+            assert model.stats["split"] == model.stats["overflow"] == 0
+            screen = app._app.renderer._last_screen
+            assert screen is not None
+            expected = ["".join(screen.data_buffer[y][x].char for x in range(columns)).rstrip() for y in range(screen.height)]
+            assert [model.text(y) for y in range(len(expected))] == expected
+            baseline = "".join(sink.chunks)
+            size = Size(rows=12, columns=max(10, columns // 2))
+            app._app._redraw()
+            assert "".join(sink.chunks) != baseline
+            assert app._app.renderer._last_size == size
+            assert app._input_area.buffer.text == draft + "a"
+            assert app._input_area.buffer.cursor_position == len(draft)
+        finally:
+            if app._app.is_running:
+                app._app.exit()
+            await task
+
+
+async def test_two_tuis_in_separate_workspaces_keep_display_and_draft_isolated(tmp_path, guarded_renderer) -> None:
+    from contextlib import ExitStack
+
+    from leapflow.cli.tui_app.app import LeapApp
+    from leapflow.cli.tui_app.status import StatusBar
+    from leapflow.cli.tui_app.theme import _LIGHT, resolve_theme
+    from tests.test_tui_command_queue import _FakeConsole, _wait_for
+
+    apps, tasks, pipes, sinks, statuses = [], [], [], [], []
+    with ExitStack() as stack:
+        for index in range(2):
+            pipe = stack.enter_context(create_pipe_input())
+            sink = _Sink()
+            output = Vt100_Output(sink, lambda: Size(rows=24, columns=80), term="xterm-256color", enable_cpr=False)
+            with create_app_session(input=pipe, output=output):
+                status = StatusBar()
+                app = LeapApp(console=_FakeConsole(), theme=resolve_theme(_LIGHT, terminal_bg="#FFFFFF"), status=status, history_path=tmp_path / f"workspace-{index}" / "history")
+                tasks.append(asyncio.create_task(app._app.run_async()))
+            apps.append(app)
+            pipes.append(pipe)
+            sinks.append(sink)
+            statuses.append(status)
+        try:
+            await _wait_for(lambda: all(app._app.renderer._last_screen is not None for app in apps))
+            pipes[0].send_text("first draft 中文")
+            await _wait_for(lambda: apps[0]._input_area.buffer.text == "first draft 中文")
+            await asyncio.sleep(0.05)
+            other_output = "".join(sinks[1].chunks)
+            statuses[0].update(context_used=222, context_max=1000)
+            baseline = "".join(sinks[0].chunks)
+            apps[0].invalidate()
+            await _wait_for(lambda: "".join(sinks[0].chunks) != baseline)
+            assert "".join(sinks[1].chunks) == other_output
+            assert statuses[1].context_used == 0
+            assert apps[1]._input_area.buffer.text == ""
+            assert apps[0]._display_clock is not apps[1]._display_clock
+            pipes[1].send_text("second draft")
+            await _wait_for(lambda: apps[1]._input_area.buffer.text == "second draft")
+            assert apps[0]._input_area.buffer.text == "first draft 中文"
+        finally:
+            for app in apps:
+                if app._app.is_running:
+                    app._app.exit()
+            await asyncio.gather(*tasks)
 
 
 @pytest.mark.parametrize(

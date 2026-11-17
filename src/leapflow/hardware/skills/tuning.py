@@ -27,6 +27,12 @@ DEFAULT_LIMITS: Mapping[str, float] = {
     "reach_step_mm": 10.0,
     "reach_joint_step_deg": 10.0,
     "reach_joint_margin_deg": 1.0,
+    "reach_continuity_rounds": 4.0,
+    "reach_refine_rounds": 6.0,
+    "reach_envelope_step_mm": 20.0,
+    "reach_envelope_yaw_samples": 8.0,
+    "reach_envelope_timeout_s": 5.0,  # advisory computation must fit ordinary LHP requests
+    "reach_envelope_ik_iterations": 16.0,  # guidance only; missed samples remain unknown
     "max_steps": 16.0,  # steps one motion.sequence may carry
     "max_wait_s": 10.0,  # longest single ``wait`` step
 }
@@ -121,7 +127,9 @@ DEFAULT_VISION: Mapping[str, float] = {
     "sync_attempts": 3.0,
 }
 
-GRIPPER_SPEC_KEYS = frozenset({"max_width_mm", "min_hold_width_mm"})
+GRIPPER_SPEC_KEYS = frozenset(
+    {"max_width_mm", "min_hold_width_mm", "release_margin_mm", "stall_band_mm"}
+)
 DEFAULT_MIN_HOLD_WIDTH_MM = 3.0
 
 
@@ -135,6 +143,14 @@ def tuned(raw: Any, name: str, defaults: Mapping[str, float]) -> dict[str, float
     values = dict(defaults)
     for key, value in raw.items():
         values[str(key)] = positive(value, f"{name}.{key}")
+        if key in {"reach_continuity_rounds", "reach_refine_rounds", "reach_envelope_yaw_samples"}:
+            if not values[str(key)].is_integer() or values[str(key)] > 16:
+                raise ValueError(f"{name}.{key} must be an integer from 1 to 16")
+        if key == "reach_envelope_timeout_s" and values[str(key)] > 5:
+            raise ValueError(f"{name}.{key} must be at most 5 seconds")
+        if key == "reach_envelope_ik_iterations":
+            if not values[str(key)].is_integer() or values[str(key)] > 50:
+                raise ValueError(f"{name}.{key} must be an integer from 1 to 50")
     return values
 
 
@@ -149,7 +165,16 @@ def positive(value: Any, name: str) -> float:
 
 
 def gripper_spec(raw: Any) -> dict[str, float]:
-    """The declared gripper spec; ``max_width_mm`` may be left to the device envelope."""
+    """The declared gripper spec; ``max_width_mm`` may be left to the device envelope.
+
+    - ``max_width_mm``: the widest commandable opening (default: the envelope max).
+    - ``min_hold_width_mm``: narrower than this, closed jaws hold nothing.
+    - ``release_margin_mm``: how far past the held width an opening must be
+      observed before a ``released`` guard passes (default: the workcell's
+      ``freshness.hold_tolerance_mm``).
+    - ``stall_band_mm``: progress toward a target smaller than this counts as
+      the jaws having stopped (default: a fraction of the position tolerance).
+    """
     if not isinstance(raw, Mapping):
         raise ValueError("'gripper_spec' must be a mapping")
     unknown = sorted(str(key) for key in raw if key not in GRIPPER_SPEC_KEYS)

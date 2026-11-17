@@ -341,12 +341,25 @@ class TestRobotArmTransport:
         await transport.close()
 
     @pytest.mark.asyncio
-    async def test_halt_sends_zero_velocity(self, transport, context, mock_robot):
-        """halt() commands zero velocity/position to all actuators."""
+    async def test_halt_holds_the_observed_posture(self, transport, context, mock_robot):
+        """halt() re-targets every actuator where it stands; zeros would be a move."""
         await transport.open(context)
+        mock_robot._positions.update(shoulder=0.7, elbow=-0.4, wrist=1.1)
+        mock_robot._gripper = 1.0
         status = await transport.halt()
-        assert status.halt_supported is True
-        assert len(mock_robot._actions_sent) >= 1
+        assert status.halt_supported is True and status.halt_delivered is True
+        assert status.stop_effect == "hold"
+        action = [float(v) for v in mock_robot._actions_sent[-1]]
+        assert action == pytest.approx([0.7, -0.4, 1.1, 1.0])
+        await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_halt_without_an_observation_sends_nothing(self, transport, context, mock_robot):
+        await transport.open(context)
+        mock_robot.get_observation = lambda: {"top": None}
+        status = await transport.halt()
+        assert status.halt_delivered is False and status.stop_effect == "none"
+        assert not mock_robot._actions_sent
         await transport.close()
 
     @pytest.mark.asyncio

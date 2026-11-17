@@ -46,6 +46,7 @@ from leapflow.hardware.model_contract import (
 )
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
+    STOP_EFFECT_NONE,
     Reading,
     TransportError,
     TransportStatus,
@@ -141,6 +142,7 @@ class ModelServiceTransport:
             connected=self._client is not None,
             halt_supported=False,
             detail="a model service commands nothing and has no emergency stop",
+            stop_effect=STOP_EFFECT_NONE,
         )
 
     # ── Data plane ──

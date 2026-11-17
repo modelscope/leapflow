@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import math
 import statistics
+from dataclasses import replace
 from typing import TYPE_CHECKING, Iterable, Iterator, Sequence
 
 from leapflow.hardware.model_contract import MaskRle
 from leapflow.hardware.rgbd import RgbdFrame
 from leapflow.hardware.skills.geometry import Plane, Transform, Vec3, dot
+from leapflow.hardware.skills.protocol import LocatedObject
 
 if TYPE_CHECKING:
     from leapflow.hardware.skills.perception import PerceptionSettings
@@ -75,6 +77,45 @@ def table_plane(
     if fitted is not None:
         return fitted
     return Plane(table.normal, table.offset + _densest_offset(points, table))
+
+
+def as_seen(
+    obj: LocatedObject, frame: RgbdFrame, mount: Transform, table: Plane | None,
+    settings: "PerceptionSettings", *, camera: str,
+) -> LocatedObject:
+    """Project arm-table geometry onto the table measured in this camera view.
+
+    A stored offset is a fallback only for its originating camera. Point targets
+    are already measured surfaces and must never receive a table correction.
+    """
+    if obj.geometry == 'point':
+        return obj
+    offset = obj.table_offset_mm if obj.camera == camera else None
+    if table is not None:
+        inverse = mount.inverse()
+        yaw = math.radians(obj.yaw_deg)
+        c, s = math.cos(yaw), math.sin(yaw)
+        x, y, z = obj.center
+        corners = [inverse.apply((x+dx*c-dy*s, y+dx*s+dy*c, z+dz))
+                   for dx in (-obj.length/2, obj.length/2)
+                   for dy in (-obj.width/2, obj.width/2)
+                   for dz in (-obj.height/2, obj.height/2)]
+        if all(p[2] > 0 for p in corners):
+            pixels = [frame.intrinsics.project(p) for p in corners]
+            box = (max(0., min(p[0] for p in pixels)), max(0., min(p[1] for p in pixels)),
+                   min(float(frame.width), max(p[0] for p in pixels)),
+                   min(float(frame.height), max(p[1] for p in pixels)))
+            if box[2] > box[0] and box[3] > box[1]:
+                viewed = table_plane(box, frame, mount, table, settings)
+                if viewed is not None:
+                    offset = viewed.height(x, y) - table.height(x, y)
+    return replace(obj, center=(*obj.center[:2], obj.center[2] + (offset or 0.)))
+
+
+def rebased(points: Sequence[Vec3], viewed: Plane, table: Plane) -> list[Vec3]:
+    """Put a view-local cloud on the arm table while preserving measured heights."""
+    return [(x, y, table.height(x, y) + viewed.above((x, y, z)) / table.normal[2])
+            for x, y, z in points]
 
 
 def _ring_points(
@@ -231,4 +272,4 @@ def mask_box(mask: MaskRle | None) -> tuple[float, float, float, float]:
     return (min(us), min(vs), max(us) + 1, max(vs) + 1)
 
 
-__all__ = ["base_points", "convex_mask", "mask_box", "table_plane"]
+__all__ = ["as_seen", "base_points", "convex_mask", "mask_box", "rebased", "table_plane"]

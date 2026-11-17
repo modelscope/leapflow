@@ -106,6 +106,15 @@ class DhChain:
             pose = pose.compose(link.transform(float(q), self.convention))
         return pose
 
+    def link_transforms(self, joints_deg: Sequence[float]) -> tuple[Transform, ...]:
+        """Cumulative base-to-link transforms, including the base origin."""
+        if len(joints_deg) != self.dof:
+            raise ValueError(f"the chain has {self.dof} joints, got {len(joints_deg)} values")
+        frames = [Transform()]
+        for link, q in zip(self.links, joints_deg):
+            frames.append(frames[-1].compose(link.transform(float(q), self.convention)))
+        return tuple(frames)
+
     def agreement(self, joints_deg: Sequence[float], flange: Pose) -> tuple[float, float]:
         """(mm, deg) between the predicted and the reported flange pose."""
         predicted = self.forward(joints_deg)

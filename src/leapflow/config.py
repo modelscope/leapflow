@@ -302,6 +302,8 @@ class Settings:
     # endpoint, and token_env (preferred) or token. Empty retains the legacy
     # LEAPFLOW_FLEET_NODES environment fallback.
     hardware_fleet_nodes: str = ""
+    # JSON bounded rank-only learning policy; never grants motion or trust.
+    hardware_view_priors: str = "{}"
     # JSON array of event-to-action rules evaluated by hardware stream sources.
     # Empty keeps reflex actions disabled until an operator declares them.
     hardware_alert_policies: str = ""
@@ -309,6 +311,13 @@ class Settings:
     # enforces (drive temperature, supply voltage, advisory fault flags). Breaches
     # are reported to the board with backoff and never gate a command.
     hardware_advisory_limits: str = ""
+    # LHP edge-node process log (`leap hw serve`). With a file the node appends and
+    # size-rotates it itself (max_mb x backups), so restarts keep earlier runs and
+    # the disk stays bounded; empty writes to stderr only. Read at node start.
+    hardware_node_log_file: str = ""
+    hardware_node_log_level: str = "INFO"
+    hardware_node_log_max_mb: float = 16.0
+    hardware_node_log_backups: int = 5
     # Node-local skills (S1.5). Comma-separated fnmatch patterns of enabled skill
     # ids; empty enables every discovered skill. The speed cap bounds every
     # skill plan; the duration cap bounds one skill execution end to end.
@@ -326,6 +335,14 @@ class Settings:
     hardware_skills_halt_timeout_s: float = 2.0
     hardware_skills_stop_grace_s: float = 1.0
     hardware_skills_dispatch_settle_s: float = 2.0
+    # Bounded pure planning; zero workers selects the CPU-aware automatic count.
+    hardware_skills_planning_workers: int = 0
+    hardware_skills_planning_max_candidates: int = 8
+    hardware_skills_planning_max_jobs: int = 16
+    hardware_skills_planning_timeout_s: float = 30.0
+    hardware_skills_planning_max_bytes: int = 262144
+    hardware_skills_planning_cancel_grace_s: float = 0.5
+    hardware_skills_planning_auto_variants: bool = True
     # Every executed skill run is recorded as an episode under the profile's
     # hardware/episodes at this rate (0 disables recording); recording is skipped
     # when the disk has less than the free-space floor left.
@@ -728,6 +745,8 @@ class Settings:
     )
     guardrail_max_repeats: int = 3
     guardrail_max_consecutive_same: int = 8
+    # Multiplexed tools carry distinct operations/programs under one name.
+    guardrail_argument_scoped_tools: tuple[str, ...] = ("hw_skill_run",)
     guardrail_stagnation_window: int = 10
     guardrail_min_success_rate: float = 0.2
     guardrail_max_calls_per_turn: int = 50
@@ -1545,8 +1564,17 @@ def _build_settings_from_env(
     # (which persists into runtime.yaml) actually reaches Settings; the legacy
     # LEAPFLOW_FLEET_NODES fallback is applied later, in fleet_config.
     hardware_fleet_nodes = os.getenv("LEAPFLOW_HARDWARE_FLEET_NODES", "").strip()
+    hardware_view_priors = os.getenv("LEAPFLOW_HARDWARE_VIEW_PRIORS", "{}").strip()
+    from leapflow.hardware.view_priors import ViewPriorSettings
+    ViewPriorSettings.from_json(hardware_view_priors)
     hardware_alert_policies = os.getenv("LEAPFLOW_HARDWARE_ALERT_POLICIES", "").strip()
     hardware_advisory_limits = os.getenv("LEAPFLOW_HARDWARE_ADVISORY_LIMITS", "").strip()
+    hardware_node_log_file = os.getenv("LEAPFLOW_HARDWARE_NODE_LOG_FILE", "").strip()
+    hardware_node_log_level = (
+        os.getenv("LEAPFLOW_HARDWARE_NODE_LOG_LEVEL", "INFO").strip() or "INFO"
+    )
+    hardware_node_log_max_mb = float(os.getenv("LEAPFLOW_HARDWARE_NODE_LOG_MAX_MB", "16") or 16.0)
+    hardware_node_log_backups = int(os.getenv("LEAPFLOW_HARDWARE_NODE_LOG_BACKUPS", "5") or 5)
     hardware_calibration_worker_enabled = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
     hardware_calibration_worker_budgets = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_BUDGETS", "{}").strip() or "{}"
     hardware_skills_enabled = os.getenv("LEAPFLOW_HARDWARE_SKILLS_ENABLED", "").strip()
@@ -1568,6 +1596,18 @@ def _build_settings_from_env(
     hardware_skills_dispatch_settle_s = float(
         os.getenv("LEAPFLOW_HARDWARE_SKILLS_DISPATCH_SETTLE_S", "2") or 2.0
     )
+    from leapflow.hardware.skills.planning import PlanningSettings
+
+    planning_defaults = PlanningSettings()
+    hardware_planning = PlanningSettings(**{
+        name: (
+            os.getenv(f"LEAPFLOW_HARDWARE_SKILLS_PLANNING_{name.upper()}", str(default))
+            .strip().lower() in ("1", "true", "yes", "on")
+            if isinstance(default, bool) else
+            type(default)(os.getenv(f"LEAPFLOW_HARDWARE_SKILLS_PLANNING_{name.upper()}", str(default)))
+        )
+        for name, default in vars(planning_defaults).items()
+    })
     hardware_skills_episode_fps = float(
         os.getenv("LEAPFLOW_HARDWARE_SKILLS_EPISODE_FPS", "30") or 30.0
     )
@@ -1637,6 +1677,8 @@ def _build_settings_from_env(
     )
     guardrail_max_repeats = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_REPEATS", "3"))
     guardrail_max_consecutive_same = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_CONSECUTIVE_SAME", "8"))
+    guardrail_argument_scoped_tools = tuple(name.strip() for name in os.getenv(
+        "LEAPFLOW_GUARDRAIL_ARGUMENT_SCOPED_TOOLS", "hw_skill_run").split(",") if name.strip())
     guardrail_stagnation_window = int(os.getenv("LEAPFLOW_GUARDRAIL_STAGNATION_WINDOW", "10"))
     guardrail_min_success_rate = float(os.getenv("LEAPFLOW_GUARDRAIL_MIN_SUCCESS_RATE", "0.2"))
     guardrail_max_calls_per_turn = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_CALLS_PER_TURN", "50"))
@@ -2094,8 +2136,13 @@ def _build_settings_from_env(
         hardware_preview_quality=hardware_preview_quality,
         hardware_preview_idle_timeout_s=hardware_preview_idle_timeout_s,
         hardware_fleet_nodes=hardware_fleet_nodes,
+        hardware_view_priors=hardware_view_priors,
         hardware_alert_policies=hardware_alert_policies,
         hardware_advisory_limits=hardware_advisory_limits,
+        hardware_node_log_file=hardware_node_log_file,
+        hardware_node_log_level=hardware_node_log_level,
+        hardware_node_log_max_mb=hardware_node_log_max_mb,
+        hardware_node_log_backups=hardware_node_log_backups,
         hardware_calibration_worker_enabled=hardware_calibration_worker_enabled,
         hardware_calibration_worker_budgets=hardware_calibration_worker_budgets,
         hardware_skills_enabled=hardware_skills_enabled,
@@ -2105,6 +2152,7 @@ def _build_settings_from_env(
         hardware_skills_halt_timeout_s=hardware_skills_halt_timeout_s,
         hardware_skills_stop_grace_s=hardware_skills_stop_grace_s,
         hardware_skills_dispatch_settle_s=hardware_skills_dispatch_settle_s,
+        **{f"hardware_skills_planning_{name}": value for name, value in vars(hardware_planning).items()},
         hardware_skills_episode_fps=hardware_skills_episode_fps,
         hardware_skills_episode_min_free_mb=hardware_skills_episode_min_free_mb,
         hardware_share_frames=hardware_share_frames,
@@ -2143,6 +2191,7 @@ def _build_settings_from_env(
         approval_bypass=approval_bypass,
         guardrail_max_repeats=guardrail_max_repeats,
         guardrail_max_consecutive_same=guardrail_max_consecutive_same,
+        guardrail_argument_scoped_tools=guardrail_argument_scoped_tools,
         guardrail_stagnation_window=guardrail_stagnation_window,
         guardrail_min_success_rate=guardrail_min_success_rate,
         guardrail_max_calls_per_turn=guardrail_max_calls_per_turn,

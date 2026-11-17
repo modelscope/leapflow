@@ -22,6 +22,7 @@ from leapflow.hardware.context import HardwareContext, Quality
 from leapflow.hardware.host_metrics import HostMetrics
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
+    STOP_EFFECT_NONE,
     Reading,
     TransportError,
     TransportStatus,
@@ -92,6 +93,7 @@ class HostTransport:
             connected=self._connected,
             halt_supported=False,
             detail="a host resource has no emergency stop",
+            stop_effect=STOP_EFFECT_NONE,
         )
 
     # ── Data plane ──

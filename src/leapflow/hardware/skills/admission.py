@@ -7,7 +7,8 @@ import json
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Mapping
 
-from leapflow.hardware.skills.digest import plan_digest
+from leapflow.hardware.skills.digest import plan_digest, run_permit_digest
+from leapflow.hardware.skills.planning import Deadline
 from leapflow.hardware.skills.protocol import (
     FAILURE_DEVICE_BUSY,
     FAILURE_INVALID_ARGS,
@@ -22,6 +23,7 @@ from leapflow.hardware.skills.protocol import (
 if TYPE_CHECKING:
     from leapflow.hardware.skills.frames import FrameGraph
     from leapflow.hardware.skills.ports import NodeSkill
+    from leapflow.hardware.skills.planning import PlanningSettings
     from leapflow.hardware.skills.runtime import SkillRuntime
     from leapflow.hardware.skills.workcell import WorkcellSpec
 
@@ -75,7 +77,8 @@ def effective_limits(
         **{name: float(spec.limits[name]) for name in (
             "move_timeout_s", "fk_tolerance_mm", "fk_tolerance_deg", "joint_path_step_deg",
             "max_steps", "max_wait_s", "reach_step_mm", "reach_joint_step_deg",
-            "reach_joint_margin_deg",
+            "reach_joint_margin_deg", "reach_continuity_rounds", "reach_refine_rounds",
+            "reach_envelope_step_mm", "reach_envelope_yaw_samples",
         )},
         "max_duration_s": duration,
     }
@@ -152,6 +155,7 @@ async def execution_basis(runtime: SkillRuntime, plan: SkillPlan) -> Mapping[str
 def seal_plan(
     runtime: SkillRuntime, spec: WorkcellSpec, skill: NodeSkill,
     planned: SkillPlan, frames: FrameGraph, *, model_basis: Mapping[str, Any],
+    result_budget: PlanningSettings | None = None, deadline: float = float("inf"),
 ) -> SkillPlan:
     """Seal the exact owner identities/dependencies before caching the intention."""
     sealed = replace(
@@ -161,6 +165,15 @@ def seal_plan(
         digest="",
     )
     sealed = replace(sealed, digest=plan_digest(sealed))
+    if result_budget is not None:
+        result_budget.check_size({"plan": sealed.to_dict(), "batch": sealed.basis.get("batch", {}),
+                                  "consent": skill.spec.consent,
+                                  "permit_digest": run_permit_digest(workcell=sealed.workcell,
+                                      skill_id=sealed.skill_id, version=sealed.version,
+                                      plan_digest=sealed.digest, limits=sealed.limits)})
+    Deadline(deadline).check()
+    if runtime._closing:
+        raise SkillError(FAILURE_SKILL_UNAVAILABLE, "node skill runtime is shutting down")
     runtime._evict_expired()
     runtime._plans[sealed.digest] = (sealed, runtime._clock())
     return sealed

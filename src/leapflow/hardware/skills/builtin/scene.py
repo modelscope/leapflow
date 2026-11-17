@@ -23,14 +23,13 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from leapflow.hardware.skills.builtin._grasp_planning import propose
 from leapflow.hardware.skills.ports import SkillContext
 from leapflow.hardware.skills.protocol import (
     COORDS,
     COORDS_PIXEL,
     EFFECT_READ,
-    FAILURE_CALIBRATION_MISSING,
     FAILURE_INVALID_ARGS,
-    FAILURE_UNREACHABLE,
     MAX_VIEW_CAMERAS,
     PLANE_COLOR,
     PLANES,
@@ -84,7 +83,7 @@ class Locate:
 
     spec = SkillSpec(
         skill_id="perceive.locate",
-        version="2.1.0",
+        version="2.2.0",
         card=(
             "Look at the table with a workcell camera and report every detection of "
             "the queried descriptions (e.g. ['red cup', 'plate']): id, label, score, "
@@ -92,7 +91,9 @@ class Locate:
             "it, and its geometry (mask or box; a point has no size), plus what the "
             "gripper holds. Several detections may answer one query; "
             "all of them are returned. Ids replace those of earlier calls and expire "
-            "after a short while."
+            "after a short while. camera=auto captures calibrated cameras together, "
+            "merging only unambiguous geometric matches; observation reports support, "
+            "truncation, conflicts, and unknown accuracy without sharing images."
         ),
         args_schema={
             "type": "object",
@@ -109,7 +110,7 @@ class Locate:
                     "maximum": 1,
                     "description": "Lowest detection score reported; the workcell's when omitted.",
                 },
-                "camera": _CAMERA_ARG,
+                "camera": {**_CAMERA_ARG, "pattern": "^(auto|camera(\\.[a-z0-9_]+)*)$"},
             },
             "required": ["queries"],
         },
@@ -136,6 +137,7 @@ class Locate:
         return SkillOutcome.succeeded(
             {
                 "objects": [obj.to_dict() for obj in found],
+                "observation": [dict(ctx.scene.observation(obj)) for obj in found],
                 "held": None if held is None else held.to_dict(),
                 "table": None if table is None else table.to_dict(),
             },
@@ -150,7 +152,7 @@ class Snapshot:
 
     spec = SkillSpec(
         skill_id="perceive.snapshot",
-        version="1.2.0",
+        version="1.3.0",
         card=(
             "Look through workcell cameras and get one image you can see. camera is the "
             "main view; with_cameras adds others (e.g. ['camera.wrist'], or ['all']) as "
@@ -247,7 +249,7 @@ class Snapshot:
             side_effect_state=SIDE_EFFECT_NONE,
             message=(
                 f"{kind} {shot['frame']} from {source} "
-                f"({shot['width']}x{shot['height']} pixels){unlifted}{situation}"
+                f"({shot['width']}x{shot['height']} pixels){unlifted}{_layout(shot)}{situation}"
             ),
         )
 
@@ -257,11 +259,13 @@ class Lift:
 
     spec = SkillSpec(
         skill_id="perceive.lift",
-        version="1.2.0",
+        version="1.3.0",
         card=(
             "Turn what you point at in a perceive.snapshot image into objects, without "
             "moving. frame is the image's fN, or vN for a mosaic (a target resolves to "
-            "the color or depth tile it lands in; keep a box inside one tile). Each "
+            "the color or depth tile it lands in; keep a box inside one tile). Pixels "
+            "are always the named image's own: vN pixels span the whole mosaic, fN "
+            "pixels only that frame's tile, from its top-left 0,0. Each "
             "target has a label and either a point [u, v] on the object's "
             "surface or a box [x0, y0, x1, y1] around it; coords says whether they are "
             "pixels of the shared image, fractions (0-1) of its sides, or thousandths "
@@ -321,7 +325,8 @@ class Lift:
             plan.args["frame"], _targets(plan.args), coords=plan.args["coords"], **binding
         )
         listed = "; ".join(f"{o.object_id} {o.label} at {_fmt(o.center)}" for o in lifted)
-        result: dict[str, Any] = {"objects": [obj.to_dict() for obj in lifted]}
+        result: dict[str, Any] = {"objects": [obj.to_dict() for obj in lifted],
+                                  "observation": [dict(ctx.scene.observation(obj)) for obj in lifted]}
         if dropped:
             result["dropped"] = [dict(entry) for entry in dropped]
         return SkillOutcome.succeeded(
@@ -332,6 +337,24 @@ class Lift:
                 + (f": {listed}" if listed else "")
             ),
         )
+
+
+def _layout(shot: Mapping[str, Any]) -> str:
+    """Where each tile of a mosaic sits, so a point can name the right image."""
+    placed = [tile for tile in shot.get("tiles") or () if isinstance(tile, Mapping)]
+    if not placed:
+        return ""
+    spots = "; ".join(
+        f"{tile.get('camera')} {tile.get('plane')} "
+        + (str(tile["frame"]) if tile.get("frame") else "(look only)")
+        + f" at x {tile.get('x')}-{int(tile.get('x', 0)) + int(tile.get('width', 0))},"
+        f" y {tile.get('y')}-{int(tile.get('y', 0)) + int(tile.get('height', 0))}"
+        for tile in placed
+    )
+    return (
+        f"\nTiles: {spots}. Point into {shot['frame']} with these mosaic pixels, or into a "
+        "tile's fN with that tile's own pixels (its top-left is 0,0)."
+    )
 
 
 def _targets(args: Mapping[str, Any]) -> tuple[PixelTarget, ...]:
@@ -358,13 +381,17 @@ class GraspPropose:
 
     spec = SkillSpec(
         skill_id="grasp.propose",
-        version="1.1.0",
+        version="1.2.0",
         card=(
             "Propose grasps for one object id from perceive.locate, without moving: "
             "each grasp has an id, the TCP poses pregrasp / grasp / retreat (mm, deg, "
             "arm base frame), the width the jaws should open to, the expected closed "
             "width, a score, and the planner that produced it. Every candidate is "
-            "inside the workspace at planning time. Grasp ids expire with their object."
+            "inside the workspace at planning time. When kinematics is verified, the "
+            "point transit to pregrasp and linear grasp/retreat are IK-checked from the "
+            "current joints; result.reach labels an unverified check. A gripper/geometry "
+            "mismatch is grasp_infeasible, distinct from unreachable. Grasp ids expire "
+            "with their object; motion.sequence rechecks paths before approval."
         ),
         args_schema={
             "type": "object",
@@ -375,6 +402,7 @@ class GraspPropose:
             "required": ["object"],
         },
         effect=EFFECT_READ,
+        bounded_planning=True,
         requires=_GRASP_REQUIRES,
     )
 
@@ -386,46 +414,7 @@ class GraspPropose:
         )
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
-        obj = ctx.scene.object(plan.args["object"])
-        table = ctx.frames.table
-        if table is None:
-            raise SkillError(
-                FAILURE_CALIBRATION_MISSING,
-                "the table is not calibrated; run calib.workspace with table_z or table_points",
-            )
-        state = await ctx.motion.state()
-        planner = ctx.grasp_planner
-        proposed = await planner.candidates(obj, table=table, current=state.tcp)
-        feasible, refused = [], []
-        for candidate in proposed:
-            try:
-                for name in ("pregrasp", "grasp", "retreat"):
-                    ctx.motion.check_target(candidate.waypoint(name))
-            except SkillError as error:
-                refused.append(error.message)
-                continue
-            feasible.append(candidate)
-        if not feasible:
-            reason = f"; first refusal: {refused[0]}" if refused else ""
-            raise SkillError(
-                FAILURE_UNREACHABLE,
-                f"{planner.name} proposed no reachable grasp for {obj.object_id} ({obj.label}, "
-                f"{obj.length:.0f} x {obj.width:.0f} x {obj.height:.0f} mm){reason}",
-            )
-        named = ctx.scene.remember_grasps(obj, feasible[: int(plan.args["top_k"])])
-        ctx.note("grasps", {"planner": planner.name, "proposed": len(proposed), "refused": refused})
-        listed = "; ".join(
-            f"{g.grasp_id} score {g.score:.2f} open {g.open_mm:.0f} mm" for g in named
-        )
-        return SkillOutcome.succeeded(
-            {
-                "object": obj.to_dict(),
-                "grasps": [grasp.to_dict() for grasp in named],
-                "planner": planner.name,
-            },
-            side_effect_state=SIDE_EFFECT_NONE,
-            message=f"{len(named)} grasp(s) for {obj.object_id}: {listed}",
-        )
+        return await propose(ctx, plan)
 
 
 def skills() -> tuple[Locate, Snapshot, Lift, GraspPropose]:

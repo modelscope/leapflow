@@ -19,14 +19,12 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from leapflow.engine._tool_helpers import _resolve_tool_name
-from leapflow.engine.context.result_budget import (
-    fit_result_to_budget as _truncate_result_for_budget,
-    head_tail_truncate as _head_tail_truncate,
-)
 from leapflow.engine.tools.tool_execution import (
     exit_code_from,
     failed_effect_is_uncertain,
+    result_is_control_signal,
     result_is_observation,
+    result_tier,
 )
 from leapflow.security.permission_failures import (
     is_permission_failure_payload,
@@ -162,6 +160,7 @@ def _tool_result_metadata(
             if value:
                 metadata[key] = _single_line_preview(value, limit=_TOOL_ARGS_PREVIEW_LIMIT)
     metadata["ok"] = True
+    metadata["result_tier"] = result_tier(result)
     if isinstance(result, dict):
         metadata["ok"] = bool(result.get("ok", True))
         exit_code = exit_code_from(result)
@@ -224,9 +223,15 @@ def _tool_result_metadata(
             "console_url",
             "next_steps",
             "skip_approval",
+            "side_effect_state",
         ):
             if key in result:
                 metadata[key] = result[key]
+        repair = result.get("argument_repair")
+        if isinstance(repair, dict) and repair.get("message"):
+            metadata["argument_repair"] = _single_line_preview(
+                repair["message"], limit=_TOOL_RESULT_PREVIEW_LIMIT
+            )
         for key in ("suggestions", "available_tools", "suggestion", "next_step"):
             value = result.get(key)
             if value:
@@ -328,11 +333,7 @@ def _tool_result_counts_as_failure(payload: Dict[str, Any]) -> bool:
 
 def _tool_result_is_control_signal(payload: Dict[str, Any]) -> bool:
     """Return whether a tool payload is execution control metadata, not an attempt result."""
-    return bool(
-        payload.get("already_executed")
-        or payload.get("duplicate_suppressed")
-        or payload.get("execution_skipped")
-    )
+    return result_is_control_signal(payload)
 
 
 def _tool_failure_text(payload: Dict[str, Any]) -> str:
@@ -464,6 +465,11 @@ def _validate_tool_arguments(spec: Any, args: Dict[str, Any]) -> Optional[Dict[s
     values. The result is marked non-failing and carries no execution_policy, so it
     neither trips the side-effect batch-stop gate nor penalizes failure budgets —
     the model simply sees the missing fields plus the accepted schema and retries.
+
+    A missing key found one level down, inside an object argument, is named as
+    misplaced (which argument holds it) so the retry moves it rather than guessing.
+    When every missing key sits inside the tool's declared ``payload_parameter``,
+    the check defers to the handler, which owns that payload's envelope repair.
     """
     if spec is None:
         return None
@@ -473,11 +479,24 @@ def _validate_tool_arguments(spec: Any, args: Dict[str, Any]) -> Optional[Dict[s
     missing = [name for name in required if name not in args]
     if not missing:
         return None
+    misplaced = _nested_argument_owners(args, missing)
+    payload = str(getattr(spec, "payload_parameter", "") or "")
+    if payload and len(misplaced) == len(missing) and set(misplaced.values()) == {payload}:
+        return None
     accepted = sorted((getattr(spec, "parameters", frozenset()) or frozenset()) | set(required))
     tool_name = str(getattr(spec, "name", "") or "")
-    return {
+    error = f"Invalid arguments for {tool_name}: missing required parameter(s): {', '.join(sorted(missing))}"
+    hint = "Call the tool again with every required parameter using the declared schema."
+    if misplaced:
+        where = ", ".join(f"{key} (inside {owner})" for key, owner in sorted(misplaced.items()))
+        error += f"; found nested instead of top-level: {where}"
+        hint = (
+            "Move each misplaced parameter out of the object that holds it to the top "
+            "level of the call, beside the other parameters, and call the tool again."
+        )
+    result: Dict[str, Any] = {
         "ok": False,
-        "error": f"Invalid arguments for {tool_name}: missing required parameter(s): {', '.join(sorted(missing))}",
+        "error": error,
         "error_type": "invalid_arguments",
         "failure_class": "invalid_request",
         "failure_code": "missing_required_fields",
@@ -485,12 +504,24 @@ def _validate_tool_arguments(spec: Any, args: Dict[str, Any]) -> Optional[Dict[s
         "missing": sorted(missing),
         "required": sorted(required),
         "accepted_parameters": accepted,
-        "recovery_hint": (
-            "Call the tool again with every required parameter using the declared schema."
-        ),
+        "recovery_hint": hint,
         "retryable": True,
         "counts_as_failure": False,
     }
+    if misplaced:
+        result["misplaced"] = dict(sorted(misplaced.items()))
+    return result
+
+
+def _nested_argument_owners(args: Dict[str, Any], names: List[str]) -> Dict[str, str]:
+    """Each of *names* found inside a top-level object argument, mapped to that argument."""
+    owners: Dict[str, str] = {}
+    for owner, value in args.items():
+        if isinstance(value, dict):
+            for name in names:
+                if name in value and name not in owners:
+                    owners[name] = str(owner)
+    return owners
 
 
 def _skipped_after_failure_result(

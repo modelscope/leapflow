@@ -66,11 +66,13 @@ from leapflow.hardware.lhp.params import (
     require_commands,
     require_str,
 )
+from leapflow.hardware.lhp.planning_requests import PlanningRequests
 from leapflow.hardware.lhp.protocol import (
     CAP_CONTROL_V1,
     CAP_FRAME_FRESHNESS_V1,
     CAP_PERMIT_V1,
     CAP_SKILL_V1,
+    CAP_SKILL_PLAN_CANCEL_V1,
     ERR_BAD_REQUEST,
     ERR_FRAME_TOO_LARGE,
     ERR_INTERNAL_ERROR,
@@ -106,6 +108,7 @@ from leapflow.hardware.node_gate import (
     verify_reading_identity,
 )
 from leapflow.hardware.transport import (
+    STOP_EFFECT_NONE,
     FrameTransport,
     TransportError,
     TransportStatus,
@@ -126,6 +129,7 @@ class _ConnectionState:
 
     authenticated: bool = False
     connection_id: str = ""
+    planning: PlanningRequests | None = None
 
 
 class LhpNodeServer:
@@ -194,6 +198,7 @@ class LhpNodeServer:
             "control.update": self._handle_control_update,
             "control.close": self._handle_control_close,
             "control.status": self._handle_control_status,
+            "skill.plan.cancel": self._handle_plan_cancel,
         }
         if skill_runtime is not None:
             from leapflow.hardware.lhp.skill_methods import SkillMethods
@@ -222,6 +227,10 @@ class LhpNodeServer:
     @property
     def sessions(self) -> NodeSessions:
         return self._sessions
+
+    def planning_requests(self) -> PlanningRequests:
+        """Create bounded preview ownership for one direct or socket binding."""
+        return PlanningRequests(self._skill_runtime, self._max_concurrent_requests)
 
     # ── Dispatch (shared by direct and socket bindings) ──
 
@@ -294,7 +303,7 @@ class LhpNodeServer:
         if protocol >= 2:
             caps.append(CAP_FRAME_FRESHNESS_V1)
         if self._skill_runtime is not None:
-            caps.append(CAP_SKILL_V1)
+            caps.extend((CAP_SKILL_V1, CAP_SKILL_PLAN_CANCEL_V1))
         result: dict[str, Any] = {
             "protocol": protocol,
             "node_id": self._node_id,
@@ -605,6 +614,8 @@ class LhpNodeServer:
                 halt_supported=getattr(context, "halt_supported", None) is not False,
                 halt_delivered=False,
                 detail=str(exc),
+                stop_effect=STOP_EFFECT_NONE,
+                stop_verified=False,
             ).to_dict()
         if status is None:
             logger.info("LHP halt for %r: no open link on this node, nothing to stop", device_id)
@@ -613,6 +624,7 @@ class LhpNodeServer:
                 halt_supported=getattr(context, "halt_supported", None) is not False,
                 detail="no link is open to this device on the node, so nothing is being driven "
                        "from here",
+                stop_effect=STOP_EFFECT_NONE,
             ).to_dict()
         return status.to_dict()
 
@@ -697,6 +709,12 @@ class LhpNodeServer:
             "side_effect_state": merged_batch_state(ok, outcomes),
         }
 
+    async def _handle_plan_cancel(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        state = self._connection_states.get(_CONNECTION_ID.get())
+        if state is None or state.planning is None:
+            raise LhpProtocolError("planning cancellation requires the owning socket connection")
+        return {"canceled": state.planning.cancel(params.get("request_id"))}
+
     # ── Socket listener ──
 
     async def start(
@@ -757,7 +775,7 @@ class LhpNodeServer:
     async def _serve_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        state = _ConnectionState()
+        state = _ConnectionState(planning=self.planning_requests())
         connection_id = str(uuid.uuid4())
         state.connection_id = connection_id
         self._connection_states[connection_id] = state
@@ -804,6 +822,11 @@ class LhpNodeServer:
                         break
                     state.authenticated = True
                     continue
+                if request.get("method") == "skill.plan.cancel":
+                    _CONNECTION_ID.set(connection_id)
+                    response = await self.handle_request(request, via="socket")
+                    await _send_frame(writer, write_lock, response)
+                    continue
                 task = asyncio.get_running_loop().create_task(
                     self._dispatch_and_reply(
                         request,
@@ -813,17 +836,26 @@ class LhpNodeServer:
                         connection_id=connection_id,
                     )
                 )
+                if request.get("method") == "skill.plan":
+                    try:
+                        state.planning.register(request.get("id"), task)
+                    except LhpProtocolError as exc:
+                        task.cancel()
+                        await _send_frame(writer, write_lock, error_response(request.get("id"), exc.code, str(exc)))
+                        continue
                 handlers.add(task)
                 task.add_done_callback(handlers.discard)
         except (ConnectionError, OSError):
             pass
         finally:
+            planning = state.planning.disconnect()
             # Sessions owned by a dropped connection fail safe.
             try:
                 self._calibration_lifecycle.disconnect(state.connection_id)
                 await self._sessions.on_disconnect(state.connection_id)
             except Exception as exc:  # noqa: BLE001 - a fail-safe fault must not leak the writer
                 logger.error("LHP disconnect fail-safe failed: %s", exc, exc_info=True)
+            await asyncio.gather(*planning, return_exceptions=True)
             self._connection_states.pop(connection_id, None)
             await self._release_connection_frames(state.connection_id)
             self._writers.discard(writer)
@@ -839,10 +871,18 @@ class LhpNodeServer:
         semaphore: asyncio.Semaphore,
         connection_id: str = "",
     ) -> None:
-        async with semaphore:
-            _CONNECTION_ID.set(connection_id)  # task-local: concurrent requests cannot mix
-            response = await self.handle_request(request, via="socket")
-            await _send_frame(writer, write_lock, response)
+        planning = self._connection_states[connection_id].planning if request.get("method") == "skill.plan" else None
+        delivered = False
+        try:
+            async with semaphore:
+                _CONNECTION_ID.set(connection_id)  # task-local: concurrent requests cannot mix
+                response = await self.handle_request(request, via="socket")
+                if planning is not None:
+                    planning.publish(request["id"], response, batch="candidates" in (request.get("params") or {}))
+                delivered = await _send_frame(writer, write_lock, response)
+        finally:
+            if planning is not None and not delivered:
+                planning.cancel(request["id"])
 
 
 def _frame_holder(connection_id: str, channel_id: str) -> str:
@@ -910,14 +950,16 @@ def _frame_kwargs(
 
 async def _send_frame(
     writer: asyncio.StreamWriter, write_lock: asyncio.Lock, payload: Mapping[str, Any]
-) -> None:
-    """Write one response frame, serialised per connection. Never raises."""
+) -> bool:
+    """Return delivery success, serialised per connection; cancellation propagates."""
     try:
         async with write_lock:
             writer.write(encode_frame(payload))
             await writer.drain()
+        return True
     except (ConnectionError, OSError, RuntimeError) as exc:
         logger.debug("LHP reply could not be delivered: %s", exc)
+        return False
 
 
 __all__ = [

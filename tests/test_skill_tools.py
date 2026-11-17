@@ -175,13 +175,14 @@ class _Tampering:
     async def connect(self) -> Mapping[str, Any]:
         return await self._inner.connect()
 
-    async def request(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
+    async def request(self, method: str, params: Mapping[str, Any] | None = None,
+                      *, timeout_s: float | None = None) -> Any:
         self.calls.append(method)
         if method in self._fail:
             raise OSError("connection reset by peer")
         if self._on_params is not None:
             params = self._on_params(method, dict(params or {}))
-        reply = await self._inner.request(method, params)
+        reply = await self._inner.request(method, params, timeout_s=timeout_s)
         return self._on_reply(method, reply) if self._on_reply is not None else reply
 
     async def close(self) -> None:
@@ -249,6 +250,7 @@ async def rigs() -> Any:
         await rig.service.close()
         for node in rig.nodes:
             await node.server.stop()
+            await node.runtime.close()
 
 
 async def _until(predicate: Any, timeout_s: float = 3.0) -> None:
@@ -345,6 +347,43 @@ async def test_dry_run_returns_the_plan_and_moves_nothing(tmp_path: Path, rigs: 
     assert result["ok"] and result["dry_run"] and result["plan"]["digest"]
     assert result["side_effect_state"] == SIDE_EFFECT_NONE
     assert rig.gate.seen == [] and rig.sim.batches == []
+
+
+async def test_envelope_fields_nested_in_args_are_lifted_and_reported(
+    tmp_path: Path, rigs: Any
+) -> None:
+    rig = rigs(tmp_path)
+    nested = {**move_by(10), "workcell": WORKCELL_ID, "skill": SEQUENCE, "dry_run": True}
+    result = await rig.service.hw_skill_run(args=nested)
+    assert result["ok"] and result["dry_run"], result
+    assert set(result["plan"]["args"]) == {"steps"}
+    repair = result["argument_repair"]
+    assert set(repair["lifted"]) == {"workcell", "skill", "dry_run"}
+    assert "beside args" in repair["message"]
+    assert any(record["action"] == "skill_args_repair" for record in rig.audit.records)
+    assert rig.gate.seen == [] and rig.sim.batches == []
+
+
+async def test_a_conflicting_nested_envelope_field_is_refused_not_guessed(
+    tmp_path: Path, rigs: Any
+) -> None:
+    rig = rigs(tmp_path)
+    result = await rig.service.hw_skill_run(
+        **{**MOVE, "args": {**move_by(10), "dry_run": False}}, dry_run=True
+    )
+    assert result["failure_code"] == "invalid_request", result
+    assert "dry_run" in result["error"] and "beside args" in result["error"]
+    assert rig.gate.seen == [] and rig.sim.batches == []
+
+
+async def test_an_unknown_skill_argument_is_left_for_the_node_to_name(
+    tmp_path: Path, rigs: Any
+) -> None:
+    rig = rigs(tmp_path)
+    result = await rig.service.hw_skill_run(**{**MOVE, "args": {**move_by(10), "speed": 5}})
+    assert result["failure_code"] == "invalid_args" and "speed" in result["error"]
+    assert "argument_repair" not in result
+    assert "beside args" in result["next_step"]
 
 
 async def test_a_denied_approval_moves_nothing(tmp_path: Path, rigs: Any) -> None:
@@ -532,7 +571,7 @@ async def test_an_unobservable_run_falls_to_the_node_deadman(tmp_path: Path, rig
 async def test_invalid_timeout_is_refused(tmp_path: Path, rigs: Any) -> None:
     rig = rigs(tmp_path)
     result = await rig.service.hw_skill_run(**MOVE, timeout_s=10_000)
-    assert result["failure_code"] == "invalid_args" and rig.sim.batches == []
+    assert result["failure_code"] == "invalid_request" and rig.sim.batches == []
 
 
 # ── Result contract ──────────────────────────────────────────────────────────
@@ -678,3 +717,74 @@ def test_plugin_never_generates_a_permit_key(tmp_path: Path) -> None:
     plugin._registry = _plugin_registry(str(key))
     plugin._init_fleet_manager()
     assert plugin._fleet_manager.permit_issuer is None and not key.exists()
+
+
+class _ViewPriors:
+    def __init__(self) -> None:
+        self.lookups: list[str] = []
+        self.scopes: list[tuple[str, str]] = []
+        self.decisions: list[tuple[Any, ...]] = []
+        self.runs: list[tuple[str, Mapping[str, Any]]] = []
+
+    async def hints(self, workcell: str) -> Mapping[str, Any]:
+        self.lookups.append(workcell)
+        return {'prior_scope': 'a'*64, 'priors': {'camera:ring:0': .5}}
+
+    def expect_scope(self, workcell: str, scope: str) -> None:
+        self.scopes.append((workcell, scope))
+
+    def record_decision(self, *args: Any) -> None:
+        self.decisions.append(args)
+
+    def record_run(self, node_id: str, run: Mapping[str, Any]) -> None:
+        self.runs.append((node_id, run))
+
+
+def _survey_rig(rigs: Any, tmp_path: Path, **kwargs: Any) -> _Rig:
+    from leapflow.hardware.skills.builtin.scene import skills as scene_skills
+    from leapflow.hardware.skills.builtin.survey import skills as survey_skills
+    from tests.test_perception import CUP, _calibrated
+    from tests._harness.skill_stubs import PERCEPTION_WORKCELL_YAML
+    devices = _calibrated(tmp_path / 'devices', CUP).devices
+    rig = rigs(tmp_path, cell=PERCEPTION_WORKCELL_YAML,
+               node_skills=(*scene_skills(), *survey_skills()), devices=devices, **kwargs)
+    rig.nodes[0].registry.calibrate_perception()
+    rig.service.set_view_priors(_ViewPriors())
+    return rig
+
+
+async def test_survey_host_approved_plan_never_reinjects_priors_or_replans(rigs, tmp_path: Path) -> None:
+    rig = _survey_rig(rigs, tmp_path)
+    await rig.service.hw_skill_run(workcell=WORKCELL_ID, skill='perceive.locate', args={'queries': ['cup']})
+    request = {'workcell': WORKCELL_ID, 'skill': 'perceive.survey', 'args': {'object': 'o1', 'mode': 'passive'}}
+    preview = await rig.service.hw_skill_run(**request, dry_run=True)
+    assert preview['ok']
+    plan = preview['plan']
+    result = await rig.service.hw_skill_run(**request, approved_plan=plan)
+    assert result['failure_code'] == 'observation_insufficient'
+    assert rig.service._view_priors.lookups == []
+    assert rig.service._view_priors.scopes[-1] == (QUALIFIED, plan['basis']['observation_scope'])
+    assert rig.service._view_priors.runs
+    tampered = await rig.service.hw_skill_run(**{**request, 'args': {**request['args'], 'priors': {'new': 1}}},
+                                              approved_plan=plan)
+    assert tampered['failure_code'] == FAILURE_PLAN_UNVERIFIED
+    assert rig.sim.batches == []
+
+
+@pytest.mark.parametrize('phase', ['approval', 'admission', 'planning'])
+async def test_survey_host_governance_refusals_are_observed_without_motion(rigs, tmp_path: Path, phase: str) -> None:
+    def wrap(client: DirectLhpClient) -> Any:
+        def alter(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            return {**params, 'plan_digest': 'b'*64} if method == 'skill.execute' else params
+        return _Tampering(client, on_params=alter)
+    rig = _survey_rig(rigs, tmp_path, gate=_Gate(phase != 'approval'),
+                      wrap=wrap if phase == 'admission' else None)
+    await rig.service.hw_skill_run(workcell=WORKCELL_ID, skill='perceive.locate', args={'queries': ['cup']})
+    mode = 'active' if phase == 'planning' else 'passive'
+    result = await rig.service.hw_skill_run(workcell=WORKCELL_ID, skill='perceive.survey',
+                                          args={'object': 'o1', 'mode': mode})
+    assert not result['ok'] and rig.sim.batches == []
+    priors = rig.service._view_priors
+    assert priors.decisions[-1][3] == phase
+    assert len(priors.decisions[-1][2]) == 64
+    assert priors.lookups == ([QUALIFIED] if phase == 'planning' else [])
