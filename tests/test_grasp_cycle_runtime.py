@@ -402,6 +402,7 @@ async def acquire_cycle(operations, path):
     )
     evidence = Evidence(path)
     result = await cli.skill_execution(args, settings, evidence, approved, "grasp_cycle")
+    assert result["ok"], {key: result.get(key) for key in ("failure_code", "error", "side_effect_state")}
     return evidence.finish(result)
 
 
@@ -421,7 +422,12 @@ async def test_actual_operations_execute_readback_and_three_cycle_report(operati
     )
     async with Session(operations.settings, evidence) as session:
         report = await qualification.report(session, WORKCELL_ID)
-    assert report["qualified"] and report["consecutive_successes"] == 3, report
+    assert report["qualified"] and report["consecutive_successes"] == 3, {
+        "blockers": report["qualification_blockers"], "cycles": report["cycles"],
+        "inspection_failure": report["inspection"].get("failure_code"),
+        "node_unavailable": report["node"].get("unavailable"),
+        "node_rejected": report["node"].get("rejected"),
+    }
     assert [r["run_id"] for r in report["cycles"]] == [r["run_id"] for r in artifacts]
     assert len({r["run_id"] for r in artifacts}) == 3
     assert operations.setup.rig.sim.halts == 0
@@ -435,7 +441,11 @@ async def test_actual_operations_execute_readback_and_three_cycle_report(operati
     # Every result here uses synthetic sensors; none is exported as physical qualification.
 
 
-async def test_actual_operations_post_exit_drift_halts_once_without_replay(operations, monkeypatch):
+@pytest.mark.parametrize("failure_policy", ["hold", "stop"])
+async def test_actual_operations_post_exit_drift_obeys_policy_without_replay(
+    operations, monkeypatch, failure_policy,
+):
+    operations.settings = replace(operations.settings, failure_policy=failure_policy)
     original = cli.verify_after_exit
 
     async def drift(settings, evidence, plan, final):
@@ -447,7 +457,8 @@ async def test_actual_operations_post_exit_drift_halts_once_without_replay(opera
     path = operations.settings.root / "data/runs/drift.json"
     with pytest.raises(Refusal):
         await acquire_cycle(operations, path)
-    assert operations.setup.rig.sim.halts == 1
+    assert operations.setup.rig.sim.halts == int(failure_policy == "stop")
+    assert operations.setup.rig.sim.batches, "exercise post-exit drift after a completed cycle"
     writes = len(operations.setup.rig.sim.batches)
     await asyncio.sleep(0.05)
     assert len(operations.setup.rig.sim.batches) == writes

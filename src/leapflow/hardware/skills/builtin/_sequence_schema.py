@@ -122,8 +122,13 @@ CARD = (
     "wider than the held width by twice the gripper tolerance; plan refuses one that "
     "cannot pass. Plan uses the arm's declared FK to sample every "
     "joint path and refuses any tool target outside the workspace, and solves every move "
-    "with IK inside the joint limits: an unreachable one is refused with the farthest "
-    "reachable target, so rewrite the program to it; execute repeats the workspace check "
+    "with IK inside the joint limits. The workspace box is not a posture-specific reach "
+    "guarantee: arm.state and hw_skill_list publish sampled top-down height bands in reach; "
+    "use them to choose lift/hover heights. Plan reports unreachable steps together in "
+    "result.problems, with each step's bound or farthest reachable pose (and rotation in "
+    "degrees), so rewrite all reported steps before planning again. Linear continuity is "
+    "tested by subdivision, not by treating every large sample jump as a branch switch. "
+    "Execute repeats the workspace check "
     "from fresh joint state and refuses when the tool or a referenced object moved."
 )
 

@@ -245,3 +245,26 @@ def test_a_failed_preview_start_keeps_its_reason_on_screen() -> None:
     assert "if (!ready.value) { stop(); return; }" not in src
     failed = src[src.index("function failed() {"):]
     assert failed.index("stop(true);") < failed.index("}"), "failed() must preserve the status"
+
+
+# ════════════════════════════════════════════════════════════════
+# Preview: a re-render tore down the stream it was reporting on
+# ════════════════════════════════════════════════════════════════
+
+
+def test_a_rerender_keeps_a_running_preview_alive() -> None:
+    """Every ``monitor.finding`` toasted and refetched the view, and ``render`` released
+    every preview on the way -- so a hardware notice closed the very camera it reported
+    on, in the same millisecond. That read as a rate limit ending the stream; it was the
+    notification. A live panel is carried into the new tree instead.
+    """
+    src = _app()
+    body = src[src.index("function render(spec) {"):src.index("function toast(finding) {")]
+    assert "disposePreviews(true)" in body, "render() must not release a live preview"
+    assert "disposePreviews();" not in body
+    assert "carried.set(entry.key, entry)" in body
+    # A panel the new spec no longer asks for is still stopped, so a dropped lens cannot
+    # leave a socket and a device lease attached to a detached card.
+    assert "if (entry.reused) return;" in body
+    assert "_carryPreviews.get(previewKey)" in src
+    assert "isLive: () => running || starting" in src

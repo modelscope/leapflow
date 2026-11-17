@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import runpy
 from dataclasses import replace
 from pathlib import Path
@@ -60,7 +61,13 @@ def test_invalid_regions_refused(tool, region):
         tool["prepare"](probe(), {"region": region})
 
 
-def test_pose_batches_obey_production_sweep_and_no_rate_percentage_inference(tool):
+@pytest.mark.parametrize("max_moves,max_frames,run_timeout_s,expected", [
+    (8, 16, 120, 4), (2, 16, 120, 2), (8, 4, 120, 2),
+    (8, 16, 65, 2), (8, 16, 90, 3),
+])
+def test_pose_batches_obey_production_sweep_and_no_rate_percentage_inference(
+    tool, max_moves, max_frames, run_timeout_s, expected,
+):
     chain = DhChain((DhLink(250, 180, 370, 0), *(DhLink(0, 0, 0, 0) for _ in range(5))), convention="standard")
     arm = piper_context()
     arm = replace(arm, kinematics=replace(arm.kinematics, dh=chain.to_dict()))
@@ -69,11 +76,35 @@ def test_pose_batches_obey_production_sweep_and_no_rate_percentage_inference(too
         (WorkspaceBox(800, 900, 800, 900, 800, 900),), "offline-fixture", 35, 5, 10, 2)
     policy = PoseCollectionPolicy("a" * 64, MountIdentity("fixture", "flange"), geometry, (0.01,) * 6,
                                   10, "b" * 64, speed_pct_max=1)
-    acquisition = CollectionProfile("camera.wrist", "wrist", ("can",), profile(timeout_s=2), 120, 16 * 1024 * 1024, 16)
+    policy = replace(policy, max_moves=max_moves)
+    acquisition = CollectionProfile("camera.wrist", "wrist", ("can",), profile(timeout_s=2),
+                                    120, 16 * 1024 * 1024, max_frames)
+    dwell = 0.3 + 2 * sum(getattr(acquisition.settled, name) for name in (
+        "receipt_uncertainty_s", "exposure_uncertainty_s", "feedback_uncertainty_s"))
+    per_move = 20 + 2 * acquisition.settled.timeout_s + dwell
+    duration_cap = min(policy.max_duration_s, run_timeout_s)
+    capacity = min(policy.max_moves, acquisition.max_frames // 2,
+                   math.floor((duration_cap - 10) / per_move))
+    assert capacity == expected
     batches = tool["pose_batches"](model, policy, acquisition, arm, [0] * 6,
-                                  move_timeout_s=20, run_timeout_s=120, region=[0, 0, 16, 16])
-    assert batches and all(2 <= len(batch["args"]["poses"]) <= 3 for batch in batches)
-    assert all(batch["duration_budget_s"] <= 120 for batch in batches)
+                                  move_timeout_s=20, run_timeout_s=run_timeout_s, region=[0, 0, 16, 16])
+    assert batches and len(batches[0]["args"]["poses"]) == capacity
+    before = [0] * model.dof
+    for batch in batches:
+        poses = batch["args"]["poses"]
+        assert 2 <= len(poses) <= capacity
+        assert 2 * len(poses) <= acquisition.max_frames
+        assert batch["duration_budget_s"] == pytest.approx(len(poses) * per_move + 10)
+        assert batch["duration_budget_s"] <= duration_cap
+        checks = []
+        for pose in poses:
+            after = list(pose.values())
+            checks.append(policy.sweep(model, [0] * model.dof, before, after))
+            before = after
+        assert batch["nominal_travel_mm"] == pytest.approx(sum(c.travel_mm for c in checks))
+        assert batch["joint_l1_deg"] == pytest.approx(sum(c.joint_l1_deg for c in checks))
+        assert batch["nominal_travel_mm"] <= policy.max_travel_mm
+        assert batch["joint_l1_deg"] <= policy.max_joint_l1_deg
     terms = tool["inflation_requirements"](model, geometry, acquisition.settled, list(policy.joint_rate_bounds_rad_s),
                                           10, fk_mm=5, fk_deg=2)
     slower = replace(policy, speed_pct_max=0.5)

@@ -418,16 +418,21 @@ async def test_a_lifted_box_is_measured_again_where_it_was(tmp_path: Path) -> No
     with pytest.raises(SkillError) as error:
         await scene.relocate(again)
     assert error.value.failure_code == FAILURE_TARGET_NOT_FOUND
-    assert "lift it again" in error.value.message
+    assert "observe again and replan" in error.value.message
+    assert "perceive.snapshot with_cameras=[all]" in error.value.result['next']
+    assert scene.object(lifted.object_id) == again
 
 
-async def test_a_lifted_point_over_an_emptied_table_falls_to_the_table(tmp_path: Path) -> None:
+async def test_a_lifted_point_over_an_emptied_table_preserves_target_identity(tmp_path: Path) -> None:
     registry = _calibrated(tmp_path, CUP)
     scene = _scene(registry)
     lifted = await _lift_cup(scene, PixelTarget("cup", point=_cup_top()))
     registry.devices[CAMERA_ID].boxes = []
-    gone = await scene.relocate(lifted)
-    assert gone.center[2] == pytest.approx(TABLE_Z, abs=2.0)  # the drift check sees it left
+    with pytest.raises(SkillError) as error:
+        await scene.relocate(lifted)
+    assert error.value.failure_code == FAILURE_TARGET_NOT_FOUND
+    assert scene.object(lifted.object_id) == lifted
+    assert scene.observation(lifted)['verdict'] != 'sufficient'
 
 
 # ── Host side: the image channel ─────────────────────────────────────────────

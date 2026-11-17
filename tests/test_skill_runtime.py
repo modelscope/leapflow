@@ -68,7 +68,7 @@ from tests._harness.skill_stubs import (
     write_workcell,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("close_skill_runtimes")]
 
 # Piper X downward-facing fixture inside the existing calibrated box/cone.
 _SAFE_JOINTS = (0.0, 80.0, -55.0, 69.99, 10.0, 0.0)
@@ -184,7 +184,7 @@ async def test_sequence_plan_is_sealed_digested_and_cached(tmp_path: Path) -> No
     runtime = _runtime(tmp_path, registry)
     plan = await runtime.plan(WORKCELL_ID, SEQUENCE, move_by(100))
     assert isinstance(plan, SkillPlan)
-    assert (plan.workcell, plan.skill_id, plan.version) == (WORKCELL_ID, SEQUENCE, "1.2.0")
+    assert (plan.workcell, plan.skill_id, plan.version) == (WORKCELL_ID, SEQUENCE, sequence_skills()[0].spec.version)
     assert plan.targets[0].z == pytest.approx(START_FLANGE[2] - TOOL_LENGTH_MM + 100)
     assert plan.limits == {
         "speed_pct": 20.0,
@@ -199,6 +199,10 @@ async def test_sequence_plan_is_sealed_digested_and_cached(tmp_path: Path) -> No
         "reach_step_mm": 10.0,
         "reach_joint_step_deg": 10.0,
         "reach_joint_margin_deg": 1.0,
+        "reach_continuity_rounds": 4.0,
+        "reach_refine_rounds": 6.0,
+        "reach_envelope_step_mm": 20.0,
+        "reach_envelope_yaw_samples": 8.0,
     }
     assert set(plan.basis["calibration"]) == {"tcp", "workspace"}
     assert plan.digest == plan_digest(plan)
@@ -206,7 +210,7 @@ async def test_sequence_plan_is_sealed_digested_and_cached(tmp_path: Path) -> No
     assert runtime.permit_digest(plan) == run_permit_digest(
         workcell=WORKCELL_ID,
         skill_id=SEQUENCE,
-        version="1.2.0",
+        version=sequence_skills()[0].spec.version,
         plan_digest=plan.digest,
         limits=plan.limits,
     )

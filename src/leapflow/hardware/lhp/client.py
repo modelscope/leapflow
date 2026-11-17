@@ -27,16 +27,20 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import math
 from contextlib import suppress
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
+from leapflow.hardware.lhp.planning_requests import PlanningOwner, PlanningRequests
 from leapflow.hardware.lhp.protocol import (
+    CAP_SKILL_PLAN_CANCEL_V1,
     ERR_CONNECTION_CLOSED,
     ERR_PROTOCOL_MISMATCH,
     ERR_TIMEOUT,
     LHP_SUPPORTED_VERSIONS,
     MAX_FRAME_BYTES,
+    LhpProtocolError,
     LhpRemoteError,
     decode_frame,
     encode_frame,
@@ -50,14 +54,23 @@ DEFAULT_REQUEST_TIMEOUT_S = 10.0
 """Per-request ceiling. A hung node must surface as a failed call, not a hung turn."""
 
 DEFAULT_CONNECT_TIMEOUT_S = 5.0
+MAX_REQUEST_TIMEOUT_S = 605.0
+
+
+def request_timeout(value: float | None, default: float | None = None) -> float | None:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value <= MAX_REQUEST_TIMEOUT_S:
+        raise ValueError(f"request timeout must be finite in (0, {MAX_REQUEST_TIMEOUT_S:g}]")
+    return float(value)
 
 
 class DirectLhpClient:
     """In-process binding: calls ``LhpNodeServer.handle_request`` directly.
 
-    No sockets, no timeouts (an in-process await either completes or the task
-    scheduling it is cancelled), and no token gate -- the same-process trust
-    domain argument from the protocol spec. The hello exchange still runs, so
+    No sockets or token gate -- the same-process trust domain argument from
+    the protocol spec. Requests accept optional deadlines, and preview ownership
+    follows the same cancellation/disconnect rules as sockets. The hello exchange runs, so
     version negotiation and the response shape are identical to the socket path.
     """
 
@@ -68,6 +81,7 @@ class DirectLhpClient:
         self._ids = itertools.count(1)
         self._node_id = ""
         self._closed = False
+        self._planning = server.planning_requests() if isinstance(server, PlanningOwner) else PlanningRequests(None, 32)
 
     async def connect(self) -> Mapping[str, Any]:
         """Negotiate the newest mutually supported version and return hello."""
@@ -94,18 +108,40 @@ class DirectLhpClient:
             f"node supports none of {LHP_SUPPORTED_VERSIONS!r}",
         )
 
-    async def request(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
-        """Send one request; raise ``LhpRemoteError`` when the node answers an error."""
+    async def request(self, method: str, params: Mapping[str, Any] | None = None,
+                      *, timeout_s: float | None = None) -> Any:
+        """Send once, with an optional bounded deadline; never retry writes."""
+        timeout = request_timeout(timeout_s)
         if self._closed:
             raise LhpRemoteError(ERR_CONNECTION_CLOSED, "client closed")
-        return await self._serve(make_request(next(self._ids), method, params))
+        request_id = next(self._ids)
+        task = asyncio.create_task(self._serve(make_request(request_id, method, params)))
+        if method == "skill.plan":
+            try:
+                self._planning.register(request_id, task)
+            except LhpProtocolError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+        try:
+            return await asyncio.wait_for(task, timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            if method == "skill.plan":
+                self._planning.cancel(request_id)
+            if isinstance(exc, asyncio.TimeoutError):
+                raise LhpRemoteError(ERR_TIMEOUT, f"{method!r} timed out after {timeout:g}s") from exc
+            raise
 
     async def close(self) -> None:
-        """No-op: the server belongs to the process, not to this client."""
+        """Cancel owned pure planning; the shared server and effectful runs stay alive."""
         self._closed = True
+        tasks = self._planning.disconnect()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _serve(self, request: Mapping[str, Any]) -> Any:
         response = await self._server.handle_request(dict(request), via="direct")
+        if request.get("method") == "skill.plan":
+            self._planning.publish(request["id"], response, batch="candidates" in (request.get("params") or {}))
         error = response_error(response)
         if error is not None:
             raise LhpRemoteError(error[0], error[1])
@@ -160,10 +196,12 @@ class SocketLhpClient:
         await self._ensure_connected()
         return dict(self._hello)
 
-    async def request(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
-        """Send one request over the (lazily established) connection."""
+    async def request(self, method: str, params: Mapping[str, Any] | None = None,
+                      *, timeout_s: float | None = None) -> Any:
+        """Send once; a per-call timeout never changes other requests' ceilings."""
+        timeout = request_timeout(timeout_s, self._timeout_s)
         await self._ensure_connected()
-        return await self._exchange(method, params)
+        return await self._exchange(method, params, timeout_s=timeout)
 
     async def close(self) -> None:
         """Drop the connection and fail every in-flight request. Never raises.
@@ -264,7 +302,9 @@ class SocketLhpClient:
             ) from exc
         self._reader_task = asyncio.get_running_loop().create_task(self._read_loop())
 
-    async def _exchange(self, method: str, params: Mapping[str, Any] | None) -> Any:
+    async def _exchange(self, method: str, params: Mapping[str, Any] | None,
+                        *, timeout_s: float | None = None) -> Any:
+        timeout = self._timeout_s if timeout_s is None else timeout_s
         reader = self._reader
         writer = self._writer
         if reader is None or writer is None:
@@ -272,26 +312,46 @@ class SocketLhpClient:
         request_id = next(self._ids)
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        try:
+        async def exchange() -> Any:
             async with self._write_lock:
                 writer.write(encode_frame(make_request(request_id, method, params)))
                 await writer.drain()
+            return await future
+
+        try:
+            return await asyncio.wait_for(exchange(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            if method == "skill.plan":
+                await self._cancel_planning(writer, request_id)
+            raise LhpRemoteError(ERR_TIMEOUT, f"{method!r} timed out after {timeout:g}s") from exc
+        except asyncio.CancelledError:
+            if method == "skill.plan":
+                await self._cancel_planning(writer, request_id)
+            raise
         except (ConnectionError, OSError, RuntimeError) as exc:
-            self._pending.pop(request_id, None)
-            future.cancel()
+            if isinstance(exc, LhpRemoteError):
+                raise
             await self._teardown_locked(ERR_CONNECTION_CLOSED, f"send failed: {exc}")
             raise LhpRemoteError(ERR_CONNECTION_CLOSED, f"send failed: {exc}") from exc
-        try:
-            return await asyncio.wait_for(future, timeout=self._timeout_s)
-        except asyncio.TimeoutError as exc:
-            # The late response (if it ever arrives) carries this id, finds no
-            # pending entry, and is dropped -- ids are never reused.
-            self._pending.pop(request_id, None)
-            raise LhpRemoteError(
-                ERR_TIMEOUT, f"{method!r} timed out after {self._timeout_s:g}s"
-            ) from exc
         finally:
             self._pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+
+    async def _cancel_planning(self, writer: asyncio.StreamWriter, request_id: int) -> None:
+        """A bounded cancellation notice; do not retry or close concurrent leases."""
+        if CAP_SKILL_PLAN_CANCEL_V1 not in self._hello.get("capabilities", ()):
+            return
+
+        async def notify() -> None:
+            async with self._write_lock:
+                if self._writer is writer and not writer.is_closing():
+                    writer.write(encode_frame(make_request(next(self._ids), "skill.plan.cancel",
+                                                           {"request_id": request_id})))
+                    await writer.drain()
+
+        with suppress(ConnectionError, OSError, RuntimeError, asyncio.TimeoutError):
+            await asyncio.wait_for(notify(), min(self._timeout_s, DEFAULT_CONNECT_TIMEOUT_S))
 
     async def _read_loop(self) -> None:
         reader = self._reader

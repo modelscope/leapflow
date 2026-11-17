@@ -135,7 +135,7 @@ def test_leap_app_style_builder_accepts_resolved_theme(tmp_path) -> None:
     app = LeapApp(
         console=None,
         theme=theme,
-        status=lambda: [],
+        status=StatusBar(theme),
         history_path=tmp_path / "tui_history",
         on_input=None,
     )
@@ -158,7 +158,7 @@ def test_leap_app_layout_keeps_status_breathing_gap(tmp_path) -> None:
     app = LeapApp(
         console=None,
         theme=theme,
-        status=lambda: [],
+        status=StatusBar(theme),
         history_path=tmp_path / "tui_history",
         on_input=None,
     )

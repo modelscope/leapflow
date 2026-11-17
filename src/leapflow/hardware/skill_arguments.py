@@ -52,6 +52,8 @@ class RunRequest:
     intent: str = ""
     timeout_s: float = DEFAULT_RUN_TIMEOUT_S
     lifted: Mapping[str, Any] = field(default_factory=dict)
+    candidates: list[Any] | None = None
+    selection: Any = None
 
     def repair_view(self) -> dict[str, Any]:
         """What was moved out of ``args``, for the result S2 reads."""
@@ -104,6 +106,14 @@ def split_request(kwargs: Mapping[str, Any], declared: frozenset[str] | None) ->
     unknown) lifts only the routing fields the request cannot proceed without,
     and leaves the rest for the node to refuse by name.
     """
+    batch = kwargs.get("candidates")
+    if "candidates" in kwargs:
+        if PAYLOAD_FIELD in kwargs or "approved_plan" in kwargs:
+            raise SkillRefusal(FAILURE_INVALID_REQUEST, "candidates cannot be combined with args or approved_plan")
+        if not isinstance(batch, list) or not batch:
+            raise SkillRefusal(FAILURE_INVALID_REQUEST, "candidates must be a nonempty list")
+    elif "selection" in kwargs:
+        raise SkillRefusal(FAILURE_INVALID_REQUEST, "selection requires candidates")
     raw = kwargs.get(PAYLOAD_FIELD)
     if raw is not None and not isinstance(raw, Mapping):
         raise SkillRefusal(FAILURE_INVALID_REQUEST, "args must be an object")
@@ -141,6 +151,8 @@ def split_request(kwargs: Mapping[str, Any], declared: frozenset[str] | None) ->
         intent=str(envelope["intent"] or "").strip(),
         timeout_s=_timeout(envelope["timeout_s"]),
         lifted=lifted,
+        candidates=batch,
+        selection=kwargs.get("selection"),
     )
 
 

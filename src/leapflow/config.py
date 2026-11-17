@@ -302,6 +302,8 @@ class Settings:
     # endpoint, and token_env (preferred) or token. Empty retains the legacy
     # LEAPFLOW_FLEET_NODES environment fallback.
     hardware_fleet_nodes: str = ""
+    # JSON bounded rank-only learning policy; never grants motion or trust.
+    hardware_view_priors: str = "{}"
     # JSON array of event-to-action rules evaluated by hardware stream sources.
     # Empty keeps reflex actions disabled until an operator declares them.
     hardware_alert_policies: str = ""
@@ -333,6 +335,13 @@ class Settings:
     hardware_skills_halt_timeout_s: float = 2.0
     hardware_skills_stop_grace_s: float = 1.0
     hardware_skills_dispatch_settle_s: float = 2.0
+    # Bounded pure planning; zero workers selects the CPU-aware automatic count.
+    hardware_skills_planning_workers: int = 0
+    hardware_skills_planning_max_candidates: int = 8
+    hardware_skills_planning_max_jobs: int = 16
+    hardware_skills_planning_timeout_s: float = 30.0
+    hardware_skills_planning_max_bytes: int = 262144
+    hardware_skills_planning_cancel_grace_s: float = 0.5
     # Every executed skill run is recorded as an episode under the profile's
     # hardware/episodes at this rate (0 disables recording); recording is skipped
     # when the disk has less than the free-space floor left.
@@ -1552,6 +1561,9 @@ def _build_settings_from_env(
     # (which persists into runtime.yaml) actually reaches Settings; the legacy
     # LEAPFLOW_FLEET_NODES fallback is applied later, in fleet_config.
     hardware_fleet_nodes = os.getenv("LEAPFLOW_HARDWARE_FLEET_NODES", "").strip()
+    hardware_view_priors = os.getenv("LEAPFLOW_HARDWARE_VIEW_PRIORS", "{}").strip()
+    from leapflow.hardware.view_priors import ViewPriorSettings
+    ViewPriorSettings.from_json(hardware_view_priors)
     hardware_alert_policies = os.getenv("LEAPFLOW_HARDWARE_ALERT_POLICIES", "").strip()
     hardware_advisory_limits = os.getenv("LEAPFLOW_HARDWARE_ADVISORY_LIMITS", "").strip()
     hardware_node_log_file = os.getenv("LEAPFLOW_HARDWARE_NODE_LOG_FILE", "").strip()
@@ -1581,6 +1593,13 @@ def _build_settings_from_env(
     hardware_skills_dispatch_settle_s = float(
         os.getenv("LEAPFLOW_HARDWARE_SKILLS_DISPATCH_SETTLE_S", "2") or 2.0
     )
+    from leapflow.hardware.skills.planning import PlanningSettings
+
+    planning_defaults = PlanningSettings()
+    hardware_planning = PlanningSettings(**{
+        name: type(default)(os.getenv(f"LEAPFLOW_HARDWARE_SKILLS_PLANNING_{name.upper()}", str(default)))
+        for name, default in vars(planning_defaults).items()
+    })
     hardware_skills_episode_fps = float(
         os.getenv("LEAPFLOW_HARDWARE_SKILLS_EPISODE_FPS", "30") or 30.0
     )
@@ -2107,6 +2126,7 @@ def _build_settings_from_env(
         hardware_preview_quality=hardware_preview_quality,
         hardware_preview_idle_timeout_s=hardware_preview_idle_timeout_s,
         hardware_fleet_nodes=hardware_fleet_nodes,
+        hardware_view_priors=hardware_view_priors,
         hardware_alert_policies=hardware_alert_policies,
         hardware_advisory_limits=hardware_advisory_limits,
         hardware_node_log_file=hardware_node_log_file,
@@ -2122,6 +2142,7 @@ def _build_settings_from_env(
         hardware_skills_halt_timeout_s=hardware_skills_halt_timeout_s,
         hardware_skills_stop_grace_s=hardware_skills_stop_grace_s,
         hardware_skills_dispatch_settle_s=hardware_skills_dispatch_settle_s,
+        **{f"hardware_skills_planning_{name}": value for name, value in vars(hardware_planning).items()},
         hardware_skills_episode_fps=hardware_skills_episode_fps,
         hardware_skills_episode_min_free_mb=hardware_skills_episode_min_free_mb,
         hardware_share_frames=hardware_share_frames,

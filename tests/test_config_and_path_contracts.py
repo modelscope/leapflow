@@ -337,6 +337,24 @@ def test_secret_vault_is_profile_scoped_and_separate_from_config(layout) -> None
     assert vault != key, "key material must be separate from the vault payload"
 
 
+def test_package_data_uses_valid_package_names_and_preserves_task_resources() -> None:
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    config = tomllib.loads((root / 'pyproject.toml').read_text())
+    resources = config['tool']['setuptools']['package-data']
+    assert all(name == '*' or all(part.isidentifier() for part in name.split('.'))
+               for name in resources)
+    included = {path.relative_to(root / 'src').as_posix()
+                for name, patterns in resources.items() if name.startswith('leapspace.')
+                for pattern in patterns
+                for path in (root / 'src' / name.replace('.', '/')).glob(pattern)}
+    assert 'leapspace/app_space/tasks/task-001/config.yaml' in included
+
+
 # ── Graceful degradation ─────────────────────────────────────────────────
 
 

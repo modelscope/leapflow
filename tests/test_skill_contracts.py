@@ -29,6 +29,7 @@ from leapflow.hardware.skills.builtin.motion import skills as motion_skills
 from leapflow.hardware.skills.builtin.policy import skills as policy_skills
 from leapflow.hardware.skills.builtin.scene import skills as scene_skills
 from leapflow.hardware.skills.builtin.sequence import skills as sequence_skills
+from leapflow.hardware.skills.builtin.survey import skills as survey_skills
 from leapflow.hardware.skills.digest import plan_digest, run_permit_digest
 from leapflow.hardware.skills.geometry import (
     Pose,
@@ -120,6 +121,7 @@ def _builtin_skills() -> tuple[NodeSkill, ...]:
     return (
         *motion_skills(),
         *sequence_skills(),
+        *survey_skills(),
         *calibration_skills(),
         *camera_skills(),
         *readiness_skills(),

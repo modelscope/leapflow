@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from leapflow.hardware.skills.episodes import EpisodeSettings
+from leapflow.hardware.skills.planning import PlanningSettings
 
 DEFAULT_PLAN_TTL_S = 300.0
 
@@ -26,6 +27,7 @@ class SkillRuntimeSettings:
     stop_grace_s: float = 1.0  # a stopped skill's unwind before it is cancelled
     dispatch_settle_s: float = 2.0  # in-flight writes reconciled before release
     episodes: EpisodeSettings = field(default_factory=EpisodeSettings)
+    planning: PlanningSettings = field(default_factory=PlanningSettings)
 
     @classmethod
     def from_settings(cls, settings: Any) -> "SkillRuntimeSettings":
@@ -41,6 +43,10 @@ class SkillRuntimeSettings:
             halt_timeout_s=float(getattr(settings, "hardware_skills_halt_timeout_s", 2.0)),
             stop_grace_s=float(getattr(settings, "hardware_skills_stop_grace_s", 1.0)),
             dispatch_settle_s=float(getattr(settings, "hardware_skills_dispatch_settle_s", 2.0)),
+            planning=PlanningSettings(**{
+                name: getattr(settings, f"hardware_skills_planning_{name}", default)
+                for name, default in vars(PlanningSettings()).items()
+            }),
             episodes=EpisodeSettings(
                 directory=layout.hardware.episodes_dir if layout is not None else None,
                 fps=float(getattr(settings, "hardware_skills_episode_fps", 30.0)),

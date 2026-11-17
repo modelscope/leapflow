@@ -15,7 +15,20 @@ through the skill's arguments) picks by id.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
+
+# Pure prepared-planning contracts are part of the skill-facing boundary.
+from leapflow.hardware.skills.motion_geometry import MotionGeometry as MotionGeometry
+from leapflow.hardware.skills.planning import (
+    CalculationPort as CalculationPort,
+    Deadline as Deadline,
+    Evaluation as Evaluation,
+    FrozenJoints as FrozenJoints,
+    PlanningCheckpoint as PlanningCheckpoint,
+    PlanningSettings as PlanningSettings,
+    PreparedPlanning as PreparedPlanning,
+    encoded as encoded,
+)
 
 from leapflow.hardware.skills.frame_status import Accuracy, FrameDiagnosis
 from leapflow.hardware.skills.geometry import Plane, Pose, Transform, WorkspaceBox
@@ -74,6 +87,11 @@ class WorkcellView(Protocol):
     @property
     def freshness(self) -> Mapping[str, float]:
         """How far the world may drift between plan and execute (mm, deg)."""
+        ...
+
+    @property
+    def observation(self) -> Mapping[str, Any]:
+        """Declared observation policy, camera ranges and optional yielding posture."""
         ...
 
     @property
@@ -145,6 +163,10 @@ class ReachCheck(Protocol):
 class MotionFacade(Protocol):
     """Governed discrete motion. Every call goes through the node write gate."""
 
+    def geometry_snapshot(self) -> MotionGeometry:
+        """Detached frozen motion values suitable for pure planning jobs."""
+        ...
+
     async def state(self) -> ArmState: ...
 
     def check_target(self, pose: Pose) -> None:
@@ -167,6 +189,10 @@ class MotionFacade(Protocol):
         """Bounded IK waypoints whose actual joint-space paths pass workspace checks."""
         ...
 
+    def reach_envelope(self) -> Mapping[str, Any]:
+        """Cached posture-specific guidance; never authority to execute a move."""
+        ...
+
     def reach_tracker(self, state: ArmState) -> ReachCheck:
         """Plan-time IK that follows pose targets from *state* inside the joint limits."""
         ...
@@ -185,8 +211,11 @@ class MotionFacade(Protocol):
     ) -> MotionResult: ...
 
     async def move_joints(
-        self, targets: Mapping[str, float], *, speed_pct: float | None = None
-    ) -> MotionResult: ...
+        self, targets: Mapping[str, float], *, speed_pct: float | None = None,
+        validate: Callable[[ArmState], None] | None = None,
+    ) -> MotionResult:
+        """Revalidate an optional pure path guard against the final pre-write state."""
+        ...
 
     async def gripper(self, width_mm: float, *, effort: float | None = None) -> GripperResult:
         """Drive the gripper and wait until its width is stable (the declared settling)."""
@@ -255,6 +284,10 @@ class ScenePort(Protocol):
         id, and the targets that lifted to nothing (``label``, ``reason``)."""
         ...
 
+    def observation(self, obj: LocatedObject, grasp: GraspCandidate | None = None) -> Mapping[str, Any]:
+        """Evidence for the exact geometry; optionally evaluated against a grasp's slack."""
+        ...
+
     def object(self, object_id: str) -> LocatedObject:
         """A remembered object; raises ``target_not_found`` when unknown or aged out."""
         ...
@@ -268,9 +301,10 @@ class ScenePort(Protocol):
         ...
 
     def remember_grasps(
-        self, obj: LocatedObject, candidates: Sequence[GraspCandidate]
+        self, obj: LocatedObject, candidates: Sequence[GraspCandidate], *,
+        validate: Callable[[tuple[GraspCandidate, ...]], None] | None = None,
     ) -> tuple[GraspCandidate, ...]:
-        """Name *candidates* for *obj* ``gN`` (replacing earlier grasps of that object)."""
+        """Name candidates atomically after synchronous validation of the exact named values."""
         ...
 
     def grasp(self, grasp_id: str) -> GraspCandidate:
@@ -283,6 +317,15 @@ class ScenePort(Protocol):
     def hold(self, held: HeldObject) -> None: ...
 
     def release(self) -> HeldObject | None: ...
+
+
+@runtime_checkable
+class SurveyPort(Protocol):
+    """Finite owner-side observation under the ordinary skill lifecycle."""
+
+    async def plan(self, args: Mapping[str, Any]) -> SkillPlan: ...
+
+    async def execute(self, plan: SkillPlan) -> SkillOutcome: ...
 
 
 @runtime_checkable
@@ -480,9 +523,27 @@ class SkillContext(Protocol):
     def motion(self) -> MotionFacade: ...
 
     @property
+    def calculations(self) -> CalculationPort: ...
+
+    @property
+    def planning_settings(self) -> PlanningSettings: ...
+
+    @property
+    def planning_deadline(self) -> float:
+        """End-to-end owner deadline, including admission and preparation."""
+        ...
+
+    async def planning_basis(self) -> Mapping[str, Any]:
+        """Current owner identity, physical generation, and calibration; refuses shutdown."""
+        ...
+
+    @property
     def scene(self) -> ScenePort:
         """Perception; raises ``SkillError`` when the workcell has no camera or locator."""
         ...
+
+    @property
+    def survey(self) -> SurveyPort: ...
 
     @property
     def grasp_planner(self) -> GraspPlanner:
@@ -539,6 +600,11 @@ class SkillContext(Protocol):
         """Persist a calibration version; returns its ``recorded_at``."""
         ...
 
+    @property
+    def evidence(self) -> Mapping[str, Any]:
+        """Current owner-loop evidence, used to bound complete planning responses."""
+        ...
+
     def note(self, key: str, value: Any) -> None:
         """Attach evidence to the run (timings, verdicts, measured residuals)."""
         ...
@@ -592,6 +658,7 @@ __all__ = [
     "PolicyPort",
     "ReachCheck",
     "ScenePort",
+    "SurveyPort",
     "SkillContext",
     "VisionPort",
     "WorkcellView",

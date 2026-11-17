@@ -111,7 +111,9 @@ class TestPermitRoundTrip:
         verifier = _make_verifier(issuer)
         permit = _issue(issuer)
         # Flip a byte in the signature
-        bad_sig = "ff" + permit.signature[2:]
+        signature = bytearray.fromhex(permit.signature)
+        signature[0] ^= 0xff
+        bad_sig = signature.hex()
         tampered = ExecutionPermit(**{**permit.to_dict(), "signature": bad_sig})
         rejection = verifier.verify(tampered, expected_digest=tampered.action_digest)
         assert rejection is not None

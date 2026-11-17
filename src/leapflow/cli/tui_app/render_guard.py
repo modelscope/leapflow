@@ -1,6 +1,28 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Wide-glyph-safe screen diffing for prompt_toolkit's renderer.
+"""Terminal-safe screen diffing for prompt_toolkit's renderer.
 
+The guard wrapped around prompt_toolkit's screen diff enforces two
+guarantees: no wide-glyph splitting and no output for unchanged frames.
+
+Unchanged frames emit nothing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+prompt_toolkit re-emits cursor hide/show, autowrap and attribute resets on
+every render, even when no cell changed. LeapFlow previously requested a
+redraw every 0.5 seconds. These cursor changes can interfere with an IME. An
+IME composition (pinyin and other input methods) lives only inside the
+terminal, so the program cannot see it. Terminal stores the marked text
+inline in its line buffer at the cursor. The crash logs show an exception
+in ``setMarkedText``: ``TTBufferRemoveObjectsInRange ... Range is out of
+bounds``, followed by a NULL dereference during drawing. Earlier exceptions
+recurred at the refresh cadence. This implicates program-driven cursor/line
+updates under an open composition; the exact native race is not observable
+through a pipe-input test. LeapFlow no longer redraws on a timer, and an
+identical frame writes no bytes at all. Cosmetic clocks hold during drafts
+and idle periods (see ``display_clock``). Real output and approval changes
+still render; this guard does not claim to detect terminal-local IME state.
+
+No write lands on part of a wide glyph
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 prompt_toolkit repaints a non-fullscreen Application by diffing the new
 screen against the previous one cell by cell and overwriting only the cells
 that changed. When a draft mixes double-width (CJK) and narrow glyphs, an
@@ -38,7 +60,7 @@ from prompt_toolkit.output import Output
 
 logger = logging.getLogger(__name__)
 
-_GUARD_MARKER = "_leapflow_wide_glyph_guard"
+_GUARD_MARKER = "_leapflow_render_guard"
 _EXPECTED_PARAMS = (
     "app",
     "output",
@@ -85,6 +107,51 @@ def blank_undrawable_wide_glyphs(screen: Screen, size: Size) -> int:
             row[x] = _CHAR_CACHE[" ", char.style]
             replaced += 1
     return replaced
+
+
+def _rows_equal(screen: Screen, previous_screen: Screen, y: int, width: int) -> bool:
+    new_row = screen.data_buffer.get(y)
+    old_row = previous_screen.data_buffer.get(y)
+    # Read each Screen's own default without inserting cells into either one.
+    new_default_row = screen.data_buffer.default_factory()
+    old_default_row = previous_screen.data_buffer.default_factory()
+    new_blank = new_default_row.default_factory()
+    old_blank = old_default_row.default_factory()
+    new_row = new_row if new_row is not None else {}
+    old_row = old_row if old_row is not None else {}
+    for x in set(new_row) | set(old_row):
+        if x >= width:
+            continue
+        new_char = new_row.get(x, new_blank)
+        old_char = old_row.get(x, old_blank)
+        if new_char.char != old_char.char or new_char.style != old_char.style:
+            return False
+    new_escapes = screen.zero_width_escapes.get(y) or {}
+    old_escapes = previous_screen.zero_width_escapes.get(y) or {}
+    return new_escapes == old_escapes
+
+
+def frame_unchanged(
+    screen: Screen,
+    previous_screen: Screen,
+    cursor_target: Point,
+    current_pos: Point,
+    size: Size,
+) -> bool:
+    """True when the terminal already shows ``screen`` with the cursor in place.
+
+    Such a repaint would only re-emit cursor and attribute toggles, which can
+    invalidate IME composition on affected terminals (see the module docstring).
+    Uses ``.get`` throughout because the screens' buffers are defaultdicts.
+    """
+    if screen.show_cursor != previous_screen.show_cursor:
+        return False
+    if cursor_target != current_pos:
+        return False
+    if screen.height != previous_screen.height:
+        return False  # Preserve space reservation and trimming.
+    rows = min(max(screen.height, previous_screen.height), size.rows)
+    return all(_rows_equal(screen, previous_screen, y, size.columns) for y in range(rows))
 
 
 def _first_changed_column(old_row: dict[int, Char], new_row: dict[int, Char], blank: Char) -> int | None:
@@ -170,6 +237,9 @@ def _wrap(original: Callable[..., tuple[Point, str | None]]) -> Callable[..., tu
     ) -> tuple[Point, str | None]:
         blank_undrawable_wide_glyphs(screen, size)
         if previous_screen is not None and not is_done and previous_width == size.columns:
+            cursor_target = screen.get_cursor_position(app.layout.current_window)
+            if frame_unchanged(screen, previous_screen, cursor_target, current_pos, size):
+                return current_pos, last_style
             current_pos, erased = erase_misaligned_wide_tails(
                 output, screen, previous_screen, current_pos, size
             )
@@ -196,7 +266,7 @@ def _wrap(original: Callable[..., tuple[Point, str | None]]) -> Callable[..., tu
     return guarded_output_screen_diff
 
 
-def install_wide_glyph_guard() -> bool:
+def install_render_guard() -> bool:
     """Install the guard into prompt_toolkit's renderer (idempotent).
 
     Returns False, leaving prompt_toolkit untouched, when the renderer's
@@ -208,7 +278,7 @@ def install_wide_glyph_guard() -> bool:
         return False
     current = getattr(renderer_module, "_output_screen_diff", None)
     if current is None:
-        logger.warning("wide-glyph guard not installed: prompt_toolkit renderer has no screen diff")
+        logger.warning("render guard not installed: prompt_toolkit renderer has no screen diff")
         return False
     if getattr(current, _GUARD_MARKER, False):
         return True
@@ -218,7 +288,7 @@ def install_wide_glyph_guard() -> bool:
         params = ()
     if params != _EXPECTED_PARAMS:
         logger.warning(
-            "wide-glyph guard not installed: unexpected prompt_toolkit screen diff signature %s",
+            "render guard not installed: unexpected prompt_toolkit screen diff signature %s",
             params,
         )
         return False

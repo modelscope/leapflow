@@ -118,6 +118,7 @@ class SceneMemory:
         self._frames: dict[str, tuple[SceneCapture, float]] = {}
         self._views: dict[str, tuple[tuple[ViewTile, ...], float]] = {}
         self._signatures: dict[str, Any] = {}
+        self._observations: dict[str, tuple[LocatedObject, Any]] = {}
         self._basis: dict[str, float] = {}
         self._counter = 0
         self._grasp_counter = 0
@@ -132,6 +133,7 @@ class SceneMemory:
         self._rebase(basis)
         self._objects = {}
         self._grasps = {}
+        self._observations = {}
         return self.add(objects, basis)
 
     def add(
@@ -147,10 +149,31 @@ class SceneMemory:
         self._objects.update((obj.object_id, (obj, now)) for obj in named)
         return tuple(named)
 
-    def update(self, obj: LocatedObject, basis: Mapping[str, float]) -> None:
-        """Record a fresh observation of an object already remembered."""
+    def update(self, obj: LocatedObject, basis: Mapping[str, float], *, invalidate_grasps: bool = False) -> None:
+        """Refresh measurement; callers checking approved drift retain their handles.
+
+        A survey that replaces planning geometry explicitly invalidates old grasps.
+        Ordinary freshness checks compare the fresh geometry with the approved value.
+        """
         if dict(basis) == self._basis and obj.object_id in self._objects:
+            previous = self._objects[obj.object_id][0]
             self._objects[obj.object_id] = (obj, self._clock())
+            if previous != obj:
+                self._observations.pop(obj.object_id, None)
+            if invalidate_grasps:
+                self._grasps = {k: v for k, v in self._grasps.items() if v[0].object_id != obj.object_id}
+
+    def remember_observation(self, obj: LocatedObject, report: Any, basis: Mapping[str, float]) -> None:
+        """Evidence belongs to the exact object value, not just its handle."""
+        entry = self._objects.get(obj.object_id)
+        if dict(basis) == self._basis and entry is not None and entry[0] == obj:
+            self._observations[obj.object_id] = (obj, report)
+
+    def observation(self, obj: LocatedObject, basis: Mapping[str, float], ttl_s: float) -> Any:
+        entry = self._observations.get(obj.object_id)
+        if entry is None or entry[0] != obj or self.recall(obj.object_id, basis, ttl_s) != obj:
+            return None
+        return entry[1]
 
     def recall(
         self, object_id: str, basis: Mapping[str, float], ttl_s: float
@@ -167,18 +190,22 @@ class SceneMemory:
         )
 
     def remember_grasps(
-        self, object_id: str, candidates: Sequence[GraspCandidate]
+        self, object_id: str, candidates: Sequence[GraspCandidate], *,
+        validate: Callable[[tuple[GraspCandidate, ...]], None] | None = None,
     ) -> tuple[GraspCandidate, ...]:
-        """Name *candidates* ``gN`` for *object_id*, replacing that object's earlier ones."""
+        """Name candidates atomically; synchronous validation precedes all memory changes."""
+        named = tuple(
+            replace(candidate, grasp_id=f"g{self._grasp_counter + index}", object_id=object_id)
+            for index, candidate in enumerate(candidates, 1)
+        )
+        if validate is not None:
+            validate(named)
         now = self._clock()
-        self._grasps = {k: v for k, v in self._grasps.items() if v[0].object_id != object_id}
-        named = []
-        for candidate in candidates:
-            self._grasp_counter += 1
-            grasp = replace(candidate, grasp_id=f"g{self._grasp_counter}", object_id=object_id)
-            self._grasps[grasp.grasp_id] = (grasp, now)
-            named.append(grasp)
-        return tuple(named)
+        retained = {k: v for k, v in self._grasps.items() if v[0].object_id != object_id}
+        retained.update((grasp.grasp_id, (grasp, now)) for grasp in named)
+        self._grasps = retained
+        self._grasp_counter += len(named)
+        return named
 
     def recall_grasp(
         self, grasp_id: str, basis: Mapping[str, float], ttl_s: float
@@ -262,6 +289,7 @@ class SceneMemory:
         """Forget everything measured against another calibration."""
         if dict(basis) != self._basis:
             self._objects, self._grasps, self._frames, self._views = {}, {}, {}, {}
+            self._observations = {}
             self._basis = dict(basis)
 
     def _valid(self, seen_at: float, basis: Mapping[str, float], ttl_s: float) -> bool:
@@ -275,6 +303,7 @@ class SceneMemory:
         self._held = held
         gone = held.obj.object_id
         self._objects.pop(gone, None)  # it is no longer on the table
+        self._observations.pop(gone, None)
         self._grasps = {k: v for k, v in self._grasps.items() if v[0].object_id != gone}
 
     def release(self) -> HeldObject | None:

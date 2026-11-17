@@ -23,11 +23,13 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_DEVICE_BUSY,
     FAILURE_ESTOPPED,
     FAILURE_GUARD_FAILED,
+    FAILURE_GRASP_INFEASIBLE,
     FAILURE_INTERNAL_DEFECT,
     FAILURE_INVALID_ARGS,
     FAILURE_LEASE_LOST,
     FAILURE_MODEL_UNAVAILABLE,
     FAILURE_OUT_OF_WORKSPACE,
+    FAILURE_OBSERVATION_INSUFFICIENT,
     FAILURE_PLAN_STALE,
     FAILURE_PLAN_UNKNOWN,
     FAILURE_SHIELD_VIOLATION,
@@ -78,12 +80,27 @@ _NEXT_STEPS: dict[str, str] = {
         "server on the node is running, then plan again."
     ),
     FAILURE_UNREACHABLE: (
-        "The target is outside what the arm can safely reach. When result.limit names the "
-        "bound a step exceeded (quantity, value, min/max; result.step the step), change that "
-        "step so it stays inside the bound and plan again. When result.reach names how far "
-        "the arm gets, tell the user that distance and the limiting joint and offer its "
-        "farthest target instead; otherwise tell the user the workcell's reachable range "
-        "(hw_skill_list) or choose another target."
+        "Rewrite every step in result.problems, not just result.step. "
+        "result.limit names the exceeded bound; result.reach names reachable distance/rotation, "
+        "farthest pose and limiting joint (z_max_mm for a top-down lift). Tell the user what "
+        "binds and use the reported reach when choosing another target. arm.state and "
+        "hw_skill_list publish posture-specific height bands in reach; the workspace box "
+        "alone does not guarantee reach. Use the bands to choose hover heights, then check "
+        "the actual posture/path with a new plan."
+    ),
+    FAILURE_GRASP_INFEASIBLE: (
+        "No grasp fits the measured object geometry and gripper opening; this is not an "
+        "arm-reach failure. Compare result.fit measured_width_mm, max_width_mm and "
+        "min_slack_mm. Re-measure with a suitable camera (camera.wrist when available), "
+        "then propose again with the new object id; never override measured dimensions "
+        "or gripper limits to force a grasp."
+    ),
+    FAILURE_OBSERVATION_INSUFFICIENT: (
+        "Measurement is insufficient, not proof of unreachability. Read result.observation "
+        "for unsupported dimensions, camera conflicts, or unknown accuracy. A fresh passive "
+        "auto-camera locate or a governed perceive.survey can gather evidence. If observation "
+        "remains insufficient, request perceive.snapshot with all cameras where frame sharing "
+        "is allowed, or ask the user to clear the view; never invent geometry or widen limits."
     ),
     FAILURE_PLAN_STALE: "Plan again with hw_skill_run; the new plan needs a new approval.",
     FAILURE_GUARD_FAILED: (
@@ -249,6 +266,8 @@ def workcell_view(
             card["args_schema"] = entry.get("args_schema")
         else:
             card["args"] = args_signature(as_mapping(entry.get("args_schema")))
+        if entry.get("batch_planning"):
+            card["batch_planning"] = entry["batch_planning"]
         card["available"] = bool(entry.get("available"))
         if not card["available"]:
             card["reason"] = entry.get("reason")
@@ -266,6 +285,7 @@ def workcell_view(
         "roles": cell.get("roles"),
         "limits": cell.get("limits"),
         "gripper_spec": cell.get("gripper_spec"),
+        "reach": cell.get("reach") or {},
         "calibration": cell.get("calibration"),
         "calibration_stale": cell.get("calibration_stale") or {},
         "calibration_status": frame_status_view(as_mapping(cell.get("calibration_status"))),

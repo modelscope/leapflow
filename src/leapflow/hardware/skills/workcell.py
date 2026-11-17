@@ -108,6 +108,7 @@ WORKCELL_FIELDS = frozenset(
         "grasp",
         "grasp_verify",
         "perception",
+        "observation",
         "policy",
         "policies",
         "calibration_target",
@@ -183,6 +184,7 @@ class WorkcellSpec:
     grasp: Mapping[str, Any] = field(default_factory=dict)
     grasp_verify: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_GRASP_VERIFY))
     perception: Mapping[str, float] = field(default_factory=dict)
+    observation: Mapping[str, Any] = field(default_factory=dict)
     policy: Mapping[str, float] = field(default_factory=dict)
     policies: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     calibration_target: Mapping[str, Any] = field(default_factory=dict)
@@ -253,6 +255,7 @@ class WorkcellSpec:
             "grasp": {**dict(self.grasp), "planner": self.grasp_planner},
             "grasp_verify": dict(self.grasp_verify),
             "perception": dict(self.perception),
+            "observation": dict(self.observation),
             "policy": dict(self.policy),
             "policies": {name: dict(decl) for name, decl in self.policies.items()},
             "calibration_target": dict(self.calibration_target),
@@ -311,6 +314,7 @@ class WorkcellSpec:
                 grasp=_parse_grasp(data.get("grasp") or {}),
                 grasp_verify=_parse_grasp_verify(data.get("grasp_verify") or {}),
                 perception=_float_map(data.get("perception") or {}, "perception"),
+                observation=_parse_observation(data.get("observation") or {}),
                 policy=_float_map(data.get("policy") or {}, "policy"),
                 policies=_parse_policies(data.get("policies") or {}),
                 calibration_target=_mapping(
@@ -330,6 +334,12 @@ class WorkcellSpec:
             raise
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkcellError(f"workcell {workcell_id!r}: {exc}") from exc
+
+
+def _parse_observation(raw: Mapping[str, Any]) -> dict[str, Any]:
+    from leapflow.hardware.skills.observability import ObservationSettings
+    ObservationSettings.from_mapping(raw)
+    return dict(raw)
 
 
 def _parse_bridge(data: Mapping[str, Any], **bindings: Any) -> dict[str, Any]:

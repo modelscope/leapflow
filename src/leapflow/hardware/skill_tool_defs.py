@@ -54,6 +54,30 @@ _RUN_SCHEMA: dict[str, Any] = {
                 f"{DEFAULT_RUN_TIMEOUT_S:g}, max {MAX_RUN_TIMEOUT_S:g})"
             ),
         },
+        "candidates": {
+            "type": "array", "minItems": 1, "maxItems": 32,
+            "items": {"type": "object", "required": ["id", "args"],
+                      "additionalProperties": False,
+                      "properties": {"id": {"type": "string", "minLength": 1, "maxLength": 64},
+                                     "args": {"type": "object"}}},
+            "description": "Task-equivalent complete independent programs, evaluated together; only one selected plan executes. Requires advertised batch_planning; cannot combine with args or approved_plan.",
+        },
+        "selection": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "require_verified": {"type": "boolean", "default": True},
+                "order": {"type": "array", "minItems": 1, "maxItems": 5,
+                          "items": {"oneOf": [{"type": "string"},
+                              {"type": "object", "required": ["metric"], "additionalProperties": False,
+                               "properties": {"metric": {"type": "string"},
+                                              "direction": {"type": "string", "enum": ["min", "max"]}}}]}},
+            },
+            "description": "Lexicographic advertised metrics, default joint_margin max, joint_travel min, tcp_distance_mm min. Verified candidates rank first.",
+        },
+        "approved_plan": {
+            "type": "object",
+            "description": "Reuse the exact full selected preview plan with its exact args; still requires approval and freshness. Expired/consumed plans refuse without replanning; incompatible with candidates.",
+        },
         "args": {
             "type": "object",
             "description": (
@@ -100,7 +124,9 @@ def build_skill_tools(service: "SkillService") -> list[ToolMetadata]:
                 "policy). The node plans the run; an actuating plan is shown to the user for "
                 "approval, then the node executes it while the host keeps its lease alive. Use "
                 "dry_run to see the plan without moving. A failed run whose side_effect_state "
-                "is not 'none' must never be repeated: the next attempt is a new plan."
+                "is not 'none' must never be repeated: the next attempt is a new plan. "
+                "For advertised batch_planning, submit task-equivalent candidates in one call; "
+                "the node validates and ranks them without another model call, executing only the selected plan."
             ),
             parameters_schema=dict(_RUN_SCHEMA),
             handler=service.hw_skill_run,

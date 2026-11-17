@@ -27,6 +27,12 @@ DEFAULT_LIMITS: Mapping[str, float] = {
     "reach_step_mm": 10.0,
     "reach_joint_step_deg": 10.0,
     "reach_joint_margin_deg": 1.0,
+    "reach_continuity_rounds": 4.0,
+    "reach_refine_rounds": 6.0,
+    "reach_envelope_step_mm": 20.0,
+    "reach_envelope_yaw_samples": 8.0,
+    "reach_envelope_timeout_s": 5.0,  # advisory computation must fit ordinary LHP requests
+    "reach_envelope_ik_iterations": 16.0,  # guidance only; missed samples remain unknown
     "max_steps": 16.0,  # steps one motion.sequence may carry
     "max_wait_s": 10.0,  # longest single ``wait`` step
 }
@@ -137,6 +143,14 @@ def tuned(raw: Any, name: str, defaults: Mapping[str, float]) -> dict[str, float
     values = dict(defaults)
     for key, value in raw.items():
         values[str(key)] = positive(value, f"{name}.{key}")
+        if key in {"reach_continuity_rounds", "reach_refine_rounds", "reach_envelope_yaw_samples"}:
+            if not values[str(key)].is_integer() or values[str(key)] > 16:
+                raise ValueError(f"{name}.{key} must be an integer from 1 to 16")
+        if key == "reach_envelope_timeout_s" and values[str(key)] > 5:
+            raise ValueError(f"{name}.{key} must be at most 5 seconds")
+        if key == "reach_envelope_ik_iterations":
+            if not values[str(key)].is_integer() or values[str(key)] > 50:
+                raise ValueError(f"{name}.{key} must be an integer from 1 to 50")
     return values
 
 

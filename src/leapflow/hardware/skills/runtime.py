@@ -42,8 +42,10 @@ bound to that context's sensing.
 This lifecycle orchestrator retains the run/dispatch settlement ordering in one
 place; declaration reload, run admission, and the catalog view (frame snapshots,
 readiness, refusals -- ``runtime_readiness.py``) are delegated to focused helpers.
-The file remains near the 800-line soft limit to keep stop/late-landing ownership
-and the single execution path auditable without splitting their shared state.
+Why this file exceeds 800 lines: stop/late-landing ownership and the single
+execution path share mutable run state that must not be split. Catalog RPC
+orchestration also snapshots registry/frame state here before offloading only
+the pure reach-envelope calculation, preserving snapshot and lifecycle ownership.
 """
 
 from __future__ import annotations
@@ -60,6 +62,9 @@ from leapflow.hardware.node_gate import NodeWriteGate
 from leapflow.hardware.skills.args import validate_args
 from leapflow.hardware.skills.admission import RunAdmission, effective_limits, ensure_model_use, execution_basis, generation_basis, seal_plan
 from leapflow.hardware.skills.context import RunContext
+from leapflow.hardware.skills.planning import CalculationPort, METRICS, PlanningSettings, PreparedPlanningSkill
+from leapflow.hardware.skills.planning_worker import PlanningWorkers
+from leapflow.hardware.skills import runtime_planning
 from leapflow.hardware.skills.digest import run_permit_digest
 from leapflow.hardware.skills.episodes import (
     NULL_TAP,
@@ -69,6 +74,7 @@ from leapflow.hardware.skills.episodes import (
 )
 from leapflow.hardware.skills.frames import FrameGraph
 from leapflow.hardware.skills.runtime_readiness import cell_listing, plan_refusal, snapshot_frames
+from leapflow.hardware.skills.reach_envelope import envelope_view
 from leapflow.hardware.skills.grasp import (
     AdmissionSensing,
     GraspSensing,
@@ -160,10 +166,12 @@ class SkillRuntime:
         sleep: Sleep = asyncio.sleep,
         poll_s: float = POLL_S,
         planners: Mapping[str, PlannerFactory] | None = None,
+        calculations: CalculationPort | None = None,
     ) -> None:
         self._registry = registry
         self._node_session_id = uuid.uuid4().hex
         self._settings = settings or SkillRuntimeSettings()
+        self._calculations = calculations if calculations is not None else PlanningWorkers(self._settings.planning)
         self._gate = gate or NodeWriteGate(registry)
         self._clock = clock
         self._sleep = sleep
@@ -179,6 +187,7 @@ class SkillRuntime:
         else:
             self._workcells = dict(workcells)
         self._plans: dict[str, tuple[SkillPlan, float]] = {}
+        self._planning_tasks: set[asyncio.Task[Any]] = set()
         self._runs: dict[str, SkillRun] = {}
         self._held: dict[str, str] = {}  # device_id -> run_id
         self._closing = False
@@ -260,10 +269,36 @@ class SkillRuntime:
         for spec in self._workcells.values():
             if workcell and spec.workcell_id != workcell:
                 continue
-            cell = cell_listing(self._skills, self._offered(spec), spec, self._frames(spec))
-            advised = [note.detail for note in advisory_notes(spec, self.ADVICE)]
-            cells.append({**cell, "advisories": advised} if advised else cell)
+            frames = self._frames(spec)
+            arm = self._registry.context(spec.role("arm")) if spec.role("arm") else None
+            reach = envelope_view(arm, spec, frames) if arm is not None else {}
+            cells.append(self._listed_cell(spec, frames, reach))
         return {"workcells": cells, "rejected": self._report.to_dict()["rejected"]}
+
+    async def list_async(self, workcell: str = "") -> dict[str, Any]:
+        """Catalog RPC: only CPU-heavy IK leaves the event loop, never registry/storage reads."""
+        snapshots = [
+            (spec, self._frames(spec),
+             self._registry.context(spec.role("arm")) if spec.role("arm") else None)
+            for spec in tuple(self._workcells.values())
+            if not workcell or spec.workcell_id == workcell
+        ]
+        cells = []
+        for spec, frames, arm in snapshots:
+            reach = await asyncio.to_thread(envelope_view, arm, spec, frames) if arm else {}
+            cells.append(self._listed_cell(spec, frames, reach))
+        return {"workcells": cells, "rejected": self._report.to_dict()["rejected"]}
+
+    def _listed_cell(
+        self, spec: WorkcellSpec, frames: FrameGraph, reach: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        cell = cell_listing(self._skills, self._offered(spec), spec, frames, reach)
+        for entry in cell["skills"]:
+            if isinstance(self._skills[entry["skill_id"]], PreparedPlanningSkill):
+                entry["batch_planning"] = {"supported": True, "metrics": dict(METRICS),
+                                           "limits": self._settings.planning.to_dict()}
+        advised = [note.detail for note in advisory_notes(spec, self.ADVICE)]
+        return {**cell, "advisories": advised} if advised else cell
 
     def _offered(self, spec: WorkcellSpec) -> tuple[str, ...]:
         if not spec.skills:
@@ -275,12 +310,25 @@ class SkillRuntime:
     # ── Plan ──
 
     async def plan(
-        self,
-        workcell: str,
-        skill_id: str,
-        args: Mapping[str, Any] | None = None,
-        *,
-        share_frames: bool = False,
+        self, workcell: str, skill_id: str, args: Mapping[str, Any] | None = None,
+        *, share_frames: bool = False,
+    ) -> SkillPlan | SkillOutcome:
+        """Owner-tracked planning, including admission and final publication time."""
+        deadline = float("inf")
+        skill = self._skills.get(skill_id)
+        if isinstance(skill, PreparedPlanningSkill) or skill is not None and skill.spec.bounded_planning:
+            deadline = time.monotonic() + self._settings.planning.timeout_s
+        try:
+            return await asyncio.wait_for(runtime_planning.run_owned(
+                self, self._plan(workcell, skill_id, args, share_frames=share_frames, deadline=deadline)),
+                timeout=None if deadline == float("inf") else max(0, deadline - time.monotonic()))
+        except asyncio.TimeoutError:
+            outcome = SkillOutcome.failed(FAILURE_TIMEOUT, "planning deadline exceeded; nothing executed")
+            return outcome.answered_by(skill.spec) if skill is not None else outcome
+
+    async def _plan(
+        self, workcell: str, skill_id: str, args: Mapping[str, Any] | None = None,
+        *, share_frames: bool = False, deadline: float = float("inf"),
     ) -> SkillPlan | SkillOutcome:
         """Plan an actuating skill (cached by digest), or run a READ skill outright.
 
@@ -292,6 +340,8 @@ class SkillRuntime:
         try:
             spec, skill = self._resolve(workcell, skill_id)
             read_spec = None if skill.spec.runs_leased else skill.spec
+            if isinstance(skill, PreparedPlanningSkill) or skill.spec.bounded_planning:
+                self._settings.planning.check_size(args)
             arguments = validate_args(skill.spec.args_schema, args)
             frames = self._frames(spec)
             offered = [self._skills[sid] for sid in self._offered(spec)]
@@ -305,7 +355,7 @@ class SkillRuntime:
                 raise SkillError(FAILURE_SKILL_UNAVAILABLE, "; ".join(reasons), result=readiness)
             limits = self._effective_limits(spec, {})
             if read_spec is not None:
-                outcome = await self._run_read(spec, skill, frames, limits, arguments)
+                outcome = await self._run_read(spec, skill, frames, limits, arguments, deadline=deadline)
                 return outcome.answered_by(read_spec)
             model_basis = await self._generation_basis(spec)
             if skill.spec.uses_motion:
@@ -319,7 +369,13 @@ class SkillRuntime:
                 writes=False,
                 recording=lambda: self._settings.episodes.enabled,
             )
-            planned = await skill.plan(ctx, arguments)
+            if isinstance(skill, PreparedPlanningSkill):
+                evaluated, prepared = await runtime_planning.evaluate(self, skill, ctx, [arguments], deadline=deadline)
+                planned = evaluated[0].value
+            else:
+                planned = await skill.plan(ctx, arguments)
+        except asyncio.TimeoutError:
+            return SkillOutcome.failed(FAILURE_TIMEOUT, "planning deadline exceeded; nothing executed")
         except SkillError as error:
             refused = SkillOutcome.from_error(error)
             return refused if read_spec is None else refused.answered_by(read_spec)
@@ -329,19 +385,28 @@ class SkillRuntime:
         if isinstance(planned, SkillOutcome):
             return planned
         try:
-            if model_basis != await self._generation_basis(spec):
-                raise SkillError(FAILURE_PLAN_STALE, "physical model generation changed during planning")
-            if self._workcells.get(workcell) is not spec:
-                raise SkillError(FAILURE_PLAN_STALE, "workcell changed during planning; plan again")
-            return self._seal(spec, skill, planned, frames, model_basis=model_basis)
+            await runtime_planning.check_basis(self, spec, frames, model_basis)
+            if isinstance(skill, PreparedPlanningSkill):
+                prepared.check_scene(ctx)
+            return self._seal(spec, skill, planned, frames, model_basis=model_basis, deadline=deadline,
+                              result_budget=self._settings.planning if isinstance(skill, PreparedPlanningSkill) else None)
         except SkillError as error:
             return SkillOutcome.from_error(error)
 
+    async def plan_batch(
+        self, workcell: str, skill_id: str, candidates: Any, selection: Any = None,
+        *, share_frames: bool = False,
+    ) -> runtime_planning.BatchPlanningResult:
+        return await runtime_planning.run_owned(self, runtime_planning.plan_batch(
+            self, workcell, skill_id, candidates, selection, share_frames=share_frames))
+
     def _seal(
         self, spec: WorkcellSpec, skill: NodeSkill, planned: SkillPlan, frames: FrameGraph,
-        *, model_basis: Mapping[str, Any],
+        *, model_basis: Mapping[str, Any], result_budget: PlanningSettings | None = None,
+        deadline: float = float("inf"),
     ) -> SkillPlan:
-        return seal_plan(self, spec, skill, planned, frames, model_basis=model_basis)
+        return seal_plan(self, spec, skill, planned, frames, model_basis=model_basis,
+                         result_budget=result_budget, deadline=deadline)
 
     def permit_digest(self, plan: SkillPlan) -> str:
         """The action digest a run-scoped permit for *plan* must bind."""
@@ -358,6 +423,10 @@ class SkillRuntime:
         entry = self._plans.get(digest)
         return entry[0] if entry is not None else None
 
+    def discard_plan(self, digest: str) -> None:
+        """Forget an undeliverable or explicitly canceled preview; never stop a run."""
+        self._plans.pop(digest, None)
+
     def _effective_limits(
         self, spec: WorkcellSpec, requested: Mapping[str, float]
     ) -> dict[str, float]:
@@ -371,9 +440,11 @@ class SkillRuntime:
         frames: FrameGraph,
         limits: Mapping[str, float],
         arguments: Mapping[str, Any],
+        *, deadline: float = float("inf"),
     ) -> SkillOutcome:
         ctx = self._context(
-            spec, frames, limits, asyncio.Event(), skill.spec.region, writes=False
+            spec, frames, limits, asyncio.Event(), skill.spec.region, writes=False,
+            planning_deadline=deadline,
         )
         planned = await skill.plan(ctx, arguments)
         if isinstance(planned, SkillOutcome):
@@ -679,7 +750,15 @@ class SkillRuntime:
     async def close(self) -> None:
         """Stop new runs and drain existing holds before the owner releases storage."""
         self._closing = True
-        await drain_runs(tuple(self._runs.values()), self.stop_all)
+        planning = tuple(self._planning_tasks)
+        for task in planning:
+            task.cancel()
+        await asyncio.gather(
+            self._calculations.close(),
+            drain_runs(tuple(self._runs.values()), self.stop_all),
+            asyncio.gather(*planning, return_exceptions=True),
+        )
+        self._plans.clear()
 
     # ── Internals ──
 
@@ -747,8 +826,15 @@ class SkillRuntime:
         admission: RunAdmission | None = None,
         run_id: str = "",
         plan: SkillPlan | None = None,
+        planning_deadline: float = float("inf"),
     ) -> RunContext:
         motion = self._motion(spec, frames, limits, cancel, region, writes=writes, tap=tap)
+
+        async def planning_basis() -> Mapping[str, Any]:
+            model = await self._generation_basis(spec)
+            await runtime_planning.check_basis(self, spec, frames, model)
+            return {"physical_model": model, "calibration": dict(frames.versions)}
+
         return RunContext(
             registry=self._registry,
             spec=spec,
@@ -763,6 +849,10 @@ class SkillRuntime:
             run_id=run_id,
             node_session_id=self._node_session_id,
             plan=plan,
+            calculations=self._calculations,
+            planning_settings=self._settings.planning,
+            planning_deadline=planning_deadline,
+            planning_basis=planning_basis,
         )
 
     def _planner(self, spec: WorkcellSpec, sensing: GraspSensing) -> GraspPlanner:

@@ -53,6 +53,7 @@ def cell_listing(
     offered: Sequence[str],
     spec: WorkcellSpec,
     frames: FrameGraph,
+    reach: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """*spec* as a host lists it: its skills' availability and its frames' diagnoses."""
     readiness = WorkcellReadiness([skills[skill_id] for skill_id in offered], spec, frames)
@@ -78,6 +79,7 @@ def cell_listing(
         "calibration_stale": dict(frames.stale),
         "calibration_status": {name: d.to_dict() for name, d in frames.diagnoses.items()},
         "skills": listed,
+        "reach": dict(reach or {}),
     }
 
 
@@ -93,7 +95,16 @@ def plan_refusal(
     Only *offered* skills -- those the workcell admits -- are proposed as remedies.
     """
     readiness = WorkcellReadiness(offered, spec, frames)
-    requires = bind_requirements(skill_spec.requires, arguments)
+    bound = dict(arguments)
+    if bound.get("camera") == "auto":
+        # Auto is acquisition policy, not an exemption from exact frame gates.
+        choices = [role for role in sorted(spec.roles) if role.split(".")[0] == "camera"]
+        camera_requires = tuple(token for token in skill_spec.requires if "{camera}" in token)
+        usable = [role for role in choices if not unmet_requirements(
+            bind_requirements(camera_requires, {**bound, "camera": role}), spec, frames)]
+        if usable:
+            bound["camera"] = usable[0]
+    requires = bind_requirements(skill_spec.requires, bound)
     reasons = unmet_requirements(requires, spec, frames, readiness.hint)
     if not reasons:
         return [], {}

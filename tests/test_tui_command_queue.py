@@ -19,6 +19,7 @@ from prompt_toolkit.formatted_text import to_plain_text
 from leapflow.cli.tui_app.app import (
     LeapApp,
     _DynamicPlaceholderProcessor,
+    _STREAMING_INPUT_CAP,
     _compute_input_cap,
     _estimate_input_rows,
 )
@@ -79,10 +80,13 @@ def test_input_overflow_hint_reports_hidden_rows(monkeypatch) -> None:
     assert "Ctrl+X Ctrl+E" in hint
 
 
-def test_input_height_pinned_small_while_agent_running(monkeypatch) -> None:
-    """While a task streams, the input area holds a stable small region so the
-    reserved bottom area does not thrash the scroll region under patch_stdout
-    (the terminal-crash cause). Adaptive sizing is idle-only.
+def test_input_height_keeps_wrapped_rows_while_agent_running(monkeypatch) -> None:
+    """A draft typed while a task streams keeps its wrapped rows, up to the cap.
+
+    Pinning the region to one row made every wrapped draft scroll inside that
+    single row: the prompt and all earlier rows disappeared from view and the
+    overflow hint stayed silent, so the input looked frozen while typing and
+    submitting still worked.
     """
     app, _console, _status = _make_app()
     monkeypatch.setattr(
@@ -90,14 +94,20 @@ def test_input_height_pinned_small_while_agent_running(monkeypatch) -> None:
         "get_terminal_size",
         lambda _fallback=(80, 24): terminal_size((20, 24)),
     )
-    app._input_area.buffer.text = "测" * 40   # long input that would grow the area when idle
-    app.agent_running = True                    # streaming -> pin to a stable footprint
+    app.agent_running = True  # streaming -> bounded but still content-sized
 
+    app._input_area.buffer.text = "测" * 40  # wraps to five rows at 20 columns
     height = app._input_area.window.height
-    resolved = height() if callable(height) else height
+    wrapped = height() if callable(height) else height
 
-    assert resolved.max == 4            # pre-regression stable cap, not the adaptive 45%
-    assert resolved.preferred == 1      # no scroll-region reshaping mid-stream
+    assert wrapped.max == _STREAMING_INPUT_CAP
+    assert wrapped.preferred == _STREAMING_INPUT_CAP  # rows shown, not a single tail
+
+    app._input_area.buffer.text = "测"  # a short draft still reserves one row
+    height = app._input_area.window.height
+    short = height() if callable(height) else height
+
+    assert short.preferred == 1
 
 
 def test_input_overflow_hint_omits_editor_while_running(monkeypatch) -> None:
@@ -148,6 +158,9 @@ class _FakeStatus:
 
     def __call__(self) -> list[tuple[str, str]]:
         return []
+
+    def use_display_clock(self, clock) -> None:
+        self.display_clock = clock
 
     def update_task_counts(self, *, running: int, queued: int) -> None:
         self.counts.append((running, queued))

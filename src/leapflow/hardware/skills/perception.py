@@ -61,6 +61,7 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_DEVICE_FAULT,
     FAILURE_INVALID_ARGS,
     FAILURE_MODEL_UNAVAILABLE,
+    FAILURE_PLAN_STALE,
     FAILURE_SKILL_UNAVAILABLE,
     FAILURE_TARGET_NOT_FOUND,
     SOURCE_LIFT,
@@ -71,6 +72,7 @@ from leapflow.hardware.skills.protocol import (
     SkillError,
 )
 from leapflow.hardware.skills.scene_memory import SceneCapture, SceneMemory
+from leapflow.hardware.skills.scene_observation import SceneObservations
 from leapflow.hardware.skills.scene_view import SceneViewer, ViewRequest, target_detection
 from leapflow.hardware.skills.table_view import base_points, convex_mask, mask_box, table_plane
 from leapflow.hardware.skills.visual_tiles import snapshot_jpeg, snapshot_size
@@ -462,6 +464,7 @@ class WorkcellScene:
         self._settings = settings
         self._note = note
         self._viewer = SceneViewer(self)
+        self._observations = SceneObservations(self)
 
     @property
     def _basis(self) -> dict[str, float]:
@@ -472,8 +475,13 @@ class WorkcellScene:
         camera: str = ROLE_CAMERA,
     ) -> tuple[LocatedObject, ...]:
         floor = self._settings.min_score if min_score is None else float(min_score)
-        found = await self._detect(queries, floor, camera)
-        return self._memory.remember(found, self._basis)
+        if camera == "auto":
+            return await self._observations.locate(queries, floor)
+        found, capture = await self._detect(queries, floor, camera)
+        named = self._memory.remember(found, self._basis)
+        for obj in named:
+            self._observations.record(obj, (self._observations.analyze(obj, capture),))
+        return named
 
     async def snapshot(
         self,
@@ -506,6 +514,7 @@ class WorkcellScene:
     ) -> tuple[tuple[LocatedObject, ...], tuple[Mapping[str, str], ...]]:
         resolved = self._viewer.resolve(frame_id, targets, coords=coords, capture_id=capture_id)
         lifted: list[LocatedObject] = []
+        captures: list[SceneCapture] = []
         dropped: list[Mapping[str, str]] = []
         for target, capture, detection, reason in resolved:
             if capture is None or detection is None:
@@ -517,8 +526,12 @@ class WorkcellScene:
                 dropped.append({"label": target.label, "reason": str(exc)})
                 continue
             lifted.append(replace(seen, source=SOURCE_LIFT))
+            captures.append(capture)
         self._note("lift", {"frame": frame_id, "lifted": len(lifted), "dropped": dropped})
-        return self._memory.add(lifted, self._basis), tuple(dropped)
+        named = self._memory.add(lifted, self._basis)
+        for obj, capture in zip(named, captures):
+            self._observations.record(obj, (self._observations.analyze(obj, capture),))
+        return named, tuple(dropped)
 
     def object(self, object_id: str) -> LocatedObject:
         obj = self._memory.recall(object_id, self._basis, self._settings.memory_ttl_s)
@@ -527,9 +540,12 @@ class WorkcellScene:
         return obj
 
     def remember_grasps(
-        self, obj: LocatedObject, candidates: Sequence[GraspCandidate]
+        self, obj: LocatedObject, candidates: Sequence[GraspCandidate], *,
+        validate: Callable[[tuple[GraspCandidate, ...]], None] | None = None,
     ) -> tuple[GraspCandidate, ...]:
-        return self._memory.remember_grasps(obj.object_id, candidates)
+        if self.object(obj.object_id) != obj:
+            raise SkillError(FAILURE_PLAN_STALE, "object changed before grasp publication")
+        return self._memory.remember_grasps(obj.object_id, candidates, validate=validate)
 
     def grasp(self, grasp_id: str) -> GraspCandidate:
         found = self._memory.recall_grasp(grasp_id, self._basis, self._settings.memory_ttl_s)
@@ -580,19 +596,12 @@ class WorkcellScene:
         return await self._remeasure(obj)
 
     async def _remeasure(self, obj: LocatedObject) -> LocatedObject:
-        capture = await self.capture(obj.camera)
-        try:
-            seen = lift_detection(reproject(obj, capture), capture, self._settings)
-        except (LookupError, ValueError) as exc:
-            observe_again = "lift it again" if obj.source == SOURCE_LIFT else "locate it again"
-            raise SkillError(
-                FAILURE_TARGET_NOT_FOUND,
-                f"{obj.object_id} ({obj.label}) cannot be measured again ({exc}); "
-                f"{observe_again} and make a new plan",
-            ) from exc
-        moved = replace(seen, object_id=obj.object_id, source=obj.source, geometry=obj.geometry)
-        self._memory.update(moved, self._basis)
-        return moved
+        return await self._observations.relocate(obj)
+
+    def observation(self, obj: LocatedObject, grasp: GraspCandidate | None = None) -> Mapping[str, Any]:
+        report = self._observations.report(obj)
+        settings = self._observations.settings
+        return report.to_dict(settings) if grasp is None else report.for_grasp(obj, grasp, settings)
 
     @property
     def held(self) -> HeldObject | None:
@@ -636,7 +645,7 @@ class WorkcellScene:
 
     async def _detect(
         self, queries: Sequence[str], min_score: float, camera: str = ROLE_CAMERA
-    ) -> list[LocatedObject]:
+    ) -> tuple[list[LocatedObject], SceneCapture]:
         capture = await self.capture(camera)
         frame = capture.frame
         result, model = await self._ground(frame, queries)
@@ -666,7 +675,7 @@ class WorkcellScene:
                 "dropped": dropped,
             },
         )
-        return kept
+        return kept, capture
 
     async def _observe(
         self, role: str = ROLE_CAMERA, *, placed: bool = True, after_monotonic: float | None = None

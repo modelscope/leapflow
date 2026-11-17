@@ -152,6 +152,12 @@ _FIELD_DESCRIPTIONS = {
         "Scanners that transmit or leave the host are opt-in and must be named here. "
         "Providers run at startup, so a change needs a daemon restart."
     ),
+    "hardware.view_priors": (
+        "JSON rank-only observation learning policy: enabled (default false), ttl_s, "
+        "max_age_s, duration_scale_s, lookup_timeout_s, max_events, max_pending. Learns only filtered "
+        "survey signals; exact node/workcell configuration scope is mandatory. "
+        "Never changes safety or approval. Requires a daemon restart."
+    ),
     "hardware.fleet_nodes": (
         "JSON array of named LHP edge nodes. Connections and heartbeat supervision are "
         "assembled at startup, so a change needs a daemon restart."
@@ -322,6 +328,29 @@ _FIELD_DESCRIPTIONS = {
         "max_keyframes (128), max_tracks (2048), roi_width (640), roi_height (480), startup_s (10), "
         "update_s (2), solve_s (30), rss_bytes (536870912). Values may tighten, never expand "
         "these ceilings. Socket location is profile-layout-owned. Requires node restart."
+    ),
+    "hardware.skills_planning_workers": (
+        "Pure planning worker count (0: CPU-aware automatic, at most two by default). "
+        "Explicit counts are bounded by available CPUs and admitted jobs. Requires node restart."
+    ),
+    "hardware.skills_planning_max_candidates": (
+        "Maximum complete alternatives in one batch request (1–32, default 8). Requires node restart."
+    ),
+    "hardware.skills_planning_max_jobs": (
+        "Maximum outstanding pure jobs, including queued and running jobs (1–128, default 16). "
+        "Requires node restart."
+    ),
+    "hardware.skills_planning_timeout_s": (
+        "End-to-end planning budget including preparation and queue time (0–600 seconds, "
+        "exclusive of zero; default 30). Requires node restart."
+    ),
+    "hardware.skills_planning_max_bytes": (
+        "Request/result and private worker payload ceiling (1024–524288 bytes, default 262144). "
+        "Requires node restart."
+    ),
+    "hardware.skills_planning_cancel_grace_s": (
+        "Cooperative cancellation grace before terminating a pure compute worker (0–5 seconds, "
+        "exclusive of zero; default 0.5). Requires node restart."
     ),
     "hardware.skills_enabled": (
         "Comma-separated patterns (fnmatch) of node skills a hardware node offers; empty "
@@ -852,6 +881,10 @@ class ConfigService:
         if spec.secret:
             return self._set_secret_backed_field(spec, str(value), scope=scope)
         coerced = _coerce_value(value, spec.value_type)
+        if normalized.startswith("hardware.skills_planning_"):
+            from leapflow.hardware.skills.planning import PlanningSettings
+
+            PlanningSettings(**{normalized.removeprefix("hardware.skills_planning_"): coerced})
         path = self._path_for_spec(spec, scope)
         data = _read_yaml(path)
         section = dict(data.get(spec.section) or {})

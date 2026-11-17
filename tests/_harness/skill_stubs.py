@@ -130,6 +130,9 @@ class SimArmTransport:
     async def close(self) -> None:
         return None
 
+    async def probe(self) -> TransportStatus:
+        return TransportStatus(connected=True, halt_supported=True, detail="simulated arm")
+
     async def halt(self) -> TransportStatus:
         self.halts += 1
         self._pending.clear()
@@ -188,7 +191,7 @@ class SimArmTransport:
                         self.pose[_AXES.index(channel_id)] = value
                     else:
                         self.joints[channel_id] = value
-                if self.forward is not None:
+                if self.forward is not None and any(cid.startswith("joint.") for cid in self._pending):
                     self.pose = list(self._forward_pose())
                 self._pending.clear()
         target = self.gripper_target

@@ -50,7 +50,7 @@ from tests._harness.skill_stubs import (
     write_workcell,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("close_skill_runtimes")]
 
 NODE_ID = "jetson01"
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import shutil
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from leapflow.cli.tui_app.theme import ResolvedTheme, Theme, detect_theme
 
@@ -108,8 +108,13 @@ class StatusBar:
         self.last_turn_elapsed: float = 0.0
         self._turn_start: float = 0.0
         self._session_start: float = time.monotonic()
+        self._display_clock: Callable[[], float] = time.monotonic
         self.distill_phase: str = ""
         self.distill_progress: float = 0.0
+
+    def use_display_clock(self, clock: Callable[[], float]) -> None:
+        """Read the displayed session age from ``clock`` (see ``display_clock``)."""
+        self._display_clock = clock
 
     def mark_turn_start(self) -> None:
         """Record start of a new agent turn."""
@@ -230,7 +235,7 @@ class StatusBar:
                 parts.append(("class:status-bar", f"{pct}% "))
             parts.append(("class:status-bar.dim", "│ "))
 
-        elapsed = time.monotonic() - self._session_start
+        elapsed = max(0.0, self._display_clock() - self._session_start)
         parts.append(("class:status-bar", f"{_format_duration(elapsed)} "))
 
         if self.last_turn_elapsed > 0 and not narrow:

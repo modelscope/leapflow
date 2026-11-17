@@ -59,7 +59,9 @@ FAILURE_SKILL_UNAVAILABLE = "skill_unavailable"
 FAILURE_CALIBRATION_MISSING = "calibration_missing"
 FAILURE_CALIBRATION_STALE = "calibration_stale"
 FAILURE_TARGET_NOT_FOUND = "target_not_found"
+FAILURE_OBSERVATION_INSUFFICIENT = "observation_insufficient"
 FAILURE_UNREACHABLE = "unreachable"
+FAILURE_GRASP_INFEASIBLE = "grasp_infeasible"  # geometry/opening, not arm reach
 FAILURE_OUT_OF_WORKSPACE = "out_of_workspace"
 FAILURE_PLAN_STALE = "plan_stale"
 FAILURE_PLAN_UNKNOWN = "plan_unknown"
@@ -214,6 +216,9 @@ class SkillSpec:
     workcell's devices (a recording) instead of answering from ``plan``: it is
     planned and approved like an actuating skill, and its run can command nothing.
 
+    ``bounded_planning`` opts a non-batch planner into the node's end-to-end
+    calculation budget, including admission and owner-loop preparation.
+
     ``region`` names the box the skill's motions must stay inside (see the
     ``REGION_*`` values): a skill declares it rather than being recognised by its
     id, so the exception for calibration is visible where the skill is defined.
@@ -239,8 +244,11 @@ class SkillSpec:
     motion_allowed: bool = True
     provides: tuple[str, ...] = ()
     provides_when: tuple[str, ...] = ()
+    bounded_planning: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.bounded_planning) is not bool:
+            raise ValueError("bounded planning must be an explicit boolean")
         if type(self.motion_allowed) is not bool:
             raise ValueError("motion permission must be an explicit boolean")
         for token in self.provides:
@@ -771,6 +779,7 @@ __all__ = [
     "FAILURE_DEVICE_FAULT",
     "FAILURE_ESTOPPED",
     "FAILURE_GUARD_FAILED",
+    "FAILURE_GRASP_INFEASIBLE",
     "FAILURE_INTERNAL_DEFECT",
     "FAILURE_INVALID_ARGS",
     "FAILURE_LEASE_LOST",

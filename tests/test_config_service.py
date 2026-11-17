@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import stat
+import json
 from pathlib import Path
 
 import pytest
@@ -157,6 +158,21 @@ class TestConfigSetUnset:
         # Verify on-disk YAML
         data = yaml.safe_load(result.path.read_text("utf-8"))
         assert data["llm"]["model"] == "test-model-x"
+
+    def test_view_prior_policy_roundtrips_settings_and_environment(self, config_env, monkeypatch) -> None:
+        import leapflow.config as cfg
+        from leapflow.hardware.view_priors import ViewPriorSettings
+        _, svc = config_env
+        policy = {'enabled': True, 'lookup_timeout_s': .25, 'max_events': 100}
+        result = svc.set('hardware.view_priors', json.dumps(policy))
+        assert result.ok
+        cfg._settings_instance = None
+        loaded = cfg.get_settings()
+        assert ViewPriorSettings.from_json(loaded.hardware_view_priors).lookup_timeout_s == .25
+        assert ViewPriorSettings.from_json(loaded.hardware_view_priors).enabled
+        monkeypatch.setenv('LEAPFLOW_HARDWARE_VIEW_PRIORS', '{"enabled": false}')
+        cfg._settings_instance = None
+        assert not ViewPriorSettings.from_json(cfg.get_settings().hardware_view_priors).enabled
 
     def test_set_rejects_unsupported_scope(self, config_env) -> None:
         _, svc = config_env

@@ -20,6 +20,7 @@ from leapflow.hardware.skills.frames import FrameGraph
 from leapflow.hardware.skills.motion import GovernedMotion
 from leapflow.hardware.skills.perception import PerceptionSettings, WorkcellScene
 from leapflow.hardware.skills.ports import GraspPlanner
+from leapflow.hardware.skills.planning import CalculationPort, PlanningSettings
 from leapflow.hardware.skills.protocol import (
     FAILURE_DEVICE_FAULT,
     FAILURE_SKILL_UNAVAILABLE,
@@ -66,7 +67,15 @@ class RunContext:
         run_id: str = "",
         node_session_id: str = "",
         plan: SkillPlan | None = None,
+        calculations: CalculationPort | None = None,
+        planning_settings: PlanningSettings | None = None,
+        planning_deadline: float = float("inf"),
+        planning_basis: Callable[[], Awaitable[Mapping[str, Any]]] | None = None,
     ) -> None:
+        self._calculations = calculations
+        self._planning_basis = planning_basis
+        self._planning_settings = planning_settings or PlanningSettings()
+        self._planning_deadline = planning_deadline
         self._registry = registry
         self._spec = spec
         self._frames = frames
@@ -87,6 +96,7 @@ class RunContext:
         self._visions: dict[str, WorkcellVision] = {}
         self._policies: WorkcellPolicies | None = None
         self._grasp_verification: Any = None
+        self._survey: Any = None
         self._calibration: Any = None
         self._bridge: Any = None
         self._frame_lifecycle: Any = None
@@ -104,6 +114,25 @@ class RunContext:
     @property
     def motion(self) -> GovernedMotion:
         return self._motion
+
+    @property
+    def calculations(self) -> CalculationPort:
+        if self._calculations is None:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, "bounded planning workers are not installed")
+        return self._calculations
+
+    async def planning_basis(self) -> Mapping[str, Any]:
+        if self._planning_basis is None:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, "owner planning basis is not installed")
+        return await self._planning_basis()
+
+    @property
+    def planning_settings(self) -> PlanningSettings:
+        return self._planning_settings
+
+    @property
+    def planning_deadline(self) -> float:
+        return self._planning_deadline
 
     @property
     def limits(self) -> Mapping[str, float]:
@@ -159,6 +188,13 @@ class RunContext:
         if role not in self._visions:
             self._visions[role] = WorkcellVision.for_workcell(self._registry, self._spec, role=role)
         return self._visions[role]
+
+    @property
+    def survey(self) -> Any:
+        if self._survey is None:
+            from leapflow.hardware.skills.survey import WorkcellSurvey
+            self._survey = WorkcellSurvey(self)
+        return self._survey
 
     @property
     def grasp_verification(self) -> Any:
