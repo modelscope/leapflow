@@ -192,6 +192,11 @@ class MotionFacade(Protocol):
         """Drive the gripper and wait until its width is stable (the declared settling)."""
         ...
 
+    @property
+    def gripper_tolerance_mm(self) -> float:
+        """The gripper's declared position tolerance: widths closer than this are one width."""
+        ...
+
     async def pause(self, seconds: float) -> None:
         """Hold still for *seconds*; raises at once when the run is stopped or out of time."""
         ...

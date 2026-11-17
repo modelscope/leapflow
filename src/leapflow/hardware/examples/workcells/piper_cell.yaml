@@ -44,6 +44,12 @@ workspace:
 # home: {joint.j1.position: 0.0, joint.j2.position: 0.0}
 
 # max_width_mm defaults to the gripper.position envelope's max_value.
+# release_margin_mm: how far past the held width an opening must be observed
+#   before a ``released`` guard passes (default: freshness.hold_tolerance_mm);
+#   it must exceed the gripper.position tolerance (0.5 mm on the Piper).
+# stall_band_mm: progress toward a gripper target smaller than this counts as
+#   the jaws having stopped (default: a fifth of the position tolerance); it
+#   must stay below that tolerance.
 gripper_spec: {max_width_mm: 70, min_hold_width_mm: 3}
 
 limits:

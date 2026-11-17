@@ -346,6 +346,25 @@ _FIELD_DESCRIPTIONS = {
         "the node logs it as failed. Read when the node starts, so a change needs a node "
         "restart."
     ),
+    "hardware.node_log_file": (
+        "File the LHP edge node (`leap hw serve`) appends its log to and rotates itself, "
+        "so a restart keeps earlier runs and the disk stays bounded; empty logs to stderr "
+        "only. `--log-file` overrides it. Read when the node starts, so a change needs a "
+        "node restart."
+    ),
+    "hardware.node_log_level": (
+        "Verbosity of the edge node's log (default INFO, so halts, stops, and run "
+        "lifecycle are kept as field evidence). Read when the node starts, so a change "
+        "needs a node restart."
+    ),
+    "hardware.node_log_max_mb": (
+        "Size at which the edge node rotates its log file; 0 disables rotation. Read "
+        "when the node starts, so a change needs a node restart."
+    ),
+    "hardware.node_log_backups": (
+        "Rotated edge-node log files kept beside the active one. Read when the node "
+        "starts, so a change needs a node restart."
+    ),
     "hardware.skills_stop_grace_s": (
         "How long a stopped skill may unwind on its own before the node cancels it. Read "
         "when the node starts, so a change needs a node restart."
@@ -587,6 +606,7 @@ _SECTION_CATEGORIES = {
 _VALUE_HINTS = {
     "runtime.log_level": "DEBUG|INFO|WARNING|ERROR",
     "daemon.log_level": "DEBUG|INFO|WARNING|ERROR",
+    "hardware.node_log_level": "DEBUG|INFO|WARNING|ERROR",
     "mcp.approval_mode": "mutating_only|always|off",
     "hardware.unverified_policy": "deny_write|prompt|allow",
     "hardware.devices_dir": "absolute path, or empty for the profile default",

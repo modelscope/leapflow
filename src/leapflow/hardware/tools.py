@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.context import (
@@ -276,6 +276,10 @@ class HardwareTools:
                 "Readings from this device have not been independently calibrated. "
                 "Treat numeric values as relative measurements, not absolute references."
             )
+        # Why a declared write is missing, so "read-only" is never a dead end.
+        demotions = self._demotions(device_id)
+        if demotions:
+            payload["admission_notes"] = [note.to_dict() for note in demotions]
         return payload
 
     def _prior_experience(self, context: HardwareContext) -> dict[str, Any]:
@@ -421,7 +425,12 @@ class HardwareTools:
         return await self._write("hw_dispense", params)
 
     async def hw_estop(self, device_id: str = "", **_: Any) -> dict[str, Any]:
-        """Halt a device immediately.
+        """Stop a device in place immediately.
+
+        A stop is never a torque release: each transport reports what its halt
+        physically left the device doing (``stop_effect``) and whether it saw that
+        state hold (``stop_verified``), and both are returned and audited. An
+        unverified stop says so, with the physical emergency stop as the fallback.
 
         Deliberately ungated: waiting for consent to stop a moving machine is
         physically absurd. It is still audited, because frequent halts are a fault
@@ -455,17 +464,22 @@ class HardwareTools:
                 "failure_code": "transport_not_open",
             }
         logger.warning(
-            "Emergency stop issued device=%s supported=%s delivered=%s detail=%s",
+            "Stop issued device=%s supported=%s delivered=%s effect=%s verified=%s detail=%s",
             device_id,
             status.halt_supported,
             status.halt_delivered,
+            status.stop_effect or "unreported",
+            status.stop_verified,
             status.detail,
         )
         outcome = ("undelivered" if not status.halt_delivered
-                   else "ok" if status.halt_supported else "unsupported")
+                   else "unsupported" if not status.halt_supported
+                   else "unverified" if status.stop_verified is False
+                   else "ok")
         self._audit.record(
             action="estop",
             device=device_id,
+            value={"stop_effect": status.stop_effect, "stop_verified": status.stop_verified},
             outcome=outcome,
             identity=self._session_identity(),
         )
@@ -479,8 +493,15 @@ class HardwareTools:
             "ok": status.halt_supported and status.halt_delivered,
             "device_id": device_id,
             "halted": status.halt_supported and status.halt_delivered,
+            "stop_effect": status.stop_effect,
+            "stop_verified": status.stop_verified,
             "status": status.to_dict(),
         }
+        if status.stop_verified is False:
+            result["warning"] = (
+                "The stop was sent but not observed to hold. Watch the device; if it is "
+                "still moving or sagging, use its physical emergency stop."
+            )
         safety = context.safety
         if safety is not None and safety.emergency_decel_s > 0:
             result["emergency_decel_s"] = safety.emergency_decel_s
@@ -590,13 +611,7 @@ class HardwareTools:
             if not channel.is_writable:
                 return BatchFeasibilityResult(
                     ok=False,
-                    error=self._refusal(
-                        device_id,
-                        channel_id,
-                        "channel_not_writable",
-                        f"Command [{idx}]: channel {channel_id!r} on {device_id!r} is read-only "
-                        "in the admitted declaration.",
-                    ),
+                    error=self._not_writable(device_id, channel_id, f"Command [{idx}]: "),
                 )
             if channel.effect != HardwareEffect.ACTUATE.value:
                 return BatchFeasibilityResult(
@@ -1529,14 +1544,7 @@ class HardwareTools:
         # reader looking in the wrong place.
         if not channel.is_writable:
             return WriteFeasibilityResult(
-                ok=False,
-                error=self._refusal(
-                    device_id,
-                    channel_id,
-                    "channel_not_writable",
-                    f"Channel {channel_id!r} on {device_id!r} is read-only in the admitted "
-                    "declaration. Run hw_describe to see why, and check the device declaration.",
-                ),
+                ok=False, error=self._not_writable(device_id, channel_id)
             )
 
         if channel.effect != expected_effect:
@@ -2161,6 +2169,37 @@ class HardwareTools:
             return False
         return not self._registry.was_described(self._session_identity(), device_id)
 
+    def _demotions(self, device_id: str) -> tuple[Any, ...]:
+        """Admission decisions that removed write access from *device_id*, if known."""
+        report = getattr(self._registry, "report", None)
+        demotions = getattr(report, "demotions", None)
+        return tuple(demotions(device_id)) if callable(demotions) else ()
+
+    def _not_writable(self, device_id: str, channel_id: str, prefix: str = "") -> dict[str, Any]:
+        """Refuse a write to a read-only channel, naming why and what lifts it.
+
+        A demoted channel is a governed decision, not a missing feature: the refusal
+        carries the admission rules behind it and an operator request for their
+        remedies, so the next step is the governed one rather than a side channel
+        that reaches the device around the declaration.
+        """
+        notes = self._demotions(device_id)
+        reasons = "; ".join(f"{note.rule}: {note.detail}" for note in notes)
+        message = (
+            f"{prefix}Channel {channel_id!r} on {device_id!r} is read-only in the admitted "
+            "declaration" + (f" ({reasons})." if reasons else ". Check the device declaration.")
+        )
+        remedies = [note for note in notes if note.remedy]
+        if remedies:
+            message += " Resolution needs an operator: " + "; ".join(
+                note.remedy for note in remedies) + ". Do not reach the device out of band."
+        result = self._refusal(device_id, channel_id, "channel_not_writable", message)
+        if notes:
+            result["admission_notes"] = [note.to_dict() for note in notes]
+        if remedies:
+            result["interaction_request"] = admission_interaction(device_id, remedies)
+        return result
+
     def _unknown_device(self, device_id: str) -> dict[str, Any]:
         known = ", ".join(c.device_id for c in self._registry.contexts()) or "(none admitted)"
         return {
@@ -2238,6 +2277,31 @@ def no_gate_interaction(device_id: str) -> dict[str, Any]:
                 ),
             },
         ],
+    }
+
+
+def admission_interaction(device_id: str, notes: Sequence[Any]) -> dict[str, Any]:
+    """Build the operator request that lifts admission demotions of *device_id*.
+
+    Each note contributes its own remedy, so the request is as specific as the
+    rules that fired; none of them is something an agent may do on its own.
+    """
+    actions: list[dict[str, Any]] = []
+    for index, note in enumerate(notes):
+        action: dict[str, Any] = {
+            "label": f"Resolve admission rule {note.rule}",
+            "description": note.remedy,
+            "is_default": index == 0,
+        }
+        if getattr(note, "remedy_command", ""):
+            action["command"] = note.remedy_command
+        actions.append(action)
+    return {
+        "interaction_type": "continue_after_fix",
+        "severity": "warning",
+        "title": f"Writes to {device_id!r} are disabled at admission",
+        "description": "; ".join(f"{note.rule}: {note.detail}" for note in notes),
+        "suggested_actions": actions,
     }
 
 
@@ -2508,8 +2572,10 @@ def build_hardware_tools(tools: HardwareTools) -> list[ToolMetadata]:
         ToolMetadata(
             name="hw_estop",
             description=(
-                "Stop all motion and output on a device immediately. Never requires approval; "
-                "use it whenever device behaviour is unexpected."
+                "Stop all motion and output on a device immediately; actuators hold where "
+                "they stand (never a torque release). Never requires approval; use it whenever "
+                "device behaviour is unexpected. The result reports stop_effect and "
+                "stop_verified."
             ),
             parameters_schema={
                 "type": "object",

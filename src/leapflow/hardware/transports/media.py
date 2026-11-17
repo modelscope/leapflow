@@ -38,6 +38,7 @@ from leapflow.hardware.media import (
 )
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
+    STOP_EFFECT_OUTPUT_OFF,
     FrameReading,
     Reading,
     TransportError,
@@ -195,6 +196,7 @@ class MediaTransport:
             connected=self._connected,
             halt_supported=False,
             detail="capture released; a media device has no emergency stop",
+            stop_effect=STOP_EFFECT_OUTPUT_OFF,
         )
 
     # ── Data plane ──

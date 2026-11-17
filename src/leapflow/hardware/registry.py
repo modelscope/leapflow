@@ -320,14 +320,28 @@ class AdmissionNote:
     rule: str
     outcome: str  # "rejected" | "demoted" | "warning"
     detail: str
+    remedy: str = ""
+    """The operator action that lifts this decision, when one exists.
+
+    Carried separately from ``detail`` so a refusal caused by the decision can
+    name the step that resolves it instead of leaving a reader -- an agent in
+    particular -- to reach the device through a side channel.
+    """
+    remedy_command: str = ""
+    """The operator command that performs ``remedy``, when it is a single command."""
 
     def to_dict(self) -> dict[str, str]:
-        return {
+        payload = {
             "device_id": self.device_id,
             "rule": self.rule,
             "outcome": self.outcome,
             "detail": self.detail,
         }
+        if self.remedy:
+            payload["remedy"] = self.remedy
+        if self.remedy_command:
+            payload["remedy_command"] = self.remedy_command
+        return payload
 
 
 @dataclass(frozen=True)
@@ -344,6 +358,13 @@ class LoadReport:
             "rejected": list(self.rejected),
             "notes": [note.to_dict() for note in self.notes],
         }
+
+    def demotions(self, device_id: str) -> tuple[AdmissionNote, ...]:
+        """The admission decisions that removed write access from *device_id*."""
+        return tuple(
+            note for note in self.notes
+            if note.device_id == device_id and note.outcome == "demoted"
+        )
 
 
 class HardwareRegistry:
@@ -898,6 +919,10 @@ class HardwareRegistry:
                     rule="V5",
                     outcome="demoted",
                     detail="halt_supported is false; all writable channels demoted to read-only",
+                    remedy=(
+                        "use a transport that can stop this device in place and declare it "
+                        "halt_supported, or keep the device observation-only"
+                    ),
                 )
             )
             channels = [c.without_write() for c in channels]
@@ -914,9 +939,16 @@ class HardwareRegistry:
                     rule="V7",
                     outcome="demoted",
                     detail=(
-                        "context is not verified by a human; writable channels demoted "
-                        "to read-only (policy unverified_context_policy=deny_write)"
+                        "context is not verified by a human on this host; writable channels "
+                        "demoted to read-only (policy unverified_context_policy=deny_write)"
                     ),
+                    remedy=(
+                        f"an operator reviews the declaration (`leap hw describe {device_id}`) "
+                        f"and confirms it with `leap hw verify {device_id} --as <operator>` on "
+                        "this host; the confirmation is bound to the declaration's digest, so "
+                        "an edited declaration needs a new one"
+                    ),
+                    remedy_command=f"leap hw verify {device_id}",
                 )
             )
             channels = [c.without_write() for c in channels]
@@ -933,6 +965,8 @@ class HardwareRegistry:
                             f"channel {channel.channel_id!r} is writable without a declared "
                             "envelope; demoted to read-only"
                         ),
+                        remedy=f"declare an envelope for {channel.channel_id!r} in the device "
+                               "declaration",
                     )
                 )
                 channels[index] = channel.without_write()

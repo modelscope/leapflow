@@ -20,9 +20,13 @@ model must never be trusted with:
   tool left its planned start, the held object changed, or a referenced object
   drifted beyond the workcell's declared ``freshness`` tolerances.
 - **Guards.** A step may declare what must hold after it (``held``,
-  ``released``, ``reached``, ``no_contact``). A failed guard ends the program:
-  ``on_fail: stop`` halts the arm, ``hold`` leaves it where it is. Either way
-  the outcome names the step and what was observed.
+  ``released``, ``reached``, ``no_contact``). A failed guard ends the program
+  with the arm held where it is: ``on_fail: hold`` (the default) fails the
+  run, ``stop`` also halts it, which latches the arm in place until it is
+  re-enabled. Neither releases torque. A guard is checked for satisfiability
+  at plan: a ``released`` the jaws can never confirm is refused before
+  approval (``_sequence_guards.ReleaseRule``). The outcome names the step,
+  what it targeted and what was observed.
 - **Holding.** Closing on a referenced grasp or object records it as held;
   opening releases it; a held width that drifts beyond the declared tolerance
   forgets it -- so the next plan starts from what the jaws report.
@@ -35,7 +39,34 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from leapflow.hardware.skills.geometry import Pose, mat_vec, tool_cone_deg, wrap_axis_deg
+from leapflow.hardware.skills.builtin._sequence_guards import (
+    ReleaseRule,
+    check_drift,
+    current_hold,
+)
+from leapflow.hardware.skills.builtin._sequence_schema import (
+    CARD,
+    COMMON_FIELDS,
+    EXPECT_HELD,
+    EXPECT_NO_CONTACT,
+    EXPECT_REACHED,
+    EXPECT_RELEASED,
+    EXPECTS,
+    FIELDS,
+    GRASP_POINTS,
+    OBJECT_POINTS,
+    ON_FAIL_HOLD,
+    ON_FAIL_STOP,
+    OP_GRIPPER,
+    OP_MOVE_JOINTS,
+    OP_MOVE_LINEAR,
+    OP_WAIT,
+    OPS,
+    POSE_OPS,
+    SPEED_ARG,
+    STEP_SCHEMA,
+)
+from leapflow.hardware.skills.geometry import Pose, mat_vec, tool_cone_deg
 from leapflow.hardware.skills.ports import PATH_DEFAULT, PATH_LINEAR, PATH_POINT, SkillContext
 from leapflow.hardware.skills.protocol import (
     EFFECT_ACTUATE,
@@ -60,121 +91,6 @@ from leapflow.hardware.skills.protocol import (
     SkillSpec,
 )
 
-OP_MOVE = "move"
-OP_MOVE_LINEAR = "move_linear"
-OP_MOVE_JOINTS = "move_joints"
-OP_GRIPPER = "gripper"
-OP_WAIT = "wait"
-OPS = (OP_MOVE, OP_MOVE_LINEAR, OP_MOVE_JOINTS, OP_GRIPPER, OP_WAIT)
-
-EXPECT_HELD = "held"
-EXPECT_RELEASED = "released"
-EXPECT_REACHED = "reached"
-EXPECT_NO_CONTACT = "no_contact"
-ON_FAIL_STOP = "stop"
-ON_FAIL_HOLD = "hold"
-
-_POSE_OPS = frozenset({OP_MOVE, OP_MOVE_LINEAR})
-_COMMON = frozenset({"op", "expect", "on_fail"})
-_FIELDS: Mapping[str, frozenset[str]] = {
-    OP_MOVE: frozenset({"pose", "relative", "ref", "offset", "speed_pct", "path"}),
-    OP_MOVE_LINEAR: frozenset({"pose", "relative", "ref", "offset", "speed_pct"}),
-    OP_MOVE_JOINTS: frozenset({"joints", "speed_pct"}),
-    OP_GRIPPER: frozenset({"width_mm", "grip", "ref", "effort"}),
-    OP_WAIT: frozenset({"seconds"}),
-}
-_EXPECTS: Mapping[str, frozenset[str]] = {
-    OP_MOVE: frozenset({EXPECT_HELD, EXPECT_REACHED, EXPECT_NO_CONTACT}),
-    OP_MOVE_LINEAR: frozenset({EXPECT_HELD, EXPECT_REACHED, EXPECT_NO_CONTACT}),
-    OP_MOVE_JOINTS: frozenset({EXPECT_HELD, EXPECT_REACHED, EXPECT_NO_CONTACT}),
-    OP_GRIPPER: frozenset({EXPECT_HELD, EXPECT_RELEASED, EXPECT_REACHED}),
-    OP_WAIT: frozenset({EXPECT_HELD, EXPECT_REACHED}),
-}
-_OBJECT_POINTS = ("", "top", "bottom")
-_GRASP_POINTS = ("pregrasp", "grasp", "retreat")
-
-_SPEED_ARG = {
-    "type": "number",
-    "minimum": 1,
-    "maximum": 100,
-    "description": "Speed, percent of the arm maximum; capped by the run's limit.",
-}
-_ANGLE = {"type": "number", "minimum": -180, "maximum": 180}
-_OFFSET = {"type": "number", "minimum": -1000, "maximum": 1000, "default": 0.0}
-_STEP_SCHEMA: Mapping[str, Any] = {
-    "type": "object",
-    "properties": {
-        "op": {"type": "string", "enum": list(OPS)},
-        "pose": {
-            "type": "object",
-            "properties": {
-                "x": {"type": "number"},
-                "y": {"type": "number"},
-                "z": {"type": "number"},
-                "rx": _ANGLE,
-                "ry": _ANGLE,
-                "rz": _ANGLE,
-                "frame": {"type": "string", "enum": ["base", "table"], "default": "base"},
-            },
-            "required": ["x", "y", "z"],
-        },
-        "relative": {
-            "type": "object",
-            "properties": {
-                "dx": _OFFSET,
-                "dy": _OFFSET,
-                "dz": _OFFSET,
-                "frame": {"type": "string", "enum": ["base", "tool"], "default": "base"},
-            },
-        },
-        "ref": {"type": "string", "minLength": 3, "maxLength": 40},
-        # A path name is checked against the arm's declared arm.pose_path in _path();
-        # the schema only has to let the key through.
-        "path": {"type": "string", "minLength": 1},
-        "offset": {
-            "type": "object",
-            "properties": {"dx": _OFFSET, "dy": _OFFSET, "dz": _OFFSET},
-        },
-        "joints": {"type": "object", "additionalProperties": True},
-        "width_mm": {"type": "number", "minimum": 0},
-        "grip": {"type": "string", "enum": ["open", "close"]},
-        "effort": {"type": "number", "minimum": 0},
-        "seconds": {"type": "number", "minimum": 0},
-        "speed_pct": _SPEED_ARG,
-        "expect": {
-            "type": "string",
-            "enum": [EXPECT_HELD, EXPECT_RELEASED, EXPECT_REACHED, EXPECT_NO_CONTACT],
-        },
-        "on_fail": {"type": "string", "enum": [ON_FAIL_STOP, ON_FAIL_HOLD], "default": "stop"},
-    },
-    "required": ["op"],
-}
-
-_CARD = (
-    "Run a motion program on the arm and gripper, approved once as a whole. Each step "
-    "has an op: move (a free transit: point-to-point when the arm declares it, else the "
-    "arm's default path) or move_linear (straight line) to a TCP "
-    "target; move_joints {joint: deg}; gripper (width_mm, or grip open|close; "
-    "ref grasp:gN opens to that grasp's open_mm and records the object as held when "
-    "the jaws close on it); wait (seconds). A move target is one of: pose {x, y, z, "
-    "rx?, ry?, rz?} in mm/deg (frame base, or table: z above the table surface); "
-    "relative {dx, dy, dz, frame base|tool} from the previous target; or ref "
-    "object:oN[.top|.bottom] / grasp:gN.pregrasp|grasp|retreat plus an optional "
-    "offset {dx, dy, dz} in the base frame. Omitted angles keep the previous target's "
-    "orientation. A move may name path: linear|point to ride that path when the arm "
-    "declares it (move_linear always rides linear); approach and retreat close to an "
-    "object with move_linear, and transit between them with move (a straight line out "
-    "of a wrist singularity is infeasible: move off it first). A step may declare "
-    "expect: held (the jaws hold something), "
-    "released (the jaws opened freely), reached (the TCP is at the last target), or "
-    "no_contact (the move arrived and the jaws were not pushed); on_fail stop halts "
-    "the arm, hold leaves it in place. Plan uses the arm's declared FK to sample every "
-    "joint path and refuses any tool target outside the workspace, and solves every move "
-    "with IK inside the joint limits: an unreachable one is refused with the farthest "
-    "reachable target, so rewrite the program to it; execute repeats the workspace check "
-    "from fresh joint state and refuses when the tool or a referenced object moved."
-)
-
 
 @dataclass(frozen=True)
 class _Ref:
@@ -186,7 +102,7 @@ class _Ref:
 def _parse_ref(text: str, *, index: int) -> _Ref:
     kind, _, rest = text.partition(":")
     handle, _, point = rest.partition(".")
-    points = _OBJECT_POINTS if kind == "object" else _GRASP_POINTS if kind == "grasp" else ()
+    points = OBJECT_POINTS if kind == "object" else GRASP_POINTS if kind == "grasp" else ()
     if not handle or (point not in points and not (kind == "grasp" and point == "")):
         raise _invalid(
             index,
@@ -222,7 +138,7 @@ def _listed(step: Mapping[str, Any]) -> str:
     expect = step["expect"]
     if not expect:
         return str(step["text"])
-    reaction = "halt" if step["on_fail"] == ON_FAIL_STOP else "hold"
+    reaction = "halt in place" if step["on_fail"] == ON_FAIL_STOP else "hold"
     return f"{step['text']} [expect {expect}, else {reaction}]"
 
 
@@ -250,10 +166,13 @@ def _envelope_text(envelope: Mapping[str, float], speed: float | None) -> str:
 class _Planner:
     """Resolves steps in order, tracking predicted TCP and joint targets."""
 
-    def __init__(self, ctx: SkillContext, state: ArmState) -> None:
+    def __init__(self, ctx: SkillContext, state: ArmState, held: HeldObject | None) -> None:
         self._ctx = ctx
         self._start = state
         self._previous: Pose | None = state.tcp
+        # The width the jaws are predicted to hold at, when it is known: what they
+        # hold now, or the width of a grasp the program closes on.
+        self._held_mm: float | None = None if held is None else held.width_mm
         self._joints = frozenset(state.joints)
         self._joint_state: dict[str, float] | None = dict(state.joints)
         self._kinematics_checked = False
@@ -264,16 +183,16 @@ class _Planner:
 
     def resolve(self, index: int, step: Mapping[str, Any]) -> dict[str, Any]:
         op = step["op"]
-        extra = sorted(set(step) - _COMMON - _FIELDS[op])
+        extra = sorted(set(step) - COMMON_FIELDS - FIELDS[op])
         if extra:
             raise _invalid(index, f"{', '.join(extra)} do(es) not apply to op {op}")
         expect = step.get("expect", "")
-        if expect and expect not in _EXPECTS[op]:
+        if expect and expect not in EXPECTS[op]:
             raise _invalid(index, f"expect {expect} does not apply to op {op}")
         resolved: dict[str, Any] = {"op": op, "expect": expect, "on_fail": step["on_fail"]}
         if "speed_pct" in step:
             resolved["speed_pct"] = float(step["speed_pct"])
-        if op in _POSE_OPS:
+        if op in POSE_OPS:
             resolved.update(self._move(index, step))
         elif op == OP_MOVE_JOINTS:
             resolved.update(self._move_joints(index, step))
@@ -458,12 +377,35 @@ class _Planner:
             width, text = 0.0, "close the gripper"
         if width > widest:
             raise _invalid(index, f"width {width:.0f} mm exceeds the gripper's {widest:.0f} mm")
+        self._predict_hold(index, step, width, widest, grasp)
         if obj_id:
             text += f" on {grasp_id or obj_id}"
         entry: dict[str, Any] = {"width_mm": width, "object": obj_id, "grasp": grasp_id}
         if "effort" in step:
             entry["effort"] = float(step["effort"])
         return {**entry, "text": text}
+
+    def _predict_hold(
+        self,
+        index: int,
+        step: Mapping[str, Any],
+        width: float,
+        widest: float,
+        grasp: GraspCandidate | None,
+    ) -> None:
+        """Refuse a release no width can confirm; follow what the jaws will hold."""
+        held = self._held_mm
+        if held is None:
+            # Closing on a planned grasp holds at its width; any other close holds
+            # something of unknown width, which only the run can judge.
+            if grasp is not None and width < grasp.width_mm:
+                self._held_mm = grasp.width_mm
+            return
+        rule = ReleaseRule.of(self._ctx)
+        if step.get("expect") == EXPECT_RELEASED:
+            rule.check(index, held, width, widest)
+        if rule.threshold(held, width) is not None:
+            self._held_mm = None
 
     def _wait(self, index: int, step: Mapping[str, Any]) -> dict[str, Any]:
         if "seconds" not in step:
@@ -487,46 +429,7 @@ class _Planner:
         return self.grasps[grasp_id]
 
 
-def _current_hold(ctx: SkillContext, state: ArmState) -> HeldObject | None:
-    """The held object, forgetting it when the jaws no longer report its width."""
-    held = ctx.scene.held
-    if held is None or state.gripper_mm is None:
-        return held
-    if abs(state.gripper_mm - held.width_mm) <= ctx.workcell.freshness["hold_tolerance_mm"]:
-        return held
-    ctx.scene.release()
-    ctx.note(
-        "hold_forgotten",
-        {
-            "object_id": held.obj.object_id,
-            "held_mm": round(held.width_mm, 1),
-            "gripper_mm": round(state.gripper_mm, 1),
-        },
-    )
-    return None
-
-
 # ── Execute ──────────────────────────────────────────────────────────────────
-
-
-def _check_drift(fresh: Mapping[str, float], planned: LocatedObject, seen: LocatedObject) -> None:
-    planar = math.hypot(seen.center[0] - planned.center[0], seen.center[1] - planned.center[1])
-    height = abs(seen.top_z - planned.top_z)
-    problems = []
-    if planar > fresh["drift_planar_mm"]:
-        problems.append(f"moved {planar:.0f} mm")
-    if height > fresh["drift_height_mm"]:
-        problems.append(f"its top changed {height:.0f} mm")
-    if min(planned.length - planned.width, seen.length - seen.width) > fresh["yaw_defined_mm"]:
-        turned = abs(wrap_axis_deg(seen.yaw_deg - planned.yaw_deg))
-        if turned > fresh["drift_yaw_deg"]:
-            problems.append(f"turned {turned:.0f} deg")
-    if problems:
-        raise SkillError(
-            FAILURE_PLAN_STALE,
-            f"{planned.object_id} ({planned.label}) {', '.join(problems)} since planning; "
-            "locate and plan again",
-        )
 
 
 class _Run:
@@ -555,6 +458,7 @@ class _Run:
         self._gripped: GripperResult | None = None
         self._released: bool | None = None
         self._release_from: float | None = None
+        self._release_at: float | None = None
         self.log: list[dict[str, Any]] = []
 
     async def step(self, index: int, step: Mapping[str, Any]) -> None:
@@ -563,7 +467,8 @@ class _Run:
         self._gripped = None
         self._released = None
         self._release_from = None
-        if op in _POSE_OPS:
+        self._release_at = None
+        if op in POSE_OPS:
             target = Pose.from_mapping(step["pose"])
             moved = await self._ctx.motion.move_tcp(
                 target, speed_pct=self._speed(step), path=step["path"]
@@ -581,15 +486,28 @@ class _Run:
             self._observed(await self._ctx.motion.state())
         if op == OP_GRIPPER and step["expect"] == EXPECT_REACHED:
             self._observed(await self._ctx.motion.state())
-        self.log.append(
-            {
-                "step": index,
-                "op": op,
-                "tcp": self.state.tcp.to_dict(1),
-                "gripper_mm": None if self.jaw is None else round(self.jaw, 1),
-            }
-        )
+        self.log.append(self._entry(index, op))
         self._guard(index, step, before)
+
+    def _entry(self, index: int, op: str) -> dict[str, Any]:
+        """One step as it ran: what it aimed at, where it ended, and how far apart."""
+        entry: dict[str, Any] = {
+            "step": index,
+            "op": op,
+            "tcp": self.state.tcp.to_dict(1),
+            "gripper_mm": None if self.jaw is None else round(self.jaw, 1),
+        }
+        gripped = self._gripped
+        if gripped is not None:
+            entry["target_mm"] = round(gripped.target_mm, 1)
+            entry["error_mm"] = round(gripped.width_mm - gripped.target_mm, 2)
+            entry["blocked"] = gripped.blocked
+            if self._release_at is not None:
+                entry["release_at_mm"] = round(self._release_at, 1)
+        elif op != OP_WAIT and self._target is not None:
+            entry["target"] = self._target.to_dict(1)
+            entry["error_mm"] = round(self.state.tcp.distance_mm(self._target), 2)
+        return entry
 
     def _speed(self, step: Mapping[str, Any]) -> float | None:
         run = self._plan.limits.get("speed_pct")
@@ -607,7 +525,7 @@ class _Run:
             return
         if abs(self.jaw - self._grip) > self._tolerance:
             self._grip = None
-            _current_hold(self._ctx, state)
+            current_hold(self._ctx, state)
 
     async def _gripper(self, step: Mapping[str, Any]) -> None:
         effort = step.get("effort")
@@ -617,7 +535,12 @@ class _Run:
         self._gripped = result
         self.jaw = result.width_mm
         self._release_from = held_width
-        released = held_width is not None and result.width_mm > held_width + self._tolerance
+        self._release_at = (
+            None
+            if held_width is None
+            else ReleaseRule.of(self._ctx).threshold(held_width, result.target_mm)
+        )
+        released = self._release_at is not None and result.width_mm >= self._release_at
         self._released = released or (held_width is None and not result.blocked)
         scene = self._ctx.scene
         if released:
@@ -645,13 +568,14 @@ class _Run:
         raise SkillError(
             FAILURE_GUARD_FAILED,
             f"step {index} ({step['text']}): expected {expect}, but {failure}; the arm "
-            + ("was halted" if stop else "holds its position"),
+            + ("was halted in place" if stop else "holds its position"),
             side_effect_state=SIDE_EFFECT_PARTIAL,
             status=STATUS_HALTED if stop else STATUS_FAILED,
             result={
                 "guard": expect,
                 "tcp": self.state.tcp.to_dict(1),
                 "gripper_mm": None if self.jaw is None else round(self.jaw, 1),
+                "observed": self.log[-1],
             },
         )
 
@@ -668,8 +592,17 @@ class _Run:
             if self._released:
                 return None
             if self._release_from is not None and jaw is not None:
-                needed = self._release_from + self._tolerance
-                return f"the jaws opened only to {jaw:.1f} mm; release requires more than {needed:.1f}"
+                needed = self._release_at
+                if needed is None:
+                    target = "its target" if gripped is None else f"{gripped.target_mm:.1f} mm"
+                    return (
+                        f"opening to {target} cannot release the {self._release_from:.1f} mm "
+                        "hold: the jaws would not clear it by more than their tolerance"
+                    )
+                return (
+                    f"the jaws opened only to {jaw:.1f} mm; "
+                    f"release requires at least {needed:.1f}"
+                )
             if gripped is not None and gripped.blocked:
                 return f"the jaws stopped at {gripped.width_mm:.1f} mm of {gripped.target_mm:.1f}"
             return "release was not confirmed"
@@ -691,13 +624,13 @@ class MotionSequence:
 
     spec = SkillSpec(
         skill_id="motion.sequence",
-        version="1.1.0",
-        card=_CARD,
+        version="1.2.0",
+        card=CARD,
         args_schema={
             "type": "object",
             "properties": {
-                "steps": {"type": "array", "items": _STEP_SCHEMA, "minItems": 1, "maxItems": 64},
-                "speed_pct": _SPEED_ARG,
+                "steps": {"type": "array", "items": STEP_SCHEMA, "minItems": 1, "maxItems": 64},
+                "speed_pct": SPEED_ARG,
             },
             "required": ["steps"],
         },
@@ -718,8 +651,8 @@ class MotionSequence:
                 f"{len(steps)} steps exceed this workcell's limit of {most}; split the program",
             )
         state = await ctx.motion.state()
-        held = _current_hold(ctx, state)
-        planner = _Planner(ctx, state)
+        held = current_hold(ctx, state)
+        planner = _Planner(ctx, state, held)
         resolved: list[dict[str, Any]] = []
         for i, step in enumerate(steps, 1):
             try:
@@ -767,14 +700,14 @@ class MotionSequence:
                 f"the tool moved {moved_mm:.1f} mm / {moved_deg:.1f} deg since planning; "
                 "plan again",
             )
-        held = _current_hold(ctx, state)
+        held = current_hold(ctx, state)
         if ("" if held is None else held.obj.object_id) != plan.basis["held"]:
             raise SkillError(FAILURE_PLAN_STALE, "what the gripper holds changed since planning")
         objects: dict[str, LocatedObject] = {}
         for oid, data in plan.basis["objects"].items():
             planned = LocatedObject.from_mapping(data)
             seen = await ctx.scene.relocate(planned)
-            _check_drift(fresh, planned, seen)
+            check_drift(fresh, planned, seen)
             objects[oid] = seen
         run = _Run(ctx, plan, objects, state)
         for index, step in enumerate(plan.basis["steps"], 1):

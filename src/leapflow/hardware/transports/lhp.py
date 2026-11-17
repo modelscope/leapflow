@@ -376,7 +376,10 @@ class LhpTransport:
         self._calibration_ack = tuple(identities)
 
     async def halt(self) -> TransportStatus:
-        """Emergency stop. Never raises and is never serialised by callers.
+        """Stop the remote device in place. Never raises and is never serialised by callers.
+
+        The node's driver decides what holding means for its device; its
+        ``stop_effect``/``stop_verified`` verdict is carried back unchanged.
 
         Every branch that could not put the stop on the wire answers
         ``halt_delivered=False`` while still reporting the device's *declared*
@@ -414,6 +417,7 @@ class LhpTransport:
             halt_supported=bool(result.get("halt_supported", False)),
             halt_delivered=bool(result.get("halt_delivered", True)),
             detail=str(result.get("detail") or ""),
+            **TransportStatus.stop_fields(result),
         )
 
     def _declared_halt_support(self) -> bool:

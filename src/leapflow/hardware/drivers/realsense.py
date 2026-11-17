@@ -55,6 +55,7 @@ from leapflow.hardware.rgbd_quality import RegionDepthProcessor, RgbdProcessor
 from leapflow.hardware.rgbd_observation import ColorGeometryProcessor, GeometryProcessor
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
+    STOP_EFFECT_OUTPUT_OFF,
     FrameReading,
     Reading,
     TransportError,
@@ -266,6 +267,7 @@ class RealSenseTransport:
             connected=False,
             halt_supported=False,
             detail="RealSense capture released; camera has no emergency stop",
+            stop_effect=STOP_EFFECT_OUTPUT_OFF,
         )
 
     async def read(self, channel_id: str) -> Reading:

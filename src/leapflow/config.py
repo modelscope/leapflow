@@ -309,6 +309,13 @@ class Settings:
     # enforces (drive temperature, supply voltage, advisory fault flags). Breaches
     # are reported to the board with backoff and never gate a command.
     hardware_advisory_limits: str = ""
+    # LHP edge-node process log (`leap hw serve`). With a file the node appends and
+    # size-rotates it itself (max_mb x backups), so restarts keep earlier runs and
+    # the disk stays bounded; empty writes to stderr only. Read at node start.
+    hardware_node_log_file: str = ""
+    hardware_node_log_level: str = "INFO"
+    hardware_node_log_max_mb: float = 16.0
+    hardware_node_log_backups: int = 5
     # Node-local skills (S1.5). Comma-separated fnmatch patterns of enabled skill
     # ids; empty enables every discovered skill. The speed cap bounds every
     # skill plan; the duration cap bounds one skill execution end to end.
@@ -1547,6 +1554,12 @@ def _build_settings_from_env(
     hardware_fleet_nodes = os.getenv("LEAPFLOW_HARDWARE_FLEET_NODES", "").strip()
     hardware_alert_policies = os.getenv("LEAPFLOW_HARDWARE_ALERT_POLICIES", "").strip()
     hardware_advisory_limits = os.getenv("LEAPFLOW_HARDWARE_ADVISORY_LIMITS", "").strip()
+    hardware_node_log_file = os.getenv("LEAPFLOW_HARDWARE_NODE_LOG_FILE", "").strip()
+    hardware_node_log_level = (
+        os.getenv("LEAPFLOW_HARDWARE_NODE_LOG_LEVEL", "INFO").strip() or "INFO"
+    )
+    hardware_node_log_max_mb = float(os.getenv("LEAPFLOW_HARDWARE_NODE_LOG_MAX_MB", "16") or 16.0)
+    hardware_node_log_backups = int(os.getenv("LEAPFLOW_HARDWARE_NODE_LOG_BACKUPS", "5") or 5)
     hardware_calibration_worker_enabled = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
     hardware_calibration_worker_budgets = os.getenv("LEAPFLOW_HARDWARE_CALIBRATION_WORKER_BUDGETS", "{}").strip() or "{}"
     hardware_skills_enabled = os.getenv("LEAPFLOW_HARDWARE_SKILLS_ENABLED", "").strip()
@@ -2096,6 +2109,10 @@ def _build_settings_from_env(
         hardware_fleet_nodes=hardware_fleet_nodes,
         hardware_alert_policies=hardware_alert_policies,
         hardware_advisory_limits=hardware_advisory_limits,
+        hardware_node_log_file=hardware_node_log_file,
+        hardware_node_log_level=hardware_node_log_level,
+        hardware_node_log_max_mb=hardware_node_log_max_mb,
+        hardware_node_log_backups=hardware_node_log_backups,
         hardware_calibration_worker_enabled=hardware_calibration_worker_enabled,
         hardware_calibration_worker_budgets=hardware_calibration_worker_budgets,
         hardware_skills_enabled=hardware_skills_enabled,

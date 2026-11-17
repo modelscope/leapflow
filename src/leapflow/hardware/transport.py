@@ -31,6 +31,28 @@ here would make the domain model unimportable standalone. The values are
 converted at the boundary where a tool result is built.
 """
 
+STOP_EFFECT_HOLD = "hold"
+STOP_EFFECT_OUTPUT_OFF = "output_off"
+STOP_EFFECT_DEVICE_LATCHED = "device_latched"
+STOP_EFFECT_NONE = "none"
+STOP_EFFECTS: tuple[str, ...] = (
+    STOP_EFFECT_HOLD,
+    STOP_EFFECT_OUTPUT_OFF,
+    STOP_EFFECT_DEVICE_LATCHED,
+    STOP_EFFECT_NONE,
+)
+"""What a halt physically left the device doing, as reported in ``TransportStatus``.
+
+- ``hold``: an actuator was commanded to stay where it stands, under power.
+- ``output_off``: an output device (a heater, a pump, a camera) stopped producing.
+- ``device_latched``: the device had already stopped itself (its own stop is
+  engaged), so the halt had nothing to add and sent nothing.
+- ``none``: nothing was sent, because nothing driven from here was active.
+
+There is deliberately no value for "released torque": a halt may never make a
+load fall, so no driver can report having done it.
+"""
+
 
 @dataclass(frozen=True)
 class Reading:
@@ -229,6 +251,14 @@ class TransportStatus:
     caller has to guess at. A driver that returns a status at all has attempted
     the stop, so the default is ``True``; only a transport that could not put the
     command on the wire answers ``False``.
+
+    Delivery still does not say what the device is doing now. ``stop_effect``
+    names it (one of ``STOP_EFFECTS``; ``""`` when the transport does not say)
+    and ``stop_verified`` reports whether the transport *observed* that state
+    after the stop: ``True`` confirmed, ``False`` contradicted or unobservable
+    within the driver's window, ``None`` not checked. An unverified hold is the
+    one answer an operator must hear about, because a stop that was sent but not
+    seen to hold is indistinguishable from one that did not land.
     """
 
     connected: bool = False
@@ -237,14 +267,32 @@ class TransportStatus:
     detail: str = ""
     latency_ms: float = 0.0
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    stop_effect: str = ""
+    stop_verified: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "connected": self.connected,
             "halt_supported": self.halt_supported,
             "halt_delivered": self.halt_delivered,
             "detail": self.detail,
             "latency_ms": self.latency_ms,
+        }
+        # Emitted only when a halt reported them, so probe/open shapes are unchanged.
+        if self.stop_effect:
+            payload["stop_effect"] = self.stop_effect
+        if self.stop_verified is not None:
+            payload["stop_verified"] = self.stop_verified
+        return payload
+
+    @classmethod
+    def stop_fields(cls, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """The stop-effect fields of a serialized status, for rebuilding it remotely."""
+        effect = payload.get("stop_effect")
+        verified = payload.get("stop_verified")
+        return {
+            "stop_effect": effect if isinstance(effect, str) and effect in STOP_EFFECTS else "",
+            "stop_verified": verified if isinstance(verified, bool) else None,
         }
 
 
@@ -306,7 +354,17 @@ class HardwareTransport(Protocol):
         ...
 
     async def halt(self) -> TransportStatus:
-        """Stop all motion and output as fast as the device allows.
+        """Stop all motion and output as fast as the device allows, *in place*.
+
+        A halt is a controlled stop: an actuator is commanded to hold where it
+        stands, under power, and an output device turns its output off. It never
+        releases torque, cuts drive power, or engages a stop that lets a load
+        sag or fall -- a stopped arm that drops what it carries, or drops onto
+        what is below it, has turned a recoverable stop into a collision. A
+        device whose only stop primitive does that must not map it here; the
+        physical emergency-stop button stays the operator's tool for it. The
+        transport reports what it left the device doing in ``stop_effect`` and
+        whether it saw that state hold in ``stop_verified``.
 
         A transport that cannot halt returns ``halt_supported=False`` rather than
         raising, and the registry then refuses to expose any writable channel for
@@ -533,6 +591,11 @@ __all__ = [
     "SIDE_EFFECT_NONE",
     "SIDE_EFFECT_PARTIAL",
     "SIDE_EFFECT_UNKNOWN",
+    "STOP_EFFECTS",
+    "STOP_EFFECT_DEVICE_LATCHED",
+    "STOP_EFFECT_HOLD",
+    "STOP_EFFECT_NONE",
+    "STOP_EFFECT_OUTPUT_OFF",
     "FrameReading",
     "FrameTransport",
     "HardwareTransport",

@@ -24,8 +24,8 @@ width); this module owns *how*, in one place:
 - **Arrival.** A move ends when the arm reports arrival *and* the observed pose
   is within the declared tolerances -- position by distance, orientation by
   geodesic angle, because a vendor may report an equivalent Euler triple. A
-  gripper has settled at its target, or once its width stayed within the
-  declared tolerance for the declared settling time (closed on an object).
+  gripper has settled at its target, or once its width made no progress
+  toward it for the declared settling time (closed on an object).
   No threshold is a constant here: admission refuses an arm or gripper that
   does not declare them.
 - **Verdicts.** A refusal before anything was sent is ``write_refused`` (NONE);
@@ -117,10 +117,11 @@ POLL_S = 0.05
 
 # The firmware's answer to a target, read while a move is in flight: a refusal
 # leaves the arm where the command found it, a fault stops it on the way. Both
-# have to end the move before the arrival timeout does -- the timeout path halts,
-# and a halt engages the emergency stop, which releases the drives and drops the
-# arm under gravity. The codes themselves live in ``hardware.arm_status`` so the
-# transport reads the same answer the same way when a write is reported.
+# have to end the move before the arrival timeout does -- the timeout path halts
+# the run, which holds the arm in place and latches it until an operator clears
+# it, a heavier verdict than either answer deserves. The codes themselves live in
+# ``hardware.arm_status`` so the transport reads the same answer the same way
+# when a write is reported.
 #
 # A refusing code can also be left over from an earlier target, so it only ends
 # the move once the arm is demonstrably still where the command found it for
@@ -134,6 +135,12 @@ _CAN_CONTROL = "can"
 # the same tilt twice through two FK paths, and float noise must not turn
 # "unchanged" into "worse" and refuse a recovery.
 _CONE_EPSILON_DEG = 1e-6
+
+# Progress toward a gripper target smaller than this share of the declared
+# position tolerance counts as no progress (``gripper_spec.stall_band_mm``
+# overrides it). Small enough that jaws creeping toward the target still count
+# as moving, large enough to sit above a width sensor's quantization noise.
+_STALL_BAND_FRACTION = 0.2
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -749,10 +756,9 @@ class GovernedMotion:
         """Fail at once when the arm has stopped executing the command.
 
         A fault is the opposite of a late arrival: the controller has already
-        dropped out of CAN control and released the drives, so no amount of
-        waiting produces progress -- the remaining poll budget only defers the
-        halt, and a halt engages the emergency stop on an arm that is already
-        falling. The status word is read first because it names the cause and
+        dropped out of CAN control, so no amount of waiting produces progress --
+        the remaining poll budget only defers the halt that holds the arm where
+        it is. The status word is read first because it names the cause and
         the joints; leaving CAN control without a code is still a fault, just an
         unnamed one.
         """
@@ -785,8 +791,8 @@ class GovernedMotion:
 
         A refusal is a planning verdict, not a late arrival: the arm is where the
         command found it and nothing was commanded. The status is what matters --
-        a timeout halts the run, and a halt engages the emergency stop, which
-        releases the drives and drops the arm. The side effect stays conservative:
+        a timeout halts the run and latches the arm until an operator clears it,
+        while a refusal only fails the step. The side effect stays conservative:
         the frame did reach the transport, so reconciliation lifts the skill's
         NONE to PARTIAL on its own.
         """
@@ -851,25 +857,43 @@ class GovernedMotion:
             elapsed_s=self._clock() - started,
         )
 
+    @property
+    def gripper_tolerance_mm(self) -> float:
+        gripper_id = self._spec.role(ROLE_GRIPPER)
+        if not gripper_id:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, "this workcell binds no gripper")
+        context = self._registry.context(gripper_id)
+        return float(context.channel(GRIPPER_POSITION).envelope.tolerance)
+
+    def _stall_band_mm(self, tolerance: float) -> float:
+        declared = self._spec.gripper_spec.get("stall_band_mm")
+        return float(declared) if declared is not None else tolerance * _STALL_BAND_FRACTION
+
     async def _await_gripper(self, target: float, context: Any) -> float:
         envelope = context.channel(GRIPPER_POSITION).envelope
         tolerance = envelope.tolerance
         settle_s = envelope.effective_settling_s
+        band = self._stall_band_mm(tolerance)
         expires = self._expiry()
-        # Settled: at the target, or unmoved (within tolerance of an anchor) for
-        # the declared settling time -- fingers closed on an object stop short.
-        # A gripper that has not started moving yet also looks unmoved, which is
-        # why the window is the declared settling time and not one poll.
-        anchor: float | None = None
-        anchored_at = 0.0
+        # Settled: at the target, or no progress toward it for the declared
+        # settling time -- fingers closed on an object stop short. Progress is
+        # measured against the closest the jaws have come, not against a band as
+        # wide as the tolerance: jaws creeping the last millimetre move less than
+        # the tolerance per settling window and would otherwise read as stopped
+        # short, which a release guard then reads as still holding. A gripper that
+        # has not started moving yet makes no progress either, which is why the
+        # window is the declared settling time and not one poll.
+        best: float | None = None
+        progressed_at = self._clock()
         while True:
             width = await self._gripper_width()
             now = self._clock()
             if _within_gripper_tolerance(width, target, tolerance):
                 return width
-            if anchor is None or not _within_gripper_tolerance(width, anchor, tolerance):
-                anchor, anchored_at = width, now
-            elif now - anchored_at >= settle_s:
+            gap = abs(target - width)
+            if best is None or best - gap > band:
+                best, progressed_at = gap, now
+            elif now - progressed_at >= settle_s:
                 return width
             if now >= expires:
                 raise SkillError(

@@ -184,7 +184,7 @@ async def test_sequence_plan_is_sealed_digested_and_cached(tmp_path: Path) -> No
     runtime = _runtime(tmp_path, registry)
     plan = await runtime.plan(WORKCELL_ID, SEQUENCE, move_by(100))
     assert isinstance(plan, SkillPlan)
-    assert (plan.workcell, plan.skill_id, plan.version) == (WORKCELL_ID, SEQUENCE, "1.1.0")
+    assert (plan.workcell, plan.skill_id, plan.version) == (WORKCELL_ID, SEQUENCE, "1.2.0")
     assert plan.targets[0].z == pytest.approx(START_FLANGE[2] - TOOL_LENGTH_MM + 100)
     assert plan.limits == {
         "speed_pct": 20.0,
@@ -206,7 +206,7 @@ async def test_sequence_plan_is_sealed_digested_and_cached(tmp_path: Path) -> No
     assert runtime.permit_digest(plan) == run_permit_digest(
         workcell=WORKCELL_ID,
         skill_id=SEQUENCE,
-        version="1.1.0",
+        version="1.2.0",
         plan_digest=plan.digest,
         limits=plan.limits,
     )
@@ -531,12 +531,19 @@ async def test_closing_on_nothing_fails_expect_held_and_names_the_step(tmp_path:
     assert registry.sim.halts == 0, "on_fail: hold leaves the arm where it is"
 
 
-async def test_a_stop_guard_halts_the_arm(tmp_path: Path) -> None:
+async def test_a_stop_guard_halts_the_arm_in_place(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
-    run = await _run(_runtime(tmp_path, registry), SEQUENCE, grip("close", expect="held"))
+    run = await _run(
+        _runtime(tmp_path, registry), SEQUENCE, grip("close", expect="held", on_fail="stop")
+    )
     assert run.outcome is not None
     assert (run.outcome.failure_code, run.outcome.status) == (FAILURE_GUARD_FAILED, STATUS_HALTED)
     assert registry.sim.halts == 1
+    # The outcome says what the halt physically did, not merely that it was sent.
+    stops = run.outcome.evidence["stops"]
+    assert {stop["stop_effect"] for stop in stops.values()} == {"hold"}
+    assert all(stop["stop_verified"] is True for stop in stops.values())
+    assert run.to_dict()["stops"] == stops
 
 
 async def test_opening_reaches_the_declared_width_and_is_released(tmp_path: Path) -> None:

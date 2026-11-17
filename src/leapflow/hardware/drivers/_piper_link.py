@@ -6,8 +6,9 @@ connects, waits for complete feedback and checks the arm's own firmware
 against the declared profile; it never energizes anything. ``energize`` is the
 blocking body of the governed ``arm.enable=1`` write, in the order verified on
 a Piper X (S-V1.9): resume a latched stop, enable every driver, enter CAN
-control. Nothing here maps channels or validates envelopes; the transport owns
-that.
+control. Resuming a latched stop releases the drives, so it is gated by the
+device's ``TorqueReleasePolicy`` (``_piper_halt``). Nothing here maps channels
+or validates envelopes; the transport owns that.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from leapflow.hardware.drivers._piper_feedback import (
     attach_receive_ledger,
     status_value,
 )
+from leapflow.hardware.drivers._piper_halt import TorqueReleasePolicy
 from leapflow.hardware.drivers._piper_motion import (
     CTRL_MODE_CAN,
     PiperMotion,
@@ -195,13 +197,19 @@ def link_state(robot: Any) -> dict[str, Any]:
 
 def energize(robot: Any, feedback: PiperFeedback, motion: PiperMotion,
              timeout_s: float, settle_s: float = ENABLE_SETTLE_S,
-             requalify_s: float = 0.0) -> WriteOutcome:
+             requalify_s: float = 0.0,
+             release: TorqueReleasePolicy | None = None) -> WriteOutcome:
     """Blocking: resume a latched stop, energize, enter CAN control, and prove it holds.
 
     ``reset()`` clears a latched stop (and drops to standby), ``enable()`` is
     repeated until every driver reports enabled, then CAN control is selected
     and confirmed. Any step refused after a frame was sent reports COMMITTED:
     the arm state may already have changed.
+
+    ``reset()`` releases every drive at once, so it is sent only when
+    ``release`` (default: refuse) allows it for the joints the arm reports;
+    otherwise the enable is refused before that frame with
+    ``piper_torque_release_refused``.
 
     Those three steps are not the whole contract. A controller that has just
     been reset can accept CAN control and then, half a second later, report a
@@ -224,19 +232,25 @@ def energize(robot: Any, feedback: PiperFeedback, motion: PiperMotion,
         return _outcome(SIDE_EFFECT_NONE, "fresh per-group CAN reception is required before "
                         f"enabling: {problem}", "piper_unqualified_feedback")
     motion.disown("a governed enable")
+    policy = release or TorqueReleasePolicy()
     deadline = time.monotonic() + timeout_s
     sent = False
     unstable = ""
     try:
         while True:
-            sent = True
             if latched(robot):
+                refusal = policy.refusal(read_joints(robot), "resuming the latched emergency stop")
+                if refusal:
+                    return _outcome(SIDE_EFFECT_COMMITTED if sent else SIDE_EFFECT_NONE,
+                                    refusal, "piper_torque_release_refused")
+                sent = True
                 robot.reset()
                 if not wait_for(lambda: not latched(robot), deadline):
                     return _outcome(SIDE_EFFECT_COMMITTED,
                                     "the arm still reports a latched emergency stop after reset(); "
                                     "release the physical stop button and retry",
                                     "piper_resume_refused")
+            sent = True
             _enable_drivers(robot, feedback, deadline)
             # A fault left over from an earlier attempt makes the mode frame
             # pointless and the failure message misleading, so it is read first.

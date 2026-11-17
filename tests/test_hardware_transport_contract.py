@@ -30,6 +30,8 @@ from leapflow.hardware.context import (
 from leapflow.hardware.testing import run_transport_conformance
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
+    STOP_EFFECT_HOLD,
+    STOP_EFFECTS,
     HardwareTransport,
     Reading,
     TransportError,
@@ -430,6 +432,23 @@ async def test_halt_reports_capability_instead_of_raising(transport_case) -> Non
     status = await transport.halt()
     assert isinstance(status, TransportStatus)
     assert isinstance(status.halt_supported, bool)
+    # What the stop left the device doing is one of the named effects, or unsaid;
+    # there is no value for a torque release, so no driver can claim one.
+    assert status.stop_effect in (*STOP_EFFECTS, "")
+    assert status.stop_verified in (True, False, None)
+
+
+def test_stop_fields_survive_the_wire_and_never_invent_an_effect() -> None:
+    """A remote halt's verdict is rebuilt exactly; anything unnamed reads as unsaid."""
+    held = TransportStatus(connected=True, halt_supported=True, detail="held",
+                           stop_effect=STOP_EFFECT_HOLD, stop_verified=False)
+    assert TransportStatus.stop_fields(held.to_dict()) == {
+        "stop_effect": STOP_EFFECT_HOLD, "stop_verified": False}
+    # Probe/open shapes carry no stop fields at all.
+    assert "stop_effect" not in TransportStatus(connected=True).to_dict()
+    assert "stop_verified" not in TransportStatus(connected=True).to_dict()
+    assert TransportStatus.stop_fields({"stop_effect": "torque_off", "stop_verified": "yes"}) == {
+        "stop_effect": "", "stop_verified": None}
 
 
 @pytest.mark.asyncio

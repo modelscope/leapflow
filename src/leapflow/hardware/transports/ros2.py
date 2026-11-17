@@ -54,6 +54,8 @@ from leapflow.hardware.transport import (
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_UNKNOWN,
+    STOP_EFFECT_HOLD,
+    STOP_EFFECT_NONE,
     FrameReading,
     Reading,
     TransportError,
@@ -71,6 +73,8 @@ logger = logging.getLogger(__name__)
 _STALE_THRESHOLD_S = 2.0
 # How long ``read_frame()`` waits for an image topic's first message after open.
 _FIRST_FRAME_TIMEOUT_S = 3.0
+_HALT_ZERO = "zero"
+"""``halt_commands`` value: the default message is this topic's stop (a rate command)."""
 
 
 class ROS2Transport:
@@ -95,11 +99,14 @@ class ROS2Transport:
         qos_depth: int = 10,
         spin_period_s: float = 0.01,
         topic_types: Mapping[str, str] | None = None,
+        halt_commands: Mapping[str, str] | None = None,
     ) -> None:
         self._topics: dict[str, str] = dict(topics or {})
         self._services: dict[str, str] = dict(services or {})
         self._actions: dict[str, str] = dict(actions or {})
         self._topic_types: dict[str, str] = dict(topic_types or {})
+        # Command channel -> the state channel its hold re-commands; "" publishes zeros.
+        self._halt_commands: dict[str, str] = dict(halt_commands or {})
         self._node_name = node_name
         self._namespace = namespace
         self._qos_depth = qos_depth
@@ -408,7 +415,7 @@ class ROS2Transport:
         except Exception:
             alive = self._connected
 
-        has_cmd = len(self._cmd_channels) > 0
+        has_cmd = self._halt_supported()
         return TransportStatus(
             connected=alive,
             halt_supported=has_cmd,
@@ -425,10 +432,15 @@ class ROS2Transport:
         )
 
     async def halt(self) -> TransportStatus:
-        """Publish zero-velocity commands to all command topics.
+        """Publish each command topic's declared stop; never a guessed one.
 
-        Lock-free (HCP requirement).  Iterates ``_cmd_channels`` and
-        publishes a zeroed message to each without acquiring any lock.
+        Lock-free (HCP requirement). A default-constructed message is a stop
+        only for a *rate* command (a zero twist or velocity); on a position
+        topic it is a full-speed move to the zero posture. What stops a topic is
+        therefore declared per channel in ``halt_commands`` (see
+        ``build_transport``): ``zero`` publishes the default message, and
+        ``{hold_from: <channel>}`` re-commands the state last observed on that
+        channel. A command topic without a declaration is not published to.
         """
         if not self._connected or self._node is None:
             return TransportStatus(
@@ -436,6 +448,7 @@ class ROS2Transport:
                 halt_supported=True,
                 halt_delivered=False,
                 detail="halt: not connected; the stop was not sent",
+                stop_effect=STOP_EFFECT_NONE,
             )
 
         if not self._cmd_channels:
@@ -443,27 +456,56 @@ class ROS2Transport:
                 connected=True,
                 halt_supported=False,
                 detail="halt: no command topics registered",
+                stop_effect=STOP_EFFECT_NONE,
             )
 
         errors: list[str] = []
-        for cid in self._cmd_channels:
+        for cid in sorted(self._cmd_channels):
             pub = self._publishers.get(cid)
             if pub is None:
                 continue
             try:
-                msg = self._build_zero_msg(pub)
+                msg = self._halt_msg(cid, pub)
                 # Publish in thread -- lock-free, no shared state modified.
                 await asyncio.to_thread(pub.publish, msg)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - every topic gets its stop attempt
                 errors.append(f"{cid}: {exc}")
 
-        detail = "halted" if not errors else f"halt partial: {'; '.join(errors)}"
+        detail = "halted: every command topic received its declared stop" if not errors else (
+            f"halt partial: {'; '.join(errors)}")
         return TransportStatus(
             connected=self._connected,
             halt_supported=True,
             halt_delivered=not errors,
             detail=detail,
+            stop_effect=STOP_EFFECT_HOLD if len(errors) < len(self._cmd_channels) else STOP_EFFECT_NONE,
         )
+
+    def _halt_supported(self) -> bool:
+        """Halt is supported only when every command topic declares a stop it can send."""
+        return bool(self._cmd_channels) and all(
+            cid in self._halt_commands
+            and (not self._halt_commands[cid] or self._halt_commands[cid] in self._subscribers)
+            for cid in self._cmd_channels)
+
+    def _halt_msg(self, channel_id: str, publisher: Any) -> Any:
+        """The declared stop message for one command topic; raises when there is none."""
+        policy = self._halt_commands.get(channel_id)
+        if policy is None:
+            raise TransportError(
+                "no stop is declared for this command topic, so nothing was published; declare "
+                "transport.config.halt_commands for it", failure_code="ros2_halt_undeclared")
+        if not policy:
+            return publisher.msg_type()
+        observed = self._latest_msgs.get(policy)
+        age = time.monotonic() - self._msg_timestamps.get(policy, float("-inf"))
+        if observed is None or age >= _STALE_THRESHOLD_S:
+            raise TransportError(
+                f"no fresh state on {policy!r} to hold at, so nothing was published",
+                failure_code="ros2_halt_no_state")
+        if isinstance(observed, publisher.msg_type):
+            return observed
+        return self._build_write_msg(channel_id, self._parse_msg(policy, observed), publisher)
 
     # ── Internal: spin loop ───────────────────────────────────────────
 
@@ -693,14 +735,6 @@ class ROS2Transport:
 
         return msg
 
-    def _build_zero_msg(self, publisher: Any) -> Any:
-        """Build a zero-valued message for halt.
-
-        Creates a default-constructed message, which for numeric types
-        (Float64, Twist, JointTrajectory) produces zeros.
-        """
-        return publisher.msg_type()
-
     def _build_joint_command_msg(self, value: Any) -> Any:
         """Build a JointTrajectoryPoint or similar from a channel value.
 
@@ -878,6 +912,10 @@ def build_transport(config: Mapping[str, Any]) -> ROS2Transport:
     - ``qos_depth``: int — QoS history depth (default 10)
     - ``spin_period_s``: float — spin_once timeout (default 0.01)
     - ``topic_types``: dict[str, str] — channel_id → message type, skipping discovery
+    - ``halt_commands``: dict — command channel_id → its stop: ``zero`` (the default
+      message, for rate commands) or ``{hold_from: <state channel_id>}`` (re-command
+      the state last observed there). Halt is supported only when every command
+      topic declares one, because a guessed stop on a position topic is a move.
     """
     topic_types = config.get("topic_types")
     return ROS2Transport(
@@ -895,7 +933,30 @@ def build_transport(config: Mapping[str, Any]) -> ROS2Transport:
         topic_types={str(k): str(v) for k, v in topic_types.items()}
         if isinstance(topic_types, Mapping)
         else {},
+        halt_commands=_halt_commands(config.get("halt_commands")),
     )
+
+
+def _halt_commands(raw: Any) -> dict[str, str]:
+    """Parse ``halt_commands``; raises a typed error naming a malformed entry."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise TransportError("ros2 halt_commands must map command channels to their stop",
+                             failure_code="ros2_invalid_config")
+    parsed: dict[str, str] = {}
+    for channel_id, policy in raw.items():
+        source = policy.get("hold_from") if isinstance(policy, Mapping) else None
+        if policy == _HALT_ZERO:
+            parsed[str(channel_id)] = ""
+        elif isinstance(source, str) and source.strip():
+            parsed[str(channel_id)] = source.strip()
+        else:
+            raise TransportError(
+                f"ros2 halt_commands[{channel_id!r}] must be {_HALT_ZERO!r} or "
+                f"{{hold_from: <state channel>}}, got {policy!r}",
+                failure_code="ros2_invalid_config")
+    return parsed
 
 
 __all__ = [

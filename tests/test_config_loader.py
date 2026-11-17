@@ -236,6 +236,93 @@ def test_daemon_serve_applies_daemon_log_level(monkeypatch, tmp_path) -> None:
     assert applied == [settings]
 
 
+def test_node_log_config_chain(monkeypatch, tmp_path) -> None:
+    """hardware.node_log_* flows env -> Settings and is discoverable in the catalog."""
+    from leapflow.config import _build_settings_from_env
+    from leapflow.config_service import _build_field_specs
+
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "home"))
+    monkeypatch.setenv("LEAPFLOW_HARDWARE_NODE_LOG_FILE", str(tmp_path / "node.log"))
+    monkeypatch.setenv("LEAPFLOW_HARDWARE_NODE_LOG_MAX_MB", "2")
+    monkeypatch.setenv("LEAPFLOW_HARDWARE_NODE_LOG_BACKUPS", "3")
+    built = _build_settings_from_env()
+
+    assert built.hardware_node_log_file == str(tmp_path / "node.log")
+    assert built.hardware_node_log_level == "INFO"
+    assert built.hardware_node_log_max_mb == 2.0
+    assert built.hardware_node_log_backups == 3
+    specs = _build_field_specs()
+    for key in ("file", "level", "max_mb", "backups"):
+        assert specs[f"hardware.node_log_{key}"].setting_name == f"hardware_node_log_{key}"
+
+
+def test_node_logging_appends_rotates_and_keeps_stderr_quiet(tmp_path) -> None:
+    """The edge node owns a size-rotated file: a restart appends rather than
+    truncating, re-init never stacks handlers, and the console keeps warnings only."""
+    import logging
+    import logging.handlers
+
+    from leapflow import logging_setup
+
+    class _Settings:
+        hardware_node_log_level = "INFO"
+        hardware_node_log_file = str(tmp_path / "logs" / "node.log")
+        hardware_node_log_max_mb = 0.001  # ~1 KiB, so a few lines rotate
+        hardware_node_log_backups = 2
+
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    original_level = root.level
+    try:
+        for handler in original_handlers:
+            root.removeHandler(handler)
+        path = logging_setup.init_node_logging(_Settings())
+        assert path == (tmp_path / "logs" / "node.log").resolve()
+        logging.getLogger("leapflow.test").info("first run")
+        # A second init (a restarted process) keeps one file handler and appends.
+        logging_setup.init_node_logging(_Settings())
+        files = [h for h in root.handlers if isinstance(h, logging.handlers.RotatingFileHandler)]
+        assert len(files) == 1
+        logging.getLogger("leapflow.test").info("second run")
+        files[0].flush()
+        assert "first run" in path.read_text() and "second run" in path.read_text()
+        console = [h for h in root.handlers if getattr(h, "_leapflow_log_handler", False)]
+        assert console[0].level == logging.WARNING
+        for index in range(60):
+            logging.getLogger("leapflow.test").info("filler line %03d %s", index, "x" * 40)
+        backups = sorted(p.name for p in path.parent.iterdir())
+        assert backups == ["node.log", "node.log.1", "node.log.2"]
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            if isinstance(handler, logging.FileHandler):
+                handler.close()
+        for handler in original_handlers:
+            root.addHandler(handler)
+        root.setLevel(original_level)
+
+
+def test_node_logging_without_a_file_stays_on_stderr() -> None:
+    from leapflow import logging_setup
+
+    class _Settings:
+        hardware_node_log_file = ""
+
+    import logging
+
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    original_level = root.level
+    try:
+        assert logging_setup.init_node_logging(_Settings()) is None
+        assert root.level == logging.INFO
+    finally:
+        for handler in list(root.handlers):
+            if handler not in original_handlers:
+                root.removeHandler(handler)
+        root.setLevel(original_level)
+
+
 def test_llm_supports_vision_overrides_the_model_table(monkeypatch, tmp_path) -> None:
     """llm.supports_vision flows YAML -> env -> Settings -> model capabilities, so a
     multimodal model the static table misses can still be shown images."""

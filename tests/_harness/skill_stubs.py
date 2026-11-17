@@ -47,10 +47,12 @@ from leapflow.hardware.skills.adapt.rotations import ARM_EULER, rotation_width
 from leapflow.hardware.skills.geometry import Pose
 from leapflow.hardware.transport import (
     SIDE_EFFECT_COMMITTED,
+    STOP_EFFECT_HOLD,
     BatchReading,
     BatchWriteOutcome,
     Reading,
     TransportError,
+    TransportStatus,
     WriteOutcome,
 )
 
@@ -95,6 +97,7 @@ class SimArmTransport:
         travel_reads: int = 2,
         stall: bool = False,
         object_width_mm: float | None = None,
+        jammed_open_mm: float | None = None,
         refuse_writes: bool = False,
         joints: Sequence[float] | None = None,
         forward: Callable[[Sequence[float]], Pose] | None = None,
@@ -110,6 +113,7 @@ class SimArmTransport:
         self.travel_reads = travel_reads
         self.stall = stall
         self.object_width_mm = object_width_mm
+        self.jammed_open_mm = jammed_open_mm  # opening stops here (a wedged object)
         self.refuse_writes = refuse_writes
         self.arm_status = arm_status  # vendor verdict on the last target, 0x04 = refused
         self.joint_communication_errors = tuple(joint_communication_errors)
@@ -126,10 +130,13 @@ class SimArmTransport:
     async def close(self) -> None:
         return None
 
-    async def halt(self) -> None:
+    async def halt(self) -> TransportStatus:
         self.halts += 1
         self._pending.clear()
         self.gripper_target = self.gripper_mm
+        # Answers like the Piper driver: held where it stands, and seen to hold.
+        return TransportStatus(connected=True, halt_supported=True, detail="held in place",
+                               stop_effect=STOP_EFFECT_HOLD, stop_verified=True)
 
     async def read(self, channel_id: str) -> Reading:
         return (await self.read_batch((channel_id,))).readings[0]
@@ -188,6 +195,9 @@ class SimArmTransport:
         held = self.object_width_mm
         if held is not None and target < held <= self.gripper_mm:
             target = held  # closing on an object stops at the object
+        jammed = self.jammed_open_mm
+        if jammed is not None and target > jammed >= self.gripper_mm:
+            target = jammed
         step = max(-10.0, min(10.0, target - self.gripper_mm))
         self.gripper_mm += step
 

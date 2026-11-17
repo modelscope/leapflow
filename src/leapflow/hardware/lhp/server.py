@@ -106,6 +106,7 @@ from leapflow.hardware.node_gate import (
     verify_reading_identity,
 )
 from leapflow.hardware.transport import (
+    STOP_EFFECT_NONE,
     FrameTransport,
     TransportError,
     TransportStatus,
@@ -605,6 +606,8 @@ class LhpNodeServer:
                 halt_supported=getattr(context, "halt_supported", None) is not False,
                 halt_delivered=False,
                 detail=str(exc),
+                stop_effect=STOP_EFFECT_NONE,
+                stop_verified=False,
             ).to_dict()
         if status is None:
             logger.info("LHP halt for %r: no open link on this node, nothing to stop", device_id)
@@ -613,6 +616,7 @@ class LhpNodeServer:
                 halt_supported=getattr(context, "halt_supported", None) is not False,
                 detail="no link is open to this device on the node, so nothing is being driven "
                        "from here",
+                stop_effect=STOP_EFFECT_NONE,
             ).to_dict()
         return status.to_dict()
 

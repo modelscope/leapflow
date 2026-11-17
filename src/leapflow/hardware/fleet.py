@@ -780,11 +780,13 @@ class FleetManager:
                     verified_at=verified_at,
                 ),
             )
-        logger.info(
-            "Fleet: stripping self-reported verification for %s from node %s; "
-            "this host holds no confirmation of that declaration",
+        logger.warning(
+            "Fleet: stripping self-reported verification for %s from node %s; this host "
+            "holds no confirmation of that declaration, so its writes are read-only here "
+            "until an operator runs `leap hw verify %s`",
             context.device_id,
             node_id,
+            host_device_id,
         )
         return replace(
             context,

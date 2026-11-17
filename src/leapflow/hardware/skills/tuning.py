@@ -121,7 +121,9 @@ DEFAULT_VISION: Mapping[str, float] = {
     "sync_attempts": 3.0,
 }
 
-GRIPPER_SPEC_KEYS = frozenset({"max_width_mm", "min_hold_width_mm"})
+GRIPPER_SPEC_KEYS = frozenset(
+    {"max_width_mm", "min_hold_width_mm", "release_margin_mm", "stall_band_mm"}
+)
 DEFAULT_MIN_HOLD_WIDTH_MM = 3.0
 
 
@@ -149,7 +151,16 @@ def positive(value: Any, name: str) -> float:
 
 
 def gripper_spec(raw: Any) -> dict[str, float]:
-    """The declared gripper spec; ``max_width_mm`` may be left to the device envelope."""
+    """The declared gripper spec; ``max_width_mm`` may be left to the device envelope.
+
+    - ``max_width_mm``: the widest commandable opening (default: the envelope max).
+    - ``min_hold_width_mm``: narrower than this, closed jaws hold nothing.
+    - ``release_margin_mm``: how far past the held width an opening must be
+      observed before a ``released`` guard passes (default: the workcell's
+      ``freshness.hold_tolerance_mm``).
+    - ``stall_band_mm``: progress toward a target smaller than this counts as
+      the jaws having stopped (default: a fraction of the position tolerance).
+    """
     if not isinstance(raw, Mapping):
         raise ValueError("'gripper_spec' must be a mapping")
     unknown = sorted(str(key) for key in raw if key not in GRIPPER_SPEC_KEYS)

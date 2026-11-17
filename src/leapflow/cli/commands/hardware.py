@@ -163,13 +163,29 @@ async def _run_serve(args: argparse.Namespace) -> int:
             "(--node-id, or LEAPFLOW_LHP_NODE_ID)"
         )
         return 1
-    return await serve_node(
-        node_id=node_id,
-        host=str(getattr(args, "host", "") or "127.0.0.1"),
-        port=int(getattr(args, "port", 0)),
-        unix_path=str(getattr(args, "unix_path", "") or ""),
-        token=token,
+    from leapflow.logging_setup import init_node_logging
+
+    log_path = init_node_logging(
+        load_config(),
+        log_file=str(getattr(args, "log_file", "") or ""),
+        verbose=bool(getattr(args, "verbose", False)),
     )
+    if log_path is not None:
+        # stderr, not stdout: stdout carries the machine-readable ready line.
+        sys.stderr.write(f"node log: {log_path}\n")
+    try:
+        return await serve_node(
+            node_id=node_id,
+            host=str(getattr(args, "host", "") or "127.0.0.1"),
+            port=int(getattr(args, "port", 0)),
+            unix_path=str(getattr(args, "unix_path", "") or ""),
+            token=token,
+        )
+    except Exception:
+        # The node's own log is where a field failure is read afterwards, so the
+        # reason it died belongs there, not only on a console nobody kept.
+        logger.critical("LHP node %r exited on an unhandled error", node_id, exc_info=True)
+        raise
 
 
 # ── Read / estop plane ─────────────────────────────────────────────────────
@@ -398,7 +414,11 @@ def _render_one_status(report: dict[str, Any]) -> None:
 
 
 def _render_estop(result: dict[str, Any]) -> None:
-    _ok(f"{result.get('device_id')}: halted={result.get('halted')}")
+    effect = result.get("stop_effect") or "unreported"
+    _ok(f"{result.get('device_id')}: halted={result.get('halted')} effect={effect} "
+        f"verified={result.get('stop_verified')}")
+    if result.get("warning"):
+        _warn(str(result["warning"]))
 
 
 def _render_sampling(result: dict[str, Any]) -> None:

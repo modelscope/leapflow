@@ -30,7 +30,6 @@ from typing import Any, Callable, Mapping
 
 from leapflow.hardware.context import (
     HardwareContext,
-    HardwareEffect,
     Quality,
     Representation,
 )
@@ -41,6 +40,8 @@ from leapflow.hardware.transport import (
     Reading,
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_UNKNOWN,
+    STOP_EFFECT_HOLD,
+    STOP_EFFECT_NONE,
     TransportError,
     TransportStatus,
     WriteOutcome,
@@ -238,10 +239,15 @@ class RobotArmTransport:
         )
 
     async def halt(self) -> TransportStatus:
-        """Emergency stop: send zero velocity to all actuators.
+        """Stop in place: command every actuator to the position it reports now.
 
-        Lock-free (as required by HCP). Constructs a zero-velocity action
-        and sends it immediately without acquiring any lock.
+        Lock-free (as required by HCP). The action channels are position
+        targets, so a vector of zeros is not a stop -- it is a full-speed move to
+        the zero posture. The halt therefore takes a *fresh* observation and
+        sends it back as the target, which leaves each joint (and the gripper,
+        with whatever it holds) where it stands. When any action channel has no
+        observed value nothing is sent: a partial vector would have to invent
+        the missing targets.
         """
         if not self._connected or self._robot is None:
             return TransportStatus(
@@ -249,15 +255,26 @@ class RobotArmTransport:
                 halt_supported=True,
                 halt_delivered=False,
                 detail="halt: not connected; the stop was not sent",
+                stop_effect=STOP_EFFECT_NONE,
             )
         try:
-            zero_commands: dict[str, Any] = {}
-            for cid, ch in self._channels.items():
-                if ch.effect in HardwareEffect.writable():
-                    # Send zero / current position to stop all motion.
-                    zero_commands[cid] = 0.0
-            if zero_commands:
-                action = self._build_action(zero_commands, hold_position=False)
+            self._obs_cache = None
+            observed = await self._get_observation()
+            hold = {cid: observed_value for cid in self._action_channels()
+                    if (observed_value := self._resolve_obs_value(cid, observed)) is not None}
+            missing = [cid for cid in self._action_channels() if cid not in hold]
+            if missing:
+                return TransportStatus(
+                    connected=self._connected,
+                    halt_supported=True,
+                    halt_delivered=False,
+                    detail=(f"halt: no observed position for {missing}, so no hold target was "
+                            "sent; use the physical emergency stop if the arm is still moving"),
+                    stop_effect=STOP_EFFECT_NONE,
+                    stop_verified=False,
+                )
+            if hold:
+                action = self._build_action(hold)
                 # Dispatch to thread but do NOT hold any lock.
                 await asyncio.to_thread(self._robot.send_action, action)
         except Exception as exc:
@@ -267,11 +284,16 @@ class RobotArmTransport:
                 halt_supported=True,
                 halt_delivered=False,
                 detail=f"halt attempted with error: {exc}",
+                stop_effect=STOP_EFFECT_NONE,
+                stop_verified=False,
             )
+        self._obs_cache = None
         return TransportStatus(
             connected=self._connected,
             halt_supported=True,
-            detail="halted",
+            detail="halted: every actuator holds its observed position" if hold
+            else "halted: no writable actuator to hold",
+            stop_effect=STOP_EFFECT_HOLD if hold else STOP_EFFECT_NONE,
         )
 
     # ------------------------------------------------------------------
@@ -471,49 +493,37 @@ class RobotArmTransport:
         self._last_obs.update(obs)
         return obs
 
-    def _build_action(
-        self,
-        commands: dict[str, Any],
-        *,
-        hold_position: bool = True,
-    ) -> Any:
+    def _action_channels(self) -> list[str]:
+        """The writable, non-frame channels that make up the action vector, in order."""
+        return [
+            cid for cid, ch in self._channels.items()
+            if ch.is_writable and ch.representation != Representation.FRAME.value
+        ]
+
+    def _build_action(self, commands: dict[str, Any]) -> Any:
         """Build a robot action tensor from channel commands.
 
-        Non-commanded channels hold their current observed position when
-        *hold_position* is True.  When False (halt), zeros are used.
+        Non-commanded channels hold their current observed position; a channel
+        with no observation refuses the whole action rather than inventing one.
         """
         try:
             import torch
         except ImportError:
             torch = None  # type: ignore[assignment]
 
-        # Collect all writable channels that map to action features.
         action_values: list[float] = []
-        action_keys: list[str] = []
-
-        for cid, ch in self._channels.items():
-            if not ch.is_writable:
-                continue
-            # Only scalar/state channels participate in the action vector;
-            # frame channels are never written.
-            if ch.representation == Representation.FRAME.value:
-                continue
-            action_keys.append(cid)
+        for cid in self._action_channels():
             if cid in commands:
                 action_values.append(float(commands[cid]))
-            elif hold_position:
-                # Use the feature key that maps to this channel.
-                obs_val = self._resolve_obs_value(cid, self._last_obs) if self._last_obs else None
-                if obs_val is not None:
-                    action_values.append(float(obs_val))
-                else:
-                    raise TransportError(
-                        f"Cannot hold position for channel {cid!r}: no observation "
-                        "available. Read the device at least once before writing.",
-                        failure_code="hold_position_no_observation",
-                    )
-            else:
-                action_values.append(0.0)
+                continue
+            obs_val = self._resolve_obs_value(cid, self._last_obs) if self._last_obs else None
+            if obs_val is None:
+                raise TransportError(
+                    f"Cannot hold position for channel {cid!r}: no observation "
+                    "available. Read the device at least once before writing.",
+                    failure_code="hold_position_no_observation",
+                )
+            action_values.append(float(obs_val))
 
         # Return as a torch tensor if available (expected format for many
         # robot SDKs), otherwise as a plain list.

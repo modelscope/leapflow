@@ -18,6 +18,7 @@ from typing import Any, ContextManager, Mapping, Protocol, runtime_checkable
 
 from leapflow.hardware.arm_status import COMM_FAULT_SHIFT, LIMIT_FAULT_SHIFT, joint_faults
 from leapflow.hardware.drivers._piper_motion import (
+    MOTION_STATUS_ARRIVED,
     SPACE_CHANNELS,
     SPACE_JOINT,
     as_int,
@@ -163,7 +164,6 @@ _JOINT_GROUPS = tuple(f"0x{i:03x}" for i in range(0x2A5, 0x2A8))
 _POSE_GROUPS = tuple(f"0x{i:03x}" for i in range(0x2A2, 0x2A5))
 _GRIPPER_GROUPS = ("0x2a8",)
 _STATUS_GROUPS = ("0x2a1", *(f"0x{i:03x}" for i in range(0x261, 0x267)))
-_MOTION_STATUS_ARRIVED = 0x00
 _MM_PER_M = 1000.0
 _FAULT_FLAGS = (
     "driver_overcurrent",
@@ -309,7 +309,7 @@ class PiperFeedback:
                 status = status_value(feedback) if feedback is not None else None
                 motion = status["motion_status"] if status else None
                 values[ARM_STATUS] = status
-                values[ARM_MOTION] = motion == _MOTION_STATUS_ARRIVED if motion is not None else None
+                values[ARM_MOTION] = motion == MOTION_STATUS_ARRIVED if motion is not None else None
                 values[ARM_CTRL_MODE] = ctrl_mode_name(status["ctrl_mode"]) if status else None
             values["_receive"] = self.receipts()
         return values

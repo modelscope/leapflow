@@ -160,7 +160,7 @@ The host sends **goals**; the node decomposes them locally. A skill is planned o
 |---|---|---|
 | Inspect | `hw_list` · `hw_describe` · `hw_read` · `hw_status` | read-only |
 | Act | `hw_configure` · `hw_actuate` · `hw_dispense` · `hw_batch_actuate` | approval-gated |
-| Safety | `hw_estop` | no approval — node-local |
+| Safety | `hw_estop` | no approval — node-local; holds in place, reports `stop_effect` / `stop_verified` |
 | Control | `hw_control_start` · `hw_control_stop` · `hw_control_status` | leased deadman |
 | Fleet | `hw_fleet_status` · `hw_fleet_discover` · `hw_fleet_halt_all` | multi-node |
 | Skills | `hw_skill_list` · `hw_skill_run` · `hw_skill_status` · `hw_skill_stop` | plan-digest approval, node-local |
@@ -205,7 +205,8 @@ The host sends **goals**; the node decomposes them locally. A skill is planned o
 pip install leapflow
 openssl rand -hex 24 > ~/.leapflow/.lhp-token && chmod 600 ~/.leapflow/.lhp-token
 LEAPFLOW_LHP_TOKEN="$(cat ~/.leapflow/.lhp-token)" \
-  leap hw serve --node-id edge01 --host 0.0.0.0 --port 8767
+  leap hw serve --node-id edge01 --host 0.0.0.0 --port 8767 \
+    --log-file ~/.leapflow/logs/lhp-node.log   # size-rotated; config hardware.node_log_*
 
 # Host
 export EDGE_LHP_TOKEN='paste-the-token-here'

@@ -37,18 +37,23 @@ SDK facts this driver is built on:
   value outside the declared envelope, invalid value, mixed motion spaces,
   unqualified feedback) also reaches nothing.
 - ``enable()`` energizes motors without motion and is reachable ONLY through
-  the governed ``arm.enable`` write, which first resumes a latched stop
-  (``reset()``) under the same approval. Bring-up never energizes anything:
-  opens also happen for read-only observation, and a physical action must
-  never ride a read path. ``halt`` maps to ``electronic_emergency_stop()`` (a
-  damped stop, never a power drop); ``disable()`` drops torque and is only
-  reachable as ``arm.enable=0``.
+  the governed ``arm.enable`` write. Bring-up never energizes anything: opens
+  also happen for read-only observation, and a physical action must never ride
+  a read path.
+- ``halt`` is a position hold (``_piper_halt``): the arm is commanded to stay
+  at the joints it reports, under power, and the hold is watched before it is
+  reported verified. The SDK's ``electronic_emergency_stop()`` is never
+  called -- it lets a raised arm sink -- and neither is anything else that
+  releases the drives. ``reset()`` (resuming a firmware stop latched by the
+  physical button) and ``disable()`` (``arm.enable=0``) do release them, so
+  both are gated by the declared ``torque_release`` policy.
 - Getters return the SDK read thread's cached frames, so reads never touch the
   bus. Freshness comes only from per-group receive receipts stamped by a
   packet callback (``_piper_feedback``), never from a getter returning a value.
 
 Responsibilities are split by module: ``_piper_link`` (bring-up, probe state,
-energize), ``_piper_motion`` (units, hold vectors, CAN-mode entry) and
+energize), ``_piper_motion`` (units, hold vectors, CAN-mode entry, halt
+preemption), ``_piper_halt`` (hold-in-place, torque-release policy) and
 ``_piper_feedback`` (cached reads certified by receive receipts). This class
 only maps declared channels onto them and owns the ``WriteOutcome`` verdicts.
 """
@@ -73,6 +78,14 @@ from leapflow.hardware.drivers._piper_feedback import (
     STATUS_CHANNELS,
     PiperFeedback,
 )
+from leapflow.hardware.drivers._piper_envelope import held_value, target_refusal
+from leapflow.hardware.drivers._piper_halt import (
+    HALT_LATCH_MOTION,
+    HALT_LATCH_POLICIES,
+    HoldSpec,
+    TorqueReleasePolicy,
+    halt_arm,
+)
 from leapflow.hardware.drivers._piper_link import (
     ENABLE_SETTLE_S,
     LinkSpec,
@@ -87,17 +100,21 @@ from leapflow.hardware.drivers._piper_motion import (
     SPACE_CHANNELS,
     SPACE_JOINT,
     HoldRefused,
+    MotionHalted,
+    MotionPreempted,
     PiperMotion,
     TargetRefused,
     enable_flag,
     motion_space,
     motion_spaces,
     numeric,
+    read_joints,
 )
 from leapflow.hardware.transport import (
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_UNKNOWN,
+    STOP_EFFECT_NONE,
     BatchReading,
     BatchWriteOutcome,
     Reading,
@@ -231,6 +248,20 @@ class PiperArmTransport:
         self._enable_timeout_s = _seconds(config, "enable_timeout_s", 6.0, 0.1)
         self._enable_settle_s = _seconds(config, "enable_settle_s", ENABLE_SETTLE_S, 0.0)
         default_force_n = _seconds(config, "default_gripper_force_n", 1.0, 0.0)
+        latch = str(config.get("halt_latch") or HALT_LATCH_MOTION).strip().lower()
+        if latch not in HALT_LATCH_POLICIES:
+            raise _invalid_config(
+                f"piper transport halt_latch must be one of {list(HALT_LATCH_POLICIES)}, got {latch!r}"
+            )
+        self._halt_spec = HoldSpec(
+            verify_s=_seconds(config, "halt_verify_s", 0.5, 0.0),
+            tolerance_deg=_seconds(config, "halt_hold_tolerance_deg", 2.0, 0.01),
+            latch=latch,
+        )
+        try:
+            self._release = TorqueReleasePolicy.from_config(config)
+        except ValueError as exc:
+            raise _invalid_config(f"piper transport {exc}") from exc
 
         self._robot: Any = None
         self._gripper: Any = None
@@ -248,6 +279,8 @@ class PiperArmTransport:
         )
         self._commanded_stroke_mm: float | None = None
         self._commanded_force_n = default_force_n
+        # Writes in flight; a halt that interrupts one latches (``halt_latch``).
+        self._writes = 0
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -315,31 +348,22 @@ class PiperArmTransport:
         )
 
     async def halt(self) -> TransportStatus:
-        """Engage the damped electronic emergency stop. Lock-free, never raises.
+        """Hold the arm where it stands, under power, and watch it stay. Never raises.
 
-        Deliberately NOT ``disable()``: dropping torque lets the arm fall.
-        Resuming (``reset()``) is a separate governed write on the
-        ``arm.enable`` path, never part of a halt.
+        Deliberately neither ``electronic_emergency_stop()`` (a raised arm sinks)
+        nor ``disable()`` / ``reset()`` (a raised arm falls): see ``_piper_halt``.
+        Every command in flight is preempted, and a halt that interrupted one
+        latches (``halt_latch``): later targets are refused until a governed
+        ``arm.enable=1``.
         """
         robot = self._robot
         if robot is None:
             return TransportStatus(connected=False, halt_supported=True,
-                                   detail="Piper transport is closed; nothing to halt")
-        # The stop ends this driver's ownership of the arm's posture; the entry
-        # is taken before the frame goes out so nothing can be held across it.
-        self._motion.disown("an emergency stop")
-        try:
-            await asyncio.to_thread(robot.electronic_emergency_stop)
-        except Exception as exc:  # noqa: BLE001 - halt must never raise
-            return TransportStatus(connected=self._connected, halt_supported=True,
-                                   detail=f"Piper emergency stop command failed: {exc}")
-        # The stop latches: re-asserting CAN control over a latched arm would
-        # only make the latch look transient. Resume is a governed enable.
-        return TransportStatus(
-            connected=self._connected,
-            halt_supported=True,
-            detail="Piper damped emergency stop engaged; resume is a separate governed action",
-        )
+                                   detail="Piper transport is closed; nothing to halt",
+                                   stop_effect=STOP_EFFECT_NONE)
+        report, latched = await asyncio.to_thread(halt_arm, robot, self._motion,
+                                                  self._halt_spec, self._writes > 0)
+        return report.status(connected=self._connected, latched=latched)
 
     # ── Reads ────────────────────────────────────────────────────────────────
 
@@ -398,17 +422,24 @@ class PiperArmTransport:
 
     async def write(self, channel_id: str, value: Any) -> WriteOutcome:
         """Write one channel, reporting whether the effect may have landed."""
+        self._writes += 1
+        try:
+            return await self._write_one(channel_id, value, self._motion.generation)
+        finally:
+            self._writes -= 1
+
+    async def _write_one(self, channel_id: str, value: Any, generation: int) -> WriteOutcome:
         if channel_id == _ARM_ENABLE:
             return await self._write_enable(value)
         if channel_id in _SETTINGS:
             return self._write_setting(channel_id, value)
         space = motion_space(channel_id)
         if space:
-            return (await self._write_motion(space, [(channel_id, value)]))[0]
+            return (await self._write_motion(space, [(channel_id, value)], generation))[0]
         if channel_id == GRIPPER_POSITION:
-            return await self._write_gripper(stroke=value)
+            return await self._write_gripper(generation, stroke=value)
         if channel_id == GRIPPER_EFFORT:
-            return await self._write_gripper(force=value)
+            return await self._write_gripper(generation, force=value)
         return _NOT_WRITABLE
 
     async def write_batch(self, commands: tuple[tuple[str, Any], ...]) -> BatchWriteOutcome:
@@ -418,7 +449,19 @@ class PiperArmTransport:
         vector. A batch naming both joint and pose targets is refused whole
         before any send: the arm obeys one move mode, and executing either half
         would move it somewhere the caller never asked for.
+
+        The halt generation is captured once, here: a halt anywhere in the
+        batch preempts every later frame of it, while an enable inside the
+        batch (which resumes a latched halt) does not preempt its own motion.
         """
+        self._writes += 1
+        try:
+            return await self._write_batch(commands, self._motion.generation)
+        finally:
+            self._writes -= 1
+
+    async def _write_batch(self, commands: tuple[tuple[str, Any], ...],
+                           generation: int) -> BatchWriteOutcome:
         spaces = motion_spaces(cid for cid, _ in commands)
         if len(spaces) > 1:
             refusal = _refused(
@@ -446,14 +489,17 @@ class PiperArmTransport:
         for space in spaces:
             indexes = [i for i, (cid, _) in enumerate(commands) if motion_space(cid) == space]
             merged = ([blocked] * len(indexes) if failed()
-                      else await self._write_motion(space, [commands[i] for i in indexes]))
+                      else await self._write_motion(space, [commands[i] for i in indexes],
+                                                    generation))
             for i, outcome in zip(indexes, merged):
                 outcomes[i] = outcome
         for i, (cid, value) in enumerate(commands):
             if cid == GRIPPER_POSITION:
-                outcomes[i] = blocked if failed() else await self._write_gripper(stroke=value)
+                outcomes[i] = (blocked if failed()
+                               else await self._write_gripper(generation, stroke=value))
             elif cid == GRIPPER_EFFORT:
-                outcomes[i] = blocked if failed() else await self._write_gripper(force=value)
+                outcomes[i] = (blocked if failed()
+                               else await self._write_gripper(generation, force=value))
         final = [outcome if outcome is not None else _NOT_WRITABLE for outcome in outcomes]
         return BatchWriteOutcome(
             ok=all(o.ok for o in final),
@@ -462,7 +508,13 @@ class PiperArmTransport:
         )
 
     async def _write_enable(self, value: Any) -> WriteOutcome:
-        """Guarded enable/disable: resume, energize, enter CAN -- or drop torque."""
+        """Guarded enable/disable: resume, energize, enter CAN -- or release the drives.
+
+        A successful enable also clears a latched halt: it is the governed act
+        that hands motion back. Releasing the drives (``arm.enable=0``) lets a
+        raised arm fall, so it is refused unless the torque-release policy
+        allows it for the joints the arm reports.
+        """
         flag = enable_flag(value)
         if flag is None:
             return _refused(f"arm.enable expects 0 or 1, got {value!r}", "invalid_value")
@@ -470,9 +522,16 @@ class PiperArmTransport:
         if robot is None or feedback is None or not self._connected:
             return _NOT_OPEN
         if flag:
-            return await asyncio.to_thread(energize, robot, feedback, self._motion,
-                                           self._enable_timeout_s, self._enable_settle_s,
-                                           self._spec.requalify_s)
+            outcome = await asyncio.to_thread(energize, robot, feedback, self._motion,
+                                              self._enable_timeout_s, self._enable_settle_s,
+                                              self._spec.requalify_s, self._release)
+            if outcome.ok:
+                self._motion.resume()
+            return outcome
+        refusal = self._release.refusal(await asyncio.to_thread(read_joints, robot),
+                                        "arm.enable=0")
+        if refusal:
+            return _refused(refusal, "piper_torque_release_refused")
         # Torque is about to drop, so the arm may end up anywhere -- including
         # by hand. Whatever vector was held stops describing it now.
         self._motion.disown("a governed disable")
@@ -497,7 +556,8 @@ class PiperArmTransport:
         readback = self._reading(channel_id, applied)
         return WriteOutcome(ok=True, side_effect_state=SIDE_EFFECT_COMMITTED, readback=readback)
 
-    async def _write_motion(self, space: str, commands: list[tuple[str, Any]]) -> list[WriteOutcome]:
+    async def _write_motion(self, space: str, commands: list[tuple[str, Any]],
+                            generation: int) -> list[WriteOutcome]:
         """Send one hold vector in ``space`` covering every commanded channel.
 
         Uncommanded values are held (see ``_piper_motion``), so a single-axis
@@ -505,7 +565,7 @@ class PiperArmTransport:
         vector and defines the side-effect verdict for every channel in it. A
         refusal on any commanded channel refuses the whole atomic vector. The
         send runs on a worker thread so a stalled CAN write never blocks the
-        event loop or delays ``halt``.
+        event loop or delays ``halt``; a halt since ``generation`` preempts it.
         """
         for channel_id, value in commands:
             refusal = self._refusal(channel_id, value)
@@ -514,6 +574,9 @@ class PiperArmTransport:
         robot = self._robot
         if robot is None or not self._connected:
             return [_NOT_OPEN] * len(commands)
+        if self._motion.halted:
+            error = self._motion.halted_error()
+            return [_refused(str(error), error.failure_code)] * len(commands)
         problem = await self._wait_receive()
         if problem:
             return [_refused(f"fresh per-group CAN reception is required before motion: {problem}",
@@ -522,8 +585,8 @@ class PiperArmTransport:
         targets = [(channels[cid], float(numeric(value) or 0.0)) for cid, value in commands]
         call = _VENDOR_CALL[space if space == SPACE_JOINT else self._motion.pose_path]
         try:
-            snapshot = await asyncio.to_thread(self._send_motion, robot, space, targets)
-        except (HoldRefused, TargetRefused) as exc:
+            snapshot = await asyncio.to_thread(self._send_motion, robot, space, targets, generation)
+        except (HoldRefused, TargetRefused, MotionPreempted, MotionHalted) as exc:
             return [_refused(str(exc), exc.failure_code)] * len(commands)
         except TransportError as exc:
             return [_failed(SIDE_EFFECT_UNKNOWN, f"{call}: {exc}", exc.failure_code)] * len(commands)
@@ -545,50 +608,26 @@ class PiperArmTransport:
             for cid, _value in commands
         ]
 
-    def _send_motion(self, robot: Any, space: str, targets: list[tuple[int, float]]) -> list[float] | None:
+    def _send_motion(self, robot: Any, space: str, targets: list[tuple[int, float]],
+                     generation: int) -> list[float] | None:
         """Blocking: read hold feedback, then send through the serialized state."""
         feedback = self._feedback.space(space) if self._feedback is not None else None
         return self._motion.send(robot, space, feedback, targets,
-                                 validate=self._require_receive, hold=self._hold_value)
+                                 validate=self._require_receive, hold=self._hold_value,
+                                 generation=generation)
 
     def _hold_value(self, space: str, index: int, value: float) -> float:
-        """Keep a held axis inside its declared envelope, or refuse to send it.
-
-        Holding an axis means commanding it where it already is. The vendor
-        clamps whatever it is given into its own firmware limit map, so a hold
-        outside the envelope does not hold at all: the arm travels to the limit
-        while the write reports success, and the caller never named that axis.
-
-        Inside the channel's own declared tolerance the clamp is applied here,
-        so what this driver sends is what the arm executes. Beyond it the vector
-        is refused before any frame goes out and the message names the axis, its
-        reading, and its limit -- the arm has to be brought inside the envelope
-        by a command that names it.
-        """
+        """Keep a held axis inside its declared envelope, or refuse (``held_value``)."""
         channel_id = _CHANNEL_OF_INDEX[space][index]
-        channel = self._context.channel(channel_id) if self._context is not None else None
-        envelope = channel.envelope if channel is not None else None
-        if envelope is None or not envelope.declared or envelope.contains(value):
-            return value
-        clamped = value
-        if envelope.min_value is not None:
-            clamped = max(clamped, envelope.min_value)
-        if envelope.max_value is not None:
-            clamped = min(clamped, envelope.max_value)
-        drift = abs(clamped - value)
-        if drift > float(envelope.tolerance or 0.0):
-            unit = channel.unit if channel is not None else ""
-            raise HoldRefused(
-                f"{channel_id} stands at {value:.3f}{' ' + unit if unit else ''}, "
-                f"{drift:.3f} outside its declared envelope "
-                f"[{envelope.min_value}, {envelope.max_value}]; holding it would move an "
-                "axis this command does not name, so name it and bring it inside first",
-                failure_code="piper_hold_outside_envelope",
-            )
-        return clamped
+        return held_value(self._channel(channel_id), channel_id, value)
 
-    async def _write_gripper(self, stroke: Any = None, force: Any = None) -> WriteOutcome:
-        """Command the gripper stroke (mm) or grip force (N); the other is held."""
+    async def _write_gripper(self, generation: int, stroke: Any = None,
+                             force: Any = None) -> WriteOutcome:
+        """Command the gripper stroke (mm) or grip force (N); the other is held.
+
+        A latched halt refuses the gripper too: opening it would drop what a
+        halted arm is holding.
+        """
         robot, gripper, feedback = self._robot, self._gripper, self._feedback
         if robot is None or gripper is None or feedback is None or not self._connected:
             return _NOT_OPEN
@@ -597,6 +636,9 @@ class PiperArmTransport:
         refusal = self._refusal(channel_id, value)
         if refusal is not None:
             return refusal
+        if self._motion.halted:
+            error = self._motion.halted_error()
+            return _refused(str(error), error.failure_code)
         problem = await self._wait_receive()
         if problem:
             return _refused(f"fresh per-group CAN reception is required before gripper commands: "
@@ -617,9 +659,11 @@ class PiperArmTransport:
             # The gripper bypasses the motion path, so the mode guard is this
             # write's own: outside CAN control the firmware drops the frame
             # while the outcome would still read committed.
-            await asyncio.to_thread(self._motion.ensure_can, robot)
+            switched = await asyncio.to_thread(self._motion.ensure_can, robot, generation)
         except TransportError as exc:
-            return _failed(SIDE_EFFECT_COMMITTED, str(exc), "piper_mode_switch_failed")
+            # Preempted included: a mode frame may already have gone out.
+            return _failed(SIDE_EFFECT_COMMITTED, str(exc), exc.failure_code
+                           if isinstance(exc, MotionPreempted) else "piper_mode_switch_failed")
         except Exception as exc:  # noqa: BLE001 - a mode frame may have landed
             return _failed(SIDE_EFFECT_UNKNOWN, f"mode selection failed: {exc}", "piper_send_failed")
         problem = await self._wait_receive()
@@ -628,8 +672,12 @@ class PiperArmTransport:
                            f"feedback lost during gripper mode selection; target not sent: {problem}",
                            "piper_unqualified_feedback")
         try:
-            await asyncio.to_thread(gripper.move_gripper_m, value=staged_stroke / _MM_PER_M,
-                                    force=staged_force)
+            await asyncio.to_thread(self._motion.emit_target, generation, gripper.move_gripper_m,
+                                    value=staged_stroke / _MM_PER_M, force=staged_force)
+        except (MotionPreempted, MotionHalted) as exc:
+            # Refused before the target frame; only a mode frame may have preceded it.
+            return _failed(SIDE_EFFECT_COMMITTED if switched else SIDE_EFFECT_NONE, str(exc),
+                           exc.failure_code)
         except Exception as exc:  # noqa: BLE001 - the gripper frame may have landed
             return _failed(SIDE_EFFECT_UNKNOWN, f"move_gripper_m send failed: {exc}",
                            "piper_send_failed")
@@ -675,18 +723,11 @@ class PiperArmTransport:
 
     def _refusal(self, channel_id: str, value: Any) -> WriteOutcome | None:
         """Driver-level defense: refuse undeclared values before any send."""
-        number = numeric(value)
-        if number is None:
-            return _refused(f"invalid value for {channel_id!r}: {value!r}", "invalid_value")
-        channel = self._context.channel(channel_id) if self._context is not None else None
-        envelope = channel.envelope if channel is not None else None
-        if envelope is not None and envelope.declared and not envelope.contains(number):
-            return _refused(
-                f"{channel_id}={number} is outside the declared envelope "
-                f"[{envelope.min_value}, {envelope.max_value}]",
-                "value_out_of_range",
-            )
-        return None
+        refusal = target_refusal(self._channel(channel_id), channel_id, value)
+        return _refused(*refusal) if refusal is not None else None
+
+    def _channel(self, channel_id: str) -> Any:
+        return self._context.channel(channel_id) if self._context is not None else None
 
     def _reading(
         self,

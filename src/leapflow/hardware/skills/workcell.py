@@ -571,6 +571,36 @@ def _gripper_problems(role: str, gripper: Any, spec: WorkcellSpec) -> list[str]:
         )
     if declared is not None and spec.gripper_spec["min_hold_width_mm"] >= declared:
         problems.append("gripper_spec.min_hold_width_mm must be below max_width_mm")
+    problems.extend(_gripper_band_problems(gripper, spec))
+    return problems
+
+
+def _gripper_band_problems(gripper: Any, spec: WorkcellSpec) -> list[str]:
+    """Widths judged against the position tolerance must be on the right side of it.
+
+    A release margin inside the tolerance can never be told apart from still
+    holding, so every ``released`` guard would be refused; a stall band at or
+    beyond it reads jaws still creeping toward their target as stopped short.
+    """
+    tolerance = gripper.channel(GRIPPER_POSITION).envelope.tolerance
+    if not (isinstance(tolerance, (int, float)) and tolerance > 0):
+        return []  # reported above
+    problems: list[str] = []
+    margin = spec.gripper_spec.get(
+        "release_margin_mm",
+        spec.freshness.get("hold_tolerance_mm", DEFAULT_FRESHNESS["hold_tolerance_mm"]),
+    )
+    if margin <= tolerance:
+        problems.append(
+            f"gripper_spec.release_margin_mm {margin:g} must exceed the {GRIPPER_POSITION} "
+            f"tolerance {tolerance:g} (a smaller opening cannot be told from still holding)"
+        )
+    band = spec.gripper_spec.get("stall_band_mm")
+    if band is not None and band >= tolerance:
+        problems.append(
+            f"gripper_spec.stall_band_mm {band:g} must be below the {GRIPPER_POSITION} "
+            f"tolerance {tolerance:g} (wider reads creeping jaws as stopped)"
+        )
     return problems
 
 

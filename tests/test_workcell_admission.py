@@ -357,3 +357,38 @@ def test_a_speed_cap_below_the_arms_lowest_speed_is_refused(tmp_path: Path) -> N
 
     assert admitted == {}
     assert "below the arm's lowest commandable speed" in report.rejected[0].detail
+
+
+@pytest.mark.parametrize(
+    "gripper_spec,freshness,problem",
+    [
+        ({"release_margin_mm": 0.4}, {}, "release_margin_mm 0.4 must exceed"),
+        ({}, {"hold_tolerance_mm": 0.5}, "release_margin_mm 0.5 must exceed"),
+        ({"stall_band_mm": 0.5}, {}, "stall_band_mm 0.5 must be below"),
+    ],
+)
+def test_gripper_bands_on_the_wrong_side_of_the_position_tolerance_are_refused(
+    tmp_path: Path, gripper_spec: dict[str, float], freshness: dict[str, float], problem: str
+) -> None:
+    """A margin the tolerance swallows refuses every release; a wide band misreads creep."""
+    directory = tmp_path / "workcells"
+    registry = SkillNodeRegistry()
+    assert registry.context(ARM_ID).channel("gripper.position").envelope.tolerance == 0.5
+    spec = {**WORKCELL_YAML["gripper_spec"], **gripper_spec}
+    write_workcell(directory, _with(gripper_spec=spec, freshness=freshness))
+
+    admitted, report = load_workcells(directory, registry)
+
+    assert admitted == {}
+    assert problem in report.rejected[0].detail
+
+
+def test_declared_gripper_bands_inside_the_tolerance_rules_are_admitted(tmp_path: Path) -> None:
+    directory = tmp_path / "workcells"
+    spec = {**WORKCELL_YAML["gripper_spec"], "release_margin_mm": 3.0, "stall_band_mm": 0.1}
+    write_workcell(directory, _with(gripper_spec=spec))
+
+    admitted, report = load_workcells(directory, SkillNodeRegistry())
+
+    assert WORKCELL_ID in admitted, report
+    assert admitted[WORKCELL_ID].gripper_spec["release_margin_mm"] == 3.0

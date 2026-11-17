@@ -183,7 +183,7 @@ async def test_a_composed_pick_resolves_grasp_handles_and_records_the_hold(
     assert _sim(runtime).batches == []  # planning never moves
 
     # One approval covers the whole program, so it shows each guard and the swept space.
-    assert "[expect held, else halt]" in plan.summary
+    assert "[expect held, else hold]" in plan.summary
     envelope = plan.basis["envelope"]
     assert envelope["z_min_mm"] == pytest.approx(grasp.z, abs=0.1)
     assert envelope["z_max_mm"] >= pregrasp.z
@@ -224,22 +224,73 @@ async def test_a_composed_place_releases_and_forgets_the_hold(tmp_path: Path) ->
     assert located.result["held"] is None
 
 
-async def test_release_guard_preserves_hold_until_width_confirms_release(tmp_path: Path) -> None:
+async def test_an_opening_the_jaws_reach_releases_a_hold_and_logs_its_error(
+    tmp_path: Path,
+) -> None:
     runtime = _cell(tmp_path, CUP)
     await _located_and_proposed(runtime)
     await _execute(runtime, await _plan(runtime, PICK))
-    step = {
-        "op": "gripper",
-        "width_mm": CUP_WIDTH + 4.0,
-        "expect": "released",
-        "on_fail": "hold",
-    }
+    step = {"op": "gripper", "width_mm": CUP_WIDTH + 4.0, "expect": "released"}
+
+    outcome = await _execute(runtime, await _plan(runtime, [step]))
+
+    # The threshold is capped where the jaws can get (target - tolerance), so an
+    # opening narrower than held + margin still confirms its release.
+    assert outcome.status == STATUS_SUCCEEDED, outcome
+    assert outcome.result["held"] is None
+    (entry,) = outcome.result["steps"]
+    assert entry["target_mm"] == pytest.approx(CUP_WIDTH + 4.0)
+    assert entry["error_mm"] == pytest.approx(0.0, abs=0.5)
+    assert entry["blocked"] is False
+    assert CUP_WIDTH < entry["release_at_mm"] <= CUP_WIDTH + 4.0
+
+
+async def test_a_release_no_width_can_confirm_is_refused_before_approval(tmp_path: Path) -> None:
+    runtime = _cell(tmp_path, CUP)
+    await _located_and_proposed(runtime)
+    await _execute(runtime, await _plan(runtime, PICK))
+    step = {"op": "gripper", "width_mm": CUP_WIDTH + 0.8, "expect": "released"}
+
+    refused = await _refusal(runtime, [step])
+
+    assert refused.failure_code == FAILURE_INVALID_ARGS
+    assert "cannot confirm a release" in refused.message
+    assert refused.result["release_needs_mm"] == pytest.approx(CUP_WIDTH + 1.0)
+    assert refused.result["step"] == 1
+    assert _gripper_targets(_sim(runtime))[-1] == 0.0, "nothing moved after the pick"
+
+
+async def test_a_release_predicted_from_a_planned_grasp_is_checked_at_plan(tmp_path: Path) -> None:
+    runtime = _cell(tmp_path, CUP)
+    g1 = (await _located_and_proposed(runtime)).result["grasps"][0]
+    program = [*PICK, {"op": "gripper", "width_mm": g1["width_mm"], "expect": "released"}]
+
+    refused = await _refusal(runtime, program)
+
+    assert refused.failure_code == FAILURE_INVALID_ARGS
+    assert refused.result["step"] == len(program)
+    assert _sim(runtime).batches == []
+
+
+@pytest.mark.parametrize("on_fail,status", [("hold", STATUS_FAILED), ("stop", STATUS_HALTED)])
+async def test_release_guard_preserves_hold_until_width_confirms_release(
+    tmp_path: Path, on_fail: str, status: str
+) -> None:
+    runtime = _cell(tmp_path, CUP)
+    await _located_and_proposed(runtime)
+    await _execute(runtime, await _plan(runtime, PICK))
+    _sim(runtime).jammed_open_mm = CUP_WIDTH + 2.0  # something wedged in the jaws
+    step = {"op": "gripper", "width_mm": 50.0, "expect": "released", "on_fail": on_fail}
 
     outcome = await _execute(runtime, await _plan(runtime, [step]))
 
     assert outcome.failure_code == FAILURE_GUARD_FAILED
-    assert outcome.status == STATUS_FAILED
-    assert "release requires more than 35.0" in outcome.message
+    assert outcome.status == status
+    assert "release requires at least 35.0" in outcome.message
+    assert ("halted in place" if on_fail == "stop" else "holds its position") in outcome.message
+    observed = outcome.result["observed"]
+    assert observed["target_mm"] == 50.0 and observed["blocked"] is True
+    assert observed["error_mm"] == pytest.approx(CUP_WIDTH + 2.0 - 50.0, abs=0.01)
     located = await _read(runtime, "perceive.locate", {"queries": ["cup"]})
     assert located.result["held"]["object"]["object_id"] == "o1"
 

@@ -605,6 +605,7 @@ async def test_a_halt_never_brings_a_device_up_just_to_put_it_down() -> None:
     assert reply["result"]["halt_supported"] is True
     assert reply["result"]["connected"] is False
     assert "nothing is being driven" in reply["result"]["detail"]
+    assert reply["result"]["stop_effect"] == "none"
     assert registry.opened is False, "a halt must never open the device"
 
 
@@ -621,6 +622,27 @@ async def test_a_halt_still_stops_a_device_whose_link_is_open() -> None:
     )
     assert reply["ok"] is True, reply
     assert reply["result"]["halt_supported"] is True
+    assert reply["result"]["stop_effect"] == "hold"
+
+
+async def test_the_node_drivers_stop_verdict_reaches_the_host_unchanged() -> None:
+    """The host never re-derives what a remote stop did; it carries the node's word."""
+    node_server, endpoint = await _start_node(_node_registry(_node_device("arm")), "jetson01")
+    host_registry = _node_registry()
+    manager = FleetManager(host_registry)
+    try:
+        await manager.register_node(FleetNode("jetson01", "J", endpoint))
+        transport = await host_registry.transport("jetson01__arm")
+        await transport.read("sensor")  # the node opens its link
+
+        status = await transport.halt()
+
+        assert status.halt_delivered is True
+        assert status.stop_effect == "hold"
+        assert status.stop_verified is None
+    finally:
+        await manager.close()
+        await node_server.stop()
 
 
 async def test_a_halt_that_releases_the_link_lets_the_next_read_reopen_it() -> None:

@@ -546,6 +546,7 @@ class SkillRuntime:
         )
         if needs_halt(outcome, motion.sent_any):
             await self._halt_run(run)
+        outcome = run.with_stops(outcome)
         if recorder is not None:
             episode = await recorder.finish(outcome)
             outcome = replace(outcome, evidence={**dict(outcome.evidence), "episode": episode})
@@ -637,8 +638,8 @@ class SkillRuntime:
         run.stop_code = failure_code
         run.cancel.set()
         # Halt at once when anything may have moved -- including a batch still
-        # inside the transport; a run that never dispatched stays energized (a
-        # halt latches the arm's emergency stop).
+        # inside the transport; a run that never dispatched is left alone (a halt
+        # holds the arm in place and latches its writes until a governed enable).
         if run.motion is None or run.motion.sent_any:
             await self._halt_run(run)
         grace = self._settings.stop_grace_s
@@ -801,11 +802,18 @@ class SkillRuntime:
             run.halt_mark = run.motion.landed
         for device_id in run.actuators:
             try:
-                await asyncio.wait_for(
+                status = await asyncio.wait_for(
                     self._registry.halt(device_id), timeout=self._settings.halt_timeout_s
                 )
             except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
                 logger.error("halting %s failed: %s", device_id, exc, exc_info=True)
+                run.record_stop(device_id, None, error=f"{type(exc).__name__}: {exc}")
+                continue
+            stop = run.record_stop(
+                device_id, status, error="" if status is not None else "no open link")
+            logger.warning("skill run %s halted %s: effect=%s verified=%s delivered=%s %s",
+                           run.run_id[:8], device_id, stop["stop_effect"] or "unreported",
+                           stop["stop_verified"], stop["halt_delivered"], stop["detail"])
 
 
 __all__ = [

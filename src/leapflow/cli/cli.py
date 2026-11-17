@@ -332,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
     hw_read.add_argument("channel", help="Channel id from `leap hw describe`")
     hw_status = hw_sub.add_parser("status", parents=[hw_json], help="Show transport health and recent events")
     hw_status.add_argument("device", nargs="?", default="", help="Optional device id; omit to roll up every device")
-    hw_estop = hw_sub.add_parser("estop", parents=[hw_json], help="Emergency-stop a device (no approval required)")
+    hw_estop = hw_sub.add_parser("estop", parents=[hw_json], help="Stop a device in place, holding actuators under power (no approval required)")
     hw_estop.add_argument("device", help="Device id from `leap hw list`")
     hw_pause = hw_sub.add_parser("pause", parents=[hw_json], help="Pause daemon sampling for a device")
     hw_pause.add_argument("device", help="Device id from `leap hw list`")
@@ -349,6 +349,10 @@ def main(argv: list[str] | None = None) -> int:
     hw_serve.add_argument("--port", type=int, default=8767, help="TCP bind port (default: 8767; 0 picks a free port)")
     hw_serve.add_argument("--unix", default="", dest="unix_path", help="Bind a Unix socket path instead of TCP")
     hw_serve.add_argument("--token", default="", help="Shared hello secret (env LEAPFLOW_LHP_TOKEN)")
+    hw_serve.add_argument(
+        "--log-file", default="", help="Append and size-rotate the node log here (config hardware.node_log_file)"
+    )
+    hw_serve.add_argument("--verbose", action="store_true", help="Log at DEBUG level")
     # Verification subcommands
     hw_verify = hw_sub.add_parser("verify", parents=[hw_json], help="Verify a device declaration (digest-bound)")
     hw_verify.add_argument("device", help="Device id to verify")
