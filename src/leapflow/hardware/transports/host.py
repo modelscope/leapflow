@@ -118,6 +118,7 @@ class HostTransport:
             quantity=channel.quantity if channel is not None else "",
             unit=channel.unit if channel is not None else "",
             sequence=sequence,
+            sequence_scope="channel_read",
             # A probe that cannot answer right now is suspect, not zero. Reporting a
             # value would put a fabricated number into the downsample window, where
             # nothing downstream could ever tell it apart from a measurement.

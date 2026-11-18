@@ -159,6 +159,7 @@ class RobotArmTransport:
             quantity=ch.quantity,
             unit=ch.unit,
             sequence=seq,
+            sequence_scope="channel_read",
             quality=Quality.OK.value,
         )
 
@@ -336,6 +337,7 @@ class RobotArmTransport:
                     observed_at=now_wall,
                     monotonic_at=now_mono,
                     sequence=seq,
+                    sequence_scope="channel_read",
                     quality=Quality.OK.value,
                 )
             )

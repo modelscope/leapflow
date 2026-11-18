@@ -252,6 +252,21 @@ async def test_busy_refusal_does_not_burn_the_permit(tmp_path: Path) -> None:
     assert "run" in retried, "the same permit still authorizes the plan once the device is free"
     await node.until_done(retried["run"]["run_id"])
 
+    third = await node.plan(SEQUENCE, move_by(10))
+    request = {"plan_digest": third["plan"]["digest"], "permit": node.permit(third["permit_digest"])}
+    token = node.server.sessions.begin_dispatch(ARM_ID)
+    node.server.sessions.finish_dispatch(token, settled=False, detail="target receipt lost")
+    blocked = await node.call("skill.execute", request)
+    assert blocked["outcome"]["failure_code"] == FAILURE_DEVICE_BUSY
+    assert "target receipt lost" in blocked["outcome"]["message"]
+    assert "hw_estop" in blocked["outcome"]["message"]
+    written = await node.call("write", {"device_id": ARM_ID, "channel_id": "joint.j1.position", "value": 0})
+    assert written["failure_code"] == FAILURE_DEVICE_BUSY
+    assert "target receipt lost" in written["error"] and "hw_estop" in written["error"]
+    assert node.server._authority.verifier.verify(
+        ExecutionPermit.from_dict(request["permit"]), expected_digest=third["permit_digest"],
+    ) is None, "uncertainty must refuse before consuming the permit"
+
 
 async def test_generation_stale_refusal_preserves_exact_permit(tmp_path: Path) -> None:
     node = _Node(tmp_path, write_mode=WRITE_MODE_PERMIT_REQUIRED)

@@ -1133,7 +1133,20 @@ class Context:
             return False
 
         previous = self.settings
-        updated = self._load_runtime_settings_from_files()
+        try:
+            updated = self._load_runtime_settings_from_files()
+        except ValueError:
+            logger.warning("Invalid runtime configuration; retaining last valid settings", exc_info=True)
+            self._config_signature = signature
+            return False
+        registry = getattr(self, "_hardware_registry", None)
+        if registry is not None and updated.hardware_observation != previous.hardware_observation:
+            try:
+                registry.reconfigure_observation(updated.hardware_observation)
+            except ValueError:
+                from dataclasses import replace
+                logger.warning("Invalid hardware observation reload; retaining last valid policy", exc_info=True)
+                updated = replace(updated, hardware_observation=previous.hardware_observation)
         self._config_signature = self._runtime_config_signature(updated)
         llm_changed = (
             previous.llm_api_key != updated.llm_api_key

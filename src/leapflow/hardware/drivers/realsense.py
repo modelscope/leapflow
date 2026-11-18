@@ -291,6 +291,7 @@ class RealSenseTransport:
             value=value,
             quantity="camera_metadata",
             sequence=self._sequence,
+            sequence_scope="device_acquisition",
             quality=Quality.OK.value,
         )
 
@@ -313,7 +314,7 @@ class RealSenseTransport:
             return Reading(device_id=self._device_id, channel_id=channel_id,
                            value=evidence.to_dict(), quantity="geometry_proposal" if geometry else "depth_quality",
                            observed_at=frame.observed_at, monotonic_at=frame.monotonic_at,
-                           sequence=frame.sequence,
+                           sequence=frame.sequence, sequence_scope="device_acquisition",
                            quality=Quality.OK.value if qualified else Quality.STALE.value)
 
     async def read_frame(

@@ -2048,3 +2048,28 @@ def _with_transport(context: HardwareContext, transport: TransportRef) -> Hardwa
     from dataclasses import replace
 
     return replace(context, transport=transport)
+
+
+def test_remote_physical_rate_uses_source_intervals_not_network_arrival() -> None:
+    from dataclasses import replace
+    from leapflow.hardware.context import Channel, Envelope
+    from leapflow.hardware.stream import HardwareEventDetector, EventKind, ReadingRing
+    from leapflow.hardware.transports.lhp import LhpTransport
+    transport = LhpTransport({"remote_device_id": "arm"})
+    channel = Channel(channel_id="angle", direction="read", quantity="angle", unit="deg", sample_rate_hz=10,
+                      envelope=Envelope(declared=True, min_value=-180, max_value=180, max_rate=50))
+    detector = HardwareEventDetector(_node_device("arm"), channel)
+    ring = ReadingRing()
+    for index, value in enumerate([179, -179, -177]):
+        reading = transport._localize_reading({"channel_id": "angle", "value": value,
+            "observed_at": 1_787_000_000 + index * .1, "sequence": 1 + index * 20,
+            "sequence_scope": "device_read", "acquisition_at": 5000 + index * .1,
+            "acquisition_epoch": "node-boot"}, "angle")
+        assert reading.acquisition_at == 5000 + index * .1
+        assert reading.rate_timebase == "source"
+        reading = replace(reading, monotonic_at=1 + index * .00001)
+        assert ring.record(reading) == 0
+        assert EventKind.RATE_EXCEEDED not in [e.kind for e in detector.observe(reading)]
+    old_peer = transport._localize_reading({"channel_id": "angle", "value": 0, "sequence": 100}, "angle")
+    assert old_peer.sequence_scope == "unknown" and old_peer.rate_timebase == "unavailable"
+    assert EventKind.RATE_EXCEEDED not in [e.kind for e in detector.observe(old_peer)]

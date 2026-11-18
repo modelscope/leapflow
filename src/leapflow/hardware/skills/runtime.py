@@ -498,7 +498,7 @@ class SkillRuntime:
         # must still be refused before this runtime consumes the cached intention.
         sessions = getattr(self._registry, "node_sessions", None)
         if sessions is not None and (reserved := sessions.busy_device(spec.device_ids)):
-            return SkillOutcome.failed(FAILURE_DEVICE_BUSY, f"{reserved} held by a session, transaction or unsettled action")
+            return SkillOutcome.failed(FAILURE_DEVICE_BUSY, sessions.busy_message(reserved))
         if self.cached_plan(digest) is not plan:
             return SkillOutcome.failed(FAILURE_PLAN_UNKNOWN, "plan expired or was executed while checking its model")
         busy = [device for device in spec.device_ids if device in self._held]

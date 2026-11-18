@@ -1891,6 +1891,7 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.stream_enabled",
         "hardware.stream_ring_capacity",
         "hardware.persist_readings",
+        "hardware.observation",
         "hardware.downsample_interval_s",
         "hardware.raw_retention_days",
         "hardware.history_retention_days",
@@ -1940,9 +1941,9 @@ def test_hardware_config_keys_are_discoverable() -> None:
     for key in keys:
         view = service.describe(key)
         assert view.description, f"{key} has no description in the catalog"
-        # Enabling hardware composes the approval classifier at construction, so it
-        # cannot take effect on a running daemon.
-        assert view.hot_reload == "restart-required"
+        # Observation tuning updates existing detectors; hardware construction
+        # settings still require a restart.
+        assert view.hot_reload == ("yes" if key == "hardware.observation" else "restart-required")
 
 
 def test_explicitly_disabled_hardware_leaves_the_classifier_untouched() -> None:

@@ -333,3 +333,29 @@ class TestAtomicYamlWrite:
 
         mode = stat.S_IMODE(target.stat().st_mode)
         assert mode == 0o600
+
+
+def test_hardware_observation_is_discoverable_validated_and_round_tripped(config_env) -> None:
+    from leapflow.config import load_config
+    settings, service = config_env
+    assert "hardware.observation" in service.writable_keys()
+    devices = settings.profile_layout.hardware.devices_dir
+    devices.mkdir(parents=True, exist_ok=True)
+    _write_yaml_atomic(devices / "bench.yaml", {
+        "hc_version": "hc.v0", "device_id": "bench", "transport": {"kind": "mock"},
+        "channels": [{"channel_id": "level", "direction": "read", "quantity": "q",
+                      "envelope": {"declared": True, "min_value": 0, "max_value": 100}}],
+    })
+    valid = json.dumps({"overrides": [{"device_id": "bench", "channel_id": "level", "soft_max": 80,
+        "margin_floor": 1, "margin_max": 5, "adaptive": True}]})
+    assert service.describe("hardware.observation").hot_reload == "yes"
+    result = service.set("hardware.observation", valid)
+    assert result.ok and result.warnings == ()
+    assert load_config().hardware_observation == valid
+    invalid = json.dumps({"overrides": [{"device_id": "bench", "channel_id": "level", "soft_max": 100,
+        "margin_floor": 1}]})
+    with pytest.raises(ValueError):
+        service.set("hardware.observation", invalid)
+    assert load_config().hardware_observation == valid
+    with pytest.raises(ValueError):
+        service.set("hardware.observation", '{"defaults":{"unknown":true}}')

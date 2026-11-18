@@ -353,6 +353,7 @@ async def test_actual_node_startup_binds_evidence_cache_or_refuses_diagnostics(
     )
     config = SimpleNamespace(
         profile_layout=layout,
+        runtime_dir=layout.runtime_dir,
         profile_manifest=SimpleNamespace(profile_id="test_profile"),
         hardware_providers="yaml",
         hardware_enabled=True,

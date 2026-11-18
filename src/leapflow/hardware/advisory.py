@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from leapflow.hardware.stream import EventKind, HardwareEvent
+from leapflow.hardware.observation import Episode, DEFAULT_REPORT_AFTER_S, DEFAULT_REPORT_MAX_S
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,6 @@ ADVISORY_EXCEEDED = EventKind.ADVISORY_EXCEEDED
 ADVISORY_CLEARED = EventKind.ADVISORY_CLEARED
 ADVISORY_KINDS = frozenset({ADVISORY_EXCEEDED, ADVISORY_CLEARED})
 
-DEFAULT_REPORT_AFTER_S = 60.0
-DEFAULT_REPORT_MAX_S = 900.0
 DEFAULT_READ_TIMEOUT_S = 2.0
 _WILDCARD = "*"
 
@@ -174,45 +173,30 @@ def _children(item: Any, part: str) -> Iterable[tuple[Any, Any]]:
 
 
 @dataclass
-class _State:
-    active: bool = False
-    since: float = 0.0
-    next_report: float = 0.0
-    interval: float = 0.0
-    folded: int = 0
-
-
-@dataclass
 class AdvisoryTracker:
     """Turn successive judgements into backed-off breach and recovery events."""
 
     clock: Callable[[], float] = time.time
-    _states: dict[tuple[str, str, str], _State] = field(default_factory=dict)
+    _states: dict[tuple[str, str, str], Episode] = field(default_factory=dict)
 
     def observe(self, limit: AdvisoryLimit, value: Any) -> list[HardwareEvent]:
         judgement = limit.judge(value)
         if not judgement.known:
             return []  # nothing matched: not evidence either way
         key = (limit.device_id, limit.channel_id, limit.name)
-        state = self._states.setdefault(key, _State())
+        state = self._states.setdefault(key, Episode())
         now = float(self.clock())
-        if judgement.breached:
-            if not state.active:
-                state.active, state.since, state.folded = True, now, 0
-                state.interval = limit.report_after_s
-                state.next_report = now + state.interval
-                return [self._event(ADVISORY_EXCEEDED, limit, judgement, now, "")]
-            if now < state.next_report:
-                state.folded += 1
-                return []
-            note = f"; still breached after {now - state.since:.0f}s, {state.folded} poll(s) folded"
-            state.interval = min(state.interval * 2.0, limit.report_max_s)
-            state.next_report, state.folded = now + state.interval, 0
+        folded = state.folded
+        phase = state.observe(breached=judgement.breached, clear=judgement.clear, now=now,
+                              report_after_s=limit.report_after_s, report_max_s=limit.report_max_s)
+        if phase == "entry":
+            return [self._event(ADVISORY_EXCEEDED, limit, judgement, now, "")]
+        if phase == "reminder":
+            note = f"; still breached after {now - state.since:.0f}s, {folded} poll(s) folded"
             return [self._event(ADVISORY_EXCEEDED, limit, judgement, now, note)]
-        if state.active and judgement.clear:
-            lasted = now - state.since
+        if phase == "recovery":
             self._states.pop(key, None)
-            return [self._event(ADVISORY_CLEARED, limit, judgement, now, f" after {lasted:.0f}s")]
+            return [self._event(ADVISORY_CLEARED, limit, judgement, now, f" after {now - state.since:.0f}s")]
         return []
 
     @staticmethod

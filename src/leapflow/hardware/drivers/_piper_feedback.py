@@ -275,10 +275,15 @@ class PiperFeedback:
         return read_joints(self._robot) if space == SPACE_JOINT else read_pose(self._robot)
 
     def gripper(self) -> tuple[float | None, float | None]:
-        """Gripper stroke (mm) and force (N), or Nones when unavailable."""
+        """SDK stroke (mm) and signed force report (N), not qualified metrology.
+
+        The SDK decodes force as signed int16 mN, then scales to N. Neither
+        its physical sign convention nor a zero/load calibration is certified here.
+        """
         state = sdk_message(self._gripper.get_gripper_status) if self._gripper is not None else None
         stroke, force = numeric(attr(state, "value")), numeric(attr(state, "force"))
-        return (stroke * _MM_PER_M if stroke is not None else None, force)
+        mode = attr(state, "mode")
+        return (stroke * _MM_PER_M if stroke is not None and mode != "angle" else None, force)
 
     def poll(self, channel_ids: tuple[str, ...]) -> dict[str, Any]:
         """Read the requested feedback channels plus the receipts that certify them.
@@ -298,7 +303,7 @@ class PiperFeedback:
             if not wanted.isdisjoint(GRIPPER_CHANNELS):
                 stroke, force = self.gripper()
                 values[GRIPPER_POSITION] = stroke
-                values[GRIPPER_EFFORT] = force if stroke is not None else None
+                values[GRIPPER_EFFORT] = force
             if ARM_ENABLED in wanted:
                 enabled = enable_status(self._robot)
                 values[ARM_ENABLED] = all(enabled) if enabled is not None else None
@@ -337,6 +342,20 @@ class PiperFeedback:
                 "faults": {name: attr(foc, name) for name in _FAULT_FLAGS},
             })
         receipts = self.receipts()
+        gripper = sdk_message(self._gripper.get_gripper_status) if self._gripper is not None else None
+        gripper_status = attr(gripper, "foc_status")
+        status = status_feedback(self._robot)
         return {"schema_version": 1, "motors": motors, "receive": receipts,
+                "settled": (as_int(attr(status, "motion_status")) == MOTION_STATUS_ARRIVED
+                            if status is not None else None),
+                "status": status_value(status) if status is not None else None,
                 "receive_qualified": not self.problem(CAN_GROUPS, receipts),
-                "effort_source": "sdk_current_estimate"}
+                "effort_source": "sdk_current_estimate",
+                "gripper": {"sdk_value": numeric(attr(gripper, "value")),
+                            "mode": attr(gripper, "mode"),
+                            "signed_force_report_n": numeric(attr(gripper, "force")),
+                            "force_source": "sdk_signed_force_report",
+                            "force_calibration": "unqualified",
+                            "faults": {name: attr(gripper_status, name) for name in (
+                                "voltage_too_low", "motor_overheating", "driver_overcurrent",
+                                "driver_overheating", "sensor_status", "driver_error_status")}}}

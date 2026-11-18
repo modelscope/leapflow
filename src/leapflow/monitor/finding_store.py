@@ -110,6 +110,32 @@ class FindingStore:
         ).fetchone()
         return row is not None
 
+    def latest_notification_checkpoints(self, domain: str) -> dict[str, dict[str, Any]]:
+        """Latest persisted condition checkpoint across watch recreation, no new table.
+
+        Ordinary dedup remains all-time per watch. Only producers carrying explicit
+        notification metadata participate in this query.
+        """
+        rows = self._con.execute(
+            """
+            SELECT payload FROM (
+                SELECT payload, row_number() OVER (
+                    PARTITION BY json_extract_string(payload, '$.notification.key')
+                    ORDER BY ts DESC, rowid DESC
+                ) AS position
+                FROM monitor_findings
+                WHERE domain = ? AND json_extract_string(payload, '$.notification.key') IS NOT NULL
+            ) WHERE position = 1
+            """, [domain],
+        ).fetchall()
+        checkpoints = {}
+        for (payload,) in rows:
+            data = self._safe_json(payload, {})
+            checkpoint = data.get("notification", {}) if isinstance(data, dict) else {}
+            if isinstance(checkpoint, dict) and checkpoint.get("key"):
+                checkpoints[str(checkpoint["key"])] = checkpoint
+        return checkpoints
+
     def delete_for_watch(self, watch_id: str) -> None:
         """Remove all findings belonging to a watch."""
         execute_with_retry(
