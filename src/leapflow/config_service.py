@@ -299,6 +299,13 @@ _FIELD_DESCRIPTIONS = {
         "else deletes from that table. Read when sampling starts, so a change needs a "
         "daemon restart."
     ),
+    "hardware.observation": (
+        "JSON report-only policy with defaults and exact overrides (device_id/channel_id). "
+        "soft_min/soft_max and margin_floor/margin_max are in channel units; confirm_s/recover_s "
+        "require continuous valid evidence. Adaptive defaults off and requires margin_max. "
+        "Hard envelope and task accuracy are unchanged. Valid updates hot-reload; invalid "
+        "updates retain the last admitted policy. Channel bounds are checked at hardware admission."
+    ),
     "hardware.raw_segment_mb": (
         "Size at which a raw sample file is closed and a new segment started. A finished "
         "segment is written once, so its indexed size and TTL are accurate and old data "
@@ -823,8 +830,9 @@ def _profile_file_for_section(section: str) -> str:
 class ConfigService:
     """Read and mutate LeapFlow configuration through layout-owned paths."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, hardware_registry: Any = None) -> None:
         self._settings = settings
+        self._hardware_registry = hardware_registry
         self._secrets = ScopedSecretResolver(settings.layout, settings.profile_layout)
 
     def snapshot(self) -> ConfigSnapshot:
@@ -886,6 +894,19 @@ class ConfigService:
         if spec.secret:
             return self._set_secret_backed_field(spec, str(value), scope=scope)
         coerced = _coerce_value(value, spec.value_type)
+        if normalized == "hardware.observation":
+            from leapflow.hardware.observation import ObservationSettings
+            policy = ObservationSettings.parse(coerced)
+            if self._hardware_registry is not None:
+                contexts = self._hardware_registry.contexts()
+            else:
+                # Offline CLI validation reads declarations only, never discovers or opens devices.
+                from leapflow.hardware.providers.yaml_provider import YamlContextProvider
+                from leapflow.hardware.registry import HardwareSettings
+                hardware = HardwareSettings.from_settings(self._settings)
+                yaml_config = next((config for kind, config in hardware.providers if kind == "yaml"), None)
+                contexts = YamlContextProvider(yaml_config).discover() if yaml_config else ()
+            policy.validate_contexts(contexts)
         if normalized.startswith("hardware.skills_planning_"):
             from leapflow.hardware.skills.planning import PlanningSettings
 
@@ -1034,7 +1055,9 @@ class ConfigService:
 
 
 def _with_metadata(spec: ConfigFieldSpec) -> ConfigFieldSpec:
-    if spec.section in _RESTART_REQUIRED_SECTIONS:
+    if spec.key == "hardware.observation":
+        reload_semantics = "yes"
+    elif spec.section in _RESTART_REQUIRED_SECTIONS:
         reload_semantics = "restart-required"
     elif spec.section in _PARTIAL_RELOAD_SECTIONS:
         reload_semantics = "partial"

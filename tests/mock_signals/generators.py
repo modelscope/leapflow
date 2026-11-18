@@ -423,19 +423,10 @@ class HardwareSignalGenerator(BaseGenerator):
         if random.random() < ch.quality_degradation_rate:
             quality = random.choice(_DEGRADED_QUALITIES)
 
-        return {
-            "device_id": self.device_id,
-            "channel_id": ch.channel_id,
-            "value": value,
-            "quantity": ch.quantity,
-            "unit": ch.unit,
-            "observed_at": time.time(),
-            "sequence": seq,
-            "quality": quality,
-            # Deliberately included for test-pipeline monotonic ordering
-            # even though Reading.to_dict() omits it for persistence.
-            "monotonic_at": time.monotonic(),
-        }
+        from leapflow.hardware.transport import Reading
+        reading = Reading(device_id=self.device_id, channel_id=ch.channel_id, value=value,
+                          quantity=ch.quantity, unit=ch.unit, sequence=seq, quality=quality)
+        return {**reading.to_dict(), "monotonic_at": reading.monotonic_at}
 
     def _make_hw_event(
         self, ch: HardwareChannelSpec, kind: str
@@ -447,21 +438,11 @@ class HardwareSignalGenerator(BaseGenerator):
         detail = self._event_detail(ch, kind, value)
 
         # Import at function level to avoid circular dependency.
-        from leapflow.hardware.stream import classify_hardware_event
+        from leapflow.hardware.stream import HardwareEvent
 
-        return {
-            "kind": kind,
-            "event_class": classify_hardware_event(kind),
-            "source": f"{self.device_id}.{ch.channel_id}",
-            "device_id": self.device_id,
-            "channel_id": ch.channel_id,
-            "quantity": ch.quantity,
-            "detail": detail,
-            "value": value,
-            "unit": ch.unit,
-            "ts": now_wall,
-            "_mono_ts": time.monotonic(),
-        }
+        return HardwareEvent(kind=kind, device_id=self.device_id, channel_id=ch.channel_id,
+                             quantity=ch.quantity, detail=detail, value=value,
+                             unit=ch.unit, observed_at=now_wall).to_payload()
 
     @staticmethod
     def _event_detail(

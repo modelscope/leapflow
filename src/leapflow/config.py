@@ -311,6 +311,8 @@ class Settings:
     # enforces (drive temperature, supply voltage, advisory fault flags). Breaches
     # are reported to the board with backoff and never gate a command.
     hardware_advisory_limits: str = ""
+    # JSON operational observation policy; never changes writes or task accuracy.
+    hardware_observation: str = "{}"
     # LHP edge-node process log (`leap hw serve`). With a file the node appends and
     # size-rotates it itself (max_mb x backups), so restarts keep earlier runs and
     # the disk stays bounded; empty writes to stderr only. Read at node start.
@@ -1569,6 +1571,9 @@ def _build_settings_from_env(
     ViewPriorSettings.from_json(hardware_view_priors)
     hardware_alert_policies = os.getenv("LEAPFLOW_HARDWARE_ALERT_POLICIES", "").strip()
     hardware_advisory_limits = os.getenv("LEAPFLOW_HARDWARE_ADVISORY_LIMITS", "").strip()
+    hardware_observation = os.getenv("LEAPFLOW_HARDWARE_OBSERVATION", "{}").strip()
+    from leapflow.hardware.observation import ObservationSettings
+    ObservationSettings.parse(hardware_observation)
     hardware_node_log_file = os.getenv("LEAPFLOW_HARDWARE_NODE_LOG_FILE", "").strip()
     hardware_node_log_level = (
         os.getenv("LEAPFLOW_HARDWARE_NODE_LOG_LEVEL", "INFO").strip() or "INFO"
@@ -2139,6 +2144,7 @@ def _build_settings_from_env(
         hardware_view_priors=hardware_view_priors,
         hardware_alert_policies=hardware_alert_policies,
         hardware_advisory_limits=hardware_advisory_limits,
+        hardware_observation=hardware_observation,
         hardware_node_log_file=hardware_node_log_file,
         hardware_node_log_level=hardware_node_log_level,
         hardware_node_log_max_mb=hardware_node_log_max_mb,

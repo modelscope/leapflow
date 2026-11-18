@@ -50,6 +50,9 @@ DEFAULT_LEASE_S = 1.0
 FINISH_POLL_S = 0.25
 """Upper bound on how long a finished body keeps its lease bookkeeping alive."""
 VALID_COMM_LOSS_POLICIES = frozenset({"halt", "hold"})
+_EFFECT_DISPATCH = "dispatch"
+_EFFECT_CONTROL = "control"
+_EFFECT_TRANSACTION = "transaction"
 
 
 # ── Session body contract ─────────────────────────────────────────────────
@@ -282,7 +285,8 @@ class NodeSessions:
         self._sessions: dict[str, LeasedSession] = {}
         self._reservations: dict[str, tuple[str, ...]] = {}
         self._dispatches: dict[str, str] = {}
-        self._uncertain_devices: set[str] = set()
+        # Per-source stamps keep a halt from clearing newer or non-physical failures.
+        self._unsettled: dict[tuple[str, str], tuple[float, str]] = {}
         self._reserved_tasks: set[asyncio.Task[Any]] = set()
         self._closing = False
 
@@ -322,9 +326,44 @@ class NodeSessions:
             return (
                 self._closing or self.reserved_device(device_id)
                 or device_id in self._dispatches.values()
-                or device_id in self._uncertain_devices
+                or any(device == device_id for device, _ in self._unsettled)
                 or any(device == device_id for device, _ in self._controls.values())
             )
+
+    def busy_message(self, device_id: str) -> str:
+        """Distinguish an active owner from uncertainty, with the appropriate remedy."""
+        with self._mutex:
+            reasons = [
+                f"unsettled {source} effect ({detail})"
+                for (device, source), (_, detail) in self._unsettled.items()
+                if device == device_id
+            ]
+            if not reasons:
+                return (f"device/consumer {device_id!r} is busy with a session, control loop, "
+                        "transaction or unsettled dispatch; stop its owner or wait for it to end")
+            remedy = ("owner reconciliation is required; a halt cannot settle a model transaction"
+                      if (device_id, _EFFECT_TRANSACTION) in self._unsettled
+                      else "halt with hw_estop and confirm stop_verified=true before resuming")
+            return f"device/consumer {device_id!r} is busy: {'; '.join(reasons)}; {remedy}"
+
+    def _mark_unsettled(self, devices: Iterable[str], source: str, detail: str) -> None:
+        """Record uncertainty under the owner mutex; never release it on a timer."""
+        for device in devices:
+            self._unsettled[device, source] = (time.monotonic(), detail)
+            logger.warning("device %s unsettled %s effect: %s", device, source, detail)
+
+    def settle_halt(self, device_id: str, *, before: float, evidence: str) -> bool:
+        """Settle physical uncertainty predating a verified halt, never persistence."""
+        with self._mutex:
+            keys = [key for key, (stamp, _) in self._unsettled.items()
+                    if key[0] == device_id and key[1] in (_EFFECT_DISPATCH, _EFFECT_CONTROL)
+                    and stamp <= before]
+            for key in keys:
+                del self._unsettled[key]
+            if keys:
+                logger.warning("device %s settled physical uncertainty after verified halt: %s",
+                               device_id, evidence)
+            return bool(keys)
 
     def reserve(self, device_ids: Iterable[str], *, owner_id: str, run_id: str = "") -> str:
         """Atomically reserve devices/consumer IDs before any async transaction work.
@@ -339,7 +378,7 @@ class NodeSessions:
             if run_id:
                 self._check_transaction_run(devices, run_id)
             elif busy := self.busy_device(devices):
-                raise ValueError(f"device/consumer {busy!r} is busy or has unsettled effects")
+                raise ValueError(self.busy_message(busy))
             token = str(uuid.uuid4())
             self._reservations[token] = devices
             return token
@@ -435,7 +474,8 @@ class NodeSessions:
                 # A callable can commit and then fail before returning. An exception
                 # alone cannot establish that persistence left the prior state intact.
                 with self._mutex:
-                    self._uncertain_devices.update(self._reservations[token])
+                    self._mark_unsettled(self._reservations[token], _EFFECT_TRANSACTION,
+                                         "persistence failed without a settlement verdict")
                 raise
             # Publish the committed owner snapshot on this loop BEFORE releasing
             # resources, including when the original requesting lease has ended.
@@ -450,7 +490,8 @@ class NodeSessions:
                     # Persistence landed but its safety projection did not. Keep
                     # every affected consumer closed until owner reconciliation.
                     with self._mutex:
-                        self._uncertain_devices.update(self._reservations[token])
+                        self._mark_unsettled(self._reservations[token], _EFFECT_TRANSACTION,
+                                             "committed safety projection was not published")
                     raise
             return result
         finally:
@@ -476,19 +517,20 @@ class NodeSessions:
         with self._mutex:
             if (
                 self._closing or self.reserved_device(device_id)
-                or device_id in self._uncertain_devices
+                or any(device == device_id for device, _ in self._unsettled)
                 or any(device == device_id for device, _ in self._controls.values())
             ):
-                raise ValueError("device reserved for model transaction, control or uncertain prior action")
+                raise ValueError(self.busy_message(device_id))
             token = str(uuid.uuid4())
             self._dispatches[token] = device_id
             return token
 
-    def finish_dispatch(self, token: str, *, settled: bool) -> None:
+    def finish_dispatch(self, token: str, *, settled: bool, detail: str = "") -> None:
         with self._mutex:
             device = self._dispatches.pop(token)
             if not settled:
-                self._uncertain_devices.add(device)
+                self._mark_unsettled((device,), _EFFECT_DISPATCH,
+                                     detail or "dispatch ended without a settlement verdict")
 
     def begin_control(
         self, device_id: str, *, stop: Callable[[], None], reservation_token: str | None = None,
@@ -506,7 +548,7 @@ class NodeSessions:
                 if self._closing or self._reservations.get(reservation_token) != (device_id,):
                     raise ValueError("exact owner control-start reservation required")
             elif self.busy_device((device_id,)):
-                raise ValueError("device is busy or has unsettled effects")
+                raise ValueError(self.busy_message(device_id))
             token = str(uuid.uuid4())
             self._controls[token] = (device_id, stop)
             if reservation_token is not None:
@@ -518,7 +560,7 @@ class NodeSessions:
         with self._mutex:
             device, _ = self._controls.pop(token)
             if not settled:
-                self._uncertain_devices.add(device)
+                self._mark_unsettled((device,), _EFFECT_CONTROL, "control loop halt was not verified")
 
     # ── Lifecycle ──
 
@@ -574,7 +616,7 @@ class NodeSessions:
         if context is None:
             return _error("unknown_device", f"unknown device {device_id!r}")
         if self.busy_device((device_id,)):
-            return _error(FAILURE_DEVICE_BUSY, f"device {device_id!r} is held by another session")
+            return _error(FAILURE_DEVICE_BUSY, self.busy_message(device_id))
         from leapflow.hardware.node_gate import control_safety_refusal
         from leapflow.hardware.lhp.protocol import FAILURE_SAFETY_DENIED
 
@@ -595,7 +637,7 @@ class NodeSessions:
         )
         # Re-check after the awaited precheck: another open may have won the device.
         if self.busy_device((device_id,)):
-            return _error(FAILURE_DEVICE_BUSY, f"device {device_id!r} is held by another session")
+            return _error(FAILURE_DEVICE_BUSY, self.busy_message(device_id))
         if self._registry.context(device_id) is not context:
             return _error(FAILURE_SAFETY_DENIED, "device declaration changed during control precheck")
         if reason := control_safety_refusal(self._registry, device_id):

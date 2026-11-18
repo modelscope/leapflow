@@ -228,8 +228,8 @@ def test_returning_to_range_is_reported_as_recovery() -> None:
 def test_rate_event_uses_the_declared_max_rate() -> None:
     detector = _detector(max_rate=5.0)
     detector.observe(_reading(10.0, sequence=1, at=1.0))
-    # 40 units in one second, against a declared 5/s.
-    events = detector.observe(_reading(50.0, sequence=2, at=2.0))
+    # Continuous 10 Hz acquisition: 4 units in 0.1 seconds against 5/s.
+    events = detector.observe(_reading(14.0, sequence=2, at=1.1))
     assert EventKind.RATE_EXCEEDED in [e.kind for e in events]
 
 
@@ -820,3 +820,533 @@ def test_step_settling_default_unchanged_through_detector() -> None:
     detector = HardwareEventDetector(context, context.channel("level"))
     assert detector._channel.envelope.settling_model == "step"
     assert detector._channel.envelope.effective_settling_s == 0.0
+
+
+@pytest.mark.parametrize("raw", [
+    {"defaults": {"adaptive": True}},
+    {"defaults": {"margin_floor": -1}},
+    {"defaults": {"soft_max": float("nan")}},
+    {"defaults": {"confirm_s": True}},
+    {"defaults": {"min_fresh_samples": 32.0}},
+    {"defaults": {"unexpected": 1}},
+    {"overrides": [{"device_id": "*", "channel_id": "level"}]},
+])
+def test_observation_rejects_invalid_policy(raw: Any) -> None:
+    from leapflow.hardware.observation import ObservationSettings
+    with pytest.raises(ValueError):
+        ObservationSettings.parse(raw)
+
+
+def test_fixed_soft_observation_confirmation_recovery_and_recurrence() -> None:
+    from leapflow.hardware.observation import ObservationPolicy
+    context = _context()
+    detector = HardwareEventDetector(context, context.channel("level"),
+                                    ObservationPolicy(soft_min=10, soft_max=80, margin_floor=2))
+    def sample(value: float, index: int) -> tuple[HardwareEvent, ...]:
+        return detector.observe(_reading(value, sequence=index, at=1 + index * 0.1))
+    assert not sample(83, 0)
+    assert not sample(83, 1)
+    entry = sample(83, 2)
+    assert [e.kind for e in entry] == [EventKind.OBSERVATION_WARNING]
+    assert entry[0].resolved_event_class == "record"
+    assert sample(79, 3) == ()  # neither entering nor clearing the band
+    for index in range(4, 9):
+        assert sample(77, index) == ()
+    clear = sample(77, 9)
+    assert [e.kind for e in clear] == [EventKind.OBSERVATION_CLEARED]
+    assert not sample(83, 10)
+    assert not sample(83, 11)
+    recurrence = sample(83, 12)
+    assert recurrence[0].observation["episode"] != entry[0].observation["episode"]
+    assert context.channel("level").envelope.max_value == 100
+
+
+def test_soft_confirmation_resets_on_invalid_and_missing_evidence() -> None:
+    from leapflow.hardware.observation import ObservationPolicy
+    context = _context()
+    detector = HardwareEventDetector(context, context.channel("level"),
+                                    ObservationPolicy(soft_max=80, margin_floor=2))
+    detector.observe(_reading(83, sequence=0, at=1))
+    detector.observe(_reading(83, sequence=1, at=1.1, quality="stale"))
+    for index in range(2):
+        assert EventKind.OBSERVATION_WARNING not in [e.kind for e in detector.observe(
+            _reading(83, sequence=2 + index, at=1.2 + 0.1 * index))]
+    assert EventKind.OBSERVATION_WARNING in [e.kind for e in detector.observe(_reading(83, sequence=4, at=1.4))]
+    detector.check_stale(now=2)
+    soft = next(row for row in detector.observation_snapshots if row["condition"] == "soft_upper")
+    assert soft["active"] and not soft["known"]
+    assert all(n["phase"] != "recovery" for n in soft["pending"])
+
+
+def test_observation_channel_validation_and_atomic_reload() -> None:
+    context = _context()
+    registry = _registry(context)
+    sources = registry.stream_sources()
+    valid = '{"overrides":[{"device_id":"sampled_device","channel_id":"level","soft_max":80,"margin_floor":2}]}'
+    registry.reconfigure_observation(valid)
+    policy = sources[0].observation_detectors[0]._observation.policy
+    assert policy.soft_max == 80
+    for raw in ('{"defaults":{"soft_max":100,"margin_floor":2}}',
+                '{"overrides":[{"device_id":"missing","channel_id":"level"}]}'):
+        with pytest.raises(ValueError):
+            registry.reconfigure_observation(raw)
+        assert sources[0].observation_detectors[0]._observation.policy == policy
+        assert registry.settings.hardware_observation == valid
+
+
+def test_global_poll_sequences_do_not_claim_channel_loss() -> None:
+    from dataclasses import replace
+    ring = ReadingRing()
+    assert ring.record(replace(_reading(1, sequence=1), sequence_scope="device_read")) == 0
+    assert ring.record(replace(_reading(1, sequence=99), sequence_scope="device_read")) == 0
+    assert ring.dropped == 0
+    assert ring.record(replace(_reading(1, sequence=100), acquisition_epoch="reconnect")) == 0
+
+
+def test_reordered_or_repeated_channel_sequences_do_not_invent_loss() -> None:
+    ring = ReadingRing()
+    for sequence in (1, 2, 1, 3, 3, 4):
+        assert ring.record(_reading(50, sequence=sequence)) == 0
+    assert ring.dropped == 0
+    assert ring.record(_reading(50, sequence=6)) == 1
+
+
+def test_circular_rates_and_discontinuous_history() -> None:
+    from dataclasses import replace
+    context = _context(max_rate=50)
+    channel = replace(context.channel("level"), unit="deg", envelope=Envelope(
+        declared=True, min_value=-180, max_value=180, max_rate=50))
+    detector = HardwareEventDetector(context, channel)
+    detector.observe(_reading(179, sequence=1, at=1))
+    assert EventKind.RATE_EXCEEDED not in [e.kind for e in detector.observe(_reading(-179, sequence=2, at=1.1))]
+    detector.observe(_reading(None, sequence=3, at=1.2))
+    assert EventKind.RATE_EXCEEDED not in [e.kind for e in detector.observe(_reading(0, sequence=4, at=1.3))]
+    detector.observe(_reading(10, sequence=5, at=1.3))
+    assert EventKind.RATE_EXCEEDED not in [e.kind for e in detector.observe(_reading(100, sequence=6, at=1.4))]
+
+
+def _adaptive_replay(values: list[float], *, adaptive: bool = True, ceiling: float = 8,
+                     pending_motion: bool = False, fault_free: bool = True) -> tuple[Any, list[Any]]:
+    from leapflow.hardware.observation import ObservationPolicy
+    context = _context(sample_rate_hz=100)
+    detector = HardwareEventDetector(context, context.channel("level"), ObservationPolicy(
+        soft_min=10, soft_max=80, margin_floor=1, margin_max=ceiling, adaptive=adaptive,
+        noise_window_s=1, min_fresh_samples=32))
+    ring = ReadingRing(128)
+    events = []
+    for index, value in enumerate(values):
+        reading = _reading(value, sequence=index + 1, at=1 + index * .01)
+        ring.record(reading)
+        events.extend(detector.observe(reading, ring=ring, pending_motion=pending_motion, fault_free=fault_free))
+    return detector, events
+
+
+@pytest.mark.parametrize("amplitude", [0, .1, 1])
+def test_synthetic_in_tolerance_replay_has_no_false_transitions(amplitude: float) -> None:
+    values = [50 + amplitude * (-1, 0, 1)[index % 3] for index in range(400)]
+    for adaptive in (False, True):
+        detector, events = _adaptive_replay(values, adaptive=adaptive)
+        assert not events
+        assert 1 <= detector._observation.margin <= 8
+        if adaptive and amplitude == 1:
+            assert detector._observation.margin == pytest.approx(3 * 1.4826)
+
+
+def test_spikes_sustained_excursion_recovery_and_drift_on_identical_replays() -> None:
+    values = [50.] * 100 + [90.] + [50.] * 10 + [83.] * 40 + [70.] * 80
+    for adaptive in (False, True):
+        _, events = _adaptive_replay(values, adaptive=adaptive)
+        warnings = [e for e in events if e.kind == EventKind.OBSERVATION_WARNING]
+        clears = [e for e in events if e.kind == EventKind.OBSERVATION_CLEARED]
+        assert len(warnings) == len(clears) == 1
+        assert warnings[0].observation["duration_s"] == pytest.approx(.2)
+        assert warnings[0].value == 83  # baseline shift never moves the operational boundary
+
+
+def test_adaptive_margin_freezes_during_warning_and_resets_on_reconnect() -> None:
+    from dataclasses import replace
+    detector, _ = _adaptive_replay([[49., 50., 51.][i % 3] for i in range(200)])
+    frozen = detector._observation.margin
+    ring = ReadingRing()
+    for index in range(40):
+        reading = _reading(86., sequence=201 + index, at=3 + index * .01)
+        ring.record(reading)
+        detector.observe(reading, ring=ring, fault_free=True)
+        assert detector._observation.margin == frozen
+    assert detector._observation.states["soft_upper"].active
+    detector.invalidate_observation()
+    assert not detector._observation.states["soft_upper"].known
+    assert detector._observation.margin == frozen
+    healthy, _ = _adaptive_replay([[49., 50., 51.][i % 3] for i in range(200)])
+    healthy.observe(replace(_reading(50., sequence=1, at=4), acquisition_epoch="new-source"),
+                    ring=ReadingRing(), fault_free=True)
+    assert healthy._observation.margin == 1
+
+
+@pytest.mark.parametrize("pending_motion,fault_free", [(True, True), (False, False)])
+def test_unqualified_or_pending_motion_never_trains_noise(pending_motion: bool, fault_free: bool) -> None:
+    detector, _ = _adaptive_replay([[49., 50., 51.][i % 3] for i in range(200)], pending_motion=pending_motion, fault_free=fault_free)
+    assert detector._observation.margin == 1
+    assert detector._observation._training_since is None
+
+
+def test_rising_noise_quality_warning_is_bounded_and_missing_data_is_not_recovery() -> None:
+    detector, events = _adaptive_replay([[46., 50., 54.][i % 3] for i in range(400)], ceiling=5)
+    quality = [e for e in events if e.observation.get("condition") == "observation_quality"]
+    assert len(quality) == 1 and quality[0].kind == EventKind.OBSERVATION_WARNING
+    assert detector._observation.margin == 5
+    detector.observe(_reading(None, sequence=401, at=5, quality="stale"))
+    state = detector._observation.states["observation_quality"]
+    assert state.active and not state.known
+    assert not any(n["phase"] == "recovery" for n in detector._observation.pending["observation_quality"])
+
+
+def test_quality_episode_freezes_margin_through_unknown_and_recovery() -> None:
+    detector, _ = _adaptive_replay([[46., 50., 54.][i % 3] for i in range(400)], ceiling=5)
+    judgment = detector._observation
+    assert judgment.states["observation_quality"].active
+    detector.invalidate_observation()
+    assert judgment.margin == 5
+    ring = ReadingRing(128)
+    recovery = None
+    for index in range(300):
+        reading = _reading(50, sequence=401 + index, at=5 + index * .01)
+        ring.record(reading)
+        events = detector.observe(reading, ring=ring, fault_free=True)
+        if recovery is None:
+            assert judgment.margin == 5
+        for event in events:
+            if (event.kind == EventKind.OBSERVATION_CLEARED
+                    and event.observation["condition"] == "observation_quality"):
+                recovery = event
+                assert event.observation["margin"] == 5
+    assert recovery is not None
+    assert not judgment.states["observation_quality"].active
+    assert judgment.margin == 1  # retraining only after the episode has recovered
+
+
+def test_sustained_trend_and_hard_boundary_proximity_never_relax_margin() -> None:
+    trend, _ = _adaptive_replay([50 + index * .05 for index in range(400)])
+    assert trend._observation.margin == 1
+    boundary, _ = _adaptive_replay([1., 2.] * 100)
+    assert boundary._observation.margin == 1
+
+
+def test_consecutive_hard_safety_uses_samples_not_breach_entry_events() -> None:
+    from leapflow.hardware.alert_policy import AlertRule, HardwareAlertPolicy
+    from leapflow.hardware.stream import _observe_sample
+    context = _context(max_rate=5)
+    detector = HardwareEventDetector(context, context.channel("level"))
+    policy = HardwareAlertPolicy([AlertRule(event_kind="threshold_exceeded", action="hw_estop", require_consecutive=3)])
+    ring = ReadingRing()
+    emitted = []
+    for index, value in enumerate([101, 101, 101, 101, 50, 101, 101, 101]):
+        reading = _reading(value, sequence=index + 1, at=1 + index * .1)
+        lost = ring.record(reading)
+        emitted.extend(_observe_sample(detector, reading, ring, None, policy, lost=lost))
+        if index == 2:
+            assert policy.fired_count == 1
+    assert policy.fired_count == 2
+    assert sum(e.kind == EventKind.THRESHOLD_EXCEEDED for e in emitted) == 2
+
+
+def test_record_only_observation_cannot_be_mapped_to_reflex_action() -> None:
+    from leapflow.hardware.alert_policy import AlertRule, HardwareAlertPolicy
+    policy = HardwareAlertPolicy([AlertRule(event_kind="observation_warning", action="hw_estop")])
+    policy.evaluate(HardwareEvent(kind="observation_warning", device_id="d", channel_id="c", quantity="q", detail="reported only"))
+    assert policy.fired_count == 0
+
+
+def test_true_hard_recurrence_survives_presentation_pacing() -> None:
+    context = _context()
+    detector = HardwareEventDetector(context, context.channel("level"))
+    source = HardwareStreamSource(None, context, context.channel("level"))
+    emitted = []
+    for index, value in enumerate([101, 50, 101, 50]):
+        source._dispatch(detector.observe(_reading(value, sequence=index + 1, at=1 + index * .1)), emitted.append)
+    assert [e.kind for e in emitted] == ["threshold_exceeded", "settled"] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adaptive", [False, True])
+async def test_scalar_batch_sampling_policy_parity(adaptive: bool) -> None:
+    from types import SimpleNamespace
+    from leapflow.hardware.stream import BatchStreamCoordinator
+    from leapflow.hardware.observation import ObservationSettings
+    values = [49., 50., 51.] * 40 + [90.] * 10 + [50.] * 20
+    context = _context(sample_rate_hz=1000)
+    tuning = ObservationSettings.parse({"overrides": [{"device_id": context.device_id, "channel_id": "level",
+        "soft_max": 80, "margin_floor": 1, "margin_max": 8, "adaptive": adaptive,
+        "noise_window_s": .05, "confirm_s": .002, "recover_s": .005}]})
+    outputs = []
+    for batch_mode in (False, True):
+        class ReplayIO:
+            index = 0
+            def device_io(self, device_id: str) -> Any:
+                return asyncio.Lock()
+            async def transport(self, device_id: str) -> Any:
+                return self
+            def observation_policy(self, device_id: str, channel: Any) -> Any:
+                return tuning.resolve(device_id, channel)
+            def observation_fault_free(self, device_id: str) -> bool:
+                return True
+            async def read(self, channel_id: str) -> Reading:
+                index = self.index
+                self.index += 1
+                if self.index == len(values):
+                    source._stopping.set()
+                return _reading(values[index], sequence=index + 1, at=1 + index * .001)
+            async def read_batch(self, device_id: str, channel_ids: Any) -> Any:
+                return SimpleNamespace(readings=(await self.read("level"),))
+        io = ReplayIO()
+        source = (BatchStreamCoordinator(io, context, (context.channel("level"),)) if batch_mode
+                  else HardwareStreamSource(io, context, context.channel("level")))
+        events = []
+        await asyncio.wait_for(source._run(events.append), timeout=2)
+        outputs.append([(e.kind, e.value, e.observation.get("duration_s")) for e in events])
+    assert outputs[0] == outputs[1]
+    assert [row[0] for row in outputs[0]] == ["observation_warning", "observation_cleared"]
+
+
+async def _sampling_cadence_probe(path: Any, *, adaptive: bool = False, factory: Any = HardwareStreamSource) -> dict[str, Any]:
+    """Offline cadence probe through real acquisition, buffering, and DuckDB writes."""
+    import json
+
+    context = _context(sample_rate_hz=500)
+    registry = _registry(context, instrument_db_path=str(path), downsample_interval_s=1,
+        hardware_observation=json.dumps({"overrides": [{
+            "device_id": context.device_id, "channel_id": "level", "soft_max": 80,
+            "margin_floor": 1, "margin_max": 8, "adaptive": adaptive,
+        }]}))
+    store = registry.reading_store
+    source = factory(registry, context, context.channel("level"), reading_store=store)
+    events = []
+    try:
+        await source.start(events.append)
+        await asyncio.sleep(2.2)
+        await source.stop()
+        return {**source.health, "windows": store.windows_written, "events": len(events)}
+    finally:
+        await source.stop()
+        await registry.close_all()
+        registry._instrument_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_observation_modes_preserve_scheduled_acquisition_and_persistence(tmp_path: Any) -> None:
+    for adaptive in (False, True):
+        result = await _sampling_cadence_probe(tmp_path / f"cadence-{adaptive}.duckdb", adaptive=adaptive)
+        assert result["windows"] > 0
+        assert result["events"] == 0
+        # Leave headroom for shared CI scheduling; this is a regression guard,
+        # not qualification of a physical device's maximum acquisition rate.
+        assert result["observed_hz"] >= result["declared_hz"] * .8
+
+
+def test_stale_level_evidence_fires_before_notification_reminders(monkeypatch: Any) -> None:
+    from leapflow.hardware.alert_policy import AlertRule, HardwareAlertPolicy
+    from leapflow.hardware.stream import _stale_observation
+    context = _context()
+    detector = HardwareEventDetector(context, context.channel("level"))
+    policy = HardwareAlertPolicy([AlertRule(event_kind="stale", action="hw_estop", require_consecutive=3)])
+    detector.observe(_reading(50, sequence=1, at=1))
+    monkeypatch.setattr("leapflow.hardware.stream.time.monotonic", lambda: 1.3)
+    assert [e.kind for e in _stale_observation(detector, policy)] == ["stale"]
+    assert not _stale_observation(detector, policy)
+    assert not _stale_observation(detector, policy)
+    assert policy.fired_count == 1
+    assert [e.observation["phase"] for e in detector.check_stale(now=61.3)] == ["reminder"]
+    detector.observe(_reading(50, sequence=2, at=62))
+    assert not detector._observation.states["stale"].active
+    assert detector._observation.pending["stale"][-1]["phase"] == "recovery"
+
+
+def test_sampling_silence_breaks_other_consecutive_safety_runs(monkeypatch: Any) -> None:
+    from leapflow.hardware.alert_policy import AlertRule, HardwareAlertPolicy
+    from leapflow.hardware.stream import _observe_sample, _stale_observation
+    context = _context()
+    detector = HardwareEventDetector(context, context.channel("level"))
+    policy = HardwareAlertPolicy([AlertRule(
+        event_kind="threshold_exceeded", action="hw_estop", require_consecutive=3)])
+    ring = ReadingRing()
+    for index in range(2):
+        reading = _reading(101, sequence=index + 1, at=1 + index * .1)
+        _observe_sample(detector, reading, ring, None, policy, lost=ring.record(reading))
+    monkeypatch.setattr("leapflow.hardware.stream.time.monotonic", lambda: 1.2)
+    _stale_observation(detector, policy)  # acquisition failed, even before stale deadline
+    assert policy.fired_count == 0
+    for index in range(3):
+        reading = _reading(101, sequence=3 + index, at=1.3 + index * .1)
+        _observe_sample(detector, reading, ring, None, policy, lost=ring.record(reading))
+        assert policy.fired_count == (1 if index == 2 else 0)
+
+
+def test_missing_numeric_values_do_not_hide_explicit_stale_quality() -> None:
+    context = _context()
+    detector = HardwareEventDetector(context, context.channel("level"))
+    detector.observe(_reading(None, sequence=1, at=1, quality="stale"))
+    state = detector._observation.states["stale"]
+    assert state.active and state.known
+    assert detector.safety_evidence[EventKind.STALE] is not None
+    detector.observe(_reading({"status": "fresh"}, sequence=2, at=1.1))
+    assert not state.active and state.known
+
+
+def test_calibration_identity_reset_preserves_notices_and_is_idempotent() -> None:
+    from leapflow.hardware.observation import ObservationPolicy
+    context = _context()
+    detector = HardwareEventDetector(context, context.channel("level"), ObservationPolicy(
+        soft_max=80, margin_floor=1, confirm_s=0))
+    detector.observe(_reading(83, sequence=1, at=1))
+    before = detector.observation_snapshots
+    old_identity = detector._observation.identity
+    detector.invalidate_observation(identity="qualified-generation-2")
+    snapshot = next(row for row in detector.observation_snapshots if row["condition"] == "soft_upper")
+    assert not snapshot["known"] and not snapshot["active"]
+    assert snapshot["identity"] != old_identity
+    assert snapshot["pending"][0]["identity"] == old_identity
+    assert snapshot["pending"][0] == next(row for row in before if row["condition"] == "soft_upper")["pending"][0]
+    detector.observe(_reading(83, sequence=2, at=1.1))
+    episode = detector._observation.states["soft_upper"].episode
+    detector.invalidate_observation(identity="qualified-generation-2")
+    assert detector._observation.states["soft_upper"].episode == episode
+
+
+@pytest.mark.component
+def test_persisted_calibration_identity_is_initialized_without_restoring_health(tmp_path: Any) -> None:
+    from leapflow.hardware.calibration_store import CalibrationRecord
+    from leapflow.hardware.observation import ObservationPolicy
+    path = str(tmp_path / "instrument.duckdb")
+    context = _context()
+    registry = _registry(context, instrument_db_path=path)
+    record = CalibrationRecord(context.device_id, "zero", 123, {"qualified": "software test"})
+    try:
+        assert registry.calibration_store.record(record)
+        registry.record_event(HardwareEvent(
+            kind="calibration_completed", device_id=context.device_id, channel_id="level",
+            quantity="q", detail="software test", value={
+                "procedure_id": record.procedure_id, "recorded_at": record.recorded_at}))
+        detector = registry.stream_sources()[0].observation_detectors[0]
+        before = detector._observation.identity
+        detector.reconfigure_observation(ObservationPolicy(soft_max=80, margin_floor=1, confirm_s=0))
+        detector.observe(_reading(83, sequence=1, at=1))
+        assert detector._observation.states["soft_upper"].active
+    finally:
+        registry._instrument_conn.close()
+    restarted = _registry(context, instrument_db_path=path)
+    try:
+        fresh = restarted.stream_sources()[0].observation_detectors[0]
+        assert fresh._observation.identity == before
+        assert fresh._observation.margin == 0
+        assert fresh.observation_snapshots == ()
+    finally:
+        restarted._instrument_conn.close()
+
+
+@pytest.mark.component
+@pytest.mark.parametrize("kind", ["activated", "invalidated", "rolled_back"])
+def test_generation_identity_matches_lifecycle_evidence_after_restart(tmp_path: Any, kind: str) -> None:
+    from leapflow.hardware.calibration.lifecycle import project_decision
+    context = _context()
+    path = str(tmp_path / "instrument.duckdb")
+    registry = _registry(context, instrument_db_path=path)
+    try:
+        store = registry.calibration_generations
+        generation = store.commit_generation(
+            workcell_id="cell", request_id="software-test", expected_generation=None,
+            dependency_digest="deps", model={"device_id": context.device_id, "synthetic": True},
+            accepted_blocks={"test": {"synthetic": True}}, causal={"software_test": True})
+        if kind == "invalidated":
+            store.invalidate(workcell_id="cell", request_id="invalidate-test",
+                expected_generation=generation.generation, dependency_digest="deps",
+                causal={"software_test": True})
+        elif kind == "rolled_back":
+            store.commit_generation(
+                workcell_id="cell", request_id="second-software-test", expected_generation=1,
+                dependency_digest="deps", model={"device_id": context.device_id, "synthetic": 2},
+                accepted_blocks={"test": {"synthetic": True}}, causal={"software_test": True})
+            store.rollback(workcell_id="cell", request_id="rollback-test", expected_generation=2,
+                dependency_digest="deps", causal={"software_test": True})
+        decision = next(event for event in store.pending_events() if event["kind"] == kind)
+        registry.record_event(HardwareEvent(
+            kind=f"calibration_{decision['kind']}", device_id=context.device_id,
+            channel_id="calibration_lifecycle", quantity="q", detail="software test",
+            value=project_decision(decision, context.device_id)))
+        before = registry.stream_sources()[0].observation_detectors[0]._observation.identity
+    finally:
+        registry._instrument_conn.close()
+    restarted = _registry(context, instrument_db_path=path)
+    try:
+        detector = restarted.stream_sources()[0].observation_detectors[0]
+        assert detector._observation.identity == before
+        assert detector.observation_snapshots == ()
+    finally:
+        restarted._instrument_conn.close()
+
+
+def test_notice_overflow_is_bounded_disclosed_and_durable_notices_are_retired() -> None:
+    from leapflow.hardware.observation import MAX_PENDING_TRANSITIONS
+    context = _context()
+    detector = HardwareEventDetector(context, context.channel("level"))
+    for index in range(40):
+        detector.observe(_reading(101 if index % 2 == 0 else 50, sequence=index + 1, at=1 + index * .1))
+    row = next(row for row in detector.observation_snapshots if row["condition"] == "threshold_exceeded")
+    assert len(row["pending"]) == MAX_PENDING_TRANSITIONS
+    assert row["pending_omitted"] == 40 - MAX_PENDING_TRANSITIONS
+    registry = _registry(context)
+    registered = registry.stream_sources()[0].observation_detectors[0]
+    registered.observe(_reading(101, sequence=1, at=1))
+    notice = registered._observation.pending["threshold_exceeded"][0]
+    registry.acknowledge_observation({notice["key"]: {**notice, "runtime_id": "another-runtime"}})
+    assert registered._observation.pending["threshold_exceeded"]
+    registry.acknowledge_observation({notice["key"]: notice})
+    assert not registered._observation.pending["threshold_exceeded"]
+    assert registered._observation.states["threshold_exceeded"].active
+
+
+@pytest.mark.parametrize("patch,expected", [
+    ({}, True), ({"settled": False}, False), ({"receive_qualified": False}, False),
+    ({"fault_free": False}, False), ({"status": {"error_code": 1}}, False),
+    ({"motors": [{"faults": {"overheat": True}}]}, False),
+    ({"motors": [{"faults": {"overheat": None}}]}, False),
+])
+def test_noise_training_requires_complete_fresh_fault_and_settled_evidence(patch: Any, expected: bool,
+                                                                        monkeypatch: Any) -> None:
+    from dataclasses import replace
+    registry = _registry(_context())
+    value = {"receive_qualified": True, "settled": True, "fault_free": True, **patch}
+    reading = _reading(value, sequence=1, at=1)
+    monkeypatch.setattr("leapflow.hardware.registry.time.monotonic", lambda: 1.1)
+    registry.note_observation(reading)
+    assert registry.observation_fault_free("sampled_device") is expected
+    registry.note_observation(replace(reading, monotonic_at=2))
+    assert not registry.observation_fault_free("sampled_device")
+    registry.note_observation(replace(reading, monotonic_at=0))
+    assert not registry.observation_fault_free("sampled_device")
+
+
+@pytest.mark.asyncio
+async def test_batch_judges_every_hard_guard_before_persistence() -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from leapflow.hardware.stream import BatchStreamCoordinator
+    from leapflow.hardware.alert_policy import AlertRule, HardwareAlertPolicy
+    base = _context()
+    context = replace(base, channels=(base.channel("level"), replace(base.channel("level"), channel_id="other")))
+    class ReplayIO:
+        async def read_batch(self, *_: Any) -> Any:
+            source._stopping.set()
+            return SimpleNamespace(readings=(_reading(50, sequence=1, at=1), replace(_reading(101, sequence=1, at=1), channel_id="other")))
+    observed_guards = []
+    class Store:
+        calls = 0
+        def record(self, *_: Any, **__: Any) -> None:
+            self.calls += 1
+            observed_guards.append(policy.fired_count)
+            raise RuntimeError("persistence is unavailable")
+    policy = HardwareAlertPolicy([AlertRule(event_kind="threshold_exceeded", action="hw_estop", require_consecutive=1)])
+    source = BatchStreamCoordinator(ReplayIO(), context, context.channels, alert_policy=policy, reading_store=Store())
+    await asyncio.wait_for(source._run(lambda _: None), timeout=2)
+    assert policy.fired_count == 1
+    assert source._store.calls == 2
+    assert observed_guards == [1, 1]

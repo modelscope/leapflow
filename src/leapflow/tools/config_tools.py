@@ -88,7 +88,7 @@ def _service() -> Any:
     """Build a ConfigService over the active settings."""
     from leapflow.config_service import ConfigService
 
-    return ConfigService(_active_settings())
+    return ConfigService(_active_settings(), hardware_registry=getattr(_context_ref, "_hardware_registry", None))
 
 
 def _field_payload(view: Any, *, include_description: bool = True) -> Dict[str, Any]:

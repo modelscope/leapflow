@@ -590,7 +590,7 @@ class TestStreamAlertPolicyIntegration:
         assert len(evaluated) == 1
         assert evaluated[0].kind == EventKind.THRESHOLD_EXCEEDED
 
-    def test_dispatch_resets_on_settled(self) -> None:
+    def test_dispatch_settled_does_not_reset_unrelated_safety_evidence(self) -> None:
         resets = []
 
         class _Policy:
@@ -640,7 +640,7 @@ class TestStreamAlertPolicyIntegration:
             observed_at=time.time(),
         )
         source._dispatch([settled_event], None)
-        assert ("dev", "ch") in resets
+        assert resets == []  # healthy raw samples reset each relevant condition independently
 
 
 # ════════════════════════════════════════════════════════════════

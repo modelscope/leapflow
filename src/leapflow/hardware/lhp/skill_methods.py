@@ -142,8 +142,8 @@ class SkillMethods:
                         node_session_id=require_str(params, "node_session_id"))
         if stale is not None:
             return _outcome(stale)
-        if self._sessions.busy_device(prepared.devices):
-            return _outcome(SkillOutcome.failed(FAILURE_DEVICE_BUSY, "reload devices are held by a session"))
+        if busy := self._sessions.busy_device(prepared.devices):
+            return _outcome(SkillOutcome.failed(FAILURE_DEVICE_BUSY, self._sessions.busy_message(busy)))
         if self._authority.mode != WRITE_MODE_PERMIT_REQUIRED:
             return _outcome(SkillOutcome.failed(FAILURE_WRITE_REFUSED, "live reload requires permit_required authority"))
         refusal = self._authority.check("skill.reload", params)
@@ -209,7 +209,7 @@ class SkillMethods:
         busy = self._sessions.busy_device(runtime.plan_devices(plan))
         if busy:
             return _outcome(
-                SkillOutcome.failed(FAILURE_DEVICE_BUSY, f"device {busy!r} is held by a session")
+                SkillOutcome.failed(FAILURE_DEVICE_BUSY, self._sessions.busy_message(busy))
             )
         refusal, admission = self._authority.admit_run(
             params, expected_digest=runtime.permit_digest(plan)

@@ -361,6 +361,14 @@ class HoldRefused(TransportError):
     """
 
 
+class TargetNotSent(TransportError):
+    """Motion preparation failed before any target was emitted.
+
+    Mode or speed frames may have been sent, but no posture was commanded.
+    This is a motion refusal, not uncertainty about target execution.
+    """
+
+
 class TargetRefused(TransportError):
     """The firmware planned the target and refused it; the arm did not move.
 
@@ -580,13 +588,7 @@ class PiperMotion:
                 vector[index] = float(value)
             snapshot = [float(value) for value in vector]  # type: ignore[arg-type]
             try:
-                if validate is not None:
-                    validate()
-                if ctrl_mode(robot) != CTRL_MODE_CAN or not self._speed_sent:
-                    self._enter_can(robot, gen)
-                self._assert_move_mode(robot, space, gen)
-                if validate is not None:
-                    validate()
+                self._prepare_target(robot, space, gen, validate)
                 if space == SPACE_JOINT:
                     self.emit_target(gen, robot.move_j, joints_to_sdk(snapshot))
                 elif self._pose_path == POSE_PATH_POINT:
@@ -602,6 +604,23 @@ class PiperMotion:
             # describes where the arm is once this vector is executed.
             self._held = {space: (epoch, list(snapshot))}
             return snapshot
+
+    def _prepare_target(self, robot: Any, space: str, generation: int,
+                        validate: Callable[[], None] | None) -> None:
+        """Keep the pre-target failure boundary separate from target execution."""
+        try:
+            if validate is not None:
+                validate()
+            if ctrl_mode(robot) != CTRL_MODE_CAN or not self._speed_sent:
+                self._enter_can(robot, generation)
+            self._assert_move_mode(robot, space, generation)
+            if validate is not None:
+                validate()
+        except (MotionPreempted, MotionHalted, TargetNotSent):
+            raise
+        except TransportError as exc:
+            raise TargetNotSent(f"{exc}; no motion target was sent",
+                                failure_code=exc.failure_code) from exc
 
     def _confirm_target(self, robot: Any, space: str, snapshot: Sequence[float]) -> None:
         """Read the firmware's own answer to the posture just sent.
@@ -730,6 +749,7 @@ __all__ = [
     "SPACE_JOINT",
     "SPACE_POSE",
     "PiperMotion",
+    "TargetNotSent",
     "as_int",
     "attr",
     "ctrl_mode",

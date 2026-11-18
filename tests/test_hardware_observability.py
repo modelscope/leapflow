@@ -784,6 +784,13 @@ def test_producer_severity_matches_digest_event_severity() -> None:
         )
 
 
+def test_report_only_observation_warning_is_notable_and_clear_is_info() -> None:
+    from leapflow.hardware.observability.digest import _event_severity
+
+    assert _event_severity("observation_warning") == "notable"
+    assert _event_severity("observation_cleared") == "info"
+
+
 def test_digest_payload_clock_is_wall() -> None:
     """Every digest payload must declare ``clock=='wall'``.
 
@@ -850,3 +857,171 @@ def test_the_device_table_offers_buttons_rather_than_an_instruction() -> None:
     assert preview["param_from_row"]["channel"] == "preview_channel", (
         "Preview must name the actual previewable channel, so it can start the target panel"
     )
+
+
+def _condition_registry(*, hard: bool = False) -> Any:
+    from leapflow.hardware.context import Channel, Envelope
+    from leapflow.hardware.observation import ObservationJudgment, ObservationPolicy
+    channel = Channel(channel_id="uncharted", direction="read", quantity="q", sample_rate_hz=10,
+                      envelope=Envelope(declared=True, min_value=0, max_value=100))
+    judgment = ObservationJudgment("bench", channel, ObservationPolicy(soft_max=80, margin_floor=1))
+    class Conditions(_Registry):
+        def observation_conditions(self) -> Any:
+            return judgment.snapshots()
+    registry = Conditions()
+    registry.judgment = judgment
+    registry.condition_name = "threshold_exceeded" if hard else "soft_upper"
+    return registry
+
+
+def _transition(registry: Any, value: float, at: float, *, valid: bool = True) -> None:
+    from leapflow.hardware.transport import Reading
+    name = registry.condition_name
+    registry.judgment.condition(name, breached=value > 81, clear=value < 79,
+        reading=Reading("bench", "uncharted", value, observed_at=_WALL + at), now=at,
+        valid=valid, soft=name.startswith("soft"))
+
+
+@pytest.mark.parametrize("hard", [False, True])
+def test_episode_notifications_persist_across_watch_recreation_and_chart_churn(tmp_path: Any, hard: bool) -> None:
+    from leapflow.monitor.finding_store import FindingStore
+    store = FindingStore(tmp_path / "findings.duckdb")
+    registry = _condition_registry(hard=hard)
+    producer = HardwareObservationProducer(lambda: registry, finding_store=store)
+    def poll(now: float, watch: str = "w1") -> list[Any]:
+        ctx = _producer_ctx(_WALL + now)
+        ctx.spec.watch_id = watch
+        return list(asyncio.run(producer.observe(ctx)))
+    try:
+        _transition(registry, 83, 0)
+        _transition(registry, 83, .2)
+        first = poll(1)
+        assert len(first) == 1
+        assert first[0].severity.value == ("alert" if hard else "notable")
+        store.save(first[0])
+        registry._events = tuple(_event("sample_loss", observed_at=_WALL + i) for i in range(60))
+        registry._windows = _windows(40)
+        quiet = poll(2)
+        assert all(f.severity.value == "info" for f in quiet)
+        recreated = HardwareObservationProducer(lambda: registry, finding_store=store)
+        ctx = _producer_ctx(_WALL + 3)
+        ctx.spec.watch_id = "w2"
+        assert all(f.severity.value == "info" for f in asyncio.run(recreated.observe(ctx)))
+        _transition(registry, 50, 4)
+        _transition(registry, 50, 4.5)
+        recovery = poll(5, "w2")
+        assert recovery[0].payload["notification"]["phase"] == "recovery"
+        store.save(recovery[0])
+        _transition(registry, 83, 6)
+        _transition(registry, 83, 6.2)
+        recurrence = poll(7, "w2")
+        assert recurrence[0].dedup_key != first[0].dedup_key
+        assert recurrence[0].payload["notification"]["phase"] == "entry"
+        assert first[0].payload["notification"]["channel_id"] == "uncharted"
+        assert "raw=83" in first[0].summary
+    finally:
+        store.close()
+
+
+def test_hard_entry_and_recovery_between_polls_are_both_reportable_once(tmp_path: Any) -> None:
+    from leapflow.monitor.finding_store import FindingStore
+    store = FindingStore(tmp_path / "findings.duckdb")
+    registry = _condition_registry(hard=True)
+    producer = HardwareObservationProducer(lambda: registry, finding_store=store)
+    try:
+        _transition(registry, 101, 0)
+        _transition(registry, 50, .1)
+        findings = asyncio.run(producer.observe(_producer_ctx(_WALL + 120)))
+        assert [f.payload["notification"]["phase"] for f in findings] == ["entry", "recovery"]
+        for finding in findings:
+            store.save(finding)
+        assert store.latest_notification_checkpoints("hardware")["bench/uncharted/threshold_exceeded"]["active"] is False
+        assert all(f.severity.value == "info" for f in asyncio.run(producer.observe(_producer_ctx(_WALL + 121))))
+    finally:
+        store.close()
+
+
+def test_failed_persistence_retries_the_same_episode(tmp_path: Any) -> None:
+    from leapflow.monitor.finding_store import FindingStore
+    store = FindingStore(tmp_path / "findings.duckdb")
+    registry = _condition_registry()
+    producer = HardwareObservationProducer(lambda: registry, finding_store=store)
+    try:
+        _transition(registry, 83, 0)
+        _transition(registry, 83, .2)
+        first = asyncio.run(producer.observe(_producer_ctx(_WALL + 1)))[0]
+        retried = asyncio.run(producer.observe(_producer_ctx(_WALL + 2)))[0]
+        assert retried.dedup_key == first.dedup_key
+        store.save(retried)
+        assert asyncio.run(producer.observe(_producer_ctx(_WALL + 3)))[0].severity.value == "info"
+    finally:
+        store.close()
+
+
+def test_restart_waits_for_fresh_confirmation_and_preserves_reminder_progress(tmp_path: Any) -> None:
+    from leapflow.monitor.finding_store import FindingStore
+    store = FindingStore(tmp_path / "findings.duckdb")
+    registry = _condition_registry()
+    producer = HardwareObservationProducer(lambda: registry, finding_store=store)
+    try:
+        _transition(registry, 83, 0)
+        _transition(registry, 83, .2)
+        entry = asyncio.run(producer.observe(_producer_ctx(_WALL + 1)))[0]
+        store.save(entry)
+        registry = _condition_registry()  # new runtime, no restored healthy assumption
+        producer = HardwareObservationProducer(lambda: registry, finding_store=store)
+        assert asyncio.run(producer.observe(_producer_ctx(_WALL + 2)))[0].severity.value == "info"
+        _transition(registry, 83, 2)
+        assert asyncio.run(producer.observe(_producer_ctx(_WALL + 2)))[0].severity.value == "info"
+        _transition(registry, 83, 2.2)
+        assert asyncio.run(producer.observe(_producer_ctx(_WALL + 3)))[0].severity.value == "info"
+        _transition(registry, 83, 62.2)
+        reminder = asyncio.run(producer.observe(_producer_ctx(_WALL + 63)))[0]
+        metadata = reminder.payload["notification"]
+        assert metadata["phase"] == "reminder"
+        assert metadata["episode"] == entry.payload["notification"]["episode"]
+        assert metadata["sequence"] == 1 and metadata["interval"] == 120
+        store.save(reminder)
+        _transition(registry, 83, 182.2)
+        assert asyncio.run(producer.observe(_producer_ctx(_WALL + 182)))[0].severity.value == "info"
+        next_reminder = asyncio.run(producer.observe(_producer_ctx(_WALL + 184)))[0]
+        assert next_reminder.payload["notification"]["interval"] == 240
+    finally:
+        store.close()
+
+
+def test_condition_presentation_bound_does_not_limit_monitoring() -> None:
+    import json
+    from leapflow.hardware.observability.series import HardwareDigest, MAX_PAYLOAD_BYTES
+    rows = tuple({"key": f"device/channel/{i}", "reason": "x" * 1024} for i in range(1000))
+    payload = HardwareDigest(generated_at=_WALL, conditions=rows).to_payload()
+    assert payload["counts"]["conditions"] == len(rows)
+    assert payload["conditions_omitted"] > 0
+    assert len(json.dumps(payload, ensure_ascii=False).encode()) <= MAX_PAYLOAD_BYTES
+
+
+def test_notification_payload_bounds_preserve_checkpoint_and_do_not_mutate_base() -> None:
+    import copy
+    import json
+    from leapflow.hardware.observability.series import HardwareDigest, MAX_PAYLOAD_BYTES, _fit
+    rows = tuple({"reason": "x" * 4000} for _ in range(100))
+    base = HardwareDigest(generated_at=_WALL, events=rows, calibration=rows, conditions=rows).to_payload()
+    original = copy.deepcopy(base)
+    checkpoint = {"key": "device/channel/soft_upper", "episode": "e1", "sequence": 2,
+                  "reason": "x" * 8192}
+    payload = _fit({**base, "notification": checkpoint})
+    assert payload["notification"] == checkpoint
+    assert base == original
+    assert len(json.dumps(payload, ensure_ascii=False).encode()) <= MAX_PAYLOAD_BYTES
+    assert any(payload.get(f"{key}_omitted", 0) for key in ("conditions", "events", "calibration"))
+
+
+def test_historical_advisory_events_notify_once_without_claiming_current_health() -> None:
+    registry = _Registry(events=(_event("advisory_exceeded"),))
+    producer = HardwareObservationProducer(lambda: registry)
+    first = asyncio.run(producer.observe(_producer_ctx(_WALL + 1)))
+    assert first[0].severity.value == "notable"
+    assert first[0].payload["notification"]["phase"] == "entry"
+    quiet = asyncio.run(producer.observe(_producer_ctx(_WALL + 2)))
+    assert all(f.severity.value == "info" for f in quiet)
+    assert "unknown" in quiet[0].title.lower()

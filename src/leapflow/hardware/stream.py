@@ -11,25 +11,24 @@ into the interaction signal pipeline is *events* -- a threshold crossed, a rate
 exceeded, samples lost -- which occur at the rate at which something worth noticing
 actually happens.
 
-Every detection rule is derived from the channel's own ``Envelope``. Nothing new is
-declared: the limits a human already wrote down for approval are the same limits
-that make an observation interesting.
+Hard detection uses the channel's unchanged ``Envelope``. Report-only operational
+warnings use the separately validated observation policy and never grant authority.
 
-Two clocks are in play and they are not interchangeable. Intervals, slew rates and
-staleness read ``Reading.monotonic_at``, because wall-clock jumps would fabricate
-rates no device produced. Anything that leaves this module -- an event's timestamp,
-a persisted window -- carries ``Reading.observed_at``, because every consumer
-outside it (findings, audit, the board's time axis) is wall-clock.
+Clocks are not interchangeable. Staleness uses host ``Reading.monotonic_at``;
+physical rates require qualified acquisition intervals (remote host arrival timing
+is unavailable for this purpose). Events and persisted windows carry wall-clock
+``Reading.observed_at``, matching findings, audit, and the board's time axis.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import deque
-from dataclasses import dataclass
-from typing import Any, Callable, Deque, Iterable, Iterator, Protocol, runtime_checkable
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Deque, Iterable, Iterator, Mapping, Protocol, runtime_checkable
 
 from leapflow.hardware.context import (
     Channel,
@@ -45,6 +44,8 @@ from leapflow.hardware.degradation import (
     sensor_loss_debounce_s,
 )
 from leapflow.hardware.transport import Reading
+from leapflow.hardware.node_gate import rate_delta
+from leapflow.hardware.observation import ObservationJudgment, ObservationPolicy, ObservationSettings
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,8 @@ _EVENT_CLASS_MAP: dict[str, str] = {
     # breach informs a person and must never drive a reflex (see ``advisory``).
     "advisory_exceeded": HardwareEventClass.RECORD,
     "advisory_cleared": HardwareEventClass.RECORD,
+    "observation_warning": HardwareEventClass.RECORD,
+    "observation_cleared": HardwareEventClass.RECORD,
 }
 
 
@@ -196,6 +199,8 @@ class EventKind:
     """A degradation policy triggered while actions are disabled; reported only."""
     ADVISORY_EXCEEDED = "advisory_exceeded"
     """A monitor-only limit the device protects itself against was breached."""
+    OBSERVATION_WARNING = "observation_warning"
+    OBSERVATION_CLEARED = "observation_cleared"
     ADVISORY_CLEARED = "advisory_cleared"
     """A breached advisory limit returned inside its hysteresis band."""
 
@@ -221,6 +226,9 @@ class HardwareEvent:
     means the classification has not been applied yet; consumers that depend on
     it should fall back to ``classify_hardware_event(self.kind)``.
     """
+
+    observation: dict[str, Any] = field(default_factory=dict)
+    sample_evidence: bool = False
 
     @property
     def event_type(self) -> str:
@@ -278,6 +286,7 @@ class HardwareEvent:
             "unit": self.unit,
             "ts": self.observed_at,
             "_mono_ts": time.monotonic(),
+            "observation": dict(self.observation),
         }
 
 
@@ -295,14 +304,23 @@ class ReadingRing:
         self._readings: Deque[Reading] = deque(maxlen=max(2, int(capacity)))
         self._dropped_sequences = 0
         self._expected_sequence: int | None = None
+        self._sequence_epoch: str = ""
+        self._sequence_scope: str = ""
 
     def record(self, reading: Reading) -> int:
         """Append *reading*, returning how many samples appear to have been lost."""
         lost = 0
-        if self._expected_sequence is not None and reading.sequence > self._expected_sequence:
-            lost = reading.sequence - self._expected_sequence
-            self._dropped_sequences += lost
-        self._expected_sequence = reading.sequence + 1
+        if (reading.acquisition_epoch, reading.sequence_scope) != (self._sequence_epoch, self._sequence_scope):
+            self._expected_sequence = None
+        self._sequence_epoch, self._sequence_scope = reading.acquisition_epoch, reading.sequence_scope
+        if reading.sequence_scope == "channel":
+            if self._expected_sequence is not None and reading.sequence > self._expected_sequence:
+                lost = reading.sequence - self._expected_sequence
+                self._dropped_sequences += lost
+            if self._expected_sequence is None or reading.sequence >= self._expected_sequence:
+                self._expected_sequence = reading.sequence + 1
+        else:
+            self._expected_sequence = None
         self._readings.append(reading)
         return lost
 
@@ -359,14 +377,15 @@ class ReadingRing:
 
 
 class HardwareEventDetector:
-    """Turns a stream of readings into events, using only declared envelope data.
+    """Judge raw hard evidence and separately configured report-only observations.
 
     Stateful per channel: staleness and rate need to remember what came before. Kept
     separate from the ring so the detection rules can be tested against a synthetic
     series without a transport in the picture.
     """
 
-    def __init__(self, context: HardwareContext, channel: Channel) -> None:
+    def __init__(self, context: HardwareContext, channel: Channel,
+                 policy: ObservationPolicy | None = None) -> None:
         self._context = context
         self._channel = channel
         self._last_numeric: float | None = None
@@ -374,12 +393,40 @@ class HardwareEventDetector:
         self._degraded_streak = 0
         self._breached = False
         self._stale = False
+        self._last_acquisition: float | None = None
+        self._acquisition_epoch = ""
+        self._observation = ObservationJudgment(context.device_id, channel, policy or ObservationPolicy())
+        self.safety_evidence: dict[str, HardwareEvent | None] = {}
 
-    def observe(self, reading: Reading, *, lost: int = 0) -> tuple[HardwareEvent, ...]:
+    @property
+    def observation_snapshots(self) -> tuple[dict[str, Any], ...]:
+        return self._observation.snapshots()
+
+    def acknowledge_observation(self, checkpoints: Mapping[str, Mapping[str, Any]]) -> None:
+        self._observation.acknowledge(checkpoints)
+
+    def reconfigure_observation(self, policy: ObservationPolicy) -> None:
+        if policy != self._observation.policy:
+            self._observation.reconfigure(policy)
+
+    def invalidate_observation(self, *, identity: str = "") -> None:
+        self._last_numeric = self._last_acquisition = None
+        if identity:
+            self._observation.reset_identity(identity)
+        else:
+            self._observation.invalidate()
+
+    def observe(self, reading: Reading, *, lost: int = 0, ring: ReadingRing | None = None,
+                pending_motion: bool = False, fault_free: bool = False) -> tuple[HardwareEvent, ...]:
         """Return the events this reading produces."""
         events: list[HardwareEvent] = []
         channel = self._channel
         envelope = channel.envelope
+        self._observation.prepare_epoch(reading)
+        self.safety_evidence = {EventKind.THRESHOLD_EXCEEDED: None, EventKind.STALE: None,
+                                EventKind.RATE_EXCEEDED: None, EventKind.QUALITY_DEGRADED: None}
+        if reading.quality == Quality.STALE.value:
+            self.safety_evidence[EventKind.STALE] = self._event(EventKind.STALE, reading, "stale source evidence")
 
         if lost > 0:
             events.append(
@@ -392,6 +439,8 @@ class HardwareEventDetector:
 
         if reading.quality != Quality.OK.value:
             self._degraded_streak += 1
+            self.safety_evidence[EventKind.QUALITY_DEGRADED] = self._event(
+                EventKind.QUALITY_DEGRADED, reading, f"quality is {reading.quality!r}")
             # Three in a row rather than one: a lone suspect sample is noise, a run of
             # them is a fault. Reporting every one would reproduce the sampling-rate
             # flood this layer exists to prevent.
@@ -409,10 +458,37 @@ class HardwareEventDetector:
         numeric = as_numeric(reading.value)
         if numeric is not None and envelope.declared:
             events.extend(self._numeric_events(reading, numeric))
-
-        self._last_numeric = numeric if numeric is not None else self._last_numeric
-        self._last_monotonic = reading.monotonic_at
-        self._stale = False
+        elif not reading.is_trustworthy or numeric is None:
+            self._observation.invalidate()
+        valid = numeric is not None and reading.is_trustworthy
+        acquisition = reading.acquisition_at if reading.acquisition_at is not None else reading.monotonic_at
+        continuous = (self._last_acquisition is None or acquisition > self._last_acquisition)
+        self._last_numeric = numeric if valid and continuous else None
+        self._last_acquisition = acquisition if valid and math.isfinite(acquisition) else None
+        self._acquisition_epoch = reading.acquisition_epoch
+        if reading.is_trustworthy and math.isfinite(reading.monotonic_at):
+            self._last_monotonic = reading.monotonic_at
+        notices = self._observation.observe_soft(reading, ring=ring, pending_motion=pending_motion,
+                                                 fault_free=fault_free)
+        for notice in notices:
+            kind = EventKind.OBSERVATION_CLEARED if notice["phase"] == "recovery" else EventKind.OBSERVATION_WARNING
+            events.append(HardwareEvent(kind=kind, device_id=self._context.device_id,
+                                        channel_id=channel.channel_id, quantity=channel.quantity,
+                                        detail=(f"{notice['condition']}: {notice['reason']}; "
+                                                f"soft={notice['soft_min']}..{notice['soft_max']}, "
+                                                f"hard={notice['hard_min']}..{notice['hard_max']}, "
+                                                f"margin={notice['margin']:g}, duration={notice['duration_s']:.2f}s; reported only"),
+                                        value=reading.value, unit=channel.unit, observed_at=reading.observed_at,
+                                        observation=notice))
+        # Bad numeric evidence invalidates soft/rate history, not the explicit
+        # quality/freshness condition carried by this same reading.
+        self._observation.condition("quality_degraded", breached=self._degraded_streak >= 3,
+                                    clear=reading.is_trustworthy, reading=reading,
+                                    now=reading.monotonic_at, reason="sampling quality")
+        self._observation.condition("stale", breached=reading.quality == Quality.STALE.value,
+                                    clear=reading.is_trustworthy, reading=reading,
+                                    now=reading.monotonic_at, reason="sampling freshness")
+        self._stale = not reading.is_trustworthy
         return tuple(events)
 
     def check_stale(self, *, now: float | None = None) -> tuple[HardwareEvent, ...]:
@@ -428,24 +504,28 @@ class HardwareEventDetector:
         never met, and in both cases the check reports nothing useful.
         """
         channel = self._channel
-        if channel.sample_rate_hz <= 0 or self._last_monotonic is None or self._stale:
+        self.safety_evidence[EventKind.STALE] = None
+        if channel.sample_rate_hz <= 0 or self._last_monotonic is None:
             return ()
         deadline = 2.0 / channel.sample_rate_hz
         elapsed = (now if now is not None else time.monotonic()) - self._last_monotonic
         if elapsed <= deadline:
             return ()
         self._stale = True
-        return (
-            HardwareEvent(
-                kind=EventKind.STALE,
-                device_id=self._context.device_id,
-                channel_id=channel.channel_id,
-                quantity=channel.quantity,
-                detail=(f"no sample for {elapsed:.2f}s on a {channel.sample_rate_hz:g} Hz channel"),
-                unit=channel.unit,
-                observed_at=time.time(),
-            ),
-        )
+        self._last_numeric = self._last_acquisition = None
+        state = self._observation.states.get("stale")
+        if state is None or not state.active:
+            self._observation.invalidate()
+        reading = Reading(self._context.device_id, channel.channel_id, None, observed_at=time.time())
+        notice = self._observation.condition("stale", breached=True, clear=False, reading=reading,
+                                             now=now if now is not None else time.monotonic(), reason="sampling silence")
+        event = HardwareEvent(kind=EventKind.STALE, device_id=self._context.device_id,
+                              channel_id=channel.channel_id, quantity=channel.quantity,
+                              detail=f"no sample for {elapsed:.2f}s on a {channel.sample_rate_hz:g} Hz channel",
+                              unit=channel.unit, observed_at=reading.observed_at,
+                              sample_evidence=True, observation=notice or {})
+        self.safety_evidence[EventKind.STALE] = event
+        return (event,) if notice else ()
 
     def _numeric_events(self, reading: Reading, numeric: float) -> list[HardwareEvent]:
         events: list[HardwareEvent] = []
@@ -466,29 +546,40 @@ class HardwareEventDetector:
                         f"left the declared range ({_bounds(envelope)})",
                     )
                 )
-        elif envelope.contains(numeric, margin=envelope.settle_margin):
+        elif reading.is_trustworthy and envelope.contains(numeric, margin=envelope.settle_margin):
             # Re-entering is worth one event too, so a watcher can see recovery
             # instead of inferring it from silence.
             self._breached = False
             events.append(self._event(EventKind.SETTLED, reading, "returned to the declared range"))
 
-        if (
-            envelope.max_rate is not None
-            and self._last_numeric is not None
-            and self._last_monotonic is not None
-        ):
-            elapsed = reading.monotonic_at - self._last_monotonic
-            if elapsed > 0 and envelope.rate_exceeded(
-                delta=numeric - self._last_numeric, elapsed_s=elapsed
-            ):
-                observed = abs(numeric - self._last_numeric) / elapsed
-                events.append(
-                    self._event(
-                        EventKind.RATE_EXCEEDED,
-                        reading,
-                        f"changing at {observed:g}/s, above the declared {envelope.max_rate:g}/s",
-                    )
-                )
+        if not envelope.contains(numeric):
+            self.safety_evidence[EventKind.THRESHOLD_EXCEEDED] = self._event(
+                EventKind.THRESHOLD_EXCEEDED, reading, f"left the declared range ({_bounds(envelope)})")
+        at = reading.acquisition_at if reading.acquisition_at is not None else reading.monotonic_at
+        elapsed = at - self._last_acquisition if self._last_acquisition is not None else 0.0
+        rate_valid = (reading.is_trustworthy and reading.rate_timebase != "unavailable"
+                      and self._last_numeric is not None and math.isfinite(at) and elapsed > 0
+                      and reading.acquisition_epoch == self._acquisition_epoch
+                      and (self._channel.sample_rate_hz <= 0 or elapsed <= 2.0 / self._channel.sample_rate_hz))
+        delta = rate_delta(self._channel, numeric, self._last_numeric) if rate_valid else 0.0
+        rate_breached = rate_valid and envelope.rate_exceeded(delta=delta, elapsed_s=elapsed)
+        if rate_breached:
+            event = self._event(EventKind.RATE_EXCEEDED, reading,
+                                f"changing at {abs(delta) / elapsed:g}/s, above the declared {envelope.max_rate:g}/s")
+            self.safety_evidence[EventKind.RATE_EXCEEDED] = event
+            events.append(event)
+        now = reading.monotonic_at
+        threshold_notice = self._observation.condition(
+            "threshold_exceeded", breached=self._breached, clear=not self._breached,
+            reading=reading, now=now, valid=reading.is_trustworthy,
+            reason=f"declared range ({_bounds(envelope)})")
+        if threshold_notice:
+            events = [replace(event, observation=threshold_notice)
+                      if event.kind in {EventKind.THRESHOLD_EXCEEDED, EventKind.SETTLED} else event
+                      for event in events]
+        self._observation.condition("rate_exceeded", breached=bool(rate_breached), clear=not rate_breached,
+                                    reading=reading, now=now, valid=bool(rate_valid), reason="declared physical rate",
+                                    extra={"rate_available": bool(rate_valid)})
         return events
 
     def _event(self, kind: str, reading: Reading, detail: str) -> HardwareEvent:
@@ -501,7 +592,47 @@ class HardwareEventDetector:
             value=reading.value,
             unit=reading.unit or self._channel.unit,
             observed_at=reading.observed_at,
+            sample_evidence=kind in {EventKind.THRESHOLD_EXCEEDED, EventKind.RATE_EXCEEDED, EventKind.QUALITY_DEGRADED},
         )
+
+
+def _stale_observation(detector: HardwareEventDetector, alert_policy: Any) -> tuple[HardwareEvent, ...]:
+    events = detector.check_stale()
+    if alert_policy is not None:
+        try:
+            alert_policy.evaluate_sample(detector._context.device_id, detector._channel.channel_id,
+                {EventKind.STALE: detector.safety_evidence.get(EventKind.STALE),
+                 EventKind.THRESHOLD_EXCEEDED: None, EventKind.RATE_EXCEEDED: None,
+                 EventKind.QUALITY_DEGRADED: None})
+        except Exception:  # noqa: BLE001 - a policy failure cannot stop acquisition
+            logger.exception("Hardware silence safety evaluation failed")
+    return events
+
+
+def _observation_policy(registry: Any, context: HardwareContext, channel: Channel) -> ObservationPolicy:
+    resolver = getattr(registry, "observation_policy", None)
+    if callable(resolver):
+        return resolver(context.device_id, channel)
+    settings = getattr(registry, "settings", None)
+    return ObservationSettings.parse(getattr(settings, "hardware_observation", "{}")).resolve(context.device_id, channel)
+
+
+def _observe_sample(detector: HardwareEventDetector, reading: Reading, ring: ReadingRing,
+                    registry: Any, alert_policy: Any, *, lost: int) -> tuple[HardwareEvent, ...]:
+    note = getattr(registry, "note_observation", None)
+    if callable(note):
+        note(reading)
+    pending = getattr(registry, "pending_write_expectations", {})
+    pending_motion = isinstance(pending, dict) and any(d == reading.device_id and v for (d, _), v in pending.items())
+    evidence = getattr(registry, "observation_fault_free", None)
+    fault_free = bool(evidence(reading.device_id)) if callable(evidence) else False
+    events = detector.observe(reading, lost=lost, ring=ring, pending_motion=pending_motion, fault_free=fault_free)
+    if alert_policy is not None:
+        try:
+            alert_policy.evaluate_sample(reading.device_id, reading.channel_id, detector.safety_evidence)
+        except Exception:  # noqa: BLE001 - report a policy failure without stopping acquisition
+            logger.exception("Hardware sample safety evaluation failed")
+    return events
 
 
 class HardwareStreamSource:
@@ -532,7 +663,7 @@ class HardwareStreamSource:
         self._context = context
         self._channel = channel
         self.ring = ReadingRing(ring_capacity)
-        self._detector = HardwareEventDetector(context, channel)
+        self._detector = HardwareEventDetector(context, channel, _observation_policy(registry, context, channel))
         self._event_sink = event_sink
         self._store = reading_store
         self._alert_policy = alert_policy
@@ -551,6 +682,10 @@ class HardwareStreamSource:
         self._sensor_loss_since: float | None = None
         self._sensor_loss_triggered: bool = False
         self._last_degradation_outcome: Any = None
+
+    @property
+    def observation_detectors(self) -> tuple[HardwareEventDetector, ...]:
+        return (self._detector,)
 
     @property
     def source_id(self) -> str:
@@ -610,14 +745,15 @@ class HardwareStreamSource:
                 # would otherwise produce log lines at the sampling rate, burying the
                 # first and most useful one.
                 if consecutive_failures == 1:
+                    self._detector.invalidate_observation()
                     logger.warning(
                         "Hardware stream %s read failed: %s", self.source_id, exc, exc_info=True
                     )
                     # Mark the start of a communication loss window.
                     self._comm_loss_start = time.monotonic()
+                self._dispatch(_stale_observation(self._detector, self._alert_policy), emit)
                 # DegradationPolicy: comm_loss enforcement.
                 await self._maybe_trigger_comm_loss()
-                self._dispatch(self._detector.check_stale(), emit)
                 await self._sleep(min(interval * (2**consecutive_failures), 30.0))
                 # Backoff deliberately abandons the old cadence; resuming the prior
                 # deadline would burst to "catch up" on a device that just recovered.
@@ -634,10 +770,11 @@ class HardwareStreamSource:
             consecutive_failures = 0
             self._samples += 1
             lost = self.ring.record(reading)
+            self._dispatch(_observe_sample(self._detector, reading, self.ring, self._registry,
+                                           self._alert_policy, lost=lost), emit)
             await self._persist(reading, lost=lost)
             # Sensor quality tracking for degradation policy.
             await self._track_sensor_quality(reading)
-            self._dispatch(self._detector.observe(reading, lost=lost), emit)
 
             next_at += interval
             delay = next_at - time.monotonic()
@@ -732,7 +869,8 @@ class HardwareStreamSource:
         if reading.quality != Quality.OK.value:
             return False
         self._channel = target
-        self._detector = HardwareEventDetector(self._context, target)
+        self._detector = HardwareEventDetector(self._context, target,
+                                               _observation_policy(self._registry, self._context, target))
         return True
 
     @property
@@ -793,11 +931,16 @@ class HardwareStreamSource:
         the value and the unit are all needed downstream, and collapsing them to a
         detail string here would force every consumer to parse it back out.
 
-        Alert policy evaluation runs after the emit so the event is recorded (and
-        visible on the board) before a response is attempted.  The policy itself
-        dispatches asynchronous tasks so it never blocks the sampling loop.
+        Sample-level safety evidence is evaluated before dispatch. Other hard events
+        are evaluated before presentation pacing; suppression cannot suppress a guard.
+        The policy dispatches asynchronous tasks and never blocks sampling.
         """
         for event in events:
+            if self._alert_policy is not None and not event.sample_evidence:
+                try:
+                    self._alert_policy.evaluate(event)
+                except Exception:  # noqa: BLE001 - policy must not stop sampling
+                    logger.exception("Hardware alert policy raised")
             if not self._admit(event):
                 continue
             if self._event_sink is not None:
@@ -810,16 +953,6 @@ class HardwareStreamSource:
                     emit(event)
                 except Exception as exc:  # noqa: BLE001 - as above
                     logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
-            # Alert policy evaluation: after emit so the event is visible first.
-            if self._alert_policy is not None:
-                try:
-                    self._alert_policy.evaluate(event)
-                    # Reset consecutive counters on recovery so a new breach cycle
-                    # starts fresh rather than carrying stale counts.
-                    if event.kind == EventKind.SETTLED:
-                        self._alert_policy.reset_channel(event.device_id, event.channel_id)
-                except Exception as exc:  # noqa: BLE001 - policy must not stop sampling
-                    logger.warning("Hardware alert policy raised: %s", exc, exc_info=True)
 
     def _admit(self, event: HardwareEvent) -> bool:
         """Return whether this event clears the per-kind-per-channel rate floor.
@@ -833,6 +966,8 @@ class HardwareStreamSource:
         - The same kind on the *same* channel is still suppressed for the
           ``MIN_EVENT_INTERVAL_S`` floor, preventing level-triggered floods.
         """
+        if event.observation.get("phase") in {"entry", "recovery", "reminder"}:
+            return True  # episode transitions must survive notification pacing
         now = time.monotonic()
         key = f"{event.kind}:{event.device_id}.{event.channel_id}"
         previous = self._last_emitted.get(key)
@@ -901,7 +1036,8 @@ class BatchStreamCoordinator:
             ch.channel_id: ReadingRing(ring_capacity) for ch in channels
         }
         self._detectors: dict[str, HardwareEventDetector] = {
-            ch.channel_id: HardwareEventDetector(context, ch) for ch in channels
+            ch.channel_id: HardwareEventDetector(context, ch, _observation_policy(registry, context, ch))
+            for ch in channels
         }
         self._event_sink = event_sink
         self._store = reading_store
@@ -925,6 +1061,10 @@ class BatchStreamCoordinator:
         self._sensor_loss_triggered: bool = False
         self._failed_channel_id: str = ""
         self._last_degradation_outcome: Any = None
+
+    @property
+    def observation_detectors(self) -> tuple[HardwareEventDetector, ...]:
+        return tuple(self._detectors.values())
 
     @property
     def source_id(self) -> str:
@@ -977,15 +1117,17 @@ class BatchStreamCoordinator:
             except Exception as exc:  # noqa: BLE001 - one device must not stop the rest
                 consecutive_failures += 1
                 if consecutive_failures == 1:
+                    for detector in self._detectors.values():
+                        detector.invalidate_observation()
                     logger.warning(
                         "Batch stream %s read failed: %s", self.source_id, exc, exc_info=True
                     )
                     self._comm_loss_start = time.monotonic()
+                # Check staleness on all channels before an action can await I/O.
+                for detector in self._detectors.values():
+                    self._dispatch(_stale_observation(detector, self._alert_policy), emit)
                 # DegradationPolicy: comm_loss enforcement.
                 await self._maybe_trigger_comm_loss()
-                # Check staleness on all channels during failures.
-                for detector in self._detectors.values():
-                    self._dispatch(detector.check_stale(), emit)
                 await self._sleep(min(interval * (2**consecutive_failures), 30.0))
                 next_at = time.monotonic()
                 continue
@@ -1000,19 +1142,26 @@ class BatchStreamCoordinator:
             consecutive_failures = 0
             self._samples += 1
 
-            # Distribute batch readings to per-channel rings and detectors.
+            # Judge every channel before any persistence await can delay a hard guard.
+            persisted = []
             for reading in batch.readings:
                 ch_id = reading.channel_id
                 ring = self._rings.get(ch_id)
                 if ring is None:
                     continue
                 lost = ring.record(reading)
-                await self._persist(reading, lost=lost)
-                # Sensor quality tracking for degradation policy.
-                await self._track_sensor_quality(reading)
                 detector = self._detectors.get(ch_id)
                 if detector is not None:
-                    self._dispatch(detector.observe(reading, lost=lost), emit)
+                    self._dispatch(_observe_sample(detector, reading, ring, self._registry,
+                                                   self._alert_policy, lost=lost), emit)
+                persisted.append((reading, lost))
+            received = {reading.channel_id for reading in batch.readings}
+            for ch_id, detector in self._detectors.items():
+                if ch_id not in received:
+                    self._dispatch(_stale_observation(detector, self._alert_policy), emit)
+            for reading, lost in persisted:
+                await self._persist(reading, lost=lost)
+                await self._track_sensor_quality(reading)
 
             next_at += interval
             delay = next_at - time.monotonic()
@@ -1109,7 +1258,8 @@ class BatchStreamCoordinator:
         self._channels = updated
         self._channel_ids = tuple(dict.fromkeys(channel.channel_id for channel in updated))
         self._rings.setdefault(target_channel_id, ReadingRing(DEFAULT_RING_CAPACITY))
-        self._detectors[target_channel_id] = HardwareEventDetector(self._context, target)
+        self._detectors[target_channel_id] = HardwareEventDetector(
+            self._context, target, _observation_policy(self._registry, self._context, target))
         return True
 
     @property
@@ -1153,6 +1303,11 @@ class BatchStreamCoordinator:
     def _dispatch(self, events: Iterable[HardwareEvent], emit: Any) -> None:
         """Hand events to the sink, signal pipeline, and alert policy, paced per kind."""
         for event in events:
+            if self._alert_policy is not None and not event.sample_evidence:
+                try:
+                    self._alert_policy.evaluate(event)
+                except Exception:  # noqa: BLE001 - policy must not stop sampling
+                    logger.exception("Hardware alert policy raised")
             if not self._admit(event):
                 continue
             if self._event_sink is not None:
@@ -1165,16 +1320,11 @@ class BatchStreamCoordinator:
                     emit(event)
                 except Exception as exc:  # noqa: BLE001 - as above
                     logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
-            if self._alert_policy is not None:
-                try:
-                    self._alert_policy.evaluate(event)
-                    if event.kind == EventKind.SETTLED:
-                        self._alert_policy.reset_channel(event.device_id, event.channel_id)
-                except Exception as exc:  # noqa: BLE001 - policy must not stop sampling
-                    logger.warning("Hardware alert policy raised: %s", exc, exc_info=True)
 
     def _admit(self, event: HardwareEvent) -> bool:
         """Return whether this event clears the per-kind-per-channel rate floor."""
+        if event.observation.get("phase") in {"entry", "recovery", "reminder"}:
+            return True  # episode transitions must survive notification pacing
         now = time.monotonic()
         key = f"{event.kind}:{event.device_id}.{event.channel_id}"
         previous = self._last_emitted.get(key)

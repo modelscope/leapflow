@@ -9,6 +9,7 @@ guard for LHP transports.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -410,6 +411,28 @@ def test_registry_refuses_lhp_control_bus():
 
     with pytest.raises(RuntimeError, match="LHP"):
         registry.start_control_loop("remote", object())
+
+
+@pytest.mark.parametrize("kind", ["dispatch", "control"])
+def test_verified_halt_settlement_is_device_scoped_and_keeps_active_claims(kind: str) -> None:
+    sessions, _ = _make_sessions()
+    if kind == "control":
+        token = sessions.begin_control("arm", stop=lambda: None)
+        sessions.finish_control(token, settled=False)
+    else:
+        token = sessions.begin_dispatch("arm")
+        sessions.finish_dispatch(token, settled=False)
+    other = sessions.begin_dispatch("other")
+    sessions.finish_dispatch(other, settled=False)
+    active = sessions.begin_dispatch("active")
+    before = time.monotonic()
+    assert sessions.busy_device(("arm",)) == "arm"
+    assert sessions.settle_halt("arm", before=before, evidence="verified hold")
+    assert sessions.busy_device(("arm",)) == ""
+    assert sessions.busy_device(("other",)) == "other"
+    assert not sessions.settle_halt("active", before=before, evidence="verified hold")
+    assert sessions.busy_device(("active",)) == "active"
+    sessions.finish_dispatch(active, settled=True)
 
 
 # ── Shutdown ─────────────────────────────────────────────────────────────

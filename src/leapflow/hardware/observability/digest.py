@@ -88,6 +88,7 @@ def build_digest(registry: Any, *, now: float | None = None) -> HardwareDigest:
         outcomes=tuple(outcomes),
         calibration=_calibration(registry, contexts, now=moment),
         storage=_storage(registry),
+        conditions=tuple(_safely(getattr(registry, "observation_conditions", lambda: ()), default=())),
     )
 
 
@@ -232,6 +233,7 @@ def _events(registry: Any) -> tuple[dict[str, Any], ...]:
                 "title": f"{kind} · {device_id}.{channel_id}",
                 "summary": str(getattr(event, "detail", "")),
                 "severity": _event_severity(kind),
+                "observation": dict(getattr(event, "observation", {}) or {}),
                 "kind": kind,
                 "device_id": device_id,
                 "channel_id": channel_id,
@@ -264,6 +266,7 @@ _NOTABLE_KINDS = frozenset(
         "sample_loss",
         "calibration_failed",
         "calibration_expired",
+        "observation_warning",
         # A degradation policy fired while actions are disabled: worth a warning,
         # but nothing was stopped, so it must not page anyone like an alert.
         "degradation_suppressed",
