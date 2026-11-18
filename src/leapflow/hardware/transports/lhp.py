@@ -721,6 +721,9 @@ class LhpTransport:
                 failure_code="lhp_result_mismatch",
             )
         observed = _as_positive_float(payload.get("observed_at"))
+        acquisition = _as_positive_float(payload.get("acquisition_at"))
+        epoch = payload.get("acquisition_epoch")
+        epoch = epoch if isinstance(epoch, str) else ""
         return Reading(
             device_id=self._local_device_id(),
             channel_id=channel_id,
@@ -730,6 +733,10 @@ class LhpTransport:
             observed_at=observed if observed > 0 else time.time(),
             sequence=int(payload.get("sequence") or 0),
             quality=str(payload.get("quality") or Quality.OK.value),
+            sequence_scope=str(payload.get("sequence_scope") or "unknown"),
+            acquisition_at=acquisition if acquisition > 0 and epoch else None,
+            acquisition_epoch=epoch,
+            rate_timebase="source" if acquisition > 0 and epoch else "unavailable",
         )
 
     def _frame_from_payload(self, payload: Any, channel_id: str) -> FrameReading:
@@ -832,7 +839,7 @@ def _as_positive_float(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0.0
     numeric = float(value)
-    return numeric if numeric > 0 else 0.0
+    return numeric if math.isfinite(numeric) and numeric > 0 else 0.0
 
 
 def _latest_observed_at(readings: list[Reading]) -> float:

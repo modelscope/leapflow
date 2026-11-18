@@ -16,7 +16,8 @@ name this node.
 
 Stopping is graceful on SIGINT/SIGTERM: the listener closes, live
 connections are dropped, and node-side transports are released before the
-process exits.
+process exits. ``leap hw stop`` (``node_lifecycle.py``) delivers that stop
+through the process's owner, using the node record written once listening.
 """
 
 from __future__ import annotations
@@ -28,10 +29,12 @@ import logging
 import os
 import signal
 import sys
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Sequence
 
 from leapflow.hardware.lhp.authority import WRITE_MODE_PERMIT_REQUIRED
+from leapflow.hardware.lhp.node_lifecycle import NODE_ID_ENV, finish_record, write_record
 from leapflow.hardware.lhp.protocol import (
     LHP_DEFAULT_PORT,
     LHP_PROTOCOL_VERSION,
@@ -41,7 +44,7 @@ from leapflow.hardware.lhp.server import LhpNodeServer
 
 logger = logging.getLogger(__name__)
 
-_NODE_ID_ENV = "LEAPFLOW_LHP_NODE_ID"
+_NODE_ID_ENV = NODE_ID_ENV
 _TOKEN_ENV = "LEAPFLOW_LHP_TOKEN"
 _WRITE_MODE_ENV = "LEAPFLOW_LHP_WRITE_MODE"
 _PERMIT_KEYS_ENV = "LEAPFLOW_LHP_PERMIT_ISSUER_KEYS"
@@ -172,12 +175,17 @@ async def serve_node(
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:  # pragma: no cover - platform without loop signals
             pass
+    record = None
     try:
         if unix_path:
             endpoint = await server.start_unix(unix_path)
         else:
             bound_host, bound_port = await server.start(host=host, port=port)
             endpoint = f"tcp://{bound_host}:{bound_port}"
+        # Lets `leap hw stop` find this process without a pid guess.
+        record = await asyncio.to_thread(
+            write_record, config.runtime_dir, node_id=node_id, endpoint=endpoint,
+        )
         ready = {
             "ok": True,
             "event": "lhp_node_ready",
@@ -198,11 +206,19 @@ async def serve_node(
         logger.info("LHP node %r serving %d device(s) at %s", node_id, len(contexts), endpoint)
         await stop.wait()
     finally:
-        await server.stop()
-        await skill_runtime.close()
-        if worker is not None:
-            await worker.close()
-        await registry.close_all()
+        complete = False
+        try:
+            async with AsyncExitStack() as cleanup:
+                # LIFO: stop admission/leases, then skills, compute, and transports.
+                # One failing closer must not skip the remaining owners' cleanup.
+                cleanup.push_async_callback(registry.close_all)
+                if worker is not None:
+                    cleanup.push_async_callback(worker.close)
+                cleanup.push_async_callback(skill_runtime.close)
+                cleanup.push_async_callback(server.stop)
+            complete = True
+        finally:
+            await asyncio.to_thread(finish_record, record, complete=complete)
     logger.info("LHP node %r stopped", node_id)
     return 0
 

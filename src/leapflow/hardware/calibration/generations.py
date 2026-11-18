@@ -606,6 +606,18 @@ class GenerationStore:
                 return ()
             if not connection.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name='calib_outbox'").fetchone()[0]:
                 raise ValueError("durable calibration outbox missing from committed schema")
+            # Lifecycle consumers reset runtime observation scope from these records.
+            # A digest is not chronology, and a rollback can decrease generation.
+            journal = connection.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name='calib_pointer_journal'"
+            ).fetchone()[0]
+            join = (
+                " LEFT JOIN calib_pointer_journal j ON j.event_id=d.event_id " if journal else " "
+            )
+            order = (
+                "d.workcell_id,COALESCE(j.revision,0),d.created_at,o.event_id"
+                if journal else "d.workcell_id,d.created_at,o.event_id"
+            )
             if device_id:
                 if not isinstance(device_id, str) or len(device_id) > 256:
                     raise ValueError("bounded exact lifecycle device required")
@@ -614,15 +626,18 @@ class GenerationStore:
                 # record-only events through their explicitly bound causal device.
                 rows = connection.execute(
                     "SELECT o.event_json FROM calib_outbox o JOIN calib_decisions d ON o.event_id=d.event_id "
-                    "WHERE NOT o.delivered AND (json_extract_string(d.decision_json,'$.causal.device_id')=? "
+                    + join + "WHERE NOT o.delivered AND (json_extract_string(d.decision_json,'$.causal.device_id')=? "
                     "OR EXISTS (SELECT 1 FROM calib_generations g WHERE g.workcell_id=d.workcell_id "
                     "AND g.generation=COALESCE(TRY_CAST(json_extract_string(d.decision_json,'$.generation') AS BIGINT), "
                     "TRY_CAST(json_extract_string(d.decision_json,'$.previous_generation') AS BIGINT)) "
-                    "AND json_extract_string(g.model_json,'$.device_id')=?)) ORDER BY o.event_id LIMIT ?",
+                    "AND json_extract_string(g.model_json,'$.device_id')=?)) ORDER BY " + order + " LIMIT ?",
                     [device_id, device_id, limit],
                 ).fetchall()
             else:
-                rows = connection.execute("SELECT event_json FROM calib_outbox WHERE NOT delivered ORDER BY event_id LIMIT ?", [limit]).fetchall()
+                rows = connection.execute(
+                    "SELECT o.event_json FROM calib_outbox o JOIN calib_decisions d ON o.event_id=d.event_id "
+                    + join + "WHERE NOT o.delivered ORDER BY " + order + " LIMIT ?", [limit]
+                ).fetchall()
             return tuple(self._read_decision(row[0]) for row in rows)
 
     def acknowledge_event(self, event_id: str) -> None:

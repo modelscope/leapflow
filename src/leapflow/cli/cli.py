@@ -353,6 +353,19 @@ def main(argv: list[str] | None = None) -> int:
         "--log-file", default="", help="Append and size-rotate the node log here (config hardware.node_log_file)"
     )
     hw_serve.add_argument("--verbose", action="store_true", help="Log at DEBUG level")
+    from leapflow.hardware.lhp.node_lifecycle import DEFAULT_STOP_TIMEOUT_S
+
+    hw_stop = hw_sub.add_parser(
+        "stop", parents=[hw_json], help="Gracefully stop a local LHP node and its workers",
+        description=(
+            "Stop the local hw serve node in the active profile, through its supervisor "
+            "when present. This is not hardware power-off: Piper holding torque/grip may "
+            "remain; physical state is unverified after disconnect. Node monitoring and "
+            "remote control stop, and camera streams are released. No automatic SIGKILL."
+        ),
+    )
+    hw_stop.add_argument("--node-id", default="", help="Select a local node (env LEAPFLOW_LHP_NODE_ID); required if ambiguous")
+    hw_stop.add_argument("--timeout", type=float, default=DEFAULT_STOP_TIMEOUT_S, help="Seconds to wait for node, workers, and supervisor to stop (default: %(default)s)")
     # Verification subcommands
     hw_verify = hw_sub.add_parser("verify", parents=[hw_json], help="Verify a device declaration (digest-bound)")
     hw_verify.add_argument("device", help="Device id to verify")

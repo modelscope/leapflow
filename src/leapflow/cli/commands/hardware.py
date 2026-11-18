@@ -28,7 +28,7 @@ import asyncio
 import json
 import logging
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +132,8 @@ async def _dispatch(args: argparse.Namespace, action: str) -> int:
         return _run_offline(action, args, json_mode)
     if action == "serve":
         return await _run_serve(args)
+    if action == "stop":
+        return await _run_stop(args, json_mode)
     if action == "validate" and getattr(args, "workcells", None) is not None:
         from leapflow.cli.commands.hardware_workcells import run_workcell_validation
 
@@ -186,6 +188,51 @@ async def _run_serve(args: argparse.Namespace) -> int:
         # reason it died belongs there, not only on a console nobody kept.
         logger.critical("LHP node %r exited on an unhandled error", node_id, exc_info=True)
         raise
+
+
+async def _run_stop(args: argparse.Namespace, json_mode: bool) -> int:
+    """Stop only the selected local node; never initialize a second hardware owner."""
+    import math
+    import os
+
+    from leapflow.hardware.lhp.node_lifecycle import (
+        DEFAULT_STOP_TIMEOUT_S, NODE_ID_ENV, StopResult, discover_nodes, stop_node,
+    )
+    from leapflow.hardware.lhp.protocol import is_valid_device_id
+
+    node_id = str(getattr(args, "node_id", "") or os.environ.get(NODE_ID_ENV, "")).strip()
+    timeout_s = float(getattr(args, "timeout", DEFAULT_STOP_TIMEOUT_S))
+    if sys.platform == "win32":
+        return _emit_result("stop", StopResult(
+            ok=False, status="unsupported_platform", detail="Graceful node stop is supported on POSIX systems only.",
+        ).to_dict(), json_mode)
+    if (node_id and not is_valid_device_id(node_id)) or not math.isfinite(timeout_s) or timeout_s <= 0:
+        return _emit_result("stop", StopResult(
+            ok=False, status="invalid_args", detail="Use a valid --node-id and a positive, finite --timeout.",
+        ).to_dict(), json_mode)
+    try:
+        settings = load_config()
+        nodes = await asyncio.to_thread(discover_nodes, settings.runtime_dir, node_id)
+    except (OSError, ValueError) as exc:
+        logger.error("Local node discovery failed", exc_info=True)
+        return _emit_result("stop", StopResult(
+            ok=False, status="discovery_failed", detail=f"Cannot discover local nodes: {type(exc).__name__}; no stop requested.",
+        ).to_dict(), json_mode)
+    if not nodes:
+        return _emit_result("stop", StopResult(
+            ok=True, status="not_running", detail="No matching local node is running in this profile; no service action taken.",
+        ).to_dict(), json_mode)
+    if len(nodes) != 1:
+        candidates = ", ".join(f"{node.node_id or '(unknown id)'} (pid {node.pid})" for node in nodes)
+        return _emit_result("stop", StopResult(
+            ok=False, status="ambiguous_node",
+            detail=f"Multiple local nodes match: {candidates}. Select one with --node-id or the correct profile; no stop requested.",
+        ).to_dict(), json_mode)
+    if not json_mode:
+        print("Warning: stopping the node cancels work and disconnects hardware. This is NOT power-off; physical arm/grip state is unverified afterward.", flush=True)
+        print(f"Waiting up to {timeout_s:g}s for {nodes[0].node_id} and its workers to stop...", flush=True)
+    result = await asyncio.to_thread(stop_node, nodes[0], timeout_s=timeout_s)
+    return _emit_result("stop", result.to_dict(), json_mode)
 
 
 # ── Read / estop plane ─────────────────────────────────────────────────────
@@ -331,6 +378,26 @@ async def _run_sampling_control(
 
 
 def _emit_result(action: str, result: dict[str, Any], json_mode: bool) -> int:
+    if action == "stop":
+        # FailureEnvelope belongs at the application boundary, not in hardware.
+        from leapflow.engine.recovery.failure_envelope import (
+            FailureEnvelope, FailureSource, Recoverability, SideEffectState,
+        )
+
+        failure = None
+        if not result.get("ok"):
+            envelope = FailureEnvelope.create(
+                source=FailureSource.SYSTEM, category="node_lifecycle",
+                failure_class="NodeStopFailure", failure_code=result["status"],
+                message=result["detail"], recoverability=Recoverability.USER_FIXABLE,
+                side_effect_state=SideEffectState.UNKNOWN if result.get("via") else SideEffectState.NONE,
+            )
+            failure = {
+                **asdict(envelope), "source": envelope.source.value,
+                "recoverability": envelope.recoverability.value,
+                "side_effect_state": envelope.side_effect_state.value,
+            }
+        result = {**result, "failure": failure}
     if json_mode:
         print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
     else:
@@ -339,6 +406,14 @@ def _emit_result(action: str, result: dict[str, Any], json_mode: bool) -> int:
 
 
 def _render(action: str, result: dict[str, Any]) -> None:
+    if action == "stop":
+        print("LEAP Hardware — stop")
+        print(f"  {result.get('status')}: {result.get('detail', '')}")
+        for consequence in result.get("consequences", ()):
+            print(f"  Warning: {consequence}")
+        if result.get("survivors"):
+            print(f"  Worker processes still running: {result['survivors']}")
+        return
     print(f"{_CYAN}LEAP Hardware \u2014 {action}{_RESET}")
     if not result.get("ok"):
         _fail(str(result.get("error") or result.get("code") or "command failed"))
@@ -1007,7 +1082,7 @@ async def _run_commission(args: argparse.Namespace, json_mode: bool) -> int:
 
 
 def _print_usage() -> None:
-    print("Usage: leap hw {list|describe|read|status|estop|pause|resume|replay|serve|verify|validate|permit-key|init|probe|commission} [--json]")
+    print("Usage: leap hw {list|describe|read|status|estop|pause|resume|replay|serve|stop|verify|validate|permit-key|init|probe|commission} [--json]")
     print()
     print("Inspect hardware and intervene in it directly.")
     print()
@@ -1021,6 +1096,7 @@ def _print_usage() -> None:
     print("  resume <device>      Resume daemon sampling for a device")
     print("  replay <path>        Replay a raw NDJSON segment through the event detector")
     print("  serve                Serve this machine as an LHP fabric node (edge runtime)")
+    print("  stop [--node-id ID]  Stop the local node and workers; not hardware power-off")
     print("  verify <device>      Write a digest-bound verification entry for a device")
     print("  validate [device]    Validate declarations against their verification entries")
     print("  permit-key           Show the permit issuer public key and key_id")

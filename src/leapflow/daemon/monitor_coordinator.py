@@ -254,7 +254,9 @@ class MonitorCoordinator:
             from leapflow.hardware.observability import HardwareObservationProducer
 
             monitors.producers.register(
-                HardwareObservationProducer(lambda: getattr(ctx, "_hardware_registry", None))
+                HardwareObservationProducer(lambda: getattr(ctx, "_hardware_registry", None),
+                                            finding_store=monitors.finding_store,
+                                            run_db=getattr(ctx, "_run_deferred_db", None))
             )
         except Exception:
             logger.debug("daemon: hardware observability producer unavailable", exc_info=True)

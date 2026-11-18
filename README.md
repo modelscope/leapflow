@@ -214,6 +214,42 @@ export LEAPFLOW_FLEET_NODES='[{"node_id":"edge01","endpoint":"tcp://<ip>:8767","
 leap daemon restart && leap hw list
 ```
 
+**Stop the edge node** (run on the node, with the same user and profile):
+
+```bash
+leap hw stop                         # stop the sole local node and its workers
+leap hw stop --node-id edge01         # select a node if several are running
+leap hw stop --timeout 60 --json      # wait longer; structured outcome
+```
+
+`stop` uses the owning systemd user unit when present, preventing its restart
+policy from immediately relaunching the node; otherwise it sends SIGTERM to the
+identified `serve` process. It waits for the node and observed workers to exit.
+Repeated stops return `not_running`; ambiguous targets are refused. Discovery is
+local and profile-scoped, and the host daemon/TUI and unrelated services remain
+running. On Linux, legacy nodes without lifecycle records can also be discovered;
+on macOS, the node must have been started by a version that writes these records.
+A timeout returns failure without sending SIGKILL. A systemd unit can independently
+force termination at its own `TimeoutStopSec`; an abnormal unit result is reported
+as unclean, not as a successful graceful stop.
+
+Stopping the service is **not hardware power-off or a parking operation**:
+- Graceful shutdown cancels runs/leases, attempts declared actuator halts, and
+  releases camera streams, previews, and device connections.
+- Piper halt attempts a powered hold-in-place; closing CAN sends no disable,
+  reset, parking move, or gripper-open command. An enabled arm may remain energized
+  and a gripper may retain its last command. Actual posture, holding torque, and
+  object retention after disconnect are **not verified**; other hardware follows
+  its driver's and firmware's shutdown behavior.
+- Node-side monitoring/deadman and host remote control/estop through this node are
+  unavailable after exit. Keep the hardware attended and follow its physical safety
+  procedures. Host fleet health changes on its configured heartbeat schedule.
+
+The command prints these consequences and distinguishes cleanup completion from
+physical verification (`hardware_state_verified: false`). For a supervised node,
+resume with `systemctl --user start <owning-unit>`; otherwise reuse the original
+`leap hw serve ...` command. Stopping a unit does not disable its boot activation.
+
 </details>
 
 <details>

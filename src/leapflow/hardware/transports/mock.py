@@ -132,6 +132,7 @@ class MockTransport:
             quantity=channel.quantity if channel is not None else "",
             unit=channel.unit if channel is not None else "",
             sequence=sequence,
+            sequence_scope="channel_read",
             quality=Quality.OK.value,
         )
 

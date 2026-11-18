@@ -167,6 +167,7 @@ class ModelServiceTransport:
             value=value,
             quantity="model_metadata",
             sequence=self._sequence,
+            sequence_scope="device_read",
             quality=quality,
         )
 

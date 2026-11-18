@@ -263,6 +263,7 @@ class ROS2Transport:
                 channel_id=channel_id,
                 value=None,
                 sequence=self._next_seq(channel_id),
+                sequence_scope="channel_read",
                 quality=Quality.STALE.value,
             )
 
@@ -285,6 +286,7 @@ class ROS2Transport:
             quantity=ch.quantity if ch else "",
             unit=ch.unit if ch else "",
             sequence=self._next_seq(channel_id),
+            sequence_scope="channel_read",
             quality=quality,
         )
 

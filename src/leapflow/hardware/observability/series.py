@@ -165,6 +165,7 @@ class HardwareDigest:
     outcomes: tuple[dict[str, Any], ...] = ()
     calibration: tuple[dict[str, Any], ...] = ()
     storage: dict[str, Any] = field(default_factory=dict)
+    conditions: tuple[dict[str, Any], ...] = ()
 
     @property
     def is_empty(self) -> bool:
@@ -191,6 +192,7 @@ class HardwareDigest:
                 "devices": len(self.devices),
                 "series": len(self.series),
                 "events": len(self.events),
+                "conditions": len(self.conditions),
                 "outcomes": len(self.outcomes),
                 "calibration": len(self.calibration),
                 "conformance_windows": len(self.conformance),
@@ -206,6 +208,8 @@ class HardwareDigest:
             "outcomes": list(self.outcomes),
             "calibration": list(self.calibration),
             "storage": dict(self.storage),
+            "conditions": [{key: value for key, value in row.items() if key != "pending"}
+                           for row in self.conditions],
         }
         return _fit(payload)
 
@@ -243,13 +247,12 @@ def decimate(points: Sequence[SeriesPoint], limit: int = MAX_POINTS) -> tuple[Se
 def _fit(payload: dict[str, Any]) -> dict[str, Any]:
     """Decimate series until the encoded payload fits ``MAX_PAYLOAD_BYTES``.
 
-    Series are the only field allowed to be large enough to need this, and they are
-    the only field it can reduce -- so an overrun that survives the loop means some
-    *other* field is unbounded, which is a producer defect this function cannot fix.
-    It says so at ``warning`` rather than returning quietly: the previous silent
-    return meant a payload four times the ceiling was persisted, pushed, and batched
-    into an RPC frame with no record anywhere that the ceiling had been passed.
+    Presentation rows may be omitted, with counts disclosed. Detector monitoring,
+    raw history, and the notification checkpoint remain complete and unchanged.
+    Copy lists because the producer shares the base digest among several findings.
     """
+    payload = {key: list(value) if isinstance(value, list) else value
+               for key, value in payload.items()}
     limit = MAX_POINTS
     while limit >= 2:
         if _encoded_size(payload) <= MAX_PAYLOAD_BYTES:
@@ -262,15 +265,20 @@ def _fit(payload: dict[str, Any]) -> dict[str, Any]:
             }
             for series in payload["series"]
         ]
-    size = _encoded_size(payload)
-    if size > MAX_PAYLOAD_BYTES:
-        logger.warning(
-            "hardware digest: payload is %d bytes after decimating series to the floor, "
-            "over the %d-byte ceiling; a non-series field is unbounded",
-            size,
-            MAX_PAYLOAD_BYTES,
-        )
-    return payload
+    for key in ("conditions", "events", "outcomes", "calibration", "sampling",
+                "devices", "device_classes", "conformance_mix", "series"):
+        rows = payload.get(key, [])
+        while rows and _encoded_size(payload) > MAX_PAYLOAD_BYTES:
+            removed = max(1, len(rows) // 2)
+            rows = rows[:-removed]
+            payload[key] = rows
+            payload[f"{key}_omitted"] = int(payload.get(f"{key}_omitted", 0)) + removed
+        if _encoded_size(payload) <= MAX_PAYLOAD_BYTES:
+            return payload
+    # An irreducible oversized checkpoint is a producer defect; never persist or
+    # push an over-budget frame or silently alter the identity used for dedup.
+    logger.error("hardware digest: irreducible payload exceeds %d bytes", MAX_PAYLOAD_BYTES)
+    raise ValueError("hardware digest notification or scalar metadata exceeds payload ceiling")
 
 
 def _as_points(rows: Sequence[dict[str, Any]]) -> tuple[SeriesPoint, ...]:

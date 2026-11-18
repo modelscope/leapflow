@@ -93,6 +93,19 @@ class Reading:
     monotonic_at: float = field(default_factory=time.monotonic)
     sequence: int = 0
     quality: str = Quality.OK.value
+    sequence_scope: str = "channel"
+    """Only contiguous channel acquisition sequences certify dropped samples.
+
+    Poll/read counters and device-wide counters must declare another scope.
+    """
+    acquisition_at: float | None = None
+    acquisition_epoch: str = ""
+    """Source-local interval evidence, compared only within one source epoch.
+
+    This counter is never compared with the host clock or used for wall time.
+    """
+    rate_timebase: str = "local"
+    """Local intervals are usable; remote arrival timing alone is unavailable."""
 
     @property
     def is_trustworthy(self) -> bool:
@@ -114,6 +127,9 @@ class Reading:
             "observed_at": self.observed_at,
             "sequence": self.sequence,
             "quality": self.quality,
+            "sequence_scope": self.sequence_scope,
+            "acquisition_at": self.acquisition_at,
+            "acquisition_epoch": self.acquisition_epoch,
         }
 
 

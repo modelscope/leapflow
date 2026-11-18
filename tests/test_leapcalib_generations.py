@@ -17,7 +17,7 @@ from leapflow.hardware.calibration.generations import GenerationStore
 from leapflow.hardware.calibration_store import CalibrationRecord, CalibrationStore
 from leapflow.hardware.lhp.control_sessions import NodeSessions
 from leapflow.hardware.node_gate import NodeWriteGate
-from leapflow.hardware.transport import WriteOutcome
+from leapflow.hardware.transport import TransportStatus, WriteOutcome
 from leapflow.storage.connection import LocalConnectionHolder
 from tests._harness.hardware_stubs import StubNodeRegistry
 
@@ -197,6 +197,122 @@ def real_registry(tmp_path: Path) -> HardwareRegistry:
     registry.load()
     registry.bind_node_sessions(NodeSessions(registry))
     return registry
+
+
+@pytest.mark.parametrize("verified", [True, False, None])
+@pytest.mark.parametrize("batch", [False, True])
+async def test_registry_halt_settles_only_verified_physical_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    verified: bool | None, batch: bool,
+) -> None:
+    registry = real_registry(tmp_path)
+    sessions, device = registry.node_sessions, "conformance_device"
+    try:
+        transport = await registry.transport(device)
+        original_write = transport.write
+
+        async def uncertain(channel_id: str, value: object) -> WriteOutcome:
+            return WriteOutcome(ok=False, side_effect_state="unknown", error="target receipt lost")
+
+        async def halt() -> TransportStatus:
+            return TransportStatus(connected=True, stop_verified=verified, detail="test halt evidence")
+
+        monkeypatch.setattr(transport, "write", uncertain)
+        monkeypatch.setattr(transport, "halt", halt)
+        gate = NodeWriteGate(registry)
+        if batch:
+            ok, outcomes = await gate.write_batch(device, (("setpoint", 1),))
+            assert not ok and outcomes[0].side_effect_state == "unknown"
+        else:
+            assert (await gate.write(device, "setpoint", 1)).side_effect_state == "unknown"
+        assert sessions.busy_device((device,)) == device
+        refusal = await gate.write(device, "setpoint", 2)
+        assert not refusal.ok and "target receipt lost" in refusal.error
+        assert "hw_estop" in refusal.error
+        assert "unsettled dispatch effect" in caplog.text
+        status = await registry.halt(device)
+        assert status.stop_verified is verified
+        monkeypatch.setattr(transport, "write", original_write)
+        if verified:
+            assert sessions.busy_device((device,)) == ""
+            assert (await gate.write(device, "setpoint", 2)).ok
+            assert "settled physical uncertainty after verified halt" in caplog.text
+        else:
+            assert sessions.busy_device((device,)) == device
+            assert not (await gate.write(device, "setpoint", 2)).ok
+    finally:
+        await registry.close_all()
+
+
+async def test_halt_cannot_clear_a_failure_recorded_while_it_is_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = real_registry(tmp_path)
+    sessions, device = registry.node_sessions, "conformance_device"
+    entered, release = asyncio.Event(), asyncio.Event()
+    stopping = None
+    try:
+        transport = await registry.transport(device)
+        first = sessions.begin_dispatch(device)
+        second = sessions.begin_dispatch(device)
+        sessions.finish_dispatch(first, settled=False, detail="old failure")
+
+        async def halt() -> TransportStatus:
+            entered.set()
+            await release.wait()
+            return TransportStatus(connected=True, stop_verified=True)
+
+        monkeypatch.setattr(transport, "halt", halt)
+        stopping = asyncio.create_task(registry.halt(device))
+        await entered.wait()
+        sessions.finish_dispatch(second, settled=False, detail="new failure during halt")
+        release.set()
+        assert (await stopping).stop_verified is True
+        assert sessions.busy_device((device,)) == device
+        assert "new failure during halt" in sessions.busy_message(device)
+        assert (await registry.halt(device)).stop_verified is True
+        assert sessions.busy_device((device,)) == ""
+    finally:
+        release.set()
+        if stopping is not None:
+            await stopping
+        await registry.close_all()
+
+
+@pytest.mark.parametrize("error_type", [OSError, asyncio.CancelledError])
+async def test_failed_or_cancelled_halt_retains_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException],
+) -> None:
+    registry = real_registry(tmp_path)
+    sessions, device = registry.node_sessions, "conformance_device"
+    transport = await registry.transport(device)
+    original_halt = transport.halt
+
+    async def halt() -> TransportStatus:
+        raise error_type("halt interrupted")
+
+    try:
+        token = sessions.begin_dispatch(device)
+        sessions.finish_dispatch(token, settled=False)
+        monkeypatch.setattr(transport, "halt", halt)
+        with pytest.raises(error_type):
+            await registry.halt(device)
+        assert sessions.busy_device((device,)) == device
+    finally:
+        monkeypatch.setattr(transport, "halt", original_halt)
+        await registry.close_all()
+
+
+async def test_missing_link_does_not_clear_uncertainty(tmp_path: Path) -> None:
+    registry = real_registry(tmp_path)
+    sessions, device = registry.node_sessions, "conformance_device"
+    try:
+        token = sessions.begin_dispatch(device)
+        sessions.finish_dispatch(token, settled=False)
+        assert await registry.halt(device) is None
+        assert sessions.busy_device((device,)) == device
+    finally:
+        await registry.close_all()
 
 
 async def test_real_registry_lazy_shared_holder_and_private_cache_binding(tmp_path: Path) -> None:
@@ -391,6 +507,8 @@ async def test_reserved_failure_preserves_generation_and_releases_only_after_set
         assert not sessions.reserved_device("conformance_device")
         assert await asyncio.to_thread(store.active, "cell") == first
         assert await asyncio.to_thread(store.committed_request, "cell", "failure") is None
+        assert not sessions.settle_halt("conformance_device", before=float("inf"), evidence="verified")
+        assert "unsettled transaction effect" in sessions.busy_message("conformance_device")
         await sessions.shutdown()
         with pytest.raises(ValueError, match="busy"):
             await sessions.run_reserved(
@@ -447,6 +565,9 @@ async def test_projection_failure_latches_all_reserved_consumers(tmp_path: Path)
         assert not sessions.reserved_device("conformance_device")
         assert sessions.unsettled_device("conformance_device")
         assert sessions.unsettled_device("consumer:precision")
+        assert not sessions.settle_halt("conformance_device", before=float("inf"), evidence="verified")
+        assert not sessions.settle_halt("consumer:precision", before=float("inf"), evidence="verified")
+        assert "a halt cannot settle a model transaction" in sessions.busy_message("conformance_device")
         with pytest.raises(ValueError, match="unsettled"):
             sessions.reserve(("consumer:precision",), owner_id="other")
         assert not (await NodeWriteGate(registry).write("conformance_device", "setpoint", 1)).ok
@@ -584,8 +705,8 @@ def test_pointer_journal_uses_commit_order_not_wall_clock(tmp_path, monkeypatch)
         store = GenerationStore(holder)
         clock = iter([900, 100, 100, 50, 1])
         monkeypatch.setattr(generations.time, "time", lambda: next(clock))
-        first = commit(store, "one")
-        commit(store, "two", 1)
+        first = commit(store, "one", model={"device_id": "test_arm", "synthetic": True, "value": "one"})
+        commit(store, "two", 1, model={"device_id": "test_arm", "synthetic": True, "value": "two"})
         assert (
             store.rollback(
                 workcell_id="cell",
@@ -605,6 +726,15 @@ def test_pointer_journal_uses_commit_order_not_wall_clock(tmp_path, monkeypatch)
             causal={},
         )
         assert GenerationStore(holder).invalidation("cell")["request_id"] == "invalid"
+        expected = ["one", "two", "back", "invalid"]
+        assert [event["request_id"] for event in store.pending_events()] == expected
+        assert [event["request_id"] for event in store.pending_events(device_id="test_arm")] == expected
+        delivered = []
+        while page := store.pending_events(limit=2, device_id="test_arm"):
+            delivered.extend(event["request_id"] for event in page)
+            for event in page:
+                store.acknowledge_event(event["event_id"])
+        assert delivered == expected  # pagination cannot replay a prior scope after invalidation
     finally:
         holder.close()
 

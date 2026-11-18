@@ -118,8 +118,10 @@ _NEXT_STEPS: dict[str, str] = {
         "is safe before running anything."
     ),
     FAILURE_DEVICE_BUSY: (
-        "Another run or control session holds the arm. Wait for it (hw_skill_status) or "
-        "stop it (hw_skill_stop)."
+        "For an active run, wait (hw_skill_status) or stop it (hw_skill_stop). "
+        "For an unsettled physical effect, halt with hw_estop and confirm stop_verified=true "
+        "before resuming; stopping a run alone does not prove settlement. "
+        "Unsettled model transactions require owner reconciliation, not a halt."
     ),
     FAILURE_SKILL_UNAVAILABLE: (
         "A requirement is unmet (the error names it). When result.readiness.next_steps is "

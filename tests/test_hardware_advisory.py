@@ -111,18 +111,22 @@ def test_active_advisories_follow_the_newest_event_per_limit():
     assert active_advisories(rows) == ["arm.temp"]
 
 
-def test_producer_marks_an_active_advisory_notable_and_a_cleared_one_info():
+def test_producer_assesses_current_conditions_without_inferencing_health_from_event_history():
     from leapflow.hardware.observability.producer import _assess
     from leapflow.monitor.types import Severity
 
     def digest(*kinds):
         events = tuple({"kind": k, "device_id": "arm", "channel_id": "t", "quantity": "temp"}
                        for k in kinds)
-        return SimpleNamespace(events=events, series=(), storage={}, sampling=(), devices=(1,))
+        return SimpleNamespace(events=events, conditions=(), series=(), storage={}, sampling=(), devices=(1,))
 
     severity, headline = _assess(digest(ADVISORY_EXCEEDED))
-    assert severity == Severity.NOTABLE and "arm.temp" in headline
+    assert severity == Severity.INFO and "unknown" in headline.lower()
     assert _assess(digest(ADVISORY_CLEARED, ADVISORY_EXCEEDED))[0] == Severity.INFO
+    current = digest()
+    current.conditions = ({"key": "arm.temp", "condition": "advisory:temp", "active": True, "known": True},)
+    severity, headline = _assess(current)
+    assert severity == Severity.NOTABLE and "arm.temp" in headline
 
 
 @pytest.mark.parametrize("raw,count", [

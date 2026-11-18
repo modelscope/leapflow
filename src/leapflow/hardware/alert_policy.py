@@ -3,7 +3,7 @@
 
 A policy is a YAML rule that maps an observed ``EventKind`` to an action. The
 mapping is loaded from ``hardware.alert_policies`` at startup and evaluated on
-every event the stream emits. The two actions are:
+every raw sample's condition evidence, before event presentation pacing. The two actions are:
 
 ``hw_estop``
     Halt the device immediately via ``transport.halt()``. Exempt from approval
@@ -17,7 +17,7 @@ Everything else
 
 ``require_consecutive`` prevents a single transient reading from triggering an
 irreversible response: the same *kind* on the same *channel* must fire at least
-that many times in a row before the policy fires.  The default (3) is chosen so
+that many valid observations in a row before the policy fires once.  The default (3) is chosen so
 a single spike is never actionable, matching the three-sample rule the quality
 degradation detector already uses in ``HardwareEventDetector``.
 
@@ -156,13 +156,31 @@ class HardwareAlertPolicy:
         device_id = str(getattr(event, "device_id", ""))
         channel_id = str(getattr(event, "channel_id", ""))
 
-        for rule in self._rules:
-            if not rule.matches(kind, device_id, channel_id):
-                continue
-            count = self._tracker.hit(kind, device_id, channel_id)
-            if count < rule.require_consecutive:
-                continue
-            self._fire(rule, event, device_id)
+        from leapflow.hardware.stream import HardwareEventClass, classify_hardware_event
+
+        if classify_hardware_event(kind) == HardwareEventClass.RECORD:
+            return  # operational warnings cannot become an action through configuration
+        matching = [rule for rule in self._rules if rule.matches(kind, device_id, channel_id)]
+        if not matching:
+            return
+        count = self._tracker.hit(kind, device_id, channel_id)
+        for rule in matching:
+            if count == rule.require_consecutive:
+                self._fire(rule, event, device_id)
+
+    def evaluate_sample(self, device_id: str, channel_id: str,
+                        evidence: Mapping[str, Any | None]) -> None:
+        """Judge consecutive raw evidence before presentation pacing, once per rule.
+
+        A healthy or unavailable sample breaks the relevant run, independently of
+        another condition on the same channel. Notifications are not evidence.
+        """
+        for kind, event in evidence.items():
+            if event is None:
+                key = self._tracker._key(kind, device_id, channel_id)
+                self._tracker.counts.pop(key, None)
+            else:
+                self.evaluate(event)
 
     def reset_channel(self, device_id: str, channel_id: str) -> None:
         """Clear consecutive counters when a channel recovers.

@@ -238,6 +238,7 @@ class NodeWriteGate:
         token = None
         attempted = [False]
         settled = False
+        detail = "dispatch ended without a settlement verdict"
         if sessions is not None:
             try:
                 token = sessions.begin_dispatch(device_id)
@@ -246,10 +247,11 @@ class NodeWriteGate:
         try:
             outcome = await self._write(device_id, channel_id, value, attempted)
             settled = outcome.side_effect_state != SIDE_EFFECT_UNKNOWN
+            detail = outcome.error or outcome.failure_code or detail
             return outcome
         finally:
             if token is not None:
-                sessions.finish_dispatch(token, settled=settled or not attempted[0])
+                sessions.finish_dispatch(token, settled=settled or not attempted[0], detail=detail)
 
     async def _write(self, device_id: str, channel_id: str, value: Any, attempted: list[bool]) -> WriteOutcome:
         context, channel = self._resolve(device_id, channel_id)
@@ -280,6 +282,7 @@ class NodeWriteGate:
         token = None
         attempted = [False]
         settled = False
+        detail = "dispatch ended without a settlement verdict"
         if sessions is not None:
             try:
                 token = sessions.begin_dispatch(device_id)
@@ -289,10 +292,12 @@ class NodeWriteGate:
         try:
             ok, outcomes = await self._write_batch(device_id, commands, attempted)
             settled = all(o.side_effect_state != SIDE_EFFECT_UNKNOWN for o in outcomes)
+            detail = next((o.error or o.failure_code or detail for o in outcomes
+                           if o.side_effect_state == SIDE_EFFECT_UNKNOWN), detail)
             return ok, outcomes
         finally:
             if token is not None:
-                sessions.finish_dispatch(token, settled=settled or not attempted[0])
+                sessions.finish_dispatch(token, settled=settled or not attempted[0], detail=detail)
 
     async def _write_batch(
         self, device_id: str, commands: Sequence[tuple[str, Any]], attempted: list[bool]

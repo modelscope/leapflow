@@ -78,8 +78,8 @@ def prepare(runtime: SkillRuntime, workcell: str) -> PreparedReload | SkillOutco
     if any(run.running for run in runtime._runs.values()) or runtime._held:
         return SkillOutcome.failed(FAILURE_DEVICE_BUSY, "reload requires all skill runs and unsettled holds to be idle")
     sessions = getattr(runtime._registry, "node_sessions", None)
-    if sessions is not None and sessions.busy_device(devices):
-        return SkillOutcome.failed(FAILURE_DEVICE_BUSY, "reload devices are held by a session or transaction")
+    if sessions is not None and (busy := sessions.busy_device(devices)):
+        return SkillOutcome.failed(FAILURE_DEVICE_BUSY, sessions.busy_message(busy))
     return PreparedReload(workcell, previous, candidate, workcell_digest(previous),
                           workcell_digest(candidate), runtime._node_session_id, devices)
 

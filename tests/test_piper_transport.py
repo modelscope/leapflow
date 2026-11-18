@@ -841,6 +841,69 @@ def test_a_write_still_refuses_a_ledger_that_never_coheres(monkeypatch: pytest.M
     assert result.side_effect_state == SIDE_EFFECT_NONE and arm.events == before
 
 
+@pytest.mark.parametrize("phase", ["hold_read", "mode_selection"])
+@pytest.mark.parametrize("recovers", [True, False])
+def test_inner_motion_gate_requalifies_or_refuses_before_target(
+    monkeypatch: pytest.MonkeyPatch, phase: str, recovers: bool,
+) -> None:
+    """Skew after admission is boundedly waited for and never called an uncertain send."""
+    transport, arm, _ = _open_transport(monkeypatch, {"receive_max_skew_s": .02,
+                                                     "receive_requalify_s": .2})
+    timers: list[threading.Timer] = []
+
+    def skew() -> None:
+        _skewed(arm, .04)
+        if recovers:
+            timer = threading.Timer(.03, arm.receive)
+            timers.append(timer)
+            timer.start()
+
+    if phase == "hold_read":
+        original_read = arm.get_joint_angles
+        injected = False
+
+        def read() -> Any:
+            nonlocal injected
+            if not injected:
+                injected = True
+                skew()
+            return original_read()
+
+        monkeypatch.setattr(arm, "get_joint_angles", read)
+    else:
+        original_mode = arm.set_motion_mode
+
+        def mode(name: str) -> None:
+            original_mode(name)
+            skew()
+
+        monkeypatch.setattr(arm, "set_motion_mode", mode)
+    try:
+        result = _write(transport, "joint.j1.position", 15)
+        if recovers:
+            assert result.ok and result.side_effect_state == SIDE_EFFECT_COMMITTED
+            assert len(arm.joint_calls) == 1
+        else:
+            assert not result.ok and result.side_effect_state == SIDE_EFFECT_NONE
+            assert result.failure_code == "piper_unqualified_feedback"
+            assert "no motion target was sent" in result.error
+            assert not arm.joint_calls
+    finally:
+        for timer in timers:
+            timer.join()
+
+
+def test_motion_can_mode_refusal_is_not_an_uncertain_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.ignore_mode = True
+    result = _write(transport, "joint.j1.position", 15)
+    assert not result.ok and result.side_effect_state == SIDE_EFFECT_NONE
+    assert result.failure_code == "piper_mode_switch_refused"
+    assert not arm.joint_calls
+
+
 def test_an_enable_waits_for_a_skewed_ledger_too(monkeypatch: pytest.MonkeyPatch) -> None:
     transport, arm, _ = _open_transport(monkeypatch, {"receive_max_skew_s": .05,
                                                      "receive_requalify_s": .5})
@@ -884,8 +947,19 @@ def test_receive_loss_during_mode_selection_prevents_target(monkeypatch: pytest.
         arm.receive(dlc=0)
     monkeypatch.setattr(arm, "set_speed_percent", lose)
     result = _write(transport, channel, value)
-    assert not result.ok and result.side_effect_state in (SIDE_EFFECT_COMMITTED, SIDE_EFFECT_UNKNOWN)
+    expected = SIDE_EFFECT_NONE if channel == "ee.x" else SIDE_EFFECT_COMMITTED
+    assert not result.ok and result.side_effect_state == expected
     assert not arm.pose_calls and not arm.gripper.calls
+
+
+def test_angle_mode_does_not_convert_stroke_or_suppress_signed_force(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+    monkeypatch.setattr(arm.gripper, "get_gripper_status", lambda: _message(
+        SimpleNamespace(value=35.0, mode="angle", force=-0.7)))
+    with pytest.raises(TransportError, match="unavailable"):
+        asyncio.run(transport.read("gripper.position"))
+    assert asyncio.run(transport.read("gripper.effort")).value == -0.7
+    assert not arm.gripper.calls
 
 
 def test_gripper_stroke_force_pair_and_mode_guard(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -952,7 +1026,7 @@ def test_a_firmware_that_never_latches_the_mode_sends_no_target(
     arm.ignore_move_mode = True
     arm.mode_feedback = 0xFF
     result = _write(transport, "joint.j1.position", 12.5)
-    assert not result.ok and result.side_effect_state == SIDE_EFFECT_UNKNOWN
+    assert not result.ok and result.side_effect_state == SIDE_EFFECT_NONE
     assert result.failure_code == "piper_move_mode_refused"
     assert "unknown(0xFF)" in (result.error or "") and "no target was sent" in (result.error or "")
     assert not arm.joint_calls

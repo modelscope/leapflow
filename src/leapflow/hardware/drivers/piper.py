@@ -64,6 +64,7 @@ import asyncio
 import importlib
 import time
 from typing import Any, Mapping
+from uuid import uuid4
 
 from leapflow.hardware.context import HardwareContext, Quality
 from leapflow.hardware.drivers._piper_feedback import (
@@ -103,6 +104,7 @@ from leapflow.hardware.drivers._piper_motion import (
     MotionHalted,
     MotionPreempted,
     PiperMotion,
+    TargetNotSent,
     TargetRefused,
     enable_flag,
     motion_space,
@@ -269,6 +271,7 @@ class PiperArmTransport:
         self._context: HardwareContext | None = None
         self._connected = False
         self._sequence = 0
+        self._acquisition_epoch = ""
         self._firmware = ""
         # Hold vectors for both motion spaces, seeded from joint feedback at
         # open so the first single-joint write holds the other five joints.
@@ -289,6 +292,7 @@ class PiperArmTransport:
         if self._connected:
             return await self.probe()
         self._context = context
+        self._acquisition_epoch = uuid4().hex
         sdk = _load_sdk()
         try:
             await asyncio.to_thread(self._bring_up, sdk)
@@ -586,7 +590,7 @@ class PiperArmTransport:
         call = _VENDOR_CALL[space if space == SPACE_JOINT else self._motion.pose_path]
         try:
             snapshot = await asyncio.to_thread(self._send_motion, robot, space, targets, generation)
-        except (HoldRefused, TargetRefused, MotionPreempted, MotionHalted) as exc:
+        except (HoldRefused, TargetNotSent, TargetRefused, MotionPreempted, MotionHalted) as exc:
             return [_refused(str(exc), exc.failure_code)] * len(commands)
         except TransportError as exc:
             return [_failed(SIDE_EFFECT_UNKNOWN, f"{call}: {exc}", exc.failure_code)] * len(commands)
@@ -717,7 +721,10 @@ class PiperArmTransport:
             await asyncio.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
 
     def _require_receive(self) -> None:
-        problem = self._receive_problem()
+        """Requalify on the motion worker too; transient skew can arise after admission."""
+        feedback = self._feedback
+        problem = (feedback.wait_qualified(self._spec.requalify_s) if feedback is not None
+                   else "Piper transport is not open")
         if problem:
             raise TransportError(problem, failure_code="piper_unqualified_feedback")
 
@@ -764,6 +771,9 @@ class PiperArmTransport:
             monotonic_at=monotonic_at,
             sequence=self._sequence,
             quality=quality,
+            sequence_scope="device_read",
+            acquisition_at=monotonic_at if receipts is not None and quality == Quality.OK.value else None,
+            acquisition_epoch=self._acquisition_epoch,
         )
 
     def _known_channel(self, channel_id: str) -> bool:

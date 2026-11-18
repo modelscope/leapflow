@@ -692,7 +692,7 @@ class LhpNodeServer:
         """
         if self._sessions.busy_device((device_id,)):
             return refusal(
-                f"device {device_id!r} is held by a running session; stop it or wait for it to end",
+                self._sessions.busy_message(device_id),
                 FAILURE_DEVICE_BUSY,
             )
         from leapflow.hardware.node_gate import recovery_safety_refusal

@@ -232,6 +232,7 @@ class MediaTransport:
             quantity=channel.quantity,
             unit=channel.unit,
             sequence=self._sequence,
+            sequence_scope="device_read",
             quality=Quality.OK.value,
         )
 

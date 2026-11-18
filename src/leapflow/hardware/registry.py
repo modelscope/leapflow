@@ -108,6 +108,7 @@ class HardwareSettings:
     hardware_alert_policies: Any = ""
     # JSON array of monitor-only advisory limits (see ``leapflow.hardware.advisory``).
     hardware_advisory_limits: Any = ""
+    hardware_observation: Any = "{}"
     # Profile-owned append-only audit destination for HardwareTools.
     audit_log_path: str = ""
     # Profile-owned record of which declarations an operator has reviewed, and
@@ -149,6 +150,7 @@ class HardwareSettings:
                 enabled=bool(getattr(settings, "hardware_enabled", True)),
                 hardware_alert_policies=getattr(settings, "hardware_alert_policies", ""),
                 hardware_advisory_limits=getattr(settings, "hardware_advisory_limits", ""),
+                hardware_observation=getattr(settings, "hardware_observation", "{}"),
             )
         return cls(
             enabled=bool(getattr(settings, "hardware_enabled", True)),
@@ -193,6 +195,7 @@ class HardwareSettings:
             fleet_nodes=str(getattr(settings, "hardware_fleet_nodes", "") or ""),
             hardware_alert_policies=getattr(settings, "hardware_alert_policies", ""),
             hardware_advisory_limits=getattr(settings, "hardware_advisory_limits", ""),
+            hardware_observation=getattr(settings, "hardware_observation", "{}"),
             audit_log_path=(
                 str(profile_layout.hardware.audit_log_path) if profile_layout is not None else ""
             ),
@@ -377,6 +380,10 @@ class HardwareRegistry:
         providers: Sequence[HardwareContextProvider] = (),
     ) -> None:
         self._settings = settings or HardwareSettings()
+        from leapflow.hardware.observation import ObservationSettings
+        self._observation_settings = ObservationSettings.parse(self._settings.hardware_observation)
+        self._observation_health: dict[str, tuple[float, bool]] = {}
+        self._observation_identities: dict[str, str] = {}
         self._explicit_providers = tuple(providers)
         self._contexts: dict[str, HardwareContext] = {}
         # Declarations owned by external sources (fabric nodes), keyed by source id
@@ -508,6 +515,9 @@ class HardwareRegistry:
                     f"committed generation {generation.generation} requires owner requalification and safety publication after restart"
                 )
                 recovered[device_id] = (reason, generation, state.invalidation is not None)
+                from leapflow.hardware.observation import calibration_identity
+                basis = state.invalidation or {"workcell_id": state.workcell_id, **generation.basis()}
+                self.invalidate_observation(device_id, identity=calibration_identity(basis))
             self._command_recovery = recovered
             self._command_recovery_error = ""
         except Exception:  # noqa: BLE001 - unreadable state must never authorize commands
@@ -649,6 +659,7 @@ class HardwareRegistry:
             )
 
         self._restore_command_recovery()
+        self._restore_observation_identities()
         if self._command_recovery_error:
             notes.append(AdmissionNote("", "physical_model_recovery", "warning", self._command_recovery_error))
         else:
@@ -1159,6 +1170,7 @@ class HardwareRegistry:
         socket holding frame claims -- and an instance dropped while unclosed kept
         that socket until the process exited.
         """
+        halt_started = time.monotonic()
         lock = self._open_locks.setdefault(device_id, asyncio.Lock())
         async with lock:
             transport = self._transports.pop(device_id, None)
@@ -1179,6 +1191,10 @@ class HardwareRegistry:
                 self._transports[device_id] = transport
             else:
                 await self._retire(device_id, transport)
+            if status.stop_verified is True and self._node_sessions is not None:
+                self._node_sessions.settle_halt(
+                    device_id, before=halt_started, evidence=status.detail or "verified halt",
+                )
             return status
 
     async def _cache_if_still_open(self, device_id: str, transport: HardwareTransport) -> None:
@@ -1228,6 +1244,105 @@ class HardwareRegistry:
 
     # ── Streaming ──
 
+    def _restore_observation_identities(self) -> None:
+        """Read existing calibration identity at admission, never on the sample path."""
+        from leapflow.hardware.observation import calibration_identity
+        self._observation_identities = {
+            device: identity for device, identity in self._observation_identities.items()
+            if device in self._contexts
+        }
+        path = self._settings.instrument_db_path
+        if not path or not Path(path).exists():
+            return
+        store = self.calibration_store
+        for device_id in self._contexts:
+            if device_id in self._observation_identities:
+                continue
+            record = store.latest(device_id)
+            if record is not None:
+                self.invalidate_observation(device_id, identity=calibration_identity({
+                    "procedure_id": record.procedure_id, "recorded_at": record.recorded_at}))
+
+    def observation_policy(self, device_id: str, channel: Any) -> Any:
+        """Resolve operational tuning without changing the admitted envelope."""
+        return self._observation_settings.resolve(device_id, channel)
+
+    def reconfigure_observation(self, raw: Any) -> None:
+        """Validate the complete update before replacing any running policy."""
+        from dataclasses import replace
+        from leapflow.hardware.observation import ObservationSettings
+        policy = ObservationSettings.parse(raw)
+        policy.validate_contexts(self.contexts())
+        resolved = [(detector, policy.resolve(detector._context.device_id, detector._channel))
+                    for source in self._stream_sources or ()
+                    for detector in source.observation_detectors]
+        for detector, channel_policy in resolved:
+            detector.reconfigure_observation(channel_policy)
+        self._observation_settings = policy
+        self._settings = replace(self._settings, hardware_observation=raw)
+
+    def observation_conditions(self) -> tuple[dict[str, Any], ...]:
+        """Current detector state plus bounded unacknowledged transitions, no I/O."""
+        return tuple(row for source in self._stream_sources or ()
+                     for detector in source.observation_detectors
+                     for row in detector.observation_snapshots)
+
+    def acknowledge_observation(self, checkpoints: Mapping[str, Mapping[str, Any]]) -> None:
+        """Retire delivered detector notices only after their finding is durable."""
+        for source in self._stream_sources or ():
+            for detector in source.observation_detectors:
+                detector.acknowledge_observation(checkpoints)
+
+    def note_observation(self, reading: Any) -> None:
+        """Cache explicit diagnostic fault evidence; unknown is never fault-free."""
+        value = reading.value
+        if not isinstance(value, Mapping) or "receive_qualified" not in value:
+            return
+        motors = value.get("motors", ())
+        diagnostics = list(motors) if isinstance(motors, (list, tuple)) else []
+        if isinstance(value.get("gripper"), Mapping):
+            diagnostics.append(value["gripper"])
+        faults = [flag for item in diagnostics if isinstance(item, Mapping)
+                  and isinstance(item.get("faults"), Mapping) for flag in item["faults"].values()]
+        status = value.get("status", {})
+        status_ok = (isinstance(status, Mapping) and status.get("error_code") == 0
+                     and status.get("arm_status") == 0)
+        status_fault = isinstance(status, Mapping) and any(
+            status.get(name) not in (None, 0) for name in ("error_code", "arm_status"))
+        faults_known = bool(diagnostics) and all(
+            isinstance(item, Mapping) and isinstance(item.get("faults"), Mapping) and bool(item["faults"])
+            for item in diagnostics)
+        explicit = (value.get("fault_free") is True and not status_fault
+                    and not any(flag is not False for flag in faults))
+        qualified = explicit or ("fault_free" not in value and status_ok and faults_known
+                                 and all(flag is False for flag in faults))
+        healthy = (reading.is_trustworthy and value.get("receive_qualified") is True
+                   and value.get("settled") is True and qualified)
+        self._observation_health[reading.device_id] = (reading.monotonic_at, healthy)
+
+    def observation_fault_free(self, device_id: str) -> bool:
+        evidence = self._observation_health.get(device_id)
+        if evidence is None or not evidence[1] or device_id in self._degradation_latches:
+            return False
+        context = self.context(device_id)
+        if context is None:
+            return False
+        deadline = max((2.0 / c.sample_rate_hz for c in context.streaming_channels if c.sample_rate_hz > 0), default=0.0)
+        return 0 <= time.monotonic() - evidence[0] <= deadline
+
+    def invalidate_observation(self, device_id: str, *, identity: str = "") -> None:
+        self._observation_health.pop(device_id, None)
+        if identity and device_id in self._contexts:
+            self._observation_identities[device_id] = identity
+        for source in self._stream_sources or ():
+            for detector in source.observation_detectors:
+                if detector._context.device_id == device_id:
+                    detector.invalidate_observation(identity=identity)
+        if self._alert_policy is not None:
+            context = self.context(device_id)
+            for channel in context.channels if context else ():
+                self._alert_policy.reset_channel(device_id, channel.channel_id)
+
     def stream_sources(self) -> tuple[Any, ...]:
         """Return one signal source per streaming channel, building them once.
 
@@ -1238,6 +1353,7 @@ class HardwareRegistry:
         if not self._settings.stream_enabled:
             return ()
         if self._stream_sources is None:
+            self._observation_settings.validate_contexts(self.contexts())
             from leapflow.hardware.alert_policy import build_alert_policy
             from leapflow.hardware.stream import build_batch_coordinators, build_stream_sources
 
@@ -1263,6 +1379,11 @@ class HardwareRegistry:
                 batch_device_ids=batch_device_ids,
             )
             self._stream_sources = (*batch_coordinators, *individual_sources)
+            for source in self._stream_sources:
+                for detector in source.observation_detectors:
+                    identity = self._observation_identities.get(detector._context.device_id)
+                    if identity:
+                        detector.invalidate_observation(identity=identity)
         return self._stream_sources
 
     @property
@@ -1546,6 +1667,14 @@ class HardwareRegistry:
         off) is simply skipped.
         """
         self._recent_events.append(event)
+        if getattr(event, "kind", "") in {
+            "calibration_completed", "calibration_activated", "calibration_rolled_back", "calibration_invalidated",
+        }:
+            from leapflow.hardware.observation import calibration_identity
+            value = getattr(event, "value", None)
+            identity = calibration_identity(value) if isinstance(value, Mapping) else repr(
+                (event.kind, getattr(event, "observed_at", time.time())))
+            self.invalidate_observation(getattr(event, "device_id", ""), identity=identity)
         store = self._reading_store
         if store is None:
             return
@@ -1965,6 +2094,7 @@ class HardwareRegistry:
         the close to finish instead of opening a second link beside the closing one --
         a camera answers that second open with "device busy".
         """
+        self.invalidate_observation(device_id)
         if device_id not in self._transports:
             return
         async with self._open_locks.setdefault(device_id, asyncio.Lock()):
