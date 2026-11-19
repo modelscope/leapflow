@@ -276,7 +276,9 @@ def test_silence_on_a_declared_rate_is_itself_an_observation() -> None:
     detector = _detector(sample_rate_hz=10.0)
     detector.observe(_reading(20.0, sequence=1, at=100.0))
     assert detector.check_stale(now=100.05) == ()
-    events = detector.check_stale(now=101.0)
+    assert detector.check_stale(now=101.0) == ()
+    assert detector.safety_evidence[EventKind.STALE] is not None
+    events = detector.check_stale(now=101.5)
     assert [e.kind for e in events] == [EventKind.STALE]
     # Reported once, not on every check.
     assert detector.check_stale(now=102.0) == ()
@@ -669,6 +671,49 @@ async def test_read_tool_omits_history_for_an_unsampled_channel() -> None:
     result = await tools.hw_read(device_id="sampled_device", channel_id="level")
     assert result["ok"] is True
     assert "history" not in result
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("quality", [Quality.OK.value, Quality.STALE.value])
+def test_channel_summary_resolves_existing_scalar_and_batch_rings(
+    batch: bool, quality: str,
+) -> None:
+    from dataclasses import replace
+    from leapflow.hardware.observability.inventory import build_device_view
+    from leapflow.hardware.stream import BatchStreamCoordinator
+
+    context = _context()
+    if batch:
+        context = replace(context, transport=TransportRef(kind="lhp"))
+    registry = _registry(context, persist_readings=False)
+    source = registry.stream_sources()[0]
+    assert isinstance(source, BatchStreamCoordinator if batch else HardwareStreamSource)
+    ring = source.ring("level") if batch else source.ring
+    assert ring is not None
+    assert registry.channel_summary(context.device_id, "level") is None
+    ring.record(_reading(42.0, sequence=1, quality=quality))
+    summary = registry.channel_summary(context.device_id, "level")
+    assert summary == ring.summary()
+    assert summary["latest"] == 42.0 and summary["quality"] == quality
+    assert registry.latest_sample(context.device_id, "level") == ring.latest
+    assert registry.channel_summary("another_device", "level") is None
+    assert registry.channel_summary(context.device_id, "knob") is None
+    assert registry.channel_summary(context.device_id, "unknown") is None
+    view = build_device_view(registry, context.device_id)
+    row = next(ch for ch in view["channels"] if ch["channel_id"] == "level")
+    assert row["value"] == 42.0 and row["samples"] == 1 and row["quality"] == quality
+    assert registry.opened_devices() == ()
+
+
+def test_channel_summary_does_not_build_sampling_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = _registry(_context(), persist_readings=False)
+
+    def unexpected_build():
+        raise AssertionError("An observation must not build sampling sources")
+
+    monkeypatch.setattr(registry, "stream_sources", unexpected_build)
+    assert registry.channel_summary("sampled_device", "level") is None
+    assert registry.latest_sample("sampled_device", "level") is None
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1151,11 +1196,12 @@ def test_stale_level_evidence_fires_before_notification_reminders(monkeypatch: A
     policy = HardwareAlertPolicy([AlertRule(event_kind="stale", action="hw_estop", require_consecutive=3)])
     detector.observe(_reading(50, sequence=1, at=1))
     monkeypatch.setattr("leapflow.hardware.stream.time.monotonic", lambda: 1.3)
-    assert [e.kind for e in _stale_observation(detector, policy)] == ["stale"]
+    assert not _stale_observation(detector, policy)
     assert not _stale_observation(detector, policy)
     assert not _stale_observation(detector, policy)
     assert policy.fired_count == 1
-    assert [e.observation["phase"] for e in detector.check_stale(now=61.3)] == ["reminder"]
+    assert [e.observation["phase"] for e in detector.check_stale(now=1.8)] == ["entry"]
+    assert [e.observation["phase"] for e in detector.check_stale(now=61.8)] == ["reminder"]
     detector.observe(_reading(50, sequence=2, at=62))
     assert not detector._observation.states["stale"].active
     assert detector._observation.pending["stale"][-1]["phase"] == "recovery"
@@ -1181,15 +1227,51 @@ def test_sampling_silence_breaks_other_consecutive_safety_runs(monkeypatch: Any)
         assert policy.fired_count == (1 if index == 2 else 0)
 
 
-def test_missing_numeric_values_do_not_hide_explicit_stale_quality() -> None:
+def test_missing_numeric_values_do_not_hide_explicit_stale_quality(monkeypatch: Any) -> None:
     context = _context()
     detector = HardwareEventDetector(context, context.channel("level"))
-    detector.observe(_reading(None, sequence=1, at=1, quality="stale"))
+    monkeypatch.setattr("leapflow.hardware.stream.time.monotonic", lambda: 1.0)
+    detector.observe(_reading(None, sequence=1, at=0, quality="stale"))
     state = detector._observation.states["stale"]
-    assert state.active and state.known
-    assert detector.safety_evidence[EventKind.STALE] is not None
-    detector.observe(_reading({"status": "fresh"}, sequence=2, at=1.1))
     assert not state.active and state.known
+    assert detector.safety_evidence[EventKind.STALE] is not None
+    monkeypatch.setattr("leapflow.hardware.stream.time.monotonic", lambda: 1.5)
+    detector.observe(_reading(None, sequence=2, at=0, quality="stale"))
+    assert state.active and state.known
+    assert detector._observation.latest["stale"]["duration_s"] == pytest.approx(.5)
+    assert not detector._observation.states["quality_degraded"].active
+    detector.observe(_reading({"status": "fresh"}, sequence=3, at=1.6))
+    assert not state.active and state.known
+
+
+def test_startup_stale_clears_before_confirmation(monkeypatch: Any) -> None:
+    detector = _detector()
+    monkeypatch.setattr("leapflow.hardware.stream.time.monotonic", lambda: 100.0)
+    for sequence in range(3):
+        assert not detector.observe(_reading(None, sequence=sequence, quality="stale"))
+    detector.observe(_reading(20, sequence=4, at=100.11))
+    assert not detector._observation.states["stale"].active
+    assert not detector._observation.pending.get("stale")
+    assert not detector._observation.pending.get("quality_degraded")
+
+
+@pytest.mark.parametrize("at,quality,expected", [
+    (12.0, "ok", 12.0), (0.0, "ok", 100.0),
+    (float("nan"), "ok", 100.0), (float("inf"), "ok", 100.0),
+    (-1.0, "ok", 100.0), (12.0, "stale", 100.0),
+])
+def test_observation_clock_uses_only_trustworthy_positive_time(
+    monkeypatch: Any, at: float, quality: str, expected: float,
+) -> None:
+    from leapflow.hardware.stream import _observation_now
+    monkeypatch.setattr("leapflow.hardware.stream.time.monotonic", lambda: 100.0)
+    assert _observation_now(_reading(None, sequence=1, at=at, quality=quality)) == expected
+
+
+@pytest.mark.parametrize("rate,window", [(10, .5), (1, 2), (0, .5)])
+def test_stale_confirmation_respects_declared_rate(rate: float, window: float) -> None:
+    from leapflow.hardware.observation import ObservationPolicy
+    assert ObservationPolicy().for_channel(_context(sample_rate_hz=rate).channel("level")).stale_confirm_s == window
 
 
 def test_calibration_identity_reset_preserves_notices_and_is_idempotent() -> None:
@@ -1350,3 +1432,74 @@ async def test_batch_judges_every_hard_guard_before_persistence() -> None:
     assert policy.fired_count == 1
     assert source._store.calls == 2
     assert observed_guards == [1, 1]
+
+
+@pytest.mark.parametrize("step", [.02, .04, .06])
+def test_rate_flapping_never_confirms_but_raw_safety_stays_immediate(step: float) -> None:
+    ctx = _context(sample_rate_hz=10, max_rate=1)
+    detector = HardwareEventDetector(ctx, ctx.channel("level"))
+    notices, raw = [], 0
+    value = 20.0
+    for index in range(300):
+        if index % 2:
+            value = 21.0 if value == 20.0 else 20.0
+        events = detector.observe(_reading(value, sequence=index, at=10 + index * step))
+        raw += detector.safety_evidence[EventKind.RATE_EXCEEDED] is not None
+        notices.extend(e.observation for e in events if e.observation.get("condition") == "rate_exceeded")
+    assert raw == 150
+    assert not notices
+    assert not detector._observation.states["rate_exceeded"].active
+
+
+def test_rate_dwell_uses_acquisition_clock_and_delays_recovery() -> None:
+    from dataclasses import replace
+    ctx = _context(sample_rate_hz=50, max_rate=1)
+    detector = HardwareEventDetector(ctx, ctx.channel("level"))
+    notices = []
+    for index in range(27):
+        reading = replace(_reading(20 + index * .1, sequence=index, at=1000 + index * .0001),
+                          acquisition_at=100 + index * .02, acquisition_epoch="node", rate_timebase="source")
+        events = detector.observe(reading)
+        notices.extend(e.observation for e in events if e.observation.get("condition") == "rate_exceeded")
+    assert [n["phase"] for n in notices] == ["entry"]
+    assert notices[0]["duration_s"] == pytest.approx(.5)
+    assert notices[0]["measured_rate"] == pytest.approx(5)
+    for index in range(27, 78):
+        reading = replace(_reading(22.6, sequence=index, at=1000 + index * .0001),
+                          acquisition_at=100 + index * .02, acquisition_epoch="node", rate_timebase="source")
+        events = detector.observe(reading)
+        notices.extend(e.observation for e in events if e.observation.get("condition") == "rate_exceeded")
+        if index < 77:
+            assert detector._observation.states["rate_exceeded"].active
+    assert [n["phase"] for n in notices] == ["entry", "recovery"]
+    assert not detector._observation.states["rate_exceeded"].active
+
+
+@pytest.mark.parametrize("invalid", ["gap", "epoch", "timebase", "sequence", "quality"])
+def test_rate_gap_requalifies_same_episode_without_confirming_unknown(invalid: str) -> None:
+    from dataclasses import replace
+    ctx = _context(sample_rate_hz=10, max_rate=1)
+    detector = HardwareEventDetector(ctx, ctx.channel("level"))
+    for index in range(7):
+        detector.observe(_reading(20 + index, sequence=index, at=10 + index * .1))
+    state = detector._observation.states["rate_exceeded"]
+    assert state.active and state.known
+    episode = state.episode
+    reading = _reading(27, sequence=7, at=10.7 if invalid != "gap" else 11)
+    patches = {"epoch": {"acquisition_epoch": "new"}, "timebase": {"rate_timebase": "unavailable"},
+               "quality": {"quality": "stale"}}
+    reading = replace(reading, **patches.get(invalid, {}))
+    events = detector.observe(reading, lost=1 if invalid == "sequence" else 0)
+    assert not state.known
+    assert any(e.kind == EventKind.OBSERVATION_UNKNOWN for e in events)
+    notices = []
+    for index in range(8, 15):
+        events = detector.observe(replace(_reading(20 + index, sequence=index,
+                                                  at=reading.monotonic_at + (index - 7) * .1),
+                                         acquisition_epoch=reading.acquisition_epoch))
+        notices.extend(e.observation for e in events if e.observation.get("condition") == "rate_exceeded")
+        if index < 13:
+            assert not state.known
+    assert state.known and state.active and state.episode == episode
+    assert [n["phase"] for n in notices] == ["entry"]
+    assert notices[0]["reconfirmed"]

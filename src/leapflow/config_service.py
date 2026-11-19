@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 from dataclasses import dataclass, fields, replace
@@ -158,9 +159,26 @@ _FIELD_DESCRIPTIONS = {
         "survey signals; exact node/workcell configuration scope is mandatory. "
         "Never changes safety or approval. Requires a daemon restart."
     ),
+    "plugin_health.error_rate_threshold": "Failure fraction (0..1) above which recent plugin usage emits a health finding. Default 0.25; hot-reloaded.",
+    "plugin_health.error_window_s": "Rolling reliability window in positive seconds. Old usage outside the window is ignored. Default 3600; hot-reloaded.",
+    "plugin_health.min_calls": "Minimum recent samples before judging plugin reliability. Positive integer, default 5; hot-reloaded.",
     "hardware.fleet_nodes": (
-        "JSON array of named LHP edge nodes. Connections and heartbeat supervision are "
-        "assembled at startup, so a change needs a daemon restart."
+        "JSON array of named LHP edge nodes. A configured node that is unreachable "
+        "(board rebooting, network down) is retried automatically with backoff and "
+        "rejoins without a restart; call hw_fleet_reconnect (or `leap hw fleet "
+        "reconnect`) to retry immediately. Changing node configuration (adding/removing "
+        "entries, endpoints, or credentials) needs a daemon restart, never from inside "
+        "an agent turn."
+    ),
+    "hardware.fleet_retry_initial_s": (
+        "Seconds before the first registration retry of an unreachable fleet node; "
+        "each failure doubles the delay up to hardware.fleet_retry_max_s. Read when "
+        "fleet supervision starts, so a change needs a daemon restart."
+    ),
+    "hardware.fleet_retry_max_s": (
+        "Upper bound, in seconds, of the backoff between registration retries of an "
+        "unreachable fleet node. Read when fleet supervision starts, so a change needs "
+        "a daemon restart."
     ),
     "hardware.alert_policies": (
         "JSON array of hardware event-to-action rules. Empty disables alert reflexes; "
@@ -299,10 +317,17 @@ _FIELD_DESCRIPTIONS = {
         "else deletes from that table. Read when sampling starts, so a change needs a "
         "daemon restart."
     ),
+    "monitor.delivery": (
+        "JSON presentation policy: minimum_severity (critical), global_interval_s (5), "
+        "repeat_interval_s (60), max_pending (128), max_items (5), max_bytes (8192), "
+        "updated_interval_s (1), max_state (4096). Persists evidence before gating; "
+        "valid hot reload preserves cooldowns and counters. Recovery is silent."
+    ),
     "hardware.observation": (
         "JSON report-only policy with defaults and exact overrides (device_id/channel_id). "
         "soft_min/soft_max and margin_floor/margin_max are in channel units; confirm_s/recover_s "
-        "require continuous valid evidence. Adaptive defaults off and requires margin_max. "
+        "require continuous valid evidence. rate_confirm_s (0.5) and rate_recover_s (1.0) "
+        "debounce reporting only, never raw safety action. Adaptive defaults off and requires margin_max. "
         "Hard envelope and task accuracy are unchanged. Valid updates hot-reload; invalid "
         "updates retain the last admitted policy. Channel bounds are checked at hardware admission."
     ),
@@ -795,6 +820,8 @@ def _spec_from_setting(name: str, value_type: Any) -> ConfigFieldSpec | None:
     if len(parts) == 1:
         return None
     section, field_name = parts
+    if name.startswith("plugin_health_"):
+        section, field_name = "plugin_health", name.removeprefix("plugin_health_")
     if section == "llm" and field_name == "api_key":
         return None
     if name in _SECRET_SETTINGS:
@@ -894,6 +921,21 @@ class ConfigService:
         if spec.secret:
             return self._set_secret_backed_field(spec, str(value), scope=scope)
         coerced = _coerce_value(value, spec.value_type)
+        if normalized in {
+            "hardware.fleet_retry_initial_s", "hardware.fleet_retry_max_s",
+            "plugin_health.error_window_s", "plugin_health.min_calls",
+            "plugin_health.error_rate_threshold",
+        }:
+            if isinstance(value, bool) or not math.isfinite(coerced):
+                raise ValueError(f"{normalized} must be finite numeric data")
+            if normalized == "plugin_health.error_rate_threshold":
+                if not 0 <= coerced <= 1:
+                    raise ValueError(f"{normalized} must be within 0..1")
+            elif coerced <= 0:
+                raise ValueError(f"{normalized} must be positive")
+        if normalized == "monitor.delivery":
+            from leapflow.monitor.delivery import DeliveryConfig
+            DeliveryConfig.parse(coerced)
         if normalized == "hardware.observation":
             from leapflow.hardware.observation import ObservationSettings
             policy = ObservationSettings.parse(coerced)
@@ -1083,7 +1125,9 @@ def _restart_warnings(spec: ConfigFieldSpec) -> tuple[str, ...]:
         return ()
     return (
         f"{spec.key} requires `leap daemon restart` to take effect; "
-        "the running leapd keeps its previous value until restarted.",
+        "the running leapd keeps its previous value until restarted. "
+        "An agent must not restart leapd from inside its own turn (that terminates "
+        "the turn); the user runs the restart after the turn ends.",
     )
 
 

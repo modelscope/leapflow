@@ -763,7 +763,9 @@ class SkillService:
     # ── Resolution ──
 
     def _nodes(self) -> list[Any]:
-        return list(self._fleet.topology().nodes)
+        # Unregistered (pending-retry) nodes are listed by topology for visibility
+        # but have no admitted declarations host-side, so they never run skills.
+        return [node for node in self._fleet.topology().nodes if node.status != "unregistered"]
 
     async def _link(self, node: Any) -> _Link:
         """The node's client with a fresh hello; refuses nodes without ``skill.v1``."""

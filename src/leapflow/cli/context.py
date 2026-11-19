@@ -1169,6 +1169,7 @@ class Context:
                     vlm=self.vlm,
                     classifier=self.intent_classifier,
                 )
+            self._notify_runtime_config_reloaded()
             logger.info("Runtime configuration reloaded")
             return True
 
@@ -1192,8 +1193,15 @@ class Context:
                 classifier=classifier,
             )
             self._sync_engine_runtime_budget(updated)
+        self._notify_runtime_config_reloaded()
         logger.info("Runtime configuration reloaded")
         return True
+
+    def _notify_runtime_config_reloaded(self) -> None:
+        """Notify the daemon owner synchronously, including in-turn config writes."""
+        callback = getattr(self, "_runtime_config_reload_callback", None)
+        if callback is not None:
+            callback(self)
 
     def _host_backend_snapshot(self) -> dict[str, Any]:
         snapshot = getattr(self.rpc, "status_snapshot", None)

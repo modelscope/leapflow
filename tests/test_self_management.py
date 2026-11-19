@@ -1286,6 +1286,42 @@ class TestP1Features:
 # ═══════════════════════════════════════════════════════════════
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,disable", [("config_unknown_key", False), ("invalid_arguments", False),
+    ("internal_defect", True), ("transport_timeout", True), ("", True)])
+async def test_plugin_health_window_and_caller_failure_recommendations(monkeypatch, code, disable) -> None:
+    from types import SimpleNamespace
+    from leapflow.learning.plugin_stats import PluginUsageTracker
+    from leapflow.learning.plugin_trust import PluginTrustLedger
+    from leapflow.monitor.plugin_health_producer import PluginHealthProducer
+    from leapflow.monitor.types import ProducerContext, WatchSpec
+    import leapflow.learning.plugin_advisor as advisor_module
+    import leapflow.plugins as plugins_module
+    tracker = PluginUsageTracker()
+    monkeypatch.setattr(tracker, "_tools_for_plugin", lambda _: ["config_get"])
+    monkeypatch.setattr(plugins_module, "get_registry", lambda: SimpleNamespace(plugins={"config_tools": object()}))
+    monkeypatch.setattr(advisor_module, "_default_advisor", SimpleNamespace(
+        _trust_ledger=PluginTrustLedger(), _usage_tracker=tracker))
+    monkeypatch.setattr("leapflow.learning.plugin_stats.time.time", lambda: 100.0)
+    for _ in range(5):
+        tracker.record("config_get", False, 1, failure_code="internal_defect")
+    monkeypatch.setattr("leapflow.learning.plugin_stats.time.time", lambda: 200.0)
+    for _ in range(5):
+        tracker.record("config_get", False, 1, failure_code=code)
+    ctx = ProducerContext(spec=WatchSpec(name="health", domain="plugin_health"), now=200)
+    producer = PluginHealthProducer(error_window_s=50)
+    findings = await producer.observe(ctx)
+    assert len(findings) == 1
+    assert ("plugin_disable" in [action.name for action in findings[0].suggested_actions]) is disable
+    evidence = {row.label: row.value for row in findings[0].evidence}
+    assert evidence["total_calls"] == "5"
+    assert evidence["error_window_s"] == "50"
+    producer.configure(1, 50, 5)
+    assert not await producer.observe(ctx)
+    producer.configure(.25, 50, 6)
+    assert not await producer.observe(ctx)
+
+
 def _valid_plugin_src(plugin_id: str, tool_name: str) -> str:
     """Return valid ToolPlugin source whose declared id matches ``plugin_id``."""
     return (

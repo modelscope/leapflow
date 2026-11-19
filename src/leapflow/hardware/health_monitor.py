@@ -244,6 +244,10 @@ class HardwareHealthMonitor:
                         "device_count": len(node.device_ids),
                         "last_heartbeat": node.last_heartbeat,
                     }
+                    if node.status == "unregistered":
+                        # last_error / attempts / next_retry_in_s: an agent reading
+                        # this must see "retrying", not conclude a restart is needed.
+                        fleet_nodes[node.node_id].update(dict(node.metadata))
             except Exception:  # noqa: BLE001
                 logger.debug("Fleet topology query failed", exc_info=True)
 
@@ -581,6 +585,9 @@ class HardwareHealthMonitor:
         the rest.  The loop runs until ``stop()`` is called.
         """
         while not self._stopped.is_set():
+            # Devices admitted after start (a fleet node that registered on a
+            # retry, a rediscovered peripheral) join supervision here.
+            self._seed_records()
             for device_id in list(self._records):
                 try:
                     await self._probe_device(device_id)
@@ -687,6 +694,10 @@ class HardwareHealthMonitor:
                         record.degradation_reason = f"fleet node {node.node_id} offline"
 
     # -- Internal helpers ---------------------------------------------------
+
+    def refresh_records(self) -> None:
+        """Start tracking devices admitted since the last seed; idempotent."""
+        self._seed_records()
 
     def _seed_records(self) -> None:
         """Initialize health records from the registry's known devices."""

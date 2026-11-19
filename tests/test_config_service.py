@@ -78,6 +78,35 @@ class TestNormalizeKey:
 # ═══════════════════════════════════════════════════════════════════
 
 
+@pytest.mark.parametrize("key,value", [
+    ("hardware.fleet_retry_initial_s", "0"), ("hardware.fleet_retry_max_s", "-1"),
+    ("hardware.fleet_retry_initial_s", "nan"), ("hardware.fleet_retry_max_s", "inf"),
+    ("plugin_health.error_rate_threshold", "-0.1"), ("plugin_health.error_rate_threshold", "1.1"),
+    ("plugin_health.error_window_s", "0"), ("plugin_health.error_window_s", "nan"),
+    ("plugin_health.min_calls", "0"), ("plugin_health.min_calls", "-1"),
+])
+def test_health_and_retry_policy_reject_invalid_config_before_write(config_env, key, value) -> None:
+    settings, service = config_env
+    before = tuple(settings.profile_dir.rglob("*.yaml"))
+    with pytest.raises(ValueError):
+        service.set(key, value)
+    assert tuple(settings.profile_dir.rglob("*.yaml")) == before
+
+
+@pytest.mark.parametrize("key,value,section,name", [
+    ("plugin_health.error_rate_threshold", ".4", "plugin_health", "error_rate_threshold"),
+    ("plugin_health.error_window_s", "120", "plugin_health", "error_window_s"),
+    ("plugin_health.min_calls", "7", "plugin_health", "min_calls"),
+    ("hardware.fleet_retry_initial_s", "2", "hardware", "fleet_retry_initial_s"),
+    ("hardware.fleet_retry_max_s", "1", "hardware", "fleet_retry_max_s"),
+])
+def test_health_and_retry_config_persists_in_correct_section(config_env, key, value, section, name) -> None:
+    _, service = config_env
+    mutation = service.set(key, value)
+    assert mutation.ok
+    assert yaml.safe_load(mutation.path.read_text())[section][name] == float(value)
+
+
 class TestCoerceValue:
     """Test type coercion for config values."""
 

@@ -70,6 +70,108 @@ class FindingStore:
                 dedup_key TEXT DEFAULT ''
             )
         """)
+        self._con.execute("ALTER TABLE monitor_findings ADD COLUMN IF NOT EXISTS delivery TEXT DEFAULT '{}'")
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS monitor_delivery_state (
+                incident_key TEXT PRIMARY KEY, last_enqueued DOUBLE NOT NULL
+            )
+        """)
+        self._con.execute("CREATE TABLE IF NOT EXISTS monitor_delivery_overflow (incident_key TEXT PRIMARY KEY)")
+        self._con.execute("ALTER TABLE monitor_delivery_overflow ADD COLUMN IF NOT EXISTS metadata TEXT DEFAULT '{}'")
+
+    def stage_delivery_overflow(self, entries: list[dict[str, Any]], capacity: int) -> int:
+        """Bound identities and presentation metadata; complete evidence stays in history."""
+        con = self._con
+        existing = set(self.delivery_overflow_keys())
+        retained = set(sorted(existing)[:max(0, capacity - 3)])
+        self.withdraw_delivery_overflow(existing - retained, force=True)
+        existing = retained
+        for entry in entries:
+            key = entry["key"]
+            if key in existing or len(existing) < capacity - 3:
+                con.execute("INSERT OR REPLACE INTO monitor_delivery_overflow VALUES (?, ?)",
+                            [key, json.dumps(entry, ensure_ascii=False)])
+                existing.add(key)
+        return len(existing)
+
+    def withdraw_delivery_overflow(self, keys: Any, *, force: bool = False) -> None:
+        for key in keys:
+            condition = "" if force else " AND coalesce(json_extract_string(metadata, '$.actionable'), 'false') != 'true'"
+            self._con.execute("DELETE FROM monitor_delivery_overflow WHERE incident_key = ?" + condition, [key])
+
+    def drop_delivery_watch(self, watch_ids: list[str]) -> None:
+        """Remove watch ownership, preserving eligible cross-watch incidents."""
+        dropped = set(watch_ids)
+        for entry in self.delivery_overflow_entries():
+            owners = [watch_id for watch_id in entry.get("watch_ids", (entry.get("watch_id"),))
+                      if watch_id not in dropped]
+            if owners:
+                entry.update(watch_ids=owners, watch_id=owners[0])
+                self._con.execute("UPDATE monitor_delivery_overflow SET metadata = ? WHERE incident_key = ?",
+                                  [json.dumps(entry, ensure_ascii=False), entry["key"]])
+            else:
+                self.withdraw_delivery_overflow([entry["key"]], force=True)
+
+    def delivery_overflow_entries(self) -> list[dict[str, Any]]:
+        return [self._safe_json(row[0], {}) for row in self._con.execute(
+            "SELECT metadata FROM monitor_delivery_overflow ORDER BY incident_key").fetchall()]
+
+    def reset_delivery_overflow(self) -> None:
+        self._con.execute("DELETE FROM monitor_delivery_overflow")
+
+    def delivery_overflow_keys(self) -> list[str]:
+        return [row[0] for row in self._con.execute("SELECT incident_key FROM monitor_delivery_overflow").fetchall()]
+
+    def delivery_timestamps(self, keys: Any) -> dict[str, float]:
+        """Read enqueue attempts, not receipt or hardware episode progress."""
+        if not keys:
+            return {}
+        placeholders = ', '.join('?' for _ in keys)
+        return dict(self._con.execute(
+            f"SELECT incident_key, last_enqueued FROM monitor_delivery_state WHERE incident_key IN ({placeholders})",
+            list(keys),
+        ).fetchall())
+
+    def record_delivery(self, keys: Any, now: float, retain_after: float, capacity: int) -> bool:
+        """Atomically retain unexpired cooldowns and record a bounded attempt.
+
+        Reserved identities ensure overflow can still be reported at capacity.
+        New identities fail closed rather than resetting a recent incident's cooldown.
+        """
+        from leapflow.monitor.delivery import GLOBAL_KEY, OVERFLOW_KEY, SATURATED_KEY
+
+        con = self._con
+        con.execute("BEGIN TRANSACTION")
+        try:
+            con.execute("DELETE FROM monitor_delivery_state WHERE last_enqueued < ?", [retain_after])
+            existing = {row[0] for row in con.execute(
+                "SELECT incident_key FROM monitor_delivery_state"
+            ).fetchall()}
+            reserved = {GLOBAL_KEY, OVERFLOW_KEY, SATURATED_KEY}
+            requested = set(keys) | {GLOBAL_KEY}
+            if OVERFLOW_KEY in requested:
+                spooled = {row[0] for row in con.execute("SELECT incident_key FROM monitor_delivery_overflow").fetchall()}
+                available = max(0, capacity - 3 - len((existing | requested) - reserved))
+                missing = spooled - existing - requested
+                if len(missing) > available:
+                    requested.add(SATURATED_KEY)
+                requested.update(sorted(missing)[:available])
+                requested.update(spooled & existing)
+                con.execute("DELETE FROM monitor_delivery_overflow")
+            regular = (existing | requested) - reserved
+            # A smaller hot-reloaded bound must not erase unexpired cooldowns.
+            # Reserved aggregate slots still work; no new regular state may grow it.
+            bound = max(capacity - 3, len(existing - reserved))
+            if len(regular) > bound:
+                con.execute("ROLLBACK")
+                return False
+            for key in requested:
+                con.execute("INSERT OR REPLACE INTO monitor_delivery_state VALUES (?, ?)", [key, now])
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        return True
 
     # ── Write ────────────────────────────────────────────────────────────
 
@@ -80,8 +182,8 @@ class FindingStore:
             """
             INSERT OR REPLACE INTO monitor_findings (
                 finding_id, watch_id, domain, ts, severity, score,
-                title, summary, evidence, tags, suggested_actions, payload, dedup_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                title, summary, evidence, tags, suggested_actions, payload, dedup_key, delivery
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 finding.finding_id,
@@ -97,6 +199,7 @@ class FindingStore:
                 json.dumps([a.to_dict() for a in finding.suggested_actions], ensure_ascii=False),
                 json.dumps(dict(finding.payload), ensure_ascii=False),
                 finding.dedup_key,
+                json.dumps(finding.delivery.to_dict(), ensure_ascii=False),
             ],
         )
 
@@ -109,6 +212,15 @@ class FindingStore:
             [watch_id, dedup_key],
         ).fetchone()
         return row is not None
+
+    def find_dedup(self, watch_id: str, dedup_key: str) -> Finding | None:
+        """Resolve the persisted reference when a producer re-offers live evidence."""
+        rows = self._con.execute("""
+            SELECT finding_id, watch_id, domain, ts, severity, score,
+                   title, summary, evidence, tags, suggested_actions, payload, dedup_key, delivery
+            FROM monitor_findings WHERE watch_id = ? AND dedup_key = ? LIMIT 1
+        """, [watch_id, dedup_key]).fetchall()
+        return self._row_to_finding(rows[0]) if rows else None
 
     def latest_notification_checkpoints(self, domain: str) -> dict[str, dict[str, Any]]:
         """Latest persisted condition checkpoint across watch recreation, no new table.
@@ -175,7 +287,7 @@ class FindingStore:
         rows = self._con.execute(
             f"""
             SELECT finding_id, watch_id, domain, ts, severity, score,
-                   title, summary, evidence, tags, suggested_actions, payload, dedup_key
+                   title, summary, evidence, tags, suggested_actions, payload, dedup_key, delivery
             FROM monitor_findings
             {where}
             ORDER BY ts DESC
@@ -220,6 +332,7 @@ class FindingStore:
             "suggested_actions": self._safe_json(row[10], []),
             "payload": self._safe_json(row[11], {}),
             "dedup_key": row[12],
+            "delivery": self._safe_json(row[13], {}),
         })
 
     @staticmethod

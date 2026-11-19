@@ -95,6 +95,11 @@ class UnixRpcServer:
         # Strong refs for stream finalizers that outlive a cancelled connection.
         self._stream_closers: set[asyncio.Task[Any]] = set()
         self._stopping = False
+        # RPC ids are connection-local; key by writer to preserve every client.
+        self._streams: dict[asyncio.StreamWriter, tuple[str, str]] = {}
+        self._shutdown_announced = False
+        if hasattr(service, "set_shutdown_notifier"):
+            service.set_shutdown_notifier(self.announce_shutdown)
         if hasattr(service, "set_client_count_provider"):
             service.set_client_count_provider(lambda: self._active_connections)
         if hasattr(service, "set_client_lease_provider"):
@@ -140,6 +145,48 @@ class UnixRpcServer:
             raise
         finally:
             transport.cleanup(self._runtime_dir)
+
+    async def announce_shutdown(
+        self, reason: str, requested_by: dict[str, Any] | None = None
+    ) -> int:
+        """Tell every open stream why leapd is about to close it; return how many.
+
+        Without this a client only sees EOF and reports "leapd closed the
+        connection unexpectedly", indistinguishable from a crash. Sent once,
+        before the service is torn down, so it reaches streams whose turn is
+        still running. Best effort per stream: a client that already hung up
+        or stopped reading must not delay the shutdown.
+        """
+        if self._shutdown_announced:
+            return 0
+        self._shutdown_announced = True
+        by = dict(requested_by or {})
+        streams = list(self._streams.items())
+        active_turns = sum(1 for _, (_, method) in streams if method == "engine.chat")
+        logger.info(
+            "daemon: shutting down reason=%s requested_by=%s open_streams=%d active_turns=%d",
+            reason, by or "-", len(streams), active_turns,
+        )
+        sent = 0
+        for writer, (request_id, method) in streams:
+            notification = StreamChunk(
+                request_id=request_id,
+                content=f"leapd is shutting down: {reason}",
+                event_type="daemon_shutdown",
+                metadata={
+                    "reason": reason,
+                    "requested_by_pid": by.get("pid"),
+                    "requested_by_command": str(by.get("command") or ""),
+                    "active_turns": active_turns,
+                    "interrupted_turn": method == "engine.chat",
+                },
+            ).to_notification()
+            try:
+                await asyncio.wait_for(_write_json(writer, notification.to_json()), timeout=1.0)
+                sent += 1
+            except (_ClientDisconnected, TimeoutError, OSError, RuntimeError):
+                logger.debug("daemon: shutdown notice not delivered request_id=%s", request_id)
+        return sent
 
     async def stop(self) -> None:
         """Close client lifetimes before waiting for the listening server to drain."""
@@ -359,6 +406,7 @@ class UnixRpcServer:
         # copied Context makes ContextVar reset tokens invalid on the next generator step.
         ctx = contextvars.copy_context()
         completed = False
+        self._streams[writer] = (request.id, request.method)
         try:
             stream = method(**params)
             pending = asyncio.create_task(anext(stream), context=ctx)
@@ -416,6 +464,7 @@ class UnixRpcServer:
             except (ConnectionResetError, BrokenPipeError):
                 pass
         finally:
+            self._streams.pop(writer, None)
             if approval_get is not None and not approval_get.done():
                 approval_get.cancel()
             if pending is not None and not pending.done():
@@ -487,8 +536,11 @@ async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
     await service.start()
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
+    stop_reason = [""]
 
-    def _request_stop() -> None:
+    def _request_stop(reason: str = "") -> None:
+        if reason and not stop_reason[0]:
+            stop_reason[0] = reason
         stop_event.set()
 
     server = UnixRpcServer(
@@ -500,7 +552,7 @@ async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _request_stop)
+            loop.add_signal_handler(sig, _request_stop, f"signal {sig.name}")
         except NotImplementedError:
             logger.debug("daemon: signal handlers unsupported on this event loop")
 
@@ -522,6 +574,9 @@ async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
             await idle_task
         except asyncio.CancelledError:
             pass
+        # A daemon.shutdown RPC has already announced itself (no-op here); a
+        # signal still owes open streams an explanation before they close.
+        await server.announce_shutdown(stop_reason[0] or "leapd stopping")
         # serve_forever itself awaits wait_closed when cancelled on Python
         # 3.12+, so accepted clients must be closed before cancelling that task.
         await server.stop()
@@ -567,6 +622,7 @@ async def _watch_idle_shutdown(
             last_active = asyncio.get_running_loop().time()
         elif asyncio.get_running_loop().time() - last_active >= idle_timeout_s:
             logger.info("daemon: idle timeout reached; shutting down")
+            await server.announce_shutdown("idle timeout")
             stop_event.set()
             return
         await asyncio.sleep(interval)

@@ -21,6 +21,7 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 # ── Event names broadcast on the daemon NotificationBus ──────────────────
 EVENT_FINDING = "monitor.finding"
+EVENT_UPDATED = "monitor.updated"
 EVENT_WATCH_STATE = "watch.state"
 EVENT_ERROR = "monitor.error"
 EVENT_HEARTBEAT = "monitor.heartbeat"
@@ -33,7 +34,7 @@ METADATA_MUTED_KEY = "muted"
 # interactive client is present; they must NOT keep the daemon alive on their own.
 METADATA_CLIENT_COUPLED_KEY = "client_coupled"
 
-_SEVERITY_RANK = {"info": 0, "notable": 1, "alert": 2}
+_SEVERITY_RANK = {"info": 0, "notable": 1, "alert": 2, "critical": 3}
 
 
 class Severity(str, Enum):
@@ -41,7 +42,8 @@ class Severity(str, Enum):
 
     INFO = "info"        # persist only (memory-level)
     NOTABLE = "notable"  # persist + passive push
-    ALERT = "alert"      # persist + push + eligible for escalation
+    ALERT = "alert"      # actionable observation, subject to delivery policy
+    CRITICAL = "critical"  # confirmed safety threat or execution-stopping fault
 
     @property
     def rank(self) -> int:
@@ -117,6 +119,40 @@ class SuggestedAction:
 
 
 @dataclass(frozen=True)
+class FindingDelivery:
+    """Domain-declared incident identity and state, independent of presentation.
+
+    ``current`` excludes historical transitions resolved before observation.
+    ``actionable`` preserves an execution interruption even after recovery.
+    """
+
+    key: str = ""
+    phase: str = "entry"
+    active: bool = True
+    current: bool = True
+    actionable: bool = False
+    withdrawn_keys: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"key": self.key, "phase": self.phase, "active": self.active,
+                "current": self.current, "actionable": self.actionable,
+                "withdrawn_keys": list(self.withdrawn_keys)}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "FindingDelivery":
+        if not isinstance(data, Mapping):
+            return cls(active=False, current=False)
+        withdrawn = data.get("withdrawn_keys", ())
+        return cls(
+            key=str(data.get("key", "")), phase=str(data.get("phase", "entry")),
+            active=data.get("active", True) is True, current=data.get("current", True) is True,
+            actionable=data.get("actionable", False) is True,
+            withdrawn_keys=tuple(key for key in withdrawn if isinstance(key, str))
+            if isinstance(withdrawn, (list, tuple)) else (),
+        )
+
+
+@dataclass(frozen=True)
 class Finding:
     """An immutable unit of observation produced by a watch.
 
@@ -138,6 +174,7 @@ class Finding:
     suggested_actions: tuple[SuggestedAction, ...] = ()
     payload: Mapping[str, Any] = field(default_factory=dict)
     dedup_key: str = ""
+    delivery: FindingDelivery = field(default_factory=FindingDelivery)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -154,6 +191,7 @@ class Finding:
             "suggested_actions": [action.to_dict() for action in self.suggested_actions],
             "payload": dict(self.payload),
             "dedup_key": self.dedup_key,
+            "delivery": self.delivery.to_dict(),
         }
 
     @classmethod
@@ -174,6 +212,7 @@ class Finding:
             ),
             payload=dict(data.get("payload") or {}),
             dedup_key=str(data.get("dedup_key", "")),
+            delivery=FindingDelivery.from_dict(data.get("delivery") or {}),
         )
 
 
@@ -308,6 +347,15 @@ class ProducerContext:
 
 
 @runtime_checkable
+class CurrentIncidentSource(Protocol):
+    """Optional domain-owned revalidation of delayed presentation evidence."""
+
+    def current_incidents(self, keys: Sequence[str], now: float) -> set[str]:
+        """Return stable identities still supported by current, valid evidence."""
+        ...
+
+
+@runtime_checkable
 class MonitorProducer(Protocol):
     """Per-domain observation logic: observe a source, emit findings.
 
@@ -327,6 +375,7 @@ class MonitorProducer(Protocol):
 
 __all__ = [
     "EVENT_FINDING",
+    "EVENT_UPDATED",
     "EVENT_WATCH_STATE",
     "EVENT_ERROR",
     "EVENT_HEARTBEAT",
@@ -338,8 +387,10 @@ __all__ = [
     "Evidence",
     "SuggestedAction",
     "Finding",
+    "FindingDelivery",
     "WatchSpec",
     "WatchView",
     "ProducerContext",
     "MonitorProducer",
+    "CurrentIncidentSource",
 ]

@@ -104,6 +104,9 @@ class HardwareSettings:
     # Typed root Settings input for LHP edge nodes; parsed by fleet_config at
     # plugin startup so the registry remains free of topology concerns.
     fleet_nodes: str = ""
+    # Backoff bounds for re-registering a configured node that is unreachable.
+    fleet_retry_initial_s: float = 5.0
+    fleet_retry_max_s: float = 60.0
     # JSON array (or already parsed sequence in tests) of reflex alert rules.
     hardware_alert_policies: Any = ""
     # JSON array of monitor-only advisory limits (see ``leapflow.hardware.advisory``).
@@ -193,6 +196,10 @@ class HardwareSettings:
                 getattr(settings, "hardware_reading_store_sensitive", True)
             ),
             fleet_nodes=str(getattr(settings, "hardware_fleet_nodes", "") or ""),
+            fleet_retry_initial_s=float(
+                getattr(settings, "hardware_fleet_retry_initial_s", 5.0) or 5.0
+            ),
+            fleet_retry_max_s=float(getattr(settings, "hardware_fleet_retry_max_s", 60.0) or 60.0),
             hardware_alert_policies=getattr(settings, "hardware_alert_policies", ""),
             hardware_advisory_limits=getattr(settings, "hardware_advisory_limits", ""),
             hardware_observation=getattr(settings, "hardware_observation", "{}"),
@@ -1281,6 +1288,26 @@ class HardwareRegistry:
         self._observation_settings = policy
         self._settings = replace(self._settings, hardware_observation=raw)
 
+    def latest_sample(self, device_id: str, channel_id: str) -> Any | None:
+        """Read an existing streaming ring without claiming a device or doing I/O."""
+        ring = self._sample_ring(device_id, channel_id)
+        return ring.latest if ring is not None else None
+
+    def _sample_ring(self, device_id: str, channel_id: str) -> Any | None:
+        """Resolve an existing scalar or batch-owned ring without building sources."""
+        for source in self._stream_sources or ():
+            context = getattr(source, "_context", None)
+            if context is None or context.device_id != device_id:
+                continue
+            ring = getattr(source, "ring", None)
+            if callable(ring):
+                ring = ring(channel_id)
+            elif getattr(source, "source_id", "") != f"hw:{device_id}:{channel_id}":
+                continue
+            if ring is not None:
+                return ring
+        return None
+
     def observation_conditions(self) -> tuple[dict[str, Any], ...]:
         """Current detector state plus bounded unacknowledged transitions, no I/O."""
         return tuple(row for source in self._stream_sources or ()
@@ -1609,10 +1636,8 @@ class HardwareRegistry:
         stays in the ring: handing it to a model is what makes an overnight run
         unaffordable, and a summary is what a decision actually needs.
         """
-        for source in self.stream_sources():
-            if source.source_id == f"hw:{device_id}:{channel_id}" and len(source.ring) > 0:
-                return source.ring.summary()
-        return None
+        ring = self._sample_ring(device_id, channel_id)
+        return ring.summary() if ring is not None and len(ring) > 0 else None
 
     async def start_streams(self) -> int:
         """Start sampling every streaming channel, returning how many started.

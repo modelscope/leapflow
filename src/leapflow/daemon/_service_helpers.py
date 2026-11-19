@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from leapflow.engine import StreamEvent
@@ -169,6 +170,26 @@ def checkpoint_open_connection(ctx: Any) -> None:
 def runtime_source() -> str:
     import leapflow
     return str(getattr(leapflow, "__file__", ""))
+
+
+def runtime_installation_error() -> str:
+    """Detect a package removed beneath this process without importing new code.
+
+    A wheel-to-editable reinstall can delete the running package's directory.
+    Already loaded modules continue working, but lazy imports use the old path.
+    Unknown origins (for example an embedded runtime) are not called broken.
+    """
+    source = runtime_source()
+    if not source:
+        return ""
+    if Path(source).is_file():
+        return ""
+    return (
+        "LeapFlow's running package files are no longer available; its installation "
+        "changed while leapd was running. This request was not started. Finish any "
+        "other active work, then run `leap daemon restart` from your own terminal "
+        "to load the current installation. Do not restart from inside an agent turn."
+    )
 
 
 def runtime_version() -> str:

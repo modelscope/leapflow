@@ -44,6 +44,28 @@ def _context() -> HardwareContext:
     return HardwareContext.from_mapping(yaml.safe_load(_EXAMPLE.read_text()))
 
 
+def test_example_collects_fresh_actuation_state_for_remote_observation() -> None:
+    from dataclasses import replace
+    from leapflow.hardware.context import TransportRef
+    from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
+    from leapflow.hardware.stream import BatchStreamCoordinator
+
+    context = _context()
+    assert context.hc_version == "hc.v1"
+    state = context.channel(context.actuation_state_channel)
+    assert state is not None and state.channel_id == "arm.enabled"
+    assert state.is_readable and state.sample_rate_hz > 0
+    registry = HardwareRegistry(HardwareSettings(enabled=True, persist_readings=False), providers=[])
+    remote = replace(context, transport=TransportRef(kind="lhp"))
+    registry.register_external_contexts("example", (remote,))
+    registry.load()
+    sources = registry.stream_sources()
+    source = next(s for s in sources if s.source_id == f"hw.batch:{context.device_id}")
+    assert isinstance(source, BatchStreamCoordinator)
+    assert source.ring(state.channel_id) is not None
+    assert registry.opened_devices() == ()
+
+
 def _message(body: Any) -> Any:
     return SimpleNamespace(msg=body) if body is not None else None
 

@@ -686,7 +686,8 @@ async def test_screws_refuses_a_stand_posture_that_is_not_joint_angles(
     unknown = await _refusal(runtime, {**FAST, "stand": {"j9": 10.0}})
     assert unknown.failure_code == FAILURE_INVALID_ARGS and "j9" in unknown.message
     text = await _refusal(runtime, {**FAST, "stand": {"j2": "up"}})
-    assert text.failure_code == FAILURE_INVALID_ARGS and "degrees" in text.message
+    assert text.failure_code == FAILURE_INVALID_ARGS
+    assert "stand.j2" in text.message and "number" in text.message
     assert sim.arm.batches == []
 
 

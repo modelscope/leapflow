@@ -179,6 +179,20 @@ def _disabled_error() -> Dict[str, Any]:
     }
 
 
+def _self_termination_refusal() -> Dict[str, Any]:
+    from leapflow.tools.shell_tools import _SELF_TERMINATION_NEXT_STEP
+
+    return {
+        "ok": False,
+        "error": "Input blocked: it would stop the leapd process that is running this turn.",
+        "failure_class": "safety_policy",
+        "failure_code": "self_termination_blocked",
+        "side_effect_state": "none",
+        "retryable": False,
+        "next_step": _SELF_TERMINATION_NEXT_STEP,
+    }
+
+
 async def terminal_open(params: Dict[str, Any]) -> Dict[str, Any]:
     """Open a persistent shell session; returns a session_id for send/read/close."""
     if not _ENABLED:
@@ -205,9 +219,11 @@ async def terminal_open(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": f"Working directory not found: {cwd}", "failure_code": "path_not_found"}
     initial = str(params.get("command") or "").strip()
     if initial:
-        from leapflow.tools.shell_tools import _is_hardline_blocked
+        from leapflow.tools.shell_tools import _is_hardline_blocked, _is_self_termination
         if _is_hardline_blocked(initial):
             return {"ok": False, "error": "Initial command blocked by safety policy.", "failure_code": "blocked"}
+        if _is_self_termination(initial):
+            return _self_termination_refusal()
 
     try:
         _popen_kwargs: Dict[str, Any] = {}
@@ -252,9 +268,11 @@ async def terminal_send(params: Dict[str, Any]) -> Dict[str, Any]:
 
     text = params.get("input", params.get("command", ""))
     text = "" if text is None else str(text)
-    from leapflow.tools.shell_tools import _is_hardline_blocked
+    from leapflow.tools.shell_tools import _is_hardline_blocked, _is_self_termination
     if _is_hardline_blocked(text):
         return {"ok": False, "error": "Input blocked by safety policy.", "failure_code": "blocked"}
+    if _is_self_termination(text):
+        return _self_termination_refusal()
     try:
         session.write(text)
     except (OSError, ValueError) as exc:

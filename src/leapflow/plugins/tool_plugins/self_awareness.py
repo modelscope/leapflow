@@ -431,6 +431,8 @@ class SelfAwarenessPlugin:
             "connected_clients": status.get("connected_clients", 0),
             "host_backend": status.get("host_backend", {}),
             "environment_sources": status.get("environment_sources", {}),
+            "monitor": status.get("watch_summary", {}),
+            "notification_delivery": status.get("notification_delivery", {}),
         }
 
     # ── Internal helpers ─────────────────────────────────────────────────

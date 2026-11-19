@@ -197,6 +197,17 @@ class TestFacetPlatform:
         assert result["host_backend"]["backend"] == "cua-driver"
         assert result["environment_sources"]["active"] == ["lark_event_source"]
 
+    def test_live_delivery_metrics_follow_provider_updates(self) -> None:
+        status = _status(watch_summary={"delivery": {"enqueued": 1}},
+                         notification_delivery={"overflowed": 2})
+        plugin = _make_plugin(provider=lambda _sid: status)
+        first = _run(plugin._handle_self_describe(facet="platform"))
+        assert first["monitor"]["delivery"]["enqueued"] == 1
+        assert first["notification_delivery"]["overflowed"] == 2
+        status["watch_summary"] = {"delivery": {"enqueued": 3}}
+        second = _run(plugin._handle_self_describe(facet="platform"))
+        assert second["monitor"]["delivery"]["enqueued"] == 3
+
     def test_platform_without_status_degrades(self) -> None:
         p = _make_plugin()
         result = _run(p._handle_self_describe(facet="platform"))

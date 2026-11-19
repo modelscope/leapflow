@@ -319,8 +319,13 @@ class HardwareContextPlugin:
             return
 
         try:
+            settings = self._registry.settings
             self._fleet_manager = FleetManager(
-                self._registry, permit_issuer=self._load_permit_issuer()
+                self._registry,
+                permit_issuer=self._load_permit_issuer(),
+                retry_initial_s=float(getattr(settings, "fleet_retry_initial_s", 5.0) or 5.0),
+                retry_max_s=float(getattr(settings, "fleet_retry_max_s", 60.0) or 60.0),
+                on_node_registered=self._on_fleet_node_registered,
             )
             # Registration is deferred to ``start_fleet``: it speaks LHP and
             # needs a running loop, while plugin assembly is synchronous.
@@ -328,6 +333,25 @@ class HardwareContextPlugin:
             logger.info("FleetManager initialized with %d configured node(s)", len(nodes))
         except Exception:  # noqa: BLE001
             logger.debug("Failed to initialize FleetManager", exc_info=True)
+
+    async def _on_fleet_node_registered(self, node: Any) -> None:
+        """Admit a node's contexts that arrived after startup (a retried node).
+
+        Trust registration is idempotent, so running it for every registration --
+        including the initial one -- only ever adds the newly admitted devices.
+        """
+        self._register_trust_configs()
+        refresh = getattr(self._health_monitor, "refresh_records", None)
+        if callable(refresh):
+            refresh()
+        bus = self._event_bus
+        if bus is not None:
+            await bus.handle_event("hw.fleet.node_online", {
+                "source": node.node_id,
+                "node_id": node.node_id,
+                "device_ids": list(node.device_ids),
+                "status": "online",
+            })
 
     def _load_permit_issuer(self) -> Any | None:
         """The host permit issuer from the profile key, or ``None`` without one.
@@ -387,9 +411,11 @@ class HardwareContextPlugin:
         needs an event loop while assembly is synchronous; the runtime calls
         this once its loop is live (``cli/context.py``, daemon-mode init).
 
-        Best-effort per node: an unreachable board logs and is skipped --
-        starting the host runtime must never depend on an edge node being
-        powered.  P2 adds retry/backoff and keep-last-degraded recovery.
+        Best-effort per node: an unreachable board is kept as *pending* and
+        retried by the heartbeat sweep with backoff (``hw_fleet_reconnect``
+        retries immediately) -- starting the host runtime must never depend on
+        an edge node being powered, and a node that boots later must join
+        without a leapd restart.
         Idempotent.  Also closes any manager orphaned by a registry re-bind.
         """
         await self._close_stale_fleet_managers()
@@ -400,18 +426,33 @@ class HardwareContextPlugin:
         self._fleet_started = True
         from leapflow.hardware.fleet_config import register_nodes_safely
 
-        registered = await register_nodes_safely(self._fleet_manager, self._pending_fleet_nodes)
+        await register_nodes_safely(self._fleet_manager, self._pending_fleet_nodes)
         self._pending_fleet_nodes = []
         await self._start_health_monitor()
-        if not registered:
+        if not self._fleet_manager.supervises_nodes:
             return
         # Fleet admission happens after the initial runtime bind, so register
         # the newly materialized remote contexts with the per-device trust gate.
+        # The heartbeat starts even when every node failed: it is what retries
+        # the pending ones.
         self._register_trust_configs()
         try:
             await self._fleet_manager.start_heartbeat()
         except Exception:  # noqa: BLE001 -- supervision must not fail startup
             logger.warning("Fleet: heartbeat failed to start", exc_info=True)
+
+    async def fleet_reconnect(self, node_id: str | None = None) -> dict[str, Any]:
+        """Retry registering unregistered fleet nodes now (``leap hw fleet reconnect``)."""
+        if self._fleet_manager is None:
+            return {
+                "ok": False,
+                "code": "fleet_not_configured",
+                "error": (
+                    "No fleet nodes are configured (hardware.fleet_nodes is empty); "
+                    "there is nothing to reconnect."
+                ),
+            }
+        return await self._fleet_manager.reconnect(node_id)
 
     async def _close_stale_health_monitors(self) -> None:
         """Stop monitors orphaned by a registry replacement."""

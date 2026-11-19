@@ -206,3 +206,30 @@ def test_event_bridge_debounce_per_watch() -> None:
     # Both suppressed equally
     assert bridge.debounced_count("watch-a") == 1
     assert bridge.debounced_count("watch-b") == 1
+
+
+async def test_final_confirmation_inside_debounce_has_bounded_trailing_delivery() -> None:
+    fired = []
+    bridge = EventBridge(mark_due=lambda watch, at: fired.append(watch))
+    trigger = EventTrigger(event_pattern="hw.*")
+    bridge.register("live", trigger)
+    fake_time = [100.0]
+    with patch("leapflow.monitor.event_bridge.time.monotonic", side_effect=lambda: fake_time[0]):
+        bridge.on_event(_make_event("hw.threshold_exceeded"))
+        trigger.advance(0)
+        for _ in range(1000):
+            bridge.on_event(_make_event("hw.observation_cleared"))
+        assert len(bridge._trailing) == 1
+        assert not trigger.is_triggered
+        handle = bridge._trailing["live"]
+        handle.cancel()
+        fake_time[0] += 1
+        bridge._flush_trailing("live")
+        assert fired == ["live", "live"]
+        assert trigger.last_event == "hw.observation_cleared"
+        assert not bridge._trailing_events
+        bridge.on_event(_make_event("hw.observation_unknown"))
+        pending = bridge._trailing["live"]
+        bridge.close()
+        assert pending.cancelled()
+        assert not bridge._trailing

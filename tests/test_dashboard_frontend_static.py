@@ -333,3 +333,48 @@ assert.equal(_previews.size, 0);
         [node, "-"], input=script, text=True, capture_output=True, timeout=10, check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_critical_charts_and_coalesced_notices_execute() -> None:
+    """Shipped JS includes critical in totals and never toasts stored noise."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for frontend execution")
+    src = _app()
+    severities = src[src.index("const SEVERITIES ="):src.index("// Academic numbering:")]
+    charts = src[src.index("function renderPie("):src.index("function renderTable(")]
+    notices = src[src.index("let criticalToast ="):src.index("// ── Live updates over WebSocket")]
+    script = """
+const assert = require('node:assert/strict');
+const timers = new Map(); let nextTimer = 0, refreshes = 0;
+function setTimeout(fn, delay) { timers.set(++nextTimer, {fn, delay}); return nextTimer; }
+function clearTimeout(id) { timers.delete(id); }
+function fetchView() { refreshes++; }
+const esc = x => x, t = x => x, tx = x => x;
+function asArray(x) { return Array.isArray(x) ? x : []; }
+function el(tag, cls, text) {
+  return {cls, text, style: {}, children: [], setAttribute() {},
+          appendChild(child) { this.children.push(child); child.parent = this; },
+          remove() { this.parent.children = this.parent.children.filter(x => x !== this); }};
+}
+const toastsEl = el('div');
+""" + severities + charts + notices + r"""
+const pie = renderPie([{severity:'critical'}, {severity:'alert'}, {severity:'info'}]);
+assert.match(pie.children[0].style.background, /var\(--critical\) 0% 33/);
+assert.equal(pie.children[1].children[0].text, 'critical 1');
+for (let i = 0; i < 3000; i++) toast({severity:'alert', title:'noise'});
+assert.equal(toastsEl.children.length, 0);
+toast({severity:'critical', title:'first'});
+toast({severity:'critical', title:'aggregate'});
+assert.equal(toastsEl.children.length, 1);
+assert.equal(toastsEl.children[0].children[0].text, 'aggregate');
+for (let i = 0; i < 1000; i++) scheduleMonitorRefresh();
+assert.equal([...timers.values()].filter(x => x.delay === 250).length, 1);
+[...timers.values()].find(x => x.delay === 250).fn();
+assert.equal(refreshes, 1);
+[...timers.values()].find(x => x.delay === 8000).fn();
+assert.equal(toastsEl.children.length, 0);
+"""
+    result = subprocess.run([node, "-"], input=script, text=True, capture_output=True,
+                            timeout=10, check=False)
+    assert result.returncode == 0, result.stderr

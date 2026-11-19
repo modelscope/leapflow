@@ -8,6 +8,7 @@ and activates matched triggers (marking corresponding watches as DUE).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Callable, Dict, Optional, Set
@@ -46,6 +47,8 @@ class EventBridge:
         self._default_debounce_s = default_debounce_s
         self._scheduler_wake = scheduler_wake
         self._mark_due = mark_due
+        self._trailing: dict[str, asyncio.TimerHandle] = {}
+        self._trailing_events: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Registration
@@ -80,6 +83,10 @@ class EventBridge:
         Args:
             watch_id: The watch whose trigger should be removed.
         """
+        handle = self._trailing.pop(watch_id, None)
+        if handle is not None:
+            handle.cancel()
+        self._trailing_events.pop(watch_id, None)
         trigger = self._triggers.pop(watch_id, None)
         if trigger is not None:
             # Rebuild active_patterns from remaining triggers
@@ -133,24 +140,49 @@ class EventBridge:
                         event_name,
                         self._debounced_count[watch_id],
                     )
+                    self._trailing_events[watch_id] = event_name
+                    if watch_id not in self._trailing:
+                        try:
+                            loop = asyncio.get_running_loop()
+                            self._trailing[watch_id] = loop.call_later(
+                                debounce_s - (now - last), self._flush_trailing, watch_id)
+                        except RuntimeError:
+                            pass  # standalone synchronous use has no background lifecycle
                     continue
-                # First trigger or outside debounce window — fire
-                trigger.notify(event_name)
-                self._last_triggered[watch_id] = now
-                logger.debug(
-                    "EventBridge: trigger fired watch=%s event=%s pattern=%s",
-                    watch_id[:8],
-                    event_name,
-                    trigger.event_pattern,
-                )
-                # Persist the due time so the scheduler SQL query finds this task.
-                if self._mark_due is not None:
-                    try:
-                        self._mark_due(watch_id, trigger.next_due_at)
-                    except Exception:  # noqa: BLE001
-                        logger.debug("EventBridge: mark_due failed for %s", watch_id[:8], exc_info=True)
-                if self._scheduler_wake is not None:
-                    self._scheduler_wake()
+                handle = self._trailing.pop(watch_id, None)
+                if handle is not None:
+                    handle.cancel()
+                self._trailing_events.pop(watch_id, None)
+                self._fire(watch_id, event_name, now)
+
+    def _fire(self, watch_id: str, event_name: str, now: float) -> None:
+        trigger = self._triggers.get(watch_id)
+        if trigger is None:
+            return
+        trigger.notify(event_name)
+        self._last_triggered[watch_id] = now
+        logger.debug("EventBridge: trigger fired watch=%s event=%s pattern=%s",
+                     watch_id[:8], event_name, trigger.event_pattern)
+        if self._mark_due is not None:
+            try:
+                self._mark_due(watch_id, trigger.next_due_at)
+            except Exception:  # noqa: BLE001
+                logger.debug("EventBridge: mark_due failed for %s", watch_id[:8], exc_info=True)
+        if self._scheduler_wake is not None:
+            self._scheduler_wake()
+
+    def _flush_trailing(self, watch_id: str) -> None:
+        self._trailing.pop(watch_id, None)
+        event_name = self._trailing_events.pop(watch_id, None)
+        if event_name is not None:
+            self._fire(watch_id, event_name, time.monotonic())
+
+    def close(self) -> None:
+        """Cancel bounded trailing invalidations on normal monitor shutdown."""
+        for handle in self._trailing.values():
+            handle.cancel()
+        self._trailing.clear()
+        self._trailing_events.clear()
 
     # ------------------------------------------------------------------
     # Properties

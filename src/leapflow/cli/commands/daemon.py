@@ -196,7 +196,14 @@ def _start(settings: object, mock_host: bool) -> int:
     return asyncio.run(_run())
 
 
-def _stop(runtime_dir: Path, *, force: bool = False, timeout_s: float = 10.0) -> int:
+def _stop(
+    runtime_dir: Path,
+    *,
+    force: bool = False,
+    timeout_s: float = 10.0,
+    action: str = "stop",
+    guarded: bool = False,
+) -> int:
     from leapflow.daemon.lifecycle import DaemonInfo, cleanup_stale, stop_daemon
 
     info = DaemonInfo.discover(runtime_dir)
@@ -208,9 +215,14 @@ def _stop(runtime_dir: Path, *, force: bool = False, timeout_s: float = 10.0) ->
             print("leapd is not running.")
         return 0
 
+    if not guarded:
+        refusal = _stop_guard(info, action=action, force=force)
+        if refusal is not None:
+            return refusal
+
     graceful_requested = False
     if info.is_healthy and info.sock_path is not None:
-        graceful_requested = _request_shutdown(info.sock_path)
+        graceful_requested = _request_shutdown(info.sock_path, action=action)
     print(f"Stopping leapd (pid={info.pid})...")
     result = stop_daemon(
         runtime_dir,
@@ -230,12 +242,90 @@ def _stop(runtime_dir: Path, *, force: bool = False, timeout_s: float = 10.0) ->
     return 1
 
 
-def _request_shutdown(sock_path: Path) -> bool:
+_SELF_TERMINATION_EXIT = 3
+HOST_DAEMON_PID_ENV = "LEAPFLOW_HOST_DAEMON_PID"
+
+
+def _stop_guard(info: object, *, action: str, force: bool) -> int | None:
+    """Refuse a stop/restart that would kill a turn; return the exit code or None.
+
+    Two layers. A process spawned by the very leapd it targets (an agent's
+    ``shell_run``, terminal session, MCP server -- all inherit
+    ``LEAPFLOW_HOST_DAEMON_PID``) is refused unconditionally, ``--force``
+    included: the turn issuing the command runs inside that daemon and would
+    be torn down mid-flight, which is exactly how a detached ``nohup ... leap
+    daemon restart`` left the TUI with an unexplained dropped connection.
+    Otherwise, a daemon with active turns needs confirmation on a TTY and
+    ``--force`` elsewhere, since stopping it interrupts those turns.
+    """
+    pid = getattr(info, "pid", None)
+    marker = os.environ.get(HOST_DAEMON_PID_ENV, "").strip()
+    if pid is not None and marker == str(pid):
+        sys.stderr.write(
+            f"Refusing 'leap daemon {action}': this command was launched from inside "
+            f"leapd (pid={pid}) itself, so it would terminate the agent turn that "
+            "issued it (--force does not override this).\n"
+            "- An unreachable fleet node is retried automatically; use "
+            "hw_fleet_reconnect (or 'leap hw fleet reconnect') to retry now.\n"
+            "- A restart-required setting: finish the turn and ask the user to run "
+            f"'leap daemon {action}' from their own terminal.\n"
+        )
+        return _SELF_TERMINATION_EXIT
+    if force:
+        return None
+    active = _active_turns(info)
+    if not active:
+        return None
+    ids = ", ".join(active)
+    if sys.stdin is not None and sys.stdin.isatty():
+        try:
+            answer = input(
+                f"leapd has {len(active)} active turn(s) ({ids}); '{action}' will "
+                "interrupt them and they may leave partial side effects. Continue? [y/N] "
+            )
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() in {"y", "yes"}:
+            return None
+        print(f"'leap daemon {action}' cancelled.")
+        return 1
+    sys.stderr.write(
+        f"Refusing 'leap daemon {action}': leapd has {len(active)} active turn(s) "
+        f"({ids}) that would be interrupted. Wait for them to finish, cancel them "
+        "with /cancel, or pass --force to interrupt them.\n"
+    )
+    return 1
+
+
+def _active_turns(info: object) -> list[str]:
+    """Return active turn request ids, or [] when leapd cannot be asked."""
+    sock_path = getattr(info, "sock_path", None)
+    if not getattr(info, "is_healthy", False) or sock_path is None:
+        return []
+    try:
+        status = asyncio.run(_runtime_status(sock_path))
+    except Exception:  # noqa: BLE001 - an unresponsive daemon must stay stoppable
+        return []
+    admission = status.get("turn_admission") if isinstance(status, dict) else None
+    if not isinstance(admission, dict):
+        return []
+    ids = [str(item) for item in admission.get("active_request_ids") or []]
+    count = int(admission.get("active", 0) or 0)
+    if count and not ids:
+        ids = [f"{count} unnamed"]
+    return ids
+
+
+def _request_shutdown(sock_path: Path, *, action: str = "stop") -> bool:
     from leapflow.daemon.client import DaemonClient, DaemonUnavailableError
+
+    requested_by = {"pid": os.getpid(), "command": f"leap daemon {action}"}
 
     async def _run() -> bool:
         try:
-            await DaemonClient(sock_path, timeout_s=2.0).shutdown()
+            await DaemonClient(sock_path, timeout_s=2.0).shutdown(
+                reason=f"leap daemon {action}", requested_by=requested_by
+            )
             return True
         except DaemonUnavailableError:
             return False
@@ -244,20 +334,31 @@ def _request_shutdown(sock_path: Path) -> bool:
 
 
 def _restart(settings: object, mock_host: bool, *, force: bool = False) -> int:
+    from leapflow.daemon.lifecycle import DaemonInfo
+
     runtime_dir = settings.runtime_dir
+    info = DaemonInfo.discover(runtime_dir)
+    if info.is_running:
+        refusal = _stop_guard(info, action="restart", force=force)
+        if refusal is not None:
+            return refusal
     print("Restarting leapd...")
-    stop_code = _stop(runtime_dir, force=force, timeout_s=10.0)
+    stop_code = _stop(runtime_dir, force=force, timeout_s=10.0, action="restart", guarded=True)
     if stop_code != 0:
         sys.stderr.write("Restart aborted because old leapd did not stop cleanly.\n")
         return stop_code
     return _start(settings, mock_host)
 
 
-
 async def _serve(settings: object, mock_host: bool) -> int:
     from leapflow.daemon.server import serve_daemon
     from leapflow.logging_setup import init_daemon_logging
 
+    # Every child leapd spawns (shell_run, terminal sessions, MCP servers, and
+    # anything they detach with nohup/setsid) inherits this marker, so a
+    # ``leap daemon stop|restart`` issued from inside a turn can recognise that
+    # it would kill its own host and refuse.
+    os.environ[HOST_DAEMON_PID_ENV] = str(os.getpid())
     # The daemon writes stdout/stderr to leapd.log; without an explicit logging
     # setup Python's lastResort handler only emits WARNING+, hiding the INFO
     # field evidence (deferred init progress, turn usage). daemon.log_level is

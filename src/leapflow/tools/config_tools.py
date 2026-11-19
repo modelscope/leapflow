@@ -293,7 +293,13 @@ async def config_set_handler(args: Dict[str, Any]) -> Dict[str, Any]:
         )
     if before.hot_reload == "restart-required":
         payload["restart_required"] = True
-        payload["next_step"] = "Run `leap daemon restart` for this change to take effect."
+        # Never phrase this as an instruction the agent can execute: this turn runs
+        # inside leapd, so restarting it from here terminates the turn mid-flight.
+        payload["next_step"] = (
+            "This setting takes effect after leapd restarts. Do not restart leapd within "
+            "the current turn (that would terminate this turn); tell the user to run "
+            "`leap daemon restart` after this turn ends."
+        )
     elif result.ok:
         # Reload so an immediate config_get reflects the new value; otherwise the
         # model sees the stale singleton and concludes the write failed.

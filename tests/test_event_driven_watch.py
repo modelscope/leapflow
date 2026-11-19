@@ -76,7 +76,8 @@ async def test_event_driven_watch_full_chain(tmp_path: Path) -> None:
             watch_id="",
             domain="filesystem",
             title="file changed",
-            severity=Severity.ALERT,
+            # Unsolicited presentation defaults to the critical floor.
+            severity=Severity.CRITICAL,
             dedup_key="f1",
         ),
     ])
@@ -108,10 +109,12 @@ async def test_event_driven_watch_full_chain(tmp_path: Path) -> None:
     assert result["ok"] is True
     assert result["findings"] == 1
 
-    # Step 5: verify finding was pushed and persisted
+    # Step 5: verify finding was pushed and persisted. Presentation is bounded
+    # and coalesced, so the aggregate notice is emitted on the delivery flush.
+    await manager.delivery.flush()
     finding_events = [p for et, p in emitted if et == EVENT_FINDING]
     assert len(finding_events) == 1
-    assert finding_events[0]["title"] == "file changed"
+    assert [item["title"] for item in finding_events[0]["items"]] == ["file changed"]
 
     assert manager.finding_store.count(watch_id=view.watch_id) == 1
     assert producer.calls == 1

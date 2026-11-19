@@ -20,6 +20,8 @@ workcell: piper_cell
 # Role name -> device id. A role's kind is its first dotted segment, so a
 # second camera binds as e.g. ``camera.wrist: <device id>``.
 roles:
+  # The bound device declares actuation_state_channel: arm.enabled; fresh disabled
+  # feedback lowers resting-pose reports only, never motion admission or interlocks.
   arm: robot_piper_arm
   gripper: robot_piper_arm
   camera: sensor_realsense_435if
