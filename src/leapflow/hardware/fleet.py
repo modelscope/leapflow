@@ -41,24 +41,32 @@ Design invariants:
 - No dependency on ``leapflow.engine``.
 
 Module split: node configuration and startup registration live in
-``fleet_config.py``; the LLM-callable tools live in ``fleet_tools.py``.
-This module keeps only the fleet model and ``FleetManager`` mechanics, and
-is slightly above the 800-line soft limit because the manager's
-registration, supervision, halt and aggregation paths share one routing
-table and one node map -- splitting them would scatter that state.
+``fleet_config.py``; the LLM-callable tools live in ``fleet_tools.py``; the
+retry schedule for configured-but-unregistered nodes lives in
+``fleet_supervision.py``. This module keeps only the fleet model and
+``FleetManager`` mechanics, and is above the 800-line soft limit because the
+manager's registration, supervision, halt and aggregation paths share one
+routing table and one node map -- splitting them would scatter that state.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from leapflow.hardware.context import HardwareContext, TransportRef
 from leapflow.hardware.lhp import LhpRemoteError, SocketLhpClient, is_valid_device_id
 from leapflow.hardware.attestation import verification_stamp
+from leapflow.hardware.fleet_supervision import (
+    DEFAULT_RETRY_INITIAL_S,
+    DEFAULT_RETRY_MAX_S,
+    PendingNodes,
+    RegistrationBackoff,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +83,8 @@ _NODE_STATUS_ONLINE = "online"
 _NODE_STATUS_OFFLINE = "offline"
 _NODE_STATUS_DEGRADED = "degraded"
 _NODE_STATUS_UNKNOWN = "unknown"
+# Configured but never admitted: registration failed and is being retried.
+_NODE_STATUS_UNREGISTERED = "unregistered"
 
 _VALID_STATUSES = frozenset(
     {
@@ -82,6 +92,7 @@ _VALID_STATUSES = frozenset(
         _NODE_STATUS_OFFLINE,
         _NODE_STATUS_DEGRADED,
         _NODE_STATUS_UNKNOWN,
+        _NODE_STATUS_UNREGISTERED,
     }
 )
 
@@ -145,6 +156,7 @@ class FleetTopology:
     total_devices: int = 0
     online_nodes: int = 0
     timestamp: float = 0.0
+    unregistered_nodes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize for JSON / dashboard consumption."""
@@ -166,6 +178,7 @@ class FleetTopology:
             ],
             "total_devices": self.total_devices,
             "online_nodes": self.online_nodes,
+            "unregistered_nodes": self.unregistered_nodes,
             "timestamp": self.timestamp,
         }
 
@@ -252,8 +265,21 @@ class FleetManager:
         heartbeat_interval_s: float = 10.0,
         node_timeout_s: float = 30.0,
         permit_issuer: Any | None = None,
+        retry_initial_s: float = DEFAULT_RETRY_INITIAL_S,
+        retry_max_s: float = DEFAULT_RETRY_MAX_S,
+        on_node_registered: Callable[[FleetNode], Any] | None = None,
     ) -> None:
         self._registry = registry
+        # Configured nodes whose registration failed. The heartbeat sweep retries
+        # them with backoff; without this a board that was still booting when
+        # leapd started stayed invisible until leapd itself was restarted.
+        self._pending = PendingNodes(RegistrationBackoff(retry_initial_s, retry_max_s))
+        # Called after every successful (re-)registration so the owner can admit
+        # the new contexts elsewhere (trust gate, health records).
+        self._on_node_registered = on_node_registered
+        # Node ids with a registration retry in flight; the heartbeat sweep and an
+        # explicit reconnect must not register the same node twice concurrently.
+        self._retrying: set[str] = set()
         # Signs execution permits for nodes in ``permit_required`` mode. Shared
         # by every remote device's transport and by the skill service; absent,
         # such nodes refuse writes with a host-side message naming why.
@@ -270,7 +296,31 @@ class FleetManager:
         """The host's permit issuer, or ``None`` when permits cannot be minted."""
         return self._permit_issuer
 
+    @property
+    def supervises_nodes(self) -> bool:
+        """True when any node is registered or awaiting a registration retry."""
+        return bool(self._nodes) or bool(len(self._pending))
+
+    def set_on_node_registered(self, callback: Callable[[FleetNode], Any] | None) -> None:
+        """Install the hook run after each successful node registration."""
+        self._on_node_registered = callback
+
     # -- Node management -------------------------------------------------
+
+    def defer_node(self, node: FleetNode, error: BaseException) -> None:
+        """Keep a configured node whose registration failed, for retry.
+
+        The node stays visible as ``unregistered`` with its last error, and the
+        heartbeat sweep retries it on an exponential backoff.
+        """
+        entry = self._pending.record_failure(node, error, time.monotonic())
+        logger.warning(
+            "Fleet: node %r not registered (attempt %d): %s; retrying in %.0fs",
+            node.node_id,
+            entry.attempts,
+            entry.last_error,
+            max(0.0, entry.next_retry_at - time.monotonic()),
+        )
 
     async def register_node(self, node: FleetNode) -> FleetNode:
         """Register an edge node, reconcile its devices into the local registry.
@@ -351,14 +401,101 @@ class FleetManager:
         for local_did in registered.device_ids:
             self._device_to_node[registered.host_device_id(local_did)] = registered.node_id
 
+        pending = self._pending.discard(registered.node_id)
         logger.info(
-            "Fleet: registered node %r (%s) with %d device(s): %s",
+            "Fleet: registered node %r (%s) with %d device(s): %s%s",
             registered.node_id,
             registered.endpoint,
             len(registered.device_ids),
             ", ".join(registered.device_ids) or "(none)",
+            f" after {pending.attempts} failed attempt(s)" if pending is not None else "",
         )
+        await self._notify_registered(registered)
         return registered
+
+    async def _notify_registered(self, node: FleetNode) -> None:
+        """Run the owner's registration hook; its failure never undoes admission."""
+        callback = self._on_node_registered
+        if callback is None:
+            return
+        try:
+            outcome = callback(node)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception:  # noqa: BLE001 - a hook defect must not unregister a live node
+            logger.warning("Fleet: node %r registration hook failed", node.node_id, exc_info=True)
+
+    async def retry_pending(self, *, force: bool = False, node_id: str | None = None) -> dict[str, Any]:
+        """Retry registering pending nodes; return a per-node outcome.
+
+        ``force`` ignores the backoff schedule (an explicit reconnect); otherwise
+        only entries whose retry time has arrived are attempted.
+        """
+        now = time.monotonic()
+        entries = self._pending.expedite(node_id, now) if force else self._pending.due(now)
+        entries = tuple(entry for entry in entries if entry.node.node_id not in self._retrying)
+        if not entries:
+            return {}
+        self._retrying.update(entry.node.node_id for entry in entries)
+        try:
+            results = await asyncio.gather(
+                *(self.register_node(entry.node) for entry in entries),
+                return_exceptions=True,
+            )
+        finally:
+            self._retrying.difference_update(entry.node.node_id for entry in entries)
+        outcome: dict[str, Any] = {}
+        for entry, result in zip(entries, results):
+            nid = entry.node.node_id
+            if isinstance(result, FleetNode):
+                outcome[nid] = {
+                    "status": _NODE_STATUS_ONLINE,
+                    "device_ids": list(result.device_ids),
+                }
+                continue
+            if not isinstance(result, Exception):
+                raise result  # CancelledError and friends must propagate
+            if not isinstance(result, FleetError):
+                logger.warning("Fleet: node %r registration raised", nid, exc_info=result)
+            if nid in self._nodes:
+                continue  # registered meanwhile (e.g. by a concurrent refresh)
+            failed = self._pending.record_failure(entry.node, result, time.monotonic())
+            logger.info(
+                "Fleet: node %r still not registered (attempt %d): %s; next retry in %.0fs",
+                nid,
+                failed.attempts,
+                failed.last_error,
+                max(0.0, failed.next_retry_at - time.monotonic()),
+            )
+            outcome[nid] = failed.to_dict(time.monotonic())
+        return outcome
+
+    async def reconnect(self, node_id: str | None = None) -> dict[str, Any]:
+        """Retry registration now for one (or every) pending node.
+
+        A named node that is already registered is probed instead, so the answer
+        always reflects the node's current reachability.
+        """
+        if node_id and node_id in self._nodes:
+            return {"ok": True, "nodes": {node_id: await self.node_health(node_id)}, "retried": 0}
+        if node_id and node_id not in self._pending:
+            return {
+                "ok": False,
+                "error": f"unknown fleet node {node_id!r}",
+                "failure_code": "fleet_unknown_node",
+                "configured": sorted(
+                    {*self._nodes, *(entry.node.node_id for entry in self._pending.entries())}
+                ),
+            }
+        outcome = await self.retry_pending(force=True, node_id=node_id)
+        now = time.monotonic()
+        for entry in self._pending.entries():
+            # A retry already in flight (heartbeat sweep) is reported, not doubled.
+            if entry.node.node_id in self._retrying and (node_id in (None, entry.node.node_id)):
+                outcome.setdefault(
+                    entry.node.node_id, {**entry.to_dict(now), "retry_in_flight": True}
+                )
+        return {"ok": True, "nodes": outcome, "retried": len(outcome)}
 
     async def unregister_node(self, node_id: str) -> None:
         """Remove a node and all its devices from the fleet.
@@ -476,8 +613,10 @@ class FleetManager:
         """
         while not self._stopped.is_set():
             await self._heartbeat_sweep()
+            due_in = [max(0.01, entry.next_retry_at - time.monotonic()) for entry in self._pending.entries()]
+            interval = min(self._heartbeat_interval, *due_in) if due_in else self._heartbeat_interval
             try:
-                await asyncio.wait_for(self._stopped.wait(), timeout=self._heartbeat_interval)
+                await asyncio.wait_for(self._stopped.wait(), timeout=interval)
                 break  # stopped
             except asyncio.TimeoutError:
                 pass
@@ -535,6 +674,8 @@ class FleetManager:
                 self._nodes[node_id] = node.with_status(_NODE_STATUS_DEGRADED)
         for node_id in changed:
             await self._refresh_node(node_id)
+        if len(self._pending):
+            await self.retry_pending()
 
     async def _refresh_node(self, node_id: str) -> None:
         """Re-admit a node's changed declarations through ``register_node``.
@@ -560,7 +701,19 @@ class FleetManager:
         """
         node = self._nodes.get(node_id)
         if node is None:
-            return {"node_id": node_id, "error": "unknown node"}
+            pending = self._pending.get(node_id)
+            if pending is None:
+                return {"node_id": node_id, "error": "unknown node"}
+            probe = await self._probe_endpoint(pending.node.endpoint, token=pending.node.token)
+            return {
+                **pending.to_dict(time.monotonic()),
+                "display_name": pending.node.display_name,
+                "reachable": probe is not None,
+                "next_step": (
+                    "Registration is retried automatically; call hw_fleet_reconnect to retry "
+                    "now. Restarting leapd is not needed."
+                ),
+            }
 
         reachable = await self._probe_endpoint(node.endpoint, token=node.token) is not None
         now = time.monotonic()
@@ -634,7 +787,19 @@ class FleetManager:
 
     def topology(self) -> FleetTopology:
         """Return current fleet topology snapshot."""
-        nodes = tuple(sorted(self._nodes.values(), key=lambda n: n.node_id))
+        now = time.monotonic()
+        hidden = {"node_id", "endpoint", "status"}
+        pending = tuple(
+            replace(
+                entry.node,
+                device_ids=(),
+                status=_NODE_STATUS_UNREGISTERED,
+                metadata={k: v for k, v in entry.to_dict(now).items() if k not in hidden},
+            )
+            for entry in self._pending.entries()
+            if entry.node.node_id not in self._nodes
+        )
+        nodes = tuple(sorted((*self._nodes.values(), *pending), key=lambda n: n.node_id))
         total_devices = sum(len(n.device_ids) for n in nodes)
         online_nodes = sum(1 for n in nodes if n.status == _NODE_STATUS_ONLINE)
         return FleetTopology(
@@ -642,6 +807,7 @@ class FleetManager:
             total_devices=total_devices,
             online_nodes=online_nodes,
             timestamp=time.time(),
+            unregistered_nodes=len(pending),
         )
 
     # -- Aggregation -----------------------------------------------------
@@ -848,6 +1014,7 @@ class FleetManager:
         devices).  Never raises.
         """
         await self.stop_heartbeat()
+        self._pending.clear()
         for node_id in list(self._nodes):
             try:
                 await self.unregister_node(node_id)

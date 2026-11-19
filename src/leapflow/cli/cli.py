@@ -378,6 +378,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     hw_validate.add_argument("--devices", default="", metavar="DIR", help="Device YAML for --workcells")
     hw_sub.add_parser("permit-key", parents=[hw_json], help="Generate an Ed25519 keypair for execution permits")
+    hw_fleet = hw_sub.add_parser("fleet", help="Inspect and supervise configured LHP fleet nodes (via leapd)")
+    hw_fleet_sub = hw_fleet.add_subparsers(dest="fleet_action")
+    hw_fleet_reconnect = hw_fleet_sub.add_parser(
+        "reconnect", parents=[hw_json],
+        help="Retry registering unregistered fleet nodes now (no leapd restart needed)",
+    )
+    hw_fleet_reconnect.add_argument("node", nargs="?", default="", help="Configured node_id; omit for all")
     # Onboarding subcommands
     hw_init = hw_sub.add_parser("init", parents=[hw_json], help="Generate an annotated hc.v1 device template")
     hw_init.add_argument("device_id", help="Device id for the new template")

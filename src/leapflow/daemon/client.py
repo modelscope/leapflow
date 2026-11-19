@@ -31,6 +31,60 @@ class DaemonUnavailableError(RuntimeError):
     """Raised when a usable leapd daemon cannot be reached."""
 
 
+class DaemonShutdownError(DaemonUnavailableError):
+    """leapd announced a deliberate shutdown before closing this connection.
+
+    Carries who stopped it and why, so a client can say "leapd was stopped by
+    `leap daemon restart` (pid X)" instead of an unexplained dropped connection.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        requested_by_pid: int | None = None,
+        requested_by_command: str = "",
+        active_turns: int = 0,
+    ) -> None:
+        self.reason = reason or "unknown"
+        self.requested_by_pid = requested_by_pid
+        self.requested_by_command = requested_by_command
+        self.active_turns = active_turns
+        super().__init__(self.describe())
+
+    def describe(self) -> str:
+        """Return a one-line account of the shutdown."""
+        if not self.requested_by_command:
+            return f"leapd shut down ({self.reason})"
+        pid = f" (pid {self.requested_by_pid})" if self.requested_by_pid else ""
+        return f"leapd was stopped by `{self.requested_by_command}`{pid}"
+
+    @classmethod
+    def from_metadata(cls, metadata: dict[str, Any]) -> "DaemonShutdownError":
+        pid = metadata.get("requested_by_pid")
+        try:
+            pid = int(pid) if pid is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        return cls(
+            str(metadata.get("reason") or ""),
+            requested_by_pid=pid,
+            requested_by_command=str(metadata.get("requested_by_command") or ""),
+            active_turns=int(metadata.get("active_turns") or 0),
+        )
+
+
+def _raise_if_shutdown(payload: dict[str, Any]) -> None:
+    """Raise :class:`DaemonShutdownError` for a ``daemon_shutdown`` notification."""
+    if payload.get("method") != "stream.chunk":
+        return
+    params = payload.get("params") or {}
+    if params.get("event_type") != "daemon_shutdown":
+        return
+    metadata = params.get("metadata")
+    raise DaemonShutdownError.from_metadata(metadata if isinstance(metadata, dict) else {})
+
+
 class DaemonClient:
     """Small JSON-RPC client that opens one Unix socket per request."""
 
@@ -62,6 +116,7 @@ class DaemonClient:
             await _send(writer, request.to_json())
             while True:
                 payload = await self._read_payload(reader)
+                _raise_if_shutdown(payload)
                 # Skip heartbeat notifications sent by the server for
                 # long-running handlers — they carry no result.
                 if payload.get("method") == "stream.chunk":
@@ -118,6 +173,7 @@ class DaemonClient:
             await _send(writer, request.to_json())
             while True:
                 payload = await self._read_payload(reader)
+                _raise_if_shutdown(payload)
                 method = payload.get("method")
                 params = dict(payload.get("params") or {})
                 if method == "stream.chunk" and params.get("id") == request.id:
@@ -144,6 +200,7 @@ class DaemonClient:
             await _send(writer, request.to_json())
             while True:
                 payload = await self._read_payload(reader)
+                _raise_if_shutdown(payload)
                 method = payload.get("method")
                 params = dict(payload.get("params") or {})
                 if method == "stream.chunk" and params.get("id") == request.id:
@@ -237,6 +294,11 @@ class DaemonClient:
         result = await self.request("hardware.resume", {"device": device})
         return dict(result or {})
 
+    async def hardware_fleet_reconnect(self, node: str = "") -> dict[str, Any]:
+        """Retry registering unregistered fleet nodes inside leapd."""
+        result = await self.request("hardware.fleet_reconnect", {"node": node})
+        return dict(result or {})
+
     async def hardware_inventory(self) -> dict[str, Any]:
         """Return the admitted device fleet grouped by declared class."""
         result = await self.request("hardware.inventory")
@@ -318,6 +380,7 @@ class DaemonClient:
             await _send(writer, request.to_json())
             while True:
                 payload = await self._read_payload(reader)
+                _raise_if_shutdown(payload)
                 params = dict(payload.get("params") or {})
                 if payload.get("method") == "stream.chunk" and params.get("id") == request.id:
                     metadata = params.get("metadata") or {}
@@ -591,9 +654,18 @@ class DaemonClient:
         """Fetch subagent delegation state from daemon."""
         return dict(await self.request("subagent.state") or {})
 
-    async def shutdown(self) -> None:
-        """Request graceful daemon shutdown."""
-        await self.request("daemon.shutdown")
+    async def shutdown(self, *, reason: str = "", requested_by: dict[str, Any] | None = None) -> None:
+        """Request graceful daemon shutdown, naming who asked and why.
+
+        leapd forwards both to every client with an open stream before closing
+        it, so their users see why the connection ended.
+        """
+        params: dict[str, Any] = {}
+        if reason:
+            params["reason"] = reason
+        if requested_by:
+            params["requested_by"] = dict(requested_by)
+        await self.request("daemon.shutdown", params)
 
     async def _open(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         try:

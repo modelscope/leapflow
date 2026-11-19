@@ -47,6 +47,7 @@ class ObservationPolicy:
     margin_floor: float | None = None
     margin_max: float | None = None
     confirm_s: float = 0.2
+    stale_confirm_s: float = 0.5
     recover_s: float = 0.5
     adaptive: bool = False
     noise_window_s: float = 5.0
@@ -96,7 +97,8 @@ class ObservationPolicy:
         floor = self.margin_floor
         if floor is None:
             floor = max(envelope.tolerance or 0.0, envelope.quantization or 0.0)
-        policy = replace(self, margin_floor=floor)
+        stale_window = max(self.stale_confirm_s, 2.0 / channel.sample_rate_hz) if channel.sample_rate_hz > 0 else self.stale_confirm_s
+        policy = replace(self, margin_floor=floor, stale_confirm_s=stale_window)
         ceiling = policy.margin_max if policy.margin_max is not None else floor
         if ceiling < floor:
             raise ValueError(
@@ -306,8 +308,11 @@ class ObservationJudgment:
             self.reconfigure(self.policy)
 
     def invalidate(self) -> None:
-        for state in self.states.values():
-            state.unknown()
+        for name, state in self.states.items():
+            # Numeric/soft evidence can be invalid while explicit freshness still
+            # has a continuous candidate. Resetting it each stale sample defeats debounce.
+            if name not in {"stale", "quality_degraded"}:
+                state.unknown()
         self._training_since = None
         self._estimated_at = -math.inf
         self._last_at = None
@@ -347,7 +352,7 @@ class ObservationJudgment:
                 breached=breached,
                 clear=clear,
                 now=now,
-                confirm_s=policy.confirm_s if soft else 0.0,
+                confirm_s=policy.stale_confirm_s if name == "stale" else policy.confirm_s if soft else 0.0,
                 recover_s=policy.recover_s if soft else 0.0,
                 report_after_s=policy.report_after_s,
                 report_max_s=policy.report_max_s,
@@ -376,6 +381,8 @@ class ObservationJudgment:
             "hard_max": self.channel.envelope.max_value,
             "report_after_s": policy.report_after_s,
             "report_max_s": policy.report_max_s,
+            "confirm_s": policy.stale_confirm_s if name == "stale" else policy.confirm_s if soft else 0.0,
+            "clear": clear and valid,
         }
         data.update(extra or {})
         self.latest[name] = data

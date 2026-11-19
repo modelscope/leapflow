@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -52,9 +53,13 @@ class _FakeConsole:
 class _FakeStatus:
     def __init__(self) -> None:
         self.counts: list[tuple[int, int]] = []
+        self.display_clock: Callable[[], float] | None = None
 
     def __call__(self) -> list[tuple[str, str]]:
         return []
+
+    def use_display_clock(self, clock: Callable[[], float]) -> None:
+        self.display_clock = clock
 
     def update_task_counts(self, *, running: int, queued: int) -> None:
         self.counts.append((running, queued))

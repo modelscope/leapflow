@@ -376,6 +376,12 @@ class ReadingRing:
         return payload
 
 
+def _observation_now(reading: Reading) -> float:
+    """Use the reception clock when source evidence cannot carry a valid clock."""
+    at = reading.monotonic_at
+    return at if reading.is_trustworthy and math.isfinite(at) and at > 0 else time.monotonic()
+
+
 class HardwareEventDetector:
     """Judge raw hard evidence and separately configured report-only observations.
 
@@ -444,7 +450,7 @@ class HardwareEventDetector:
             # Three in a row rather than one: a lone suspect sample is noise, a run of
             # them is a fault. Reporting every one would reproduce the sampling-rate
             # flood this layer exists to prevent.
-            if self._degraded_streak == 3:
+            if self._degraded_streak == 3 and reading.quality != Quality.STALE.value:
                 events.append(
                     self._event(
                         EventKind.QUALITY_DEGRADED,
@@ -466,8 +472,8 @@ class HardwareEventDetector:
         self._last_numeric = numeric if valid and continuous else None
         self._last_acquisition = acquisition if valid and math.isfinite(acquisition) else None
         self._acquisition_epoch = reading.acquisition_epoch
-        if reading.is_trustworthy and math.isfinite(reading.monotonic_at):
-            self._last_monotonic = reading.monotonic_at
+        if reading.is_trustworthy:
+            self._last_monotonic = _observation_now(reading)
         notices = self._observation.observe_soft(reading, ring=ring, pending_motion=pending_motion,
                                                  fault_free=fault_free)
         for notice in notices:
@@ -482,12 +488,13 @@ class HardwareEventDetector:
                                         observation=notice))
         # Bad numeric evidence invalidates soft/rate history, not the explicit
         # quality/freshness condition carried by this same reading.
-        self._observation.condition("quality_degraded", breached=self._degraded_streak >= 3,
+        now = _observation_now(reading)
+        self._observation.condition("quality_degraded", breached=self._degraded_streak >= 3 and reading.quality != Quality.STALE.value,
                                     clear=reading.is_trustworthy, reading=reading,
-                                    now=reading.monotonic_at, reason="sampling quality")
+                                    now=now, reason="sampling quality")
         self._observation.condition("stale", breached=reading.quality == Quality.STALE.value,
                                     clear=reading.is_trustworthy, reading=reading,
-                                    now=reading.monotonic_at, reason="sampling freshness")
+                                    now=now, reason="sampling freshness")
         self._stale = not reading.is_trustworthy
         return tuple(events)
 
@@ -568,7 +575,7 @@ class HardwareEventDetector:
                                 f"changing at {abs(delta) / elapsed:g}/s, above the declared {envelope.max_rate:g}/s")
             self.safety_evidence[EventKind.RATE_EXCEEDED] = event
             events.append(event)
-        now = reading.monotonic_at
+        now = _observation_now(reading)
         threshold_notice = self._observation.condition(
             "threshold_exceeded", breached=self._breached, clear=not self._breached,
             reading=reading, now=now, valid=reading.is_trustworthy,

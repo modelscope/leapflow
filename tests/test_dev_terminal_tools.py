@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import sys
 
+import pytest
+
 from leapflow.tools import dev_tools
 from leapflow.tools import terminal_session as ts
 from leapflow.tools.dev_tools import lint_check, set_dev_commands
@@ -106,6 +108,50 @@ def test_lint_check_reports_issue_count(tmp_path, monkeypatch) -> None:
 
 
 # ── terminal_session ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize("command", [
+    "leap daemon stop", "leap daemon restart --force",
+    "nohup sh -c 'sleep 5; leap daemon restart' & disown",
+    "setsid leap daemon stop", "pkill -f leapd", "killall leapd",
+    "kill -TERM 4242", 'kill "$LEAPFLOW_HOST_DAEMON_PID"',
+    "kill -9 ${LEAPFLOW_HOST_DAEMON_PID}", "kill $(cat leapd.pid)",
+])
+def test_shell_self_termination_is_typed_and_never_executed(command, monkeypatch) -> None:
+    from leapflow.tools.shell_tools import shell_run
+    monkeypatch.setenv("LEAPFLOW_HOST_DAEMON_PID", "4242")
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("blocked command must never spawn")
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", forbidden)
+    result = _run(shell_run({"command": command}))
+    assert result["ok"] is False
+    assert result["failure_code"] == "self_termination_blocked"
+    assert result["failure_class"] == "safety_policy"
+    assert result["side_effect_state"] == "none"
+    assert result["retryable"] is False
+    assert "hw_fleet_reconnect" in result["next_step"]
+
+
+@pytest.mark.parametrize("command", ["leap daemon status", "kill -0 4242", "kill 9999", "echo healthy"])
+def test_shell_guard_preserves_safe_commands(command, monkeypatch) -> None:
+    from leapflow.tools.shell_tools import _is_self_termination
+    monkeypatch.setenv("LEAPFLOW_HOST_DAEMON_PID", "4242")
+    assert not _is_self_termination(command)
+
+
+def test_terminal_initial_and_send_commands_share_guard(monkeypatch) -> None:
+    from types import SimpleNamespace
+    monkeypatch.setenv("LEAPFLOW_HOST_DAEMON_PID", "4242")
+    ts.set_terminal_sessions_enabled(True)
+    try:
+        opened = _run(terminal_open({"command": "leap daemon restart --force"}))
+        assert opened["failure_code"] == "self_termination_blocked"
+        monkeypatch.setattr(ts, "_get", lambda _: SimpleNamespace(alive=lambda: True))
+        sent = _run(terminal_send({"session_id": "guard-probe", "input": "kill 4242"}))
+        assert sent["failure_code"] == "self_termination_blocked"
+        assert sent["side_effect_state"] == "none"
+    finally:
+        ts.set_terminal_sessions_enabled(False)
+
 
 def test_terminal_disabled_by_default() -> None:
     ts.set_terminal_sessions_enabled(False)

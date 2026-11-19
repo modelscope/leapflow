@@ -1595,6 +1595,139 @@ async def test_start_fleet_registers_env_nodes_and_skips_unreachable(
         await node_server.stop()
 
 
+def test_pending_registration_backoff_is_bounded_and_diagnostics_are_redacted() -> None:
+    from leapflow.hardware.fleet_supervision import PendingNodes, RegistrationBackoff
+
+    backoff = RegistrationBackoff(initial_s=2.0, maximum_s=5.0)
+    assert [backoff.delay(i) for i in (1, 2, 3, 10**6)] == [2.0, 4.0, 5.0, 5.0]
+    assert RegistrationBackoff(initial_s=20.0, maximum_s=1.0).delay(1) == 1.0
+    pending = PendingNodes(backoff)
+    node = FleetNode("board", "Board", "tcp://127.0.0.1:1", token="test-secret")
+    error = FleetError("offline", failure_code="fleet_unreachable")
+    first = pending.record_failure(node, error, 100.0)
+    assert first.next_retry_at == 102.0
+    assert pending.due(101.9) == ()
+    assert pending.due(102.0) == (first,)
+    second = pending.record_failure(node, error, 102.0)
+    assert second.attempts == 2 and second.next_retry_at == 106.0
+    assert "test-secret" not in json.dumps(second.to_dict(102.0))
+    assert pending.expedite("board", 103.0)[0].next_retry_at == 103.0
+    assert pending.discard("board") is not None
+    assert len(pending) == 0
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_registration_backoff_rejects_invalid_delays(value: float) -> None:
+    from leapflow.hardware.fleet_supervision import RegistrationBackoff
+
+    with pytest.raises(ValueError):
+        RegistrationBackoff(initial_s=value)
+    with pytest.raises(ValueError):
+        RegistrationBackoff(maximum_s=value)
+
+
+async def test_all_pending_fleet_recovers_automatically_and_publishes_online_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    import leapflow.hardware.fleet as fleet_module
+    from leapflow.hardware.plugin import HardwareContextPlugin
+
+    server, endpoint = await _start_node(_node_registry(_node_device("arm")), "board")
+    monkeypatch.setenv("LEAPFLOW_FLEET_NODES", json.dumps([
+        {"node_id": "board", "endpoint": endpoint},
+    ]))
+    registry = _node_registry()
+    registry._settings = dataclasses.replace(
+        registry.settings, fleet_retry_initial_s=0.02, fleet_retry_max_s=0.04,
+    )
+    fetch = fleet_module.fetch_node_declarations
+    calls = 0
+
+    async def fail_first(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise FleetError("booting", failure_code="fleet_unreachable")
+        return await fetch(*args, **kwargs)
+
+    monkeypatch.setattr(fleet_module, "fetch_node_declarations", fail_first)
+    plugin = HardwareContextPlugin()
+    plugin._registry = registry
+    plugin._event_bus = type("Bus", (), {"handle_event": AsyncMock()})()
+    plugin._init_fleet_manager()
+    try:
+        await plugin.start_fleet()
+        manager = plugin._fleet_manager
+        assert manager._heartbeat_task is not None
+        topology = manager.topology().to_dict()
+        assert topology["unregistered_nodes"] == 1
+        assert topology["nodes"][0]["status"] == "unregistered"
+        assert topology["nodes"][0]["metadata"]["auto_retry"] is True
+        async with asyncio.timeout(2.0):
+            while manager.route_device("board__arm") is None:
+                await asyncio.sleep(0.01)
+        assert calls == 2
+        assert manager.topology().unregistered_nodes == 0
+        assert manager.topology().online_nodes == 1
+        assert (await registry.read("board__arm", "sensor")).value == 21.5
+        plugin._event_bus.handle_event.assert_awaited_once_with("hw.fleet.node_online", {
+            "source": "board", "node_id": "board", "device_ids": ["arm"], "status": "online",
+        })
+    finally:
+        await plugin._teardown()
+        await server.stop()
+        await registry.close_all()
+
+
+async def test_reconnect_bypasses_backoff_without_duplicate_inflight_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import leapflow.hardware.fleet as fleet_module
+
+    server, endpoint = await _start_node(_node_registry(_node_device("arm")), "board")
+    registry = _node_registry()
+    manager = FleetManager(registry, retry_initial_s=60.0)
+    node = FleetNode("board", "Board", endpoint)
+    manager.defer_node(node, FleetError("booting"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    fetch = fleet_module.fetch_node_declarations
+    calls = 0
+
+    async def parked(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return await fetch(*args, **kwargs)
+
+    monkeypatch.setattr(fleet_module, "fetch_node_declarations", parked)
+    task = None
+    try:
+        assert await manager.retry_pending() == {}
+        task = asyncio.create_task(manager.reconnect("board"))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        concurrent = await manager.reconnect("board")
+        assert concurrent["nodes"]["board"]["retry_in_flight"] is True
+        assert calls == 1
+        release.set()
+        result = await asyncio.wait_for(task, timeout=2.0)
+        assert result["nodes"]["board"]["status"] == "online"
+        assert manager.route_device("board__arm") == "board"
+        unknown = await manager.reconnect("unknown")
+        assert unknown["failure_code"] == "fleet_unknown_node"
+        assert unknown["configured"] == ["board"]
+        assert (await manager.reconnect("board"))["nodes"]["board"]["reachable"] is True
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        await manager.close()
+        await server.stop()
+        await registry.close_all()
+
+
 async def test_cli_read_plane_registers_configured_fleet_nodes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -3,9 +3,9 @@
 
 Kept apart from ``fleet.py`` (the manager mechanics) because node
 configuration is an input boundary with its own concerns: tolerant parsing,
-secret hygiene, and best-effort startup.  P2 grows this module with the
-Settings-based double track and registration backoff; ``FleetManager`` stays
-unaware of where its nodes were configured.
+secret hygiene, and best-effort startup.  Registration backoff for nodes that
+are unreachable at startup lives with the manager (``fleet_supervision.py``);
+``FleetManager`` stays unaware of where its nodes were configured.
 
 It also owns the one thing an operator -- not the fleet -- writes: the
 confirmation that a node's declaration is the one a human reviewed.  A node
@@ -91,11 +91,13 @@ def configured_nodes_from_env() -> tuple[FleetNode, ...]:
 async def register_nodes_safely(
     manager: "FleetManager", nodes: Iterable[FleetNode]
 ) -> tuple[FleetNode, ...]:
-    """Register nodes best-effort; a failing node is logged and skipped.
+    """Register nodes best-effort; a failing node is kept for retry, never fatal.
 
     Both startup paths (the daemon runtime and the in-process CLI read plane)
     share this so one unreachable board can never keep the reachable nodes --
-    or the host's own devices -- from being usable.
+    or the host's own devices -- from being usable. A node that fails is handed
+    to ``manager.defer_node`` so the heartbeat sweep keeps retrying it; dropping
+    it here left a board that was still booting invisible until leapd restarted.
 
     Registrations run concurrently: each unreachable node costs its full
     connect timeout, and a serial loop would add those costs up in front of
@@ -108,14 +110,18 @@ async def register_nodes_safely(
         *(manager.register_node(node) for node in candidates),
         return_exceptions=True,
     )
+    defer = getattr(manager, "defer_node", None)
     registered: list[FleetNode] = []
     for node, result in zip(candidates, results):
-        if isinstance(result, FleetError):
-            # Expected operational failure (board off, wrong token): visible
-            # but not alarming.  P2 owns retry/backoff and re-registration.
-            logger.warning("Fleet: node %r not registered: %s", node.node_id, result)
+        if isinstance(result, Exception):
+            if not isinstance(result, FleetError):
+                logger.warning("Fleet: node %r registration raised", node.node_id, exc_info=result)
+            if callable(defer):
+                defer(node, result)
+            else:
+                logger.warning("Fleet: node %r not registered: %s", node.node_id, result)
         elif isinstance(result, BaseException):
-            logger.warning("Fleet: node %r registration raised", node.node_id, exc_info=result)
+            raise result
         else:
             registered.append(result)
     return tuple(registered)

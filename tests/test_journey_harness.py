@@ -70,6 +70,21 @@ def test_scrub_removes_volatile_substrings() -> None:
     assert "<TS>" in cleaned and "<ID>" in cleaned and "<TMP>" in cleaned
 
 
+def test_context_warning_estimate_is_volatile_but_capacity_and_round_are_not() -> None:
+    """Description-length churn cannot invalidate a warning's semantic shape."""
+    warning = "SYSTEM: Context utilization is high ({used}/32,768 estimated tokens, round 2)."
+    first = _chat_body(warning.format(used="25,607"))
+    second = _chat_body(warning.format(used="25,759"))
+    assert fingerprint(first) == fingerprint(second)
+    assert fingerprint(first) != fingerprint(_chat_body(
+        warning.format(used="25,607").replace("32,768", "65,536"),
+    ))
+    assert fingerprint(first) != fingerprint(_chat_body(
+        warning.format(used="25,607").replace("round 2", "round 3"),
+    ))
+    assert fingerprint(first) != fingerprint(_chat_body("No context warning."))
+
+
 def test_fingerprint_is_stable_across_runs_but_sensitive_to_intent() -> None:
     """Equivalent prompts match; a different question does not."""
     first = _chat_body("list files in /var/folders/ab/T/pytest-1/ws at 2026-08-06T00:00:00Z")
@@ -671,6 +686,27 @@ def test_hermetic_env_drops_inherited_leapflow_variables(
     assert env["LEAPFLOW_DATA_DIR"] == str(tmp_path / "data")
     assert "LEAPFLOW_GATEWAY_MANIFEST" not in env, "inherited LEAPFLOW_* must be stripped"
     assert env["PATH"], "non-LeapFlow environment must be preserved"
+
+
+def test_hermetic_env_child_loads_the_parents_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Scratch-directory subprocesses must verify the checkout used by pytest."""
+    import subprocess
+    import sys
+
+    import leapflow
+
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "unrelated"))
+    env = hermetic_env(data_dir=tmp_path, profile="default", llm_base_url="http://x/v1")
+    package_root = str(Path(leapflow.__file__).resolve().parent.parent)
+    assert env["PYTHONPATH"].split(os.pathsep) == [package_root, str(tmp_path / "unrelated")]
+    result = subprocess.run(
+        [sys.executable, "-c", "import leapflow; print(leapflow.__file__)"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=10,
+        check=True,
+    )
+    assert Path(result.stdout.strip()).resolve() == Path(leapflow.__file__).resolve()
 
 
 def test_hermetic_env_points_every_provider_at_the_proxy(tmp_path: Path) -> None:

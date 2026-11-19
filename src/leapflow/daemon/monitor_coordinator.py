@@ -82,7 +82,9 @@ class MonitorCoordinator:
             self._monitors.producers.register(SessionAnalysisProducer())
             self._monitors.producers.register(SignalObservationProducer())
             self._monitors.producers.register(CapabilityAdaptationProducer())
-            self._monitors.producers.register(PluginHealthProducer())
+            self._plugin_health_producer = PluginHealthProducer()
+            self._plugin_health_producer.configure_from_settings(settings)
+            self._monitors.producers.register(self._plugin_health_producer)
             self._monitors.producers.register(EvolutionProducer())
             self._register_hardware_producer(ctx, settings)
             self._install_evolution_sink(ctx, settings)
@@ -278,6 +280,9 @@ class MonitorCoordinator:
         gate = self._signal_noise_gate
         if gate is not None:
             gate.update_config(SignalNoiseConfig.from_settings(settings))
+        producer = getattr(self, "_plugin_health_producer", None)
+        if producer is not None:
+            producer.configure_from_settings(settings)
 
     def _make_monitor_signal_subscriber(
         self,

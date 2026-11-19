@@ -34,6 +34,7 @@ vendor: "AgileX"
 model: "Piper X"
 location: "workbench_1"
 halt_supported: true
+actuation_state_channel: "arm.enabled"
 
 kinematics:
   chain_type: "serial"
@@ -538,6 +539,7 @@ channels:
     quantity: "state"
     representation: "state"
     effect: "read"
+    sample_rate_hz: 10.0
     description: >-
       True when every motor reports enabled. The motor flags survive an
       emergency stop and a controller fault, so this alone is not evidence that

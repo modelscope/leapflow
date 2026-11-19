@@ -600,6 +600,15 @@ async def test_registry_stream_publication_is_classified_once_and_rebindable(
         assert all(event.event_class == HardwareEventClass.RECORD for event in rebound_events)
         assert len(observed) == channel_count
         assert registry.recent_events(limit=20) == tuple(initial_events + rebound_events)
+        from leapflow.hardware.observability.inventory import build_device_view
+
+        view = build_device_view(registry, context.device_id)
+        for channel in context.channels:
+            summary = registry.channel_summary(context.device_id, channel.channel_id)
+            assert summary is not None and summary["samples"] >= 4
+            assert summary["latest"] == 20.0 and summary["quality"] == Quality.OK.value
+            row = next(ch for ch in view["channels"] if ch["channel_id"] == channel.channel_id)
+            assert row["samples"] == summary["samples"] and row["value"] == 20.0
     finally:
         await registry.close_all()
     assert not (await transport.probe()).connected

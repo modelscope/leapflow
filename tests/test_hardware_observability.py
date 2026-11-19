@@ -990,6 +990,72 @@ def test_restart_waits_for_fresh_confirmation_and_preserves_reminder_progress(tm
         store.close()
 
 
+def test_restart_short_stale_closes_old_checkpoint_without_new_alert(tmp_path: Any) -> None:
+    from leapflow.hardware.transport import Reading
+    from leapflow.monitor.finding_store import FindingStore
+    store = FindingStore(tmp_path / "restart-stale.duckdb")
+    registry = _condition_registry()
+    name = "stale"
+    def sample(reg: Any, at: float, breached: bool) -> None:
+        reg.judgment.condition(name, breached=breached, clear=not breached, now=at,
+            reading=Reading("bench", "uncharted", None, observed_at=_WALL + at))
+    try:
+        sample(registry, 1, True)
+        sample(registry, 1.5, True)
+        old = asyncio.run(HardwareObservationProducer(lambda: registry).observe(_producer_ctx(_WALL + 2)))[0]
+        assert old.severity.value == "alert"
+        store.save(old)
+        registry = _condition_registry()
+        producer = HardwareObservationProducer(lambda: registry, finding_store=store)
+        sample(registry, 100, True)
+        assert all(f.severity.value == "info" for f in asyncio.run(producer.observe(_producer_ctx(_WALL + 100))))
+        sample(registry, 100.11, False)
+        recovery = asyncio.run(producer.observe(_producer_ctx(_WALL + 100.11)))[0]
+        assert recovery.severity.value == "notable"
+        assert recovery.payload["notification"]["phase"] == "recovery"
+        assert recovery.payload["notification"]["episode"] == old.payload["notification"]["episode"]
+        store.save(recovery)
+        assert all(f.severity.value == "info" for f in asyncio.run(producer.observe(_producer_ctx(_WALL + 101))))
+    finally:
+        store.close()
+
+
+def test_cross_runtime_short_reminder_is_suppressed_but_recovery_survives() -> None:
+    from leapflow.hardware.observability.producer import _notification
+    old = {"active": True, "identity": "i", "runtime_id": "old", "episode": "persisted",
+           "source_episode": "old-source", "sequence": 2, "next_report_at": 0}
+    notice = {"phase": "entry", "condition": "stale", "identity": "i", "runtime_id": "new",
+              "episode": "new-source", "duration_s": .11, "revision": 1, "confirm_s": .5}
+    assert _notification(notice, old, 100) is None
+    recovered = _notification({**notice, "phase": "recovery", "revision": 2}, old, 100.11)
+    assert recovered["phase"] == "recovery" and recovered["episode"] == "persisted"
+
+
+@pytest.mark.parametrize("value,quality,age,declared,severity", [
+    (False, "ok", .1, True, "notable"), (0, "ok", .1, True, "notable"),
+    (True, "ok", .1, True, "alert"), (False, "stale", .1, True, "alert"),
+    (False, "ok", 1, True, "alert"), (False, "ok", -.1, True, "alert"),
+    (False, "ok", .1, False, "alert"), (None, "ok", .1, True, "alert"),
+])
+def test_disabled_threshold_severity_requires_fresh_declared_evidence(
+    value: Any, quality: str, age: float, declared: bool, severity: str,
+) -> None:
+    from leapflow.hardware.transport import Reading
+    registry = _condition_registry(hard=True)
+    context = _context(hc_version="hc.v1", actuation_state_channel="arm.enabled" if declared else "")
+    context.channel = lambda _: _channel("arm.enabled")
+    registry.context = lambda _: context
+    registry.latest_sample = lambda *_: Reading("bench", "arm.enabled", value,
+        observed_at=_WALL + 1 - age, quality=quality)
+    _transition(registry, 103, 0)
+    finding = asyncio.run(HardwareObservationProducer(lambda: registry).observe(_producer_ctx(_WALL + 1)))[0]
+    assert finding.severity.value == severity
+    if severity == "notable":
+        assert "Check zero calibration" in finding.summary
+        assert "do not move automatically" in finding.summary
+    assert registry.judgment.states["threshold_exceeded"].active
+
+
 def test_condition_presentation_bound_does_not_limit_monitoring() -> None:
     import json
     from leapflow.hardware.observability.series import HardwareDigest, MAX_PAYLOAD_BYTES

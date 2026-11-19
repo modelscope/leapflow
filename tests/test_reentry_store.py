@@ -221,10 +221,21 @@ def test_schedule_reentry_disclosed_and_blocked_in_subagents() -> None:
     assert "schedule_reentry" in DELEGATE_BLOCKED_TOOLS       # but not for subagents
 
 
-def test_reentry_config_default_off() -> None:
-    from leapflow.config import get_settings
+def test_reentry_config_default_off(tmp_path, monkeypatch) -> None:
+    from leapflow.config import Settings
     from leapflow.config_service import ConfigService
 
-    settings = get_settings()
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("LEAPFLOW_WORKSPACE_ROOT", str(tmp_path))
+    settings = Settings(
+        llm_api_key="",
+        llm_base_url="https://example.invalid/v1",
+        llm_model="test-model",
+        llm_max_retries=0,
+        mock_host=True,
+        duckdb_path=tmp_path / "leap.duckdb",
+        log_level="WARNING",
+        workspace_root=tmp_path,
+    )
     assert settings.agent_reentry_enabled is False            # default off = zero behavior change
     assert "agent.reentry_enabled" in ConfigService(settings).writable_keys()

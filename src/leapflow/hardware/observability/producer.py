@@ -135,7 +135,17 @@ class HardwareObservationProducer:
             )
         base = digest.to_payload()
         for row in conditions:
-            for notice in row.get("pending", ()):
+            pending = list(row.get("pending", ()))
+            restored = checkpoints.get(row["key"], {})
+            # Fresh healthy evidence can close a prior runtime's incident even when
+            # debounce correctly prevented a new entry in this runtime.
+            if (not pending and restored.get("active") and row.get("known")
+                    and row.get("clear") and not row.get("active")
+                    and row.get("identity") == restored.get("identity")
+                    and row.get("runtime_id") != restored.get("runtime_id")):
+                pending.append({**row, "phase": "recovery", "episode": row.get("episode", ""),
+                                "revision": row.get("revision", 0)})
+            for notice in pending:
                 checkpoint = checkpoints.get(row["key"], {})
                 notification = _notification(notice, checkpoint, ctx.now)
                 if notification is None:
@@ -144,6 +154,10 @@ class HardwareObservationProducer:
                 phase, condition = notification["phase"], notice["condition"]
                 hard = condition in _ALERT_EVENTS
                 severity = Severity.NOTABLE if phase == "recovery" or not hard else Severity.ALERT
+                disabled = condition == "threshold_exceeded" and _actuation_disabled(registry, notice, ctx.now)
+                notification["actuation_disabled"] = disabled
+                if disabled:
+                    severity = Severity.NOTABLE
                 where = f"{notice.get('device_id', '')}.{notice.get('channel_id', '')}"
                 detail = (
                     f"{where}: {notice.get('reason', condition)}; raw={notice.get('value')}, "
@@ -151,6 +165,12 @@ class HardwareObservationProducer:
                     f"hard={notice.get('hard_min')}..{notice.get('hard_max')}, "
                     f"margin={notice.get('margin', 0):g}, duration={notice.get('duration_s', 0):.2f}s"
                 )
+                if disabled and phase != "recovery":
+                    detail += (
+                        "; disabled resting pose is outside the declared command range; "
+                        "motion from this pose may be refused. Check zero calibration or "
+                        "return within range under supervision; do not move automatically."
+                    )
                 payload = _fit({**base, "notification": notification})
                 findings.append(
                     Finding(
@@ -279,6 +299,28 @@ def _state_fingerprint(digest: Any) -> str:
     return hashlib.sha256(repr((states, failing, behind)).encode()).hexdigest()[:24]
 
 
+def _actuation_disabled(registry: Any, notice: dict[str, Any], now: float) -> bool:
+    """Only fresh, explicit disabled evidence lowers reporting severity, never safety."""
+    context_for = getattr(registry, "context", None)
+    sample_for = getattr(registry, "latest_sample", None)
+    if not callable(context_for) or not callable(sample_for):
+        return False
+    context = context_for(notice.get("device_id", ""))
+    state_id = getattr(context, "actuation_state_channel", "")
+    if not state_id or context.hc_version != "hc.v1":
+        return False
+    channel = context.channel(state_id)
+    if channel is None or not channel.is_readable or channel.sample_rate_hz <= 0:
+        return False
+    reading = sample_for(context.device_id, state_id)
+    if reading is None or not reading.is_trustworthy:
+        return False
+    age = now - reading.observed_at
+    return 0 <= age <= 2.0 / channel.sample_rate_hz and (
+        reading.value is False or type(reading.value) in (int, float) and reading.value == 0
+    )
+
+
 def _notification(
     notice: dict[str, Any], checkpoint: dict[str, Any], now: float
 ) -> dict[str, Any] | None:
@@ -300,6 +342,9 @@ def _notification(
     )
     if phase == "entry" and continued:
         phase = "reminder"  # restored progress is not restored healthy evidence
+    confirm_s = float(notice.get("confirm_s", 0.5 if notice.get("condition") == "stale" else 0.0))
+    if phase == "reminder" and continued and not same_runtime and notice.get("duration_s", 0.0) < confirm_s:
+        return None
     if phase == "reminder" and continued and now < checkpoint.get("next_report_at", 0.0):
         return None
     episode = checkpoint["episode"] if continued else notice["episode"]

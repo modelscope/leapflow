@@ -302,6 +302,11 @@ class Settings:
     # endpoint, and token_env (preferred) or token. Empty retains the legacy
     # LEAPFLOW_FLEET_NODES environment fallback.
     hardware_fleet_nodes: str = ""
+    # A configured node unreachable at startup (or later dropped from the
+    # registry) is retried with exponential backoff between these bounds, so a
+    # rebooting edge board rejoins without a leapd restart.
+    hardware_fleet_retry_initial_s: float = 5.0
+    hardware_fleet_retry_max_s: float = 60.0
     # JSON bounded rank-only learning policy; never grants motion or trust.
     hardware_view_priors: str = "{}"
     # JSON array of event-to-action rules evaluated by hardware stream sources.
@@ -919,6 +924,11 @@ class Settings:
             "input_tap": False,
         }
     )
+
+    # Rolling plugin reliability policy; applies without restarting leapd.
+    plugin_health_error_rate_threshold: float = 0.25
+    plugin_health_error_window_s: float = 3600.0
+    plugin_health_min_calls: int = 5
 
     # ── Scheduler ──
     scheduler_enabled: bool = True
@@ -1566,6 +1576,12 @@ def _build_settings_from_env(
     # (which persists into runtime.yaml) actually reaches Settings; the legacy
     # LEAPFLOW_FLEET_NODES fallback is applied later, in fleet_config.
     hardware_fleet_nodes = os.getenv("LEAPFLOW_HARDWARE_FLEET_NODES", "").strip()
+    hardware_fleet_retry_initial_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_FLEET_RETRY_INITIAL_S", "5") or 5.0
+    )
+    hardware_fleet_retry_max_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_FLEET_RETRY_MAX_S", "60") or 60.0
+    )
     hardware_view_priors = os.getenv("LEAPFLOW_HARDWARE_VIEW_PRIORS", "{}").strip()
     from leapflow.hardware.view_priors import ViewPriorSettings
     ViewPriorSettings.from_json(hardware_view_priors)
@@ -1837,6 +1853,10 @@ def _build_settings_from_env(
             }
         except Exception:
             logger.warning("Invalid LEAPFLOW_OBSERVER_ENABLED_SET: %s", _observer_enabled_raw)
+
+    plugin_health_error_rate_threshold = float(os.getenv("LEAPFLOW_PLUGIN_HEALTH_ERROR_RATE_THRESHOLD", "0.25"))
+    plugin_health_error_window_s = float(os.getenv("LEAPFLOW_PLUGIN_HEALTH_ERROR_WINDOW_S", "3600"))
+    plugin_health_min_calls = int(os.getenv("LEAPFLOW_PLUGIN_HEALTH_MIN_CALLS", "5"))
 
     # Scheduler
     scheduler_enabled = _bool("LEAPFLOW_SCHEDULER_ENABLED", "true")
@@ -2141,6 +2161,8 @@ def _build_settings_from_env(
         hardware_preview_quality=hardware_preview_quality,
         hardware_preview_idle_timeout_s=hardware_preview_idle_timeout_s,
         hardware_fleet_nodes=hardware_fleet_nodes,
+        hardware_fleet_retry_initial_s=hardware_fleet_retry_initial_s,
+        hardware_fleet_retry_max_s=hardware_fleet_retry_max_s,
         hardware_view_priors=hardware_view_priors,
         hardware_alert_policies=hardware_alert_policies,
         hardware_advisory_limits=hardware_advisory_limits,
@@ -2274,6 +2296,9 @@ def _build_settings_from_env(
         # Observer / Daemon
         observer_auto_start=observer_auto_start,
         observer_enabled_set=observer_enabled_set,
+        plugin_health_error_rate_threshold=plugin_health_error_rate_threshold,
+        plugin_health_error_window_s=plugin_health_error_window_s,
+        plugin_health_min_calls=plugin_health_min_calls,
         # Scheduler
         scheduler_enabled=scheduler_enabled,
         scheduler_tick_seconds=scheduler_tick_seconds,

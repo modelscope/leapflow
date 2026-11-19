@@ -196,6 +196,57 @@ _BLOCKED_CWD_PREFIXES: FrozenSet[str] = frozenset({
     "/System", "/usr", "/bin", "/sbin", "/var/root",
 })
 
+# Commands that stop the leapd hosting this turn. The turn runs inside that
+# process, so a restart issued from here (even detached via nohup/disown) tears
+# the turn down mid-flight and the client sees an unexplained disconnect. Not
+# approvable: the only safe executor of a daemon restart is the user, after the
+# turn. ``leap daemon stop|restart`` itself also refuses via the inherited
+# LEAPFLOW_HOST_DAEMON_PID marker; this is the defense in depth that also
+# covers direct signals.
+_LEAPD_PROCESS = r"(?:leapd\b|daemon\s+serve\b)"
+_SELF_TERMINATION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bleap\s+daemon\s+(?:stop|restart)\b", re.IGNORECASE),
+    re.compile(rf"\b(?:pkill|killall)\b[^\n;&|]*{_LEAPD_PROCESS}", re.IGNORECASE),
+    re.compile(
+        rf"\bkill\b[^\n;&|]*(?:\$\(|`)[^)`]*(?:{_LEAPD_PROCESS}|leapd\.pid)",
+        re.IGNORECASE,
+    ),
+]
+_KILL_OPERANDS = re.compile(r"\bkill\b((?:\s+-?[\w-]+)+)")
+_SELF_TERMINATION_NEXT_STEP = (
+    "Do not stop or restart leapd from inside a turn: this turn runs in that process. "
+    "For an unreachable fleet node call hw_fleet_reconnect (registration is also "
+    "retried automatically). For a restart-required setting, finish the turn and tell "
+    "the user to run `leap daemon restart` themselves."
+)
+
+
+def _host_daemon_pids() -> set[str]:
+    pids = {str(os.getpid())}
+    marker = os.environ.get("LEAPFLOW_HOST_DAEMON_PID", "").strip()
+    if marker:
+        pids.add(marker)
+    return pids
+
+
+def _is_self_termination(command: str) -> bool:
+    """Return whether ``command`` would stop the leapd that runs this turn."""
+    if any(p.search(command) for p in _SELF_TERMINATION_PATTERNS):
+        return True
+    # Expand only this protected marker, never arbitrary shell text or substitutions.
+    marker = os.environ.get("LEAPFLOW_HOST_DAEMON_PID", str(os.getpid()))
+    target_text = re.sub(r"\$\{LEAPFLOW_HOST_DAEMON_PID\}|\$LEAPFLOW_HOST_DAEMON_PID\b", marker, command)
+    target_text = target_text.replace('"', "").replace("'", "")
+    pids = _host_daemon_pids()
+    for match in _KILL_OPERANDS.finditer(target_text):
+        tokens = match.group(1).split()
+        if "-0" in tokens:  # liveness probe, sends no signal
+            continue
+        if any(token in pids for token in tokens):
+            return True
+    return False
+
+
 # Module-level approval gate (injected by orchestrator; None = auto-deny dangerous)
 _approval_gate: CommandApprovalGate | None = None
 
@@ -339,6 +390,19 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
             failure_code="shell_command_required",
             retryable=False,
             cwd=cwd,
+        )
+
+    if _is_self_termination(command):
+        return _shell_failure_result(
+            error=(
+                "Command blocked: it would stop the leapd process that is running this "
+                "turn, terminating the turn mid-flight."
+            ),
+            failure_class="safety_policy",
+            failure_code="self_termination_blocked",
+            retryable=False,
+            cwd=cwd,
+            extra={"side_effect_state": "none", "next_step": _SELF_TERMINATION_NEXT_STEP},
         )
 
     if _is_hardline_blocked(command):
