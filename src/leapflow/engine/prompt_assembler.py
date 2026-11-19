@@ -80,6 +80,7 @@ class PromptAssembler:
         # reflect calls made in THIS turn, not the full session.
         if self._engine._guardrail is not None:
             self._engine._guardrail.reset()
+        self._engine._last_guardrail_halt = None
         self._engine._current_command_id = self._engine._current_task_contract.task_id
         self._engine._tool_execution_ledger.reset(store=self._engine._conversation_store)
         try:

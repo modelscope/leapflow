@@ -6,7 +6,8 @@ orchestrator -- the agent loop, public entry points, and thin delegation
 wrappers. Behavior is progressively extracted into delegate components and
 sub-packages; the remaining length is loop-iteration state shared across
 those components, which resists further splitting without indirection that
-costs more than it saves."""
+costs more than it saves. Guardrail stop context is handed from that loop to
+its existing tool-free finalization helpers; cap policy stays in tools/."""
 
 from __future__ import annotations
 
@@ -246,6 +247,9 @@ class AgentEngine:
 
         # Tool loop guardrails (injected by CLI)
         self._guardrail: Optional[Any] = None
+        # The guardrail violation that stopped the current turn, if any; read by
+        # the forced-finalize path so the user is told why and how to resume.
+        self._last_guardrail_halt: Optional[Any] = None
 
         # Optional override for dynamic tool result budget (set by CLI wiring)
         self._tool_result_budget: Optional[int] = None
@@ -2362,6 +2366,7 @@ class AgentEngine:
                     break
 
             if self._tool_dispatch._check_guardrail(messages) == "halt":
+                content = ""  # A text tool request is not a final answer.
                 break
 
             if status == BudgetStatus.SOFT_LIMIT and not self._should_extend_budget(
@@ -2417,7 +2422,10 @@ class AgentEngine:
             fallback = (
                 _app_onboarding_recovery_message(messages)
                 or _last_tool_failures_recovery_message(messages, include_generic=False)
-                or await self._synthesize_forced_answer(messages)
+                or await self._synthesize_forced_answer(
+                    messages, stop_reason=getattr(self._last_guardrail_halt, "reason", None)
+                )
+                or (self._budget_exhausted_response(messages) if self._last_guardrail_halt else "")
                 or _last_tool_failures_recovery_message(messages)
                 or fatal_error
                 or self._budget_exhausted_response(messages)
@@ -2533,7 +2541,9 @@ class AgentEngine:
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
-    async def _synthesize_forced_answer(self, messages: List[Dict[str, Any]]) -> str:
+    async def _synthesize_forced_answer(
+        self, messages: List[Dict[str, Any]], *, stop_reason: str | None = None
+    ) -> str:
         """One tool-free LLM round to answer with what the turn already gathered.
 
         A turn can stop before the model has written a final answer: a detected
@@ -2549,7 +2559,17 @@ class AgentEngine:
         """
         try:
             prompt = list(messages)
-            prompt.append(build_user_message_text(_FORCED_FINALIZE_PROMPT))
+            finalize_prompt = _FORCED_FINALIZE_PROMPT
+            if stop_reason:
+                finalize_prompt += (
+                    f"\nThis turn stopped because: {stop_reason}. "
+                    "In the user's language, distinguish completed steps from steps not yet executed. "
+                    "Explain that replying 'continue' resumes the remaining work in a new turn. "
+                    "Do not claim the task is complete without evidence. "
+                    "Completed or uncertain side effects must be verified before repeating actions; "
+                    "continuation does not bypass existing safety or approval gates."
+                )
+            prompt.append(build_user_message_text(finalize_prompt))
             compressed = self._prompt_assembler._prepare_llm_messages(
                 self._healer.heal(prompt), tools=None, round_number=0
             )
@@ -2571,9 +2591,17 @@ class AgentEngine:
         open-question count and next step so the stop is informative and
         continuable (not a bare dead-stop); otherwise the plain notice.
         """
-        base = (
-            "I've reached my reasoning step limit. Here's my best answer based on progress so far."
-        )
+        halt = getattr(self, "_last_guardrail_halt", None)
+        if halt is not None:
+            base = (
+                f"This turn stopped: {halt.reason}. "
+                "Reply 'continue' to continue the remaining work in a new turn. "
+                "Completed or uncertain actions must be verified before they are repeated."
+            )
+        else:
+            base = (
+                "I've reached my reasoning step limit. Here's my best answer based on progress so far."
+            )
         led = self._research_ledger
         if led.is_empty or led.open_question_count == 0:
             return base

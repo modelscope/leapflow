@@ -141,6 +141,93 @@ async def test_concurrent_session_engines_are_isolated() -> None:
             lt.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("custom_guard", [False, True])
+async def test_concurrent_session_guardrail_baselines_are_independent(custom_guard) -> None:
+    """Starting B in another workspace cannot reset A's active-turn call budget."""
+    from leapflow.engine.session.session_factory import build_session_engine
+    from leapflow.engine.tools.tool_guardrails import CompositeGuardrail, TurnCapGuard
+    from leapflow.memory import WorkingMemoryProvider
+
+    class CustomGuard:
+        def __init__(self) -> None:
+            self.cap = TurnCapGuard(max_calls=3, hard_max_calls=5)
+
+        def check(self, history):
+            return self.cap.check(history)
+
+        def reset(self):
+            self.cap.reset()
+
+    def history(count: int) -> list[dict]:
+        return [{"role": "assistant", "tool_calls": [
+            {"id": str(index), "function": {"name": "read", "arguments": {"index": index}}},
+        ]} for index in range(count)]
+
+    with tempfile.TemporaryDirectory() as td:
+        base, lt = _build_base_engine(td, _EchoLLM())
+        try:
+            base._guardrail = CustomGuard() if custom_guard else CompositeGuardrail(
+                guards=[TurnCapGuard(max_calls=3, hard_max_calls=5)],
+            )
+            base._guardrail.check(history(120))
+            base._last_guardrail_halt = object()
+            a, b = [build_session_engine(
+                base, session_id=name, working_memory=WorkingMemoryProvider(max_tokens=512),
+                workspace_root=f"/tmp/work-{name}",
+            ) for name in ("a", "b")]
+            assert a._guardrail is not b._guardrail and a._guardrail is not base._guardrail
+            assert a._last_guardrail_halt is b._last_guardrail_halt is None
+            a_started, b_started = asyncio.Event(), asyncio.Event()
+
+            async def run_a():
+                assert not a._guardrail.check(history(120)).violated  # Fresh baseline.
+                a_started.set()
+                await asyncio.wait_for(b_started.wait(), timeout=2)
+                violation = a._guardrail.check(history(123))
+                assert violation.violated and violation.reason.endswith("(3/3)")
+                assert a._current_session_id == "a"
+
+            async def run_b():
+                await asyncio.wait_for(a_started.wait(), timeout=2)
+                b._guardrail.reset()
+                assert not b._guardrail.check(history(200)).violated
+                b_started.set()
+                await asyncio.sleep(0)
+                assert not b._guardrail.check(history(201)).violated
+                assert b._current_session_id == "b"
+
+            await asyncio.gather(run_a(), run_b())
+            assert a._settings.workspace_root != b._settings.workspace_root
+            assert not base._guardrail.check(history(122)).violated
+        finally:
+            lt.close()
+
+
+def test_fresh_composite_guardrail_restores_soft_cap_without_mutating_original() -> None:
+    from leapflow.engine.tools.tool_guardrails import CompositeGuardrail, TurnCapGuard
+
+    cap = TurnCapGuard(max_calls=3, hard_max_calls=8)
+    guard = CompositeGuardrail(guards=[cap])
+    guard.check([])
+    assert guard.extend_turn_cap(2) == 5
+    fresh = guard.fresh()
+    assert fresh._guards[0] is not cap
+    assert fresh._guards[0].cap == 3 and cap.cap == 5
+    assert not fresh.check([]).violated
+    assert fresh.extend_turn_cap(3) == 6 and cap.cap == 5
+    assert CompositeGuardrail(guards=[CustomNoCapGuard()]).extend_turn_cap(3) is None
+
+
+class CustomNoCapGuard:
+    def check(self, history):
+        from leapflow.engine.tools.tool_guardrails import GuardrailViolation
+        return GuardrailViolation(violated=False)
+
+    def reset(self):
+        pass
+
+
 def test_ensure_session_creates_a_provided_session_id() -> None:
     """A daemon-bound (client-owned) session id is created-if-not-exists, so a
     distinct per-TUI session persists even though the engine did not mint it."""
