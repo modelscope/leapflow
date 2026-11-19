@@ -29,10 +29,11 @@ _FLEET_WRITE_META = {
 def build_fleet_tools(fleet_manager: "FleetManager") -> list["ToolMetadata"]:
     """Generate ToolMetadata for fleet management tools.
 
-    Three tools are exposed:
+    Four tools are exposed:
 
     - ``hw_fleet_status`` — show fleet topology, node health, device count
     - ``hw_fleet_discover`` — probe endpoints for new nodes
+    - ``hw_fleet_reconnect`` — retry registering configured nodes now
     - ``hw_fleet_halt_all`` — emergency stop all fleet devices
     """
     from leapflow.plugins.protocol import ToolMetadata
@@ -83,6 +84,15 @@ def build_fleet_tools(fleet_manager: "FleetManager") -> list["ToolMetadata"]:
             "total": len(nodes),
         }
 
+    async def _fleet_reconnect(**kwargs: Any) -> dict[str, Any]:
+        """Retry registration of unregistered configured nodes immediately.
+
+        Connects and reads declarations only; nothing is actuated, so no
+        approval is involved.
+        """
+        node = str(kwargs.get("node") or "").strip() or None
+        return await fleet_manager.reconnect(node)
+
     async def _fleet_halt_all(**kwargs: Any) -> dict[str, Any]:
         """Emergency stop ALL fleet devices on ALL nodes."""
         halt_map = await fleet_manager.halt_all()
@@ -128,6 +138,29 @@ def build_fleet_tools(fleet_manager: "FleetManager") -> list["ToolMetadata"]:
             handler=_fleet_discover,
             x_leapflow=dict(_FLEET_READ_META),
             provides_capabilities=("hw.fleet.discover",),
+        ),
+        ToolMetadata(
+            name="hw_fleet_reconnect",
+            description=(
+                "Retry registering configured fleet nodes that are 'unregistered' "
+                "(unreachable when leapd started or since). Unregistered nodes are "
+                "already retried automatically with backoff; this retries now, e.g. "
+                "right after an edge board finished booting. Connects and reads "
+                "declarations only -- never actuates. Use this instead of restarting "
+                "leapd; omit node to retry every unregistered node."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Configured node_id to retry; omit for all.",
+                    },
+                },
+            },
+            handler=_fleet_reconnect,
+            x_leapflow=dict(_FLEET_READ_META),
+            provides_capabilities=("hw.fleet.reconnect",),
         ),
         ToolMetadata(
             name="hw_fleet_halt_all",

@@ -919,6 +919,8 @@ class HardwareContext:
     safety: SafetyPolicy | None = None
     trust_config: TrustConfig | None = None
     degradation: DegradationPolicy | None = None
+    # Optional hc.v1 state channel; reporting only, never a safety exemption.
+    actuation_state_channel: str = ""
     control_bindings: Mapping[str, Any] | None = None
     """Raw control_bindings section from the YAML declaration.
 
@@ -977,6 +979,7 @@ class HardwareContext:
             safety=self.safety,
             trust_config=self.trust_config,
             degradation=self.degradation,
+            actuation_state_channel=self.actuation_state_channel,
             control_bindings=self.control_bindings,
         )
 
@@ -1013,6 +1016,8 @@ class HardwareContext:
             result["degradation"] = self.degradation.to_dict()
         if self.control_bindings is not None:
             result["control_bindings"] = dict(self.control_bindings)
+        if self.actuation_state_channel:
+            result["actuation_state_channel"] = self.actuation_state_channel
         return result
 
     @classmethod
@@ -1073,6 +1078,7 @@ class HardwareContext:
             safety=safety,
             trust_config=trust_config,
             degradation=degradation,
+            actuation_state_channel=str(data.get("actuation_state_channel") or ""),
             control_bindings=control_bindings,
         )
 

@@ -150,6 +150,26 @@ def test_run_local_reconciles_fleet_nodes_before_actions(
     assert _json_out(capsys)["ok"] is True
 
 
+@pytest.mark.parametrize("json_mode", [True, False])
+def test_hw_list_refuses_before_opening_daemon_owned_store(monkeypatch, tmp_path, capsys, json_mode) -> None:
+    import leapflow.cli.commands.hardware as module
+    from leapflow.daemon.lifecycle import DaemonInfo
+    monkeypatch.setattr(module, "load_config", lambda: make_settings(str(tmp_path)))
+    monkeypatch.setattr(DaemonInfo, "discover", lambda _: SimpleNamespace(is_running=True, pid=4242))
+    def forbidden(_):
+        raise AssertionError("list must not create a second hardware registry")
+    monkeypatch.setattr(module, "_build_local_registry", forbidden)
+    assert module.cmd_hardware(_ns("list", json=json_mode)) != 0
+    output = capsys.readouterr()
+    if json_mode:
+        payload = json.loads(output.out)
+        assert payload["failure_code"] == "hardware_store_owned_by_daemon"
+        assert payload["side_effect_state"] == "none"
+        assert "leap daemon status" in payload["next_step"]
+    else:
+        assert "leap daemon status" in output.out + output.err
+
+
 def test_hw_describe_returns_full_reference(monkeypatch, tmp_path, capsys) -> None:
     from leapflow.cli.commands.hardware import cmd_hardware
 

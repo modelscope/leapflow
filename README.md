@@ -162,7 +162,7 @@ The host sends **goals**; the node decomposes them locally. A skill is planned o
 | Act | `hw_configure` · `hw_actuate` · `hw_dispense` · `hw_batch_actuate` | approval-gated |
 | Safety | `hw_estop` | no approval — node-local; holds in place, reports `stop_effect` / `stop_verified` |
 | Control | `hw_control_start` · `hw_control_stop` · `hw_control_status` | leased deadman |
-| Fleet | `hw_fleet_status` · `hw_fleet_discover` · `hw_fleet_halt_all` | multi-node |
+| Fleet | `hw_fleet_status` · `hw_fleet_discover` · `hw_fleet_reconnect` · `hw_fleet_halt_all` | multi-node; unreachable nodes auto-retry |
 | Skills | `hw_skill_list` · `hw_skill_run` · `hw_skill_status` · `hw_skill_stop` | plan-digest approval, node-local |
 | Data | `hw_skill_label` | labels a recorded episode's outcome |
 

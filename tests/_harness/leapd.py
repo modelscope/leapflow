@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+import leapflow
+
 from leapflow.daemon.client import DaemonClient
 from leapflow.daemon.lifecycle import DaemonInfo, cleanup_stale, wait_ready
 from leapflow.daemon._transport import get_transport
@@ -139,6 +141,11 @@ def hermetic_env(
     )
     if extra:
         env.update({str(k): str(v) for k, v in extra.items()})
+    # pytest's source path is process-local. A child started in its scratch root
+    # must load the same package as the parent, not a stale installed release.
+    package_root = str(Path(leapflow.__file__).resolve().parent.parent)
+    inherited_paths = [part for part in env.get("PYTHONPATH", "").split(os.pathsep) if part]
+    env["PYTHONPATH"] = os.pathsep.join([package_root, *inherited_paths])
     return env
 
 

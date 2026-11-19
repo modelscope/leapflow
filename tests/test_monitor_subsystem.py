@@ -6,6 +6,7 @@ No network, no LLM: uses a temporary DuckDB and a fake in-process producer.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,7 @@ from leapflow.monitor import (
     WatchSpec,
 )
 from leapflow.monitor.finding_store import FindingStore
-from leapflow.monitor.types import ProducerContext
+from leapflow.monitor.types import FindingDelivery, ProducerContext
 from leapflow.scheduler.coordinator import parse_trigger_expression
 from leapflow.scheduler.triggers import create_trigger
 from leapflow.scheduler.triggers.event import EventTrigger
@@ -48,6 +49,66 @@ class _FakeProducer:
 
 def _holder(tmp_path: Path) -> LocalConnectionHolder:
     return LocalConnectionHolder(tmp_path / "leap.duckdb")
+
+
+@pytest.mark.parametrize("operation", ["pause", "mute", "stop"])
+async def test_slow_producer_cannot_repage_after_consent_changes(tmp_path, operation):
+    entered, release = asyncio.Event(), asyncio.Event()
+    class SlowProducer(_FakeProducer):
+        async def observe(self, ctx):
+            entered.set()
+            await release.wait()
+            return await super().observe(ctx)
+    holder = _holder(tmp_path)
+    events = []
+    manager = MonitorManager(holder=holder, emit=lambda kind, payload: events.append((kind, payload)))
+    manager.producers.register(SlowProducer("test", [Finding(watch_id="", domain="test", title="critical",
+                                                           severity=Severity.CRITICAL)]))
+    watch = await manager.arm_watch(WatchSpec(name="slow", domain="test"))
+    running = asyncio.create_task(manager.run_watch_once(watch.watch_id))
+    await entered.wait()
+    if operation == "pause":
+        manager.pause_watch(watch.watch_id)
+    elif operation == "stop":
+        manager.stop_watch(watch.watch_id)
+    else:
+        manager.set_muted(watch.watch_id, True)
+    release.set()
+    assert (await running)["ok"]
+    await manager.delivery.flush()
+    assert manager.finding_store.count() == 1
+    assert not [event for event in events if event[0] == EVENT_FINDING]
+    await manager.stop()
+    holder.close()
+
+
+async def test_live_reoffer_reuses_persisted_reference_after_failed_freshness(tmp_path):
+    holder = _holder(tmp_path)
+    events = []
+    manager = MonitorManager(holder=holder, emit=lambda kind, payload: events.append((kind, payload)))
+    finding = Finding(watch_id="", domain="test", title="Current critical incident",
+                      severity=Severity.CRITICAL, dedup_key="same-episode",
+                      delivery=FindingDelivery(key="stable"))
+    manager.producers.register(_FakeProducer("test", [finding]))
+    watch = await manager.arm_watch(WatchSpec(name="current", domain="test"))
+    async def stale(candidates, now):
+        return {}
+    manager.delivery._validate = stale
+    await manager.run_watch_once(watch.watch_id)
+    await manager.delivery.flush()
+    persisted = manager.list_findings(watch_id=watch.watch_id)[0]
+    assert not [event for event in events if event[0] == EVENT_FINDING]
+    manager.delivery._validate = manager._validate_delivery
+    await manager.run_watch_once(watch.watch_id)
+    await manager.delivery.flush()
+    notices = [event[1] for event in events if event[0] == EVENT_FINDING]
+    assert notices[0]["items"][0]["finding_id"] == persisted.finding_id
+    assert manager.finding_store.count() == 1
+    await manager.run_watch_once(watch.watch_id)
+    await manager.delivery.flush()
+    assert len([event for event in events if event[0] == EVENT_FINDING]) == 1
+    await manager.stop()
+    holder.close()
 
 
 # ── Contract serialization ────────────────────────────────────────────────
@@ -168,6 +229,7 @@ async def test_manager_run_once_persists_and_gates_push(tmp_path: Path) -> None:
         Finding(watch_id="", domain="finance", title="quiet", severity=Severity.INFO, dedup_key="i"),
         Finding(watch_id="", domain="finance", title="move", severity=Severity.NOTABLE, dedup_key="n"),
         Finding(watch_id="", domain="finance", title="spike", severity=Severity.ALERT, dedup_key="a"),
+        Finding(watch_id="", domain="finance", title="interruption", severity=Severity.CRITICAL, dedup_key="c"),
     ]))
     manager = MonitorManager(
         holder=_holder(tmp_path),
@@ -178,24 +240,26 @@ async def test_manager_run_once_persists_and_gates_push(tmp_path: Path) -> None:
 
     result = await manager.run_watch_once(view.watch_id)
     assert result["ok"] is True
-    assert result["findings"] == 3  # all persisted
+    assert result["findings"] == 4  # all persisted, including filtered evidence
+    await manager.delivery.flush()
     finding_events = [p for et, p in emitted if et == EVENT_FINDING]
-    assert {p["title"] for p in finding_events} == {"move", "spike"}  # info gated out
+    assert len(finding_events) == 1
+    assert [item["title"] for item in finding_events[0]["items"]] == ["interruption"]
 
     # Second cycle: dedup keys already present -> nothing new persisted/pushed.
-    before = len(emitted)
     result2 = await manager.run_watch_once(view.watch_id)
     assert result2["findings"] == 0
-    assert len(emitted) == before
-
-    assert manager.finding_store.count(watch_id=view.watch_id) == 3
+    await manager.delivery.flush()
+    assert len([p for et, p in emitted if et == EVENT_FINDING]) == 1
+    assert manager.finding_store.count(watch_id=view.watch_id) == 4
+    await manager.stop()
 
 
 async def test_manager_muted_watch_persists_without_push(tmp_path: Path) -> None:
     emitted: list[tuple[str, dict]] = []
     producers = ProducerRegistry()
     producers.register(_FakeProducer("sentiment", [
-        Finding(watch_id="", domain="sentiment", title="surge", severity=Severity.ALERT, dedup_key="s"),
+        Finding(watch_id="", domain="sentiment", title="surge", severity=Severity.CRITICAL, dedup_key="s")
     ]))
     manager = MonitorManager(
         holder=_holder(tmp_path),

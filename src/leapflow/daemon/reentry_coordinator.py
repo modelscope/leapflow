@@ -46,6 +46,9 @@ class ReentryCoordinator:
         ``agent_reentry_enabled`` (default off) plus a
         global-budget backstop. Best-effort: never blocks startup.
         """
+        if self.is_running():
+            return
+        self._ctx = ctx
         try:
             store = getattr(ctx, "_reentry_store", None)
             manager = getattr(ctx, "_subagent_manager", None)
@@ -145,6 +148,15 @@ class ReentryCoordinator:
 
     async def stop(self) -> None:
         """Stop the reentry driver and wait for task completion."""
+        ctx = getattr(self, "_ctx", None)
+        if ctx is not None:
+            ctx._reentry_event_observer = None
+            ctx._reentry_hardware_observer = None
+            registry = getattr(ctx, "_hardware_registry", None)
+            if registry is not None:
+                registry.set_deliberative_observer(None)
+        self._ctx = None
+        self._reentry_service = None
         if self._reentry_stop is not None:
             self._reentry_stop.set()
         if self._reentry_task is not None:

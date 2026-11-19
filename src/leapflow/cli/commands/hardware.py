@@ -142,6 +142,8 @@ async def _dispatch(args: argparse.Namespace, action: str) -> int:
         return await _run_verification(action, args, json_mode)
     if action == "permit-key":
         return _run_permit_key(args, json_mode)
+    if action == "fleet":
+        return await _run_fleet(args, json_mode)
     if action in _ONBOARDING_ACTIONS:
         return await _run_onboarding(action, args, json_mode)
     _fail(f"Unknown hw action: {action}")
@@ -271,6 +273,18 @@ async def _register_fleet_read_plane(registry: Any) -> None:
 
 async def _run_local(action: str, args: argparse.Namespace, json_mode: bool) -> int:
     settings = load_config()
+    if action == "list":
+        from leapflow.daemon.lifecycle import DaemonInfo
+
+        info = DaemonInfo.discover(settings.runtime_dir)
+        if info.is_running:
+            return _emit_result(action, {
+                "ok": False, "code": "hardware_store_owned_by_daemon",
+                "failure_code": "hardware_store_owned_by_daemon",
+                "failure_class": "resource_busy", "side_effect_state": "none",
+                "error": f"leapd (pid={info.pid}) owns the hardware database; local reconciliation is unavailable.",
+                "next_step": "Use hw_list in the TUI or `leap daemon status`; do not restart leapd inside a turn.",
+            }, json_mode)
     registry = _build_local_registry(settings)
     if registry is None:
         return _emit_result(
@@ -374,6 +388,41 @@ async def _run_sampling_control(
     return _emit_result(action, result, json_mode)
 
 
+async def _run_fleet(args: argparse.Namespace, json_mode: bool) -> int:
+    """``leap hw fleet reconnect [node]`` -- retry node registration inside leapd.
+
+    Fleet supervision lives only in leapd, so this always routes through its RPC;
+    retrying in this process would register the node into a throwaway registry.
+    """
+    fleet_action = getattr(args, "fleet_action", None)
+    if fleet_action != "reconnect":
+        _fail("Usage: leap hw fleet reconnect [node]")
+        return 1
+    node = str(getattr(args, "node", "") or "").strip()
+    action = "fleet reconnect"
+    info = _discover_daemon(load_config())
+    if info is None:
+        return _emit_result(
+            action,
+            {
+                "ok": False,
+                "code": "daemon_required",
+                "error": (
+                    "Fleet nodes are supervised by leapd, which is not running. Start it with "
+                    "`leap daemon start`; configured nodes register on startup and are "
+                    "retried automatically while unreachable."
+                ),
+            },
+            json_mode,
+        )
+    client = DaemonClient(info.sock_path)
+    try:
+        result = await client.hardware_fleet_reconnect(node)
+    except DaemonUnavailableError as exc:
+        result = {"ok": False, "code": "daemon_error", "error": f"leapd request failed: {exc}"}
+    return _emit_result(action, result, json_mode)
+
+
 # ── Output ─────────────────────────────────────────────────────────────────
 
 
@@ -417,6 +466,8 @@ def _render(action: str, result: dict[str, Any]) -> None:
     print(f"{_CYAN}LEAP Hardware \u2014 {action}{_RESET}")
     if not result.get("ok"):
         _fail(str(result.get("error") or result.get("code") or "command failed"))
+        if result.get("next_step"):
+            _info(str(result["next_step"]))
         return
     renderer = {
         "list": _render_list,
@@ -427,9 +478,32 @@ def _render(action: str, result: dict[str, Any]) -> None:
         "pause": _render_sampling,
         "resume": _render_sampling,
         "replay": _render_replay,
+        "fleet reconnect": _render_fleet_reconnect,
     }.get(action)
     if renderer is not None:
         renderer(result)
+
+
+def _render_fleet_reconnect(result: dict[str, Any]) -> None:
+    nodes = result.get("nodes") or {}
+    if not nodes:
+        _info("No unregistered fleet nodes; every configured node is registered.")
+        return
+    for node_id, outcome in nodes.items():
+        status = str(outcome.get("status") or "")
+        if status == "online":
+            devices = ", ".join(outcome.get("device_ids") or []) or "(none)"
+            _ok(f"{node_id} online — devices: {devices}")
+        elif outcome.get("retry_in_flight"):
+            _info(f"{node_id}: a retry is already in progress")
+        elif status == "unregistered":
+            _warn(
+                f"{node_id} still unreachable: {outcome.get('last_error')} "
+                f"(attempt {outcome.get('attempts')}, next automatic retry in "
+                f"{outcome.get('next_retry_in_s')}s)"
+            )
+        else:
+            _info(f"{node_id}: {status or outcome}")
 
 
 def _render_list(result: dict[str, Any]) -> None:

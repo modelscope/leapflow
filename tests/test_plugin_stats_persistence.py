@@ -24,7 +24,7 @@ from leapflow.engine.session.session_factory import (
     persist_plugin_trust_state,
 )
 from leapflow.engine.turn_usage import TurnUsageTracker
-from leapflow.learning.plugin_stats import PluginUsageTracker
+from leapflow.learning.plugin_stats import GRADING_VERSION, PluginUsageTracker
 from leapflow.learning.plugin_stats_store import PluginStatsStore
 from leapflow.learning.plugin_trust import PluginTrustLedger, PluginTrustLevel, trust_history
 
@@ -280,6 +280,7 @@ class TestUsageStateRoundTrip:
     def test_malformed_sample_rows_are_skipped(self) -> None:
         """A truncated blob loses samples, never startup."""
         state = {
+            "grading_version": GRADING_VERSION,
             "max_samples_per_tool": 500,
             "samples": {
                 "good_tool": [[1.0, True, 5.0], [2.0, False, 7.0]],
@@ -292,6 +293,18 @@ class TestUsageStateRoundTrip:
         assert len(restored._samples["good_tool"]) == 2
         assert len(restored._samples.get("broken_tool", [])) == 0
         assert "wrong_shape" not in restored._samples
+
+    @pytest.mark.parametrize("version", [None, GRADING_VERSION - 1, GRADING_VERSION + 1])
+    def test_obsolete_grades_are_discarded(self, version: int | None) -> None:
+        tracker = PluginUsageTracker()
+        tracker.record("config_get", False, 4.0)
+        state = tracker.to_state()
+        assert state["grading_version"] == GRADING_VERSION
+        if version is None:
+            state.pop("grading_version")
+        else:
+            state["grading_version"] = version
+        assert PluginUsageTracker.load_state(state)._samples == {}
 
     def test_persisted_window_uses_tracker_sample_limit(self) -> None:
         """Persistence uses the tracker-configured sample window, not a new limit."""
@@ -357,6 +370,7 @@ class TestUsageSinkWiring:
         db_path = _db(tmp_path)
         PluginStatsStore(db_path).save_usage_state(
             {
+                "grading_version": GRADING_VERSION,
                 "max_samples_per_tool": 500,
                 "samples": {"legacy_tool": [[1.0, True, 4.0], [2.0, False, 9.0]]},
             }
@@ -369,6 +383,22 @@ class TestUsageSinkWiring:
         assert len(advisor._usage_tracker._samples["legacy_tool"]) == 2
         # The restored tracker is still wired to the trust ledger.
         assert advisor._usage_tracker._trust_ledger is advisor._trust_ledger
+
+    def test_legacy_usage_discard_does_not_reset_trust(
+        self, tmp_path: Path, reset_singletons
+    ) -> None:
+        sf, pa = reset_singletons
+        store = PluginStatsStore(_db(tmp_path))
+        ledger = PluginTrustLedger(candidate_at=1)
+        ledger.record_success("config_tools")
+        store.save_trust_state(ledger.to_state())
+        store.save_usage_state({"samples": {"config_get": [[1, False, 9]]}})
+        sf._wire_plugin_stats_sink(TurnUsageTracker(), db_path=_db(tmp_path))
+        advisor = pa.get_default_advisor()
+        assert advisor._usage_tracker._samples == {}
+        assert advisor._trust_ledger.level("config_tools") is PluginTrustLevel.CANDIDATE
+        assert persist_plugin_trust_state()
+        assert store.load_usage_state()["grading_version"] == GRADING_VERSION
 
     def test_corrupt_usage_state_degrades_to_empty_tracker(
         self, tmp_path: Path, reset_singletons

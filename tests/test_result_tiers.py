@@ -256,7 +256,7 @@ def test_stats_and_report_keep_the_three_rates_apart() -> None:
     assert row["failure_codes"] == {"unreachable": 2, "invalid_args": 1, "guard_failed": 1}
 
 
-def test_persistence_round_trips_tiers_and_loads_legacy_rows() -> None:
+def test_persistence_round_trips_tiers_and_discards_legacy_grading() -> None:
     tracker, _, _ = _tracker()
     tracker.record("hw_skill_run", False, 10.0, tier=TIER_REFUSED, failure_code="unreachable")
     restored = PluginUsageTracker.load_state(tracker.to_state())
@@ -266,8 +266,7 @@ def test_persistence_round_trips_tiers_and_loads_legacy_rows() -> None:
     legacy = PluginUsageTracker.load_state(
         {"samples": {"shell_run": [[1.0, False, 5.0], [2.0, True, 3.0]]}}
     )
-    tiers = [s.tier for s in legacy._samples["shell_run"]]
-    assert tiers == [TIER_FAILED, TIER_SUCCEEDED]
+    assert not legacy._samples
 
 
 def test_turn_summary_counts_tiers_and_forwards_them() -> None:

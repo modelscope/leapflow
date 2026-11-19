@@ -827,6 +827,7 @@
 
   function asArray(value) { return Array.isArray(value) ? value : []; }
 
+  const SEVERITIES = ["critical", "alert", "notable", "info"];
   function severityOf(item) { return String((item && item.severity) || "info").toLowerCase(); }
 
   function severityCounts(items) {
@@ -1167,7 +1168,7 @@
     } else {
       severity = true;
       const counts = severityCounts(data);
-      rows = ["alert", "notable", "info"].map((key) => ({ key, label: t(key), value: counts[key] || 0 }));
+      rows = SEVERITIES.map((key) => ({ key, label: t(key), value: counts[key] || 0 }));
     }
     const max = Math.max(1, ...rows.map((r) => r.value));
     rows.forEach((row) => {
@@ -1266,12 +1267,18 @@
   }
 
   function renderPie(data, title) {
-    const counts = severityCounts(data); const total = Math.max(1, (counts.alert || 0) + (counts.notable || 0) + (counts.info || 0));
+    const counts = severityCounts(data);
+    const total = Math.max(1, SEVERITIES.reduce((sum, key) => sum + (counts[key] || 0), 0));
     const d = el("div", "chart card pie-card");
     if (title) d.appendChild(el("div", "card-title", esc(tx(title))));
     const pie = el("div", "pie");
-    pie.style.background = "conic-gradient(var(--alert) 0 " + ((counts.alert || 0) / total * 100) + "%, var(--notable) 0 " + (((counts.alert || 0) + (counts.notable || 0)) / total * 100) + "%, var(--info) 0 100%)";
-    d.appendChild(pie); d.appendChild(renderLegend(["alert", "notable", "info"], counts)); return d;
+    let cumulative = 0;
+    pie.style.background = "conic-gradient(" + SEVERITIES.map((key) => {
+      const start = cumulative / total * 100;
+      cumulative += counts[key] || 0;
+      return "var(--" + key + ") " + start + "% " + (cumulative / total * 100) + "%";
+    }).join(", ") + ")";
+    d.appendChild(pie); d.appendChild(renderLegend(SEVERITIES, counts)); return d;
   }
 
   function renderLegend(keys, counts) {
@@ -2038,13 +2045,32 @@
     }
   }
 
+  let criticalToast = null;
+  let criticalToastTimer = null;
+  let monitorRefreshTimer = null;
+
+  function scheduleMonitorRefresh() {
+    if (monitorRefreshTimer !== null) return;
+    monitorRefreshTimer = setTimeout(() => {
+      monitorRefreshTimer = null;
+      fetchView();
+    }, 250);
+  }
+
   function toast(finding) {
-    const sev = (finding.severity || "info").toLowerCase();
-    const t = el("div", "toast sev-" + sev);
-    t.appendChild(el("div", "card-title", esc(finding.title)));
-    if (finding.summary) t.appendChild(el("div", "summary", esc(finding.summary)));
-    toastsEl.appendChild(t);
-    setTimeout(() => t.remove(), 8000);
+    if (finding.severity !== "critical") return;
+    if (criticalToastTimer !== null) clearTimeout(criticalToastTimer);
+    if (criticalToast) criticalToast.remove();
+    criticalToast = el("div", "toast sev-critical");
+    criticalToast.setAttribute("role", "status");
+    criticalToast.appendChild(el("div", "card-title", esc(String(finding.title || "Critical condition").slice(0, 256))));
+    criticalToast.appendChild(el("div", "summary", esc("Inspect current state and stored evidence before continuing affected work.")));
+    toastsEl.appendChild(criticalToast);
+    criticalToastTimer = setTimeout(() => {
+      criticalToast.remove();
+      criticalToast = null;
+      criticalToastTimer = null;
+    }, 8000);
   }
 
   // ── Live updates over WebSocket ──
@@ -2058,7 +2084,8 @@
     ws.onclose = () => { setConnectionStatus("reconnecting…"); setTimeout(connectWS, 3000); };
     ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
-      if (msg.type === "monitor.finding") { toast(msg.payload || {}); fetchView(); }
+      if (msg.type === "monitor.finding") { toast(msg.payload || {}); scheduleMonitorRefresh(); }
+      else if (msg.type === "monitor.updated") { scheduleMonitorRefresh(); }
       else if (msg.type === "approval_request") { showApproval(msg.payload || {}); }
       else if (msg.type === "watch.state") { fetchView(); }
       else if (msg.type === "evolution.presentation") { updateEvolutionLive(msg.payload || {}); }

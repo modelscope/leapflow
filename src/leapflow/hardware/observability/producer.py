@@ -23,7 +23,7 @@ from leapflow.hardware.advisory import ADVISORY_KINDS
 from leapflow.hardware.observability.digest import ALERT_KINDS, build_digest
 from leapflow.hardware.observation import Episode
 from leapflow.hardware.observability.series import _fit
-from leapflow.monitor.types import Evidence, Finding, ProducerContext, Severity
+from leapflow.monitor.types import Evidence, Finding, FindingDelivery, ProducerContext, Severity
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,17 @@ class HardwareObservationProducer:
     def domain(self) -> str:
         return DOMAIN
 
+    def current_incidents(self, keys: Sequence[str], now: float) -> set[str]:
+        """Revalidate pending safety notices without reading transport or history."""
+        registry = self._registry_provider()
+        if registry is None:
+            return set()
+        requested = set(keys)
+        return {f"hardware:{row['key']}" for row in registry.observation_conditions()
+                if f"hardware:{row['key']}" in requested and _is_current(row, now)
+                and not (row.get("condition") == "threshold_exceeded"
+                         and _actuation_disabled(registry, row, now))}
+
     async def observe(self, ctx: ProducerContext) -> Sequence[Finding]:
         """Return uncheckpointed transitions or a current-state digest."""
         try:
@@ -94,78 +105,9 @@ class HardwareObservationProducer:
         acknowledge = getattr(registry, "acknowledge_observation", None)
         if callable(acknowledge):
             acknowledge(checkpoints)
-        findings = []
-        monitored = {row["key"] for row in digest.conditions}
-        conditions = list(digest.conditions)
-        # Command-path faults and older/external producers may not have a streaming
-        # detector. Their individual evidence is still reported once, never as a set
-        # of whatever happens to remain in the event ring.
-        for event in reversed(digest.events):
-            kind = str(event.get("kind", ""))
-            condition = f"advisory:{event.get('quantity', '')}" if kind in ADVISORY_KINDS else kind
-            key = f"{event.get('device_id', '')}/{event.get('channel_id', '')}/{condition}"
-            if (kind not in _ALERT_EVENTS and kind not in ADVISORY_KINDS) or key in monitored:
-                continue
-            episode = hashlib.sha256(
-                repr((key, event.get("x"), event.get("detail"))).encode()
-            ).hexdigest()[:24]
-            phase = "recovery" if kind == "advisory_cleared" else "entry"
-            conditions.append(
-                {
-                    "key": key,
-                    "pending": (
-                        {
-                            "key": key,
-                            "condition": condition,
-                            "episode": episode,
-                            "runtime_id": episode,
-                            "revision": 1,
-                            "phase": phase,
-                            "active": phase != "recovery",
-                            "known": True,
-                            "reason": event.get("detail", ""),
-                            "device_id": event.get("device_id", ""),
-                            "channel_id": event.get("channel_id", ""),
-                            "observed_at": event.get("x", 0.0),
-                            "event_only": True,
-                            "identity": episode,
-                        },
-                    ),
-                }
-            )
         base = digest.to_payload()
-        for row in conditions:
-            for notice in row.get("pending", ()):
-                checkpoint = checkpoints.get(row["key"], {})
-                notification = _notification(notice, checkpoint, ctx.now)
-                if notification is None:
-                    continue
-                checkpoints[row["key"]] = notification
-                phase, condition = notification["phase"], notice["condition"]
-                hard = condition in _ALERT_EVENTS
-                severity = Severity.NOTABLE if phase == "recovery" or not hard else Severity.ALERT
-                where = f"{notice.get('device_id', '')}.{notice.get('channel_id', '')}"
-                detail = (
-                    f"{where}: {notice.get('reason', condition)}; raw={notice.get('value')}, "
-                    f"soft={notice.get('soft_min')}..{notice.get('soft_max')}, "
-                    f"hard={notice.get('hard_min')}..{notice.get('hard_max')}, "
-                    f"margin={notice.get('margin', 0):g}, duration={notice.get('duration_s', 0):.2f}s"
-                )
-                payload = _fit({**base, "notification": notification})
-                findings.append(
-                    Finding(
-                        watch_id=ctx.spec.watch_id or DOMAIN,
-                        domain=DOMAIN,
-                        title=f"Hardware {condition} {phase}: {where}",
-                        summary=detail,
-                        severity=severity,
-                        ts=ctx.now,
-                        dedup_key=f"hardware:{row['key']}:{notification['episode']}:{notification['sequence']}",
-                        tags=(DOMAIN, condition, phase),
-                        evidence=(Evidence(kind="metric", label=where, value=detail),),
-                        payload=payload,
-                    )
-                )
+        withdrawn = tuple(row["key"] for row in digest.conditions if not _is_current(row, ctx.now))
+        findings = self._transition_findings(ctx, registry, _conditions(digest), checkpoints, base, withdrawn)
         if self._finding_store is None:
             self._checkpoints = checkpoints
         if findings:
@@ -190,8 +132,127 @@ class HardwareObservationProducer:
                 tags=(DOMAIN,),
                 evidence=_evidence(digest),
                 payload=base,
+                delivery=FindingDelivery(active=False, withdrawn_keys=tuple(f"hardware:{key}" for key in withdrawn)),
             )
         ]
+
+    def _transition_findings(
+        self, ctx: ProducerContext, registry: Any, conditions: Sequence[dict[str, Any]],
+        checkpoints: dict[str, dict[str, Any]], base: dict[str, Any], withdrawn: tuple[str, ...],
+    ) -> list[Finding]:
+        findings: list[Finding] = []
+        for row in conditions:
+            pending = list(row.get("pending", ()))
+            restored = checkpoints.get(row["key"], {})
+            # Fresh healthy evidence can close a prior runtime's incident even when
+            # debounce correctly prevented a new entry in this runtime.
+            if (not pending and restored.get("active") and row.get("known")
+                    and row.get("clear") and not row.get("active")
+                    and row.get("identity") == restored.get("identity")
+                    and row.get("runtime_id") != restored.get("runtime_id")):
+                pending.append({**row, "phase": "recovery", "episode": row.get("episode", ""),
+                                "revision": row.get("revision", 0)})
+            reobserved = (not pending and _is_current(row, ctx.now) and restored.get("active")
+                          and restored.get("episode") == row.get("episode")
+                          and restored.get("runtime_id") == row.get("runtime_id"))
+            if reobserved:
+                # Episode persistence is not presentation progress. Re-offer live
+                # evidence after a stale/failed enqueue; durable delivery owns repeats.
+                pending.append({**row, "phase": restored["phase"]})
+            for notice in pending:
+                notification = dict(restored) if reobserved else _notification(notice, checkpoints.get(row["key"], {}), ctx.now)
+                if notification is None:
+                    continue
+                checkpoints[row["key"]] = notification
+                phase, condition = notification["phase"], notice["condition"]
+                disabled = condition == "threshold_exceeded" and _actuation_disabled(registry, notice, ctx.now)
+                notification["actuation_disabled"] = disabled
+                where = f"{notice.get('device_id', '')}.{notice.get('channel_id', '')}"
+                detail = _notice_detail(notice, where, disabled)
+                current = bool(_is_current(row, ctx.now) and row.get("episode") == notice.get("episode"))
+                actionable = bool(notice.get("event_only") and condition == "unreachable")
+                findings.append(Finding(
+                    watch_id=ctx.spec.watch_id or DOMAIN, domain=DOMAIN,
+                    title=f"Hardware {condition} {phase}: {where}", summary=detail,
+                    severity=_notice_severity(notice, phase, disabled), ts=ctx.now,
+                    dedup_key=f"hardware:{row['key']}:{notification['episode']}:{notification['sequence']}",
+                    tags=(DOMAIN, condition, phase),
+                    evidence=(Evidence(kind="metric", label=where, value=detail),),
+                    payload=_fit({**base, "notification": notification}),
+                    delivery=FindingDelivery(key=f"hardware:{row['key']}", phase=phase,
+                        active=phase != "recovery", current=current, actionable=actionable,
+                        withdrawn_keys=tuple(f"hardware:{key}" for key in withdrawn)),
+                ))
+        return findings
+
+
+def _is_current(row: dict[str, Any], now: float) -> bool:
+    if not row.get("known") or not row.get("active"):
+        return False
+    if row.get("condition") in {"threshold_exceeded", "rate_exceeded"}:
+        age = now - float(row.get("observed_at", 0))
+        return 0 <= age <= float(row.get("freshness_s", 0))
+    return True
+
+
+def _conditions(digest: Any) -> list[dict[str, Any]]:
+    monitored = {row["key"] for row in digest.conditions}
+    conditions = list(digest.conditions)
+    # Command-path faults and older/external producers may not have a streaming
+    # detector. Their individual evidence is still reported once, never as a set
+    # of whatever happens to remain in the event ring.
+    for event in reversed(digest.events):
+        kind = str(event.get("kind", ""))
+        condition = f"advisory:{event.get('quantity', '')}" if kind in ADVISORY_KINDS else kind
+        key = f"{event.get('device_id', '')}/{event.get('channel_id', '')}/{condition}"
+        if (kind not in _ALERT_EVENTS and kind not in ADVISORY_KINDS) or key in monitored:
+            continue
+        episode = hashlib.sha256(repr((key, event.get("x"), event.get("detail"))).encode()).hexdigest()[:24]
+        phase = "recovery" if kind == "advisory_cleared" else "entry"
+        conditions.append({"key": key, "pending": ({
+            "key": key, "condition": condition, "episode": episode, "runtime_id": episode,
+            "revision": 1, "phase": phase, "active": phase != "recovery", "known": True,
+            "reason": event.get("detail", ""), "device_id": event.get("device_id", ""),
+            "channel_id": event.get("channel_id", ""), "observed_at": event.get("x", 0.0),
+            "event_only": True, "identity": episode,
+        },)})
+    return conditions
+
+
+def _notice_severity(notice: dict[str, Any], phase: str, disabled: bool) -> Severity:
+    condition = notice["condition"]
+    if phase == "recovery" or disabled or condition not in _ALERT_EVENTS:
+        return Severity.NOTABLE
+    if notice.get("event_only"):
+        # An unreachable command is an execution interruption, not chart history.
+        return Severity.CRITICAL if condition == "unreachable" else Severity.ALERT
+    if condition == "rate_exceeded" and not notice.get("rate_available"):
+        return Severity.ALERT
+    confirm = float(notice.get("confirm_s", 0.5 if condition in {"rate_exceeded", "stale"} else 0.0))
+    if (condition in {"threshold_exceeded", "rate_exceeded", "stale", "unreachable"}
+            and notice.get("known") and float(notice.get("duration_s", 0)) + 1e-9 >= confirm):
+        return Severity.CRITICAL
+    return Severity.ALERT
+
+
+def _notice_detail(notice: dict[str, Any], where: str, disabled: bool) -> str:
+    condition = notice["condition"]
+    if condition == "rate_exceeded":
+        detail = (f"{where}: measured={notice.get('measured_rate')} {notice.get('unit', '')}/s, "
+                  f"declared_max={notice.get('declared_max_rate')}; "
+                  f"delta={notice.get('rate_delta')}, dt={notice.get('acquisition_interval_s')}s, "
+                  f"timebase={notice.get('rate_timebase', 'unavailable')}; "
+                  f"duration={notice.get('duration_s', 0):.2f}s")
+    else:
+        detail = (f"{where}: {notice.get('reason', condition)}; raw={notice.get('value')}, "
+                  f"soft={notice.get('soft_min')}..{notice.get('soft_max')}, "
+                  f"hard={notice.get('hard_min')}..{notice.get('hard_max')}, "
+                  f"margin={notice.get('margin', 0):g}, duration={notice.get('duration_s', 0):.2f}s")
+    if disabled and notice["phase"] != "recovery":
+        detail += ("; disabled resting pose is outside the declared command range; "
+                   "motion from this pose may be refused. Check zero calibration or "
+                   "return within range under supervision; do not move automatically.")
+    return detail
 
 
 def _assess(digest: Any) -> tuple[Severity, str]:
@@ -279,6 +340,28 @@ def _state_fingerprint(digest: Any) -> str:
     return hashlib.sha256(repr((states, failing, behind)).encode()).hexdigest()[:24]
 
 
+def _actuation_disabled(registry: Any, notice: dict[str, Any], now: float) -> bool:
+    """Only fresh, explicit disabled evidence lowers reporting severity, never safety."""
+    context_for = getattr(registry, "context", None)
+    sample_for = getattr(registry, "latest_sample", None)
+    if not callable(context_for) or not callable(sample_for):
+        return False
+    context = context_for(notice.get("device_id", ""))
+    state_id = getattr(context, "actuation_state_channel", "")
+    if not state_id or context.hc_version != "hc.v1":
+        return False
+    channel = context.channel(state_id)
+    if channel is None or not channel.is_readable or channel.sample_rate_hz <= 0:
+        return False
+    reading = sample_for(context.device_id, state_id)
+    if reading is None or not reading.is_trustworthy:
+        return False
+    age = now - reading.observed_at
+    return 0 <= age <= 2.0 / channel.sample_rate_hz and (
+        reading.value is False or type(reading.value) in (int, float) and reading.value == 0
+    )
+
+
 def _notification(
     notice: dict[str, Any], checkpoint: dict[str, Any], now: float
 ) -> dict[str, Any] | None:
@@ -300,7 +383,11 @@ def _notification(
     )
     if phase == "entry" and continued:
         phase = "reminder"  # restored progress is not restored healthy evidence
-    if phase == "reminder" and continued and now < checkpoint.get("next_report_at", 0.0):
+    confirm_s = float(notice.get("confirm_s", 0.5 if notice.get("condition") == "stale" else 0.0))
+    if phase == "reminder" and continued and not same_runtime and notice.get("duration_s", 0.0) < confirm_s:
+        return None
+    if (phase == "reminder" and continued and not notice.get("reconfirmed")
+            and now < checkpoint.get("next_report_at", 0.0)):
         return None
     episode = checkpoint["episode"] if continued else notice["episode"]
     sequence = (

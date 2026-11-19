@@ -32,6 +32,7 @@ from leapflow.daemon._service_helpers import (
     memory_entry_to_dict,
     normalize_stream_event,
     persisted_session_workspace,
+    runtime_installation_error,
     runtime_source,
     runtime_version,
 )
@@ -465,6 +466,10 @@ class RuntimeLeapService:
         from leapflow.daemon.notifications import NotificationBus
         self.notification_bus = NotificationBus()
 
+    def set_shutdown_notifier(self, notifier: Callable[..., Any]) -> None:
+        """Bind the transport-owned shutdown announcement before teardown."""
+        self._shutdown_notifier = notifier
+
     def set_client_count_provider(self, provider: Callable[[], int]) -> None:
         self._client_count = provider
 
@@ -484,6 +489,8 @@ class RuntimeLeapService:
         self._approval_coordinator.install_gate(ctx, self)
         install_learn_notifications(ctx, self.notification_bus)
         self._ctx = ctx
+        ctx._runtime_config_reload_callback = self._on_runtime_config_reloaded
+        self._reentry_reload_task: asyncio.Task[Any] | None = None
         # Wire the session-scoped status snapshot into the self-awareness surface
         # so self_describe/runtime_snapshot answer from live evidence rather than
         # source code. bind_runtime reaches only plugins declaring
@@ -597,12 +604,22 @@ class RuntimeLeapService:
         if self._deferred_init_task is None or self._deferred_init_task.done():
             self._deferred_init_task = asyncio.create_task(self._run_deferred_init(self._ctx))
 
-    async def shutdown(self) -> None:
+    async def shutdown(
+        self, *, reason: str = "leapd stopping", requested_by: dict[str, Any] | None = None
+    ) -> None:
+        notifier = getattr(self, "_shutdown_notifier", None)
+        if notifier is not None:
+            await notifier(reason, requested_by)
         self._build_staleness.cancel_pending()
         if self._ctx is None:
             return
         ctx = self._ctx
         self._ctx = None
+        ctx._runtime_config_reload_callback = None
+        reload_task = getattr(self, "_reentry_reload_task", None)
+        if reload_task is not None and not reload_task.done():
+            reload_task.cancel()
+            await asyncio.gather(reload_task, return_exceptions=True)
         environment_sources = self._environment_source_manager
         self._environment_source_manager = None
         if environment_sources is not None:
@@ -687,6 +704,11 @@ class RuntimeLeapService:
     async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
         request_id = str(kwargs.get("request_id") or uuid.uuid4().hex[:12])
         workspace_arg = str(kwargs.get("workspace_root") or "").strip()
+        installation_error = await asyncio.to_thread(runtime_installation_error)
+        if installation_error:
+            # Refuse before warming, admission, session construction, or engine I/O.
+            # A reinstall changes future imports, not this process's package path.
+            raise RuntimeError(installation_error)
 
         # Ensure deferred init completed. Emit a status chunk first so the
         # server dispatch loop receives an immediate first chunk (keepalive
@@ -784,9 +806,6 @@ class RuntimeLeapService:
             ctx = self.context
             try:
                 if ctx.reload_runtime_config_if_changed():
-                    self._settings = ctx.settings
-                    self._monitor_coordinator.update_settings(ctx.settings)
-                    self._propagate_config_to_sessions(ctx)
                     chunk = StreamChunk(
                         request_id=request_id,
                         content="Configuration reloaded in leapd.",
@@ -1142,6 +1161,32 @@ class RuntimeLeapService:
     def _ensure_session_registry(self, base_engine: Any) -> Any:
         return self._session_coordinator.ensure_registry(base_engine, self._settings)
 
+    def _on_runtime_config_reloaded(self, ctx: Any) -> None:
+        """Apply config to every live session before config_set returns."""
+        self._settings = ctx.settings
+        self._propagate_config_to_sessions(ctx)
+        self._monitor_coordinator.update_settings(ctx.settings)
+        task = getattr(self, "_reentry_reload_task", None)
+        if task is None or task.done():
+            self._reentry_reload_task = asyncio.create_task(self._sync_reentry_runtime(ctx))
+
+    async def _sync_reentry_runtime(self, ctx: Any) -> None:
+        """Converge lifecycle to the latest setting; rapid toggles cannot spawn twice."""
+        try:
+            while self._ctx is ctx:
+                enabled = bool(getattr(self._settings, "agent_reentry_enabled", False))
+                if enabled and not self._reentry_coordinator.is_running():
+                    await self._reentry_coordinator.start(
+                        ctx, self._settings, self._turn_admission, self.notification_bus,
+                        request_approval=self._request_approval,
+                    )
+                elif not enabled and self._reentry_coordinator.is_running():
+                    await self._reentry_coordinator.stop()
+                if enabled == bool(getattr(self._settings, "agent_reentry_enabled", False)):
+                    return
+        except Exception:
+            logger.warning("Reentry runtime config reload failed", exc_info=True)
+
     def _propagate_config_to_sessions(self, ctx: Any) -> None:
         """Propagate updated LLM/config to all active session engines."""
         registry = self._session_coordinator.registry
@@ -1151,6 +1196,7 @@ class RuntimeLeapService:
         llm = ctx.llm
         vlm = getattr(ctx, "vlm", None)
         classifier = getattr(ctx, "intent_classifier", None)
+        from leapflow.engine.session.session_factory import _settings_for_workspace
         from leapflow.memory.providers.working import resolve_working_memory_max_tokens
 
         for sid in registry.session_ids():
@@ -1162,8 +1208,9 @@ class RuntimeLeapService:
                 # Base engine is already reconfigured by reload_runtime_config_if_changed.
                 continue
             try:
+                session_settings = _settings_for_workspace(settings, session_ctx.workspace_root)
                 engine.reconfigure_runtime(
-                    settings=settings,
+                    settings=session_settings,
                     llm=llm,
                     vlm=vlm,
                     classifier=classifier,
@@ -1417,6 +1464,24 @@ class RuntimeLeapService:
                 "error": f"Rediscovery failed and the previous device set is unchanged: {exc}",
             }
         return {"ok": True, **report.to_dict()}
+
+    async def hardware_fleet_reconnect(self, node: str = "") -> dict[str, Any]:
+        """Retry registering configured fleet nodes that are not registered yet.
+
+        The supported recovery for a node that was unreachable when leapd started:
+        unlike a daemon restart it interrupts no turn. Connects and reads
+        declarations only, so it takes no turn-admission slot and no approval.
+        """
+        _, refusal = self._hardware_registry_or_error("a fleet reconnect")
+        if refusal is not None:
+            return refusal
+        from leapflow.plugins import get_registry as _get_tool_registry
+
+        plugin = _get_tool_registry().get_plugin("hardware_context")
+        reconnect = getattr(plugin, "fleet_reconnect", None)
+        if not callable(reconnect):
+            return {"ok": False, "code": "fleet_unavailable", "error": "The hardware plugin is not loaded."}
+        return await reconnect(str(node or "").strip() or None)
 
     async def hardware_frame(
         self,
@@ -1756,7 +1821,7 @@ class RuntimeLeapService:
                     metadata=notification.to_dict(),
                 )
         finally:
-            self.notification_bus.unsubscribe(subscriber_id)
+            self.notification_bus.unsubscribe(subscriber_id, queue)
 
     # ── Status ───────────────────────────────────────────────────────
 
@@ -1816,12 +1881,14 @@ class RuntimeLeapService:
             "context_budget_snapshot": context_metadata.get("context_budget_snapshot", {}),
             "session_id": str(getattr(engine, "_current_session_id", "") or "") if engine is not None else "",
             "runtime_source": runtime_source(),
+            "runtime_installation_error": await asyncio.to_thread(runtime_installation_error),
             "runtime_executable": sys.executable,
             "runtime_version": runtime_version(),
             "pending_approvals": self._approval_coordinator.pending_count(),
             "turn_admission": self._turn_admission_status(),
             "deferred_init": self._deferred_init_status(ctx),
             "watch_summary": await self._monitor_coordinator.get_summary(),
+            "notification_delivery": self.notification_bus.stats,
             "host_backend": host,
             "environment_sources": {
                 "active": list(self._environment_source_manager.source_ids)

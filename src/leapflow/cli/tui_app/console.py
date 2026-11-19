@@ -218,10 +218,27 @@ class LeapConsole:
             label.append(f"  {_format_elapsed(command.elapsed_s)}", style="leap.dim")
         self._console.print(label)
 
+    def monitor_notice(self, finding: Mapping[str, Any]) -> bool:
+        """Compact critical-only unsolicited notice; details remain in the board."""
+        if finding.get("severity") != "critical":
+            return False
+        title = str(finding.get("title") or "Critical condition requires inspection")[:256]
+        notice = Text("Critical · ", style="leap.error")
+        notice.append(title, style="bold")
+        items = finding.get("items", [])
+        if isinstance(items, list):
+            scopes = [str(item.get("title", ""))[:160] for item in items[:3] if isinstance(item, Mapping)]
+            if scopes:
+                notice.append(" — " + "; ".join(scopes), style="leap.dim")
+        notice.append(" · Inspect /board list before continuing affected work.", style="leap.dim")
+        self._console.print(notice)
+        return True
+
     def monitor_card(self, finding: Mapping[str, Any]) -> None:
-        """Render a compact, non-blocking card for a pushed monitor finding."""
+        """Render a detailed card for explicit inspection."""
         severity = str(finding.get("severity", "info"))
         border = {
+            "critical": "leap.error",
             "alert": "leap.error",
             "notable": "leap.warning",
             "info": "leap.border",

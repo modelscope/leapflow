@@ -1234,6 +1234,8 @@ async def cmd_interactive_daemon(
         runtime_source = daemon_status.get("runtime_source")
         if runtime_source:
             console.system(f"Runtime source: {runtime_source}")
+        if daemon_status.get("runtime_installation_error"):
+            console.warning(str(daemon_status["runtime_installation_error"]))
         runtime_executable = daemon_status.get("runtime_executable")
         if runtime_executable:
             console.system(f"Python: {runtime_executable}")
@@ -1274,7 +1276,7 @@ async def cmd_interactive_daemon(
         record_user: bool = True,
     ) -> None:
         nonlocal turn_count, active_turn_request_id
-        from leapflow.daemon.client import DaemonUnavailableError
+        from leapflow.daemon.client import DaemonRpcError, DaemonShutdownError, DaemonUnavailableError
 
         if record_user:
             exit_stats.record_user_message()
@@ -1332,12 +1334,28 @@ async def cmd_interactive_daemon(
                     if not metadata.get("heartbeat"):
                         console.system(event.content)
             turn_completed = True
+        except DaemonRpcError:
+            console.warning(
+                "leapd returned a request error, not a connection loss. "
+                "The command was not replayed; inspect the error before trying again."
+            )
+            raise
         except DaemonUnavailableError as exc:
+            if isinstance(exc, DaemonShutdownError):
+                # A deliberate stop is not a transport fault: replaying the turn would
+                # restart a daemon the user just stopped and could repeat side effects.
+                console.warning(
+                    f"{exc.describe()}; this turn was interrupted and may have left "
+                    "partial side effects. Check what it changed, then re-issue the "
+                    "instruction (the TUI reconnects to leapd and keeps this session)."
+                )
+                raise
             if allow_retry and not saw_real_event:
                 retry_error = exc
             else:
+                progress = "after receiving turn output" if saw_real_event else "again before output"
                 console.warning(
-                    "Lost connection to leapd after the turn started; "
+                    f"Lost connection to leapd {progress}; "
                     "the command was not replayed to avoid duplicate side effects."
                 )
                 raise
@@ -1639,7 +1657,7 @@ async def cmd_interactive_daemon(
     async def _notification_listener() -> None:
         """Subscribe to daemon notifications and render them in TUI."""
         nonlocal daemon_session_mode
-        from leapflow.daemon.client import DaemonUnavailableError
+        from leapflow.daemon.client import DaemonShutdownError, DaemonUnavailableError
 
         async def _refresh_watch_count() -> None:
             try:
@@ -1691,10 +1709,10 @@ async def cmd_interactive_daemon(
                             console.system("Distillation complete — no skills produced (insufficient signal)")
                         app.invalidate()
                     elif event_type == "monitor.finding":
-                        console.monitor_card(payload)
-                        if str(payload.get("severity")) == "alert":
+                        # Defense in depth for notifications from older daemons.
+                        if payload.get("severity") == "critical" and console.monitor_notice(payload):
                             status.update_monitor_counts(alerts=status.alert_count + 1)
-                        app.invalidate()
+                            app.invalidate()
                     elif event_type == "watch.state":
                         await _refresh_watch_count()
                     elif event_type == "signal.stream":
@@ -1702,6 +1720,15 @@ async def cmd_interactive_daemon(
                         status.increment_signal_stream()
                     elif event_type == "monitor.error":
                         logger.debug("monitor error notification: %s", payload)
+            except DaemonShutdownError as exc:
+                # A running turn reports this itself; an idle TUI would otherwise
+                # only find out on its next command.
+                if not app.agent_running:
+                    console.warning(
+                        f"{exc.describe()}. The next command reconnects to leapd "
+                        "and keeps this session."
+                    )
+                await asyncio.sleep(3.0)
             except (DaemonUnavailableError, OSError, asyncio.IncompleteReadError):
                 await asyncio.sleep(3.0)
             except asyncio.CancelledError:

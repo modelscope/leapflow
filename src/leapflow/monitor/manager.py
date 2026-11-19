@@ -14,20 +14,23 @@ import asyncio
 import logging
 import time
 from dataclasses import replace
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Sequence
 
+from leapflow.monitor.delivery import BoundedFindingDelivery, DeliveryCandidate, DeliveryStore, DeliveryValidator, FindingPresentation
 from leapflow.monitor.event_bridge import EventBridge
 from leapflow.monitor.finding_store import FindingStore
 from leapflow.monitor.producers import ProducerRegistry
 from leapflow.monitor.types import (
     EVENT_ERROR,
-    EVENT_FINDING,
     EVENT_WATCH_STATE,
     METADATA_CLIENT_COUPLED_KEY,
     METADATA_KIND_KEY,
     METADATA_MUTED_KEY,
     WATCH_KIND,
     Finding,
+    FindingDelivery,
+    CurrentIncidentSource,
+    Severity,
     ProducerContext,
     WatchSpec,
     WatchView,
@@ -90,7 +93,11 @@ class _MonitorExecutor:
         producers: ProducerRegistry,
         emit: Optional[EmitFn],
         services: Any,
+        delivery: FindingPresentation,
+        run_db: Any = None,
     ) -> None:
+        self._delivery = delivery
+        self._run_db = run_db
         self._tasks = task_store
         self._findings = finding_store
         self._producers = producers
@@ -101,7 +108,7 @@ class _MonitorExecutor:
         """Run one observation cycle for a watch (skill_name == domain)."""
         force = bool(parameters.get("_force", False))
         spec = WatchSpec.from_params(parameters)
-        task = self._tasks.load(spec.watch_id) if spec.watch_id else None
+        task = await self._db(lambda: self._tasks.load(spec.watch_id)) if spec.watch_id else None
         muted = bool((task.metadata or {}).get(METADATA_MUTED_KEY)) if task else False
         run_count = task.run_count if task else 0
         last_run_at = task.last_run_at if task else 0.0
@@ -129,20 +136,43 @@ class _MonitorExecutor:
                                      "error": str(exc)})
             return {"ok": False, "error": str(exc)}
 
-        threshold = spec.push_threshold()
-        persisted = 0
-        emitted = 0
+        try:
+            saved, state_updates = await self._db(lambda: self._persist(findings, spec.watch_id))
+            current_task = await self._db(lambda: self._tasks.load(spec.watch_id)) if spec.watch_id else None
+            muted = (current_task is None or current_task.state not in _ACTIVE_STATES
+                     or bool((current_task.metadata or {}).get(METADATA_MUTED_KEY)))
+            current_spec = WatchSpec.from_params(current_task.parameters) if current_task else spec
+            await self._delivery.offer([*state_updates, *saved], current_spec.push_threshold(), muted)
+        except Exception as exc:  # noqa: BLE001 - never present evidence that failed persistence
+            logger.warning("monitor: persistence/delivery failed", exc_info=True)
+            self._push(EVENT_ERROR, {"watch_id": spec.watch_id, "domain": spec.domain, "error": str(exc)})
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "findings": len(saved), "emitted": 0}
+
+    async def _db(self, fn: Callable[[], Any]) -> Any:
+        return await self._run_db(fn) if self._run_db else await asyncio.to_thread(fn)
+
+    def _persist(self, findings: List[Finding], watch_id: str) -> tuple[List[Finding], List[Finding]]:
+        saved, state_updates = [], []
         for finding in findings:
             if not finding.watch_id:
-                finding = replace(finding, watch_id=spec.watch_id)
-            if finding.dedup_key and self._findings.exists_dedup(finding.watch_id, finding.dedup_key):
+                finding = replace(finding, watch_id=watch_id)
+            existing = self._findings.find_dedup(finding.watch_id, finding.dedup_key) if finding.dedup_key else None
+            if existing is not None:
+                finding = replace(finding, finding_id=existing.finding_id)
+                delivery = finding.delivery
+                withdrawn = delivery.withdrawn_keys
+                if delivery.key and not delivery.actionable and (not delivery.active or not delivery.current):
+                    withdrawn = (*withdrawn, delivery.key)
+                if delivery.key and (delivery.actionable or (delivery.active and delivery.current)):
+                    state_updates.append(finding)
+                elif withdrawn:
+                    state_updates.append(replace(finding, severity=Severity.INFO,
+                        delivery=FindingDelivery(active=False, withdrawn_keys=withdrawn)))
                 continue
             self._findings.save(finding)
-            persisted += 1
-            if not muted and finding.severity.rank >= threshold.rank:
-                self._push(EVENT_FINDING, finding.to_dict())
-                emitted += 1
-        return {"ok": True, "findings": persisted, "emitted": emitted}
+            saved.append(finding)
+        return saved, state_updates
 
     def _push(self, event_type: str, payload: dict) -> None:
         if self._emit is None:
@@ -170,17 +200,25 @@ class MonitorManager:
         services: Any = None,
         tick_seconds: int = 60,
         grace_seconds: float = 120.0,
+        delivery_factory: Callable[[DeliveryStore, Optional[EmitFn], DeliveryValidator], FindingPresentation] | None = None,
+        run_db: Any = None,
     ) -> None:
+        self._run_db = run_db
         self._task_store = TaskStore(holder)
         self._finding_store = FindingStore(holder)
         self.producers = producers or ProducerRegistry()
         self._emit = emit
+        self.delivery = (delivery_factory(self._finding_store, emit, self._validate_delivery) if delivery_factory else
+                         BoundedFindingDelivery(self._finding_store, emit, run_db=run_db,
+                                                validate=self._validate_delivery))
         self._executor = _MonitorExecutor(
             task_store=self._task_store,
             finding_store=self._finding_store,
             producers=self.producers,
             emit=emit,
             services=services,
+            delivery=self.delivery,
+            run_db=run_db,
         )
         self._scheduler = LocalScheduler(
             store=self._task_store,
@@ -196,10 +234,38 @@ class MonitorManager:
         )
         self._event_bridge = EventBridge(
             scheduler_wake=self._scheduler.wake,
-            mark_due=self._task_store.advance_next_due,
+            mark_due=self._mark_event_due,
         )
         self._started = False
         self._background_tasks: set[asyncio.Task[Any]] = set()
+
+    async def _validate_delivery(self, candidates: Sequence[DeliveryCandidate], now: float) -> dict[str, tuple[str, ...]]:
+        """Re-read consent off-loop; domain producers alone validate live evidence."""
+        started = time.monotonic()
+        watch_ids = {watch_id for item in candidates for watch_id in item.watch_ids}
+        def load() -> dict[str, Any]:
+            return {watch_id: self._task_store.load(watch_id) for watch_id in watch_ids}
+        tasks = await self._executor._db(load)
+        current: dict[str, set[str]] = {}
+        for domain in {item.domain for item in candidates if not item.actionable}:
+            producer = self.producers.resolve(domain)
+            if isinstance(producer, CurrentIncidentSource):
+                keys = [item.incident_key for item in candidates if item.domain == domain and not item.actionable]
+                current[domain] = producer.current_incidents(keys, now + time.monotonic() - started)
+        eligible = {}
+        for item in candidates:
+            if item.domain in current and not item.actionable and item.incident_key not in current[item.domain]:
+                continue
+            owners = []
+            for watch_id in item.watch_ids:
+                task = tasks.get(watch_id)
+                if (task is not None and task.state in _ACTIVE_STATES
+                        and not (task.metadata or {}).get(METADATA_MUTED_KEY)
+                        and Severity(item.severity).rank >= WatchSpec.from_params(task.parameters).push_threshold().rank):
+                    owners.append(watch_id)
+            if owners:
+                eligible[item.key] = tuple(owners)
+        return eligible
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -207,15 +273,25 @@ class MonitorManager:
         """Start the background tick loop (idempotent)."""
         if self._started:
             return
+        self.delivery.start()
+        tasks = await self._executor._db(self._task_store.load_all)
+        for task in tasks:
+            if _is_watch(task) and task.trigger_type == "event" and task.state not in {"done", "failed"}:
+                self._event_bridge.register(task.task_id, EventTrigger.deserialize(task.trigger_config))
         await self._scheduler.start()
         self._started = True
 
     async def stop(self) -> None:
         """Stop the background tick loop (idempotent)."""
-        if not self._started:
-            return
-        await self._scheduler.stop()
+        self._event_bridge.close()
+        if self._started:
+            await self._scheduler.stop()
         self._started = False
+        for task in self._background_tasks:
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        await self.delivery.stop()
 
     @property
     def event_bridge(self) -> EventBridge:
@@ -312,6 +388,7 @@ class MonitorManager:
 
     def pause_watch(self, watch_id: str) -> Optional[WatchView]:
         """Suspend a watch so it stops firing until resumed."""
+        self.delivery.drop_watch(watch_id)
         return self._transition(watch_id, TaskState.SUSPENDED.value)
 
     def resume_watch(self, watch_id: str) -> Optional[WatchView]:
@@ -321,6 +398,7 @@ class MonitorManager:
     def stop_watch(self, watch_id: str) -> Optional[WatchView]:
         """Terminally stop a watch (kept for history)."""
         self._event_bridge.unregister(watch_id)
+        self.delivery.drop_watch(watch_id)
         return self._transition(watch_id, TaskState.DONE.value)
 
     def set_muted(self, watch_id: str, muted: bool) -> Optional[WatchView]:
@@ -330,6 +408,8 @@ class MonitorManager:
             return None
         meta = dict(task.metadata) if isinstance(task.metadata, dict) else {}
         meta[METADATA_MUTED_KEY] = bool(muted)
+        if muted:
+            self.delivery.drop_watch(watch_id)
         meta.setdefault(METADATA_KIND_KEY, WATCH_KIND)
         task.metadata = meta
         self._task_store.save(task)
@@ -401,6 +481,18 @@ class MonitorManager:
             logger.debug("monitor: background run_watch_once failed for %s", watch_id, exc_info=True)
 
     # ── Internal ───────────────────────────────────────────────────────────
+
+    def _mark_event_due(self, watch_id: str, at: float) -> None:
+        task = asyncio.create_task(self._persist_event_due(watch_id, at))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _persist_event_due(self, watch_id: str, at: float) -> None:
+        try:
+            await self._executor._db(lambda: self._task_store.advance_next_due(watch_id, at))
+            self._scheduler.wake()
+        except Exception:  # noqa: BLE001 - an event subscriber must never block acquisition
+            logger.warning("monitor: event due time could not be persisted", exc_info=True)
 
     def _transition(self, watch_id: str, state: str) -> Optional[WatchView]:
         task = self._task_store.load(watch_id)

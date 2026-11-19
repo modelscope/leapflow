@@ -15,7 +15,9 @@ state this module was actually in while this docstring claimed otherwise.
 from __future__ import annotations
 
 import logging
-from typing import Sequence
+import math
+import time
+from typing import Any, Sequence
 
 from leapflow.monitor.types import (
     Evidence,
@@ -44,10 +46,29 @@ class PluginHealthProducer:
 
     domain = "plugin_health"
 
-    def __init__(self, error_rate_threshold: float = _ERROR_RATE_THRESHOLD) -> None:
-        self._error_rate_threshold = error_rate_threshold
-        # Track previous trust levels to detect degradation
+    def __init__(
+        self, error_rate_threshold: float = _ERROR_RATE_THRESHOLD,
+        *, error_window_s: float = 3600.0, min_calls: int = 5,
+    ) -> None:
+        self.configure(error_rate_threshold, error_window_s, min_calls)
         self._last_trust_levels: dict[str, str] = {}
+
+    def configure(self, threshold: float, window_s: float, min_calls: int) -> None:
+        """Apply validated health policy, including runtime config reloads."""
+        if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise ValueError("plugin_health.error_rate_threshold must be within 0..1")
+        if not math.isfinite(window_s) or window_s <= 0 or min_calls < 1:
+            raise ValueError("Plugin health window and minimum calls must be positive")
+        self._error_rate_threshold = threshold
+        self._error_window_s = window_s
+        self._min_calls = min_calls
+
+    def configure_from_settings(self, settings: Any) -> None:
+        self.configure(
+            float(getattr(settings, "plugin_health_error_rate_threshold", 0.25)),
+            float(getattr(settings, "plugin_health_error_window_s", 3600.0)),
+            int(getattr(settings, "plugin_health_min_calls", 5)),
+        )
 
     async def observe(self, ctx: ProducerContext) -> Sequence[Finding]:
         """Called periodically by MonitorManager. Check trust + error rates."""
@@ -122,11 +143,21 @@ class PluginHealthProducer:
             self._last_trust_levels[plugin_id] = current_level
 
             # --- High error rate detection ---
-            stats = usage_tracker.stats_for_plugin(plugin_id)
-            if stats is None or stats.total_calls < 5:
+            stats = usage_tracker.stats_for_plugin(plugin_id, since=time.time() - self._error_window_s)
+            if stats is None or stats.total_calls < self._min_calls:
                 continue  # Insufficient data for error rate judgment
 
             if stats.error_rate > self._error_rate_threshold:
+                codes = getattr(stats, "failed_codes", {})
+                actions = [SuggestedAction(
+                    name="plugin_status", label=f"Inspect {plugin_id}",
+                    kind="intent", params={"plugin_id": plugin_id},
+                )]
+                if _disable_warranted(codes, stats.failures):
+                    actions.append(SuggestedAction(
+                        name="plugin_disable", label=f"Disable {plugin_id}",
+                        kind="approval", params={"plugin_id": plugin_id},
+                    ))
                 findings.append(Finding(
                     watch_id=watch_id,
                     domain=self.domain,
@@ -150,25 +181,25 @@ class PluginHealthProducer:
                             label="total_calls",
                             value=str(stats.total_calls),
                         ),
+                        Evidence(kind="metric", label="error_window_s", value=str(self._error_window_s)),
+                        Evidence(kind="metric", label="failure_codes", value=str(dict(
+                            sorted(codes.items(), key=lambda item: item[1], reverse=True)[:5]
+                        ))),
                     ),
-                    suggested_actions=(
-                        SuggestedAction(
-                            name="plugin_status",
-                            label=f"Inspect {plugin_id}",
-                            kind="intent",
-                            params={"plugin_id": plugin_id},
-                        ),
-                        SuggestedAction(
-                            name="plugin_disable",
-                            label=f"Disable {plugin_id}",
-                            kind="approval",
-                            params={"plugin_id": plugin_id},
-                        ),
-                    ),
+                    suggested_actions=tuple(actions),
                     dedup_key=f"error_rate:{plugin_id}",
                 ))
 
         return findings
+
+
+def _disable_warranted(codes: dict[str, int], failures: int) -> bool:
+    """Input-only errors implicate the caller, not the plugin implementation."""
+    input_codes = {"invalid_request", "invalid_arguments", "unknown_key", "unknown_category", "missing_parameter"}
+    input_prefixes = ("config_unknown_", "config_invalid_", "invalid_argument", "schema_", "argument_")
+    if sum(codes.values()) < failures:
+        return True  # missing classifications are not proven caller-input failures
+    return any(code not in input_codes and not code.startswith(input_prefixes) for code in codes)
 
 
 __all__ = ["PluginHealthProducer"]

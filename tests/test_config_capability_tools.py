@@ -151,7 +151,67 @@ def test_config_set_reports_restart_requirement(cfg_home) -> None:
 
     assert result["ok"] is True
     assert result["restart_required"] is True
-    assert "restart" in result["next_step"].lower()
+    assert "Do not restart leapd within" in result["next_step"]
+    assert "tell the user" in result["next_step"]
+    assert "after this turn ends" in result["next_step"]
+
+
+@pytest.mark.asyncio
+async def test_in_turn_reentry_config_write_updates_both_session_engines(cfg_home, monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    from leapflow.cli.context import Context
+    from leapflow.config import load_config
+    from leapflow.daemon.service import RuntimeLeapService
+    from leapflow.storage.reentry_store import ReentryStore
+    from tests.test_session_factory import _build_base_engine, _EchoLLM
+
+    ctx = Context(load_config(), mock_host=True)
+    base, memory = _build_base_engine(str(cfg_home.parent / "engine"), _EchoLLM())
+    base.reconfigure_runtime(settings=ctx.settings, llm=ctx.llm, vlm=ctx.vlm,
+                             classifier=ctx.intent_classifier)
+    ctx.engine = base
+    store = ReentryStore(cfg_home.parent / "reentry.duckdb")
+    ctx._reentry_store = store
+    ctx._subagent_manager = Mock()
+    base.set_reentry_store(store)
+    daemon = RuntimeLeapService(ctx.settings)
+    daemon._ctx = ctx
+    registry = daemon._ensure_session_registry(base)
+    a = await registry.acquire("a", workspace_root=cfg_home.parent / "workspace-a")
+    b = await registry.acquire("b", workspace_root=cfg_home.parent / "workspace-b")
+    ctx._runtime_config_reload_callback = daemon._on_runtime_config_reloaded
+    monkeypatch.setattr(ctx, "_configure_mcp_manager", lambda _: None)
+    config_tools.set_config_context(ctx)
+    try:
+        assert a.engine._schedule_reentry(delay_seconds=60)["ok"] is False
+        a.engine._wm.remember_chat({"role": "user", "content": "only-in-a"})
+        result = await config_tools.config_set_handler({"key": "agent.reentry_enabled", "value": True})
+        assert result["ok"] and result["session_reloaded"]
+        assert a.engine._settings.agent_reentry_enabled is True
+        assert b.engine._settings.agent_reentry_enabled is True
+        assert a.engine._settings.workspace_root != b.engine._settings.workspace_root
+        scheduled = a.engine._schedule_reentry(delay_seconds=60, reason="same-turn")
+        assert scheduled["ok"], scheduled
+        assert store.load(scheduled["trigger_id"]).session_id == "a"
+        assert list(b.engine._wm.as_chat_messages()) == []
+        await daemon._reentry_reload_task
+        assert daemon._reentry_coordinator.is_running()
+        driver = daemon._reentry_coordinator._reentry_task
+        result = await config_tools.config_set_handler({"key": "agent.reentry_enabled", "value": False})
+        assert result["ok"] and not a.engine._settings.agent_reentry_enabled
+        await daemon._reentry_reload_task
+        assert not daemon._reentry_coordinator.is_running()
+        assert driver.done()
+        assert ctx._reentry_event_observer is None
+    finally:
+        task = getattr(daemon, "_reentry_reload_task", None)
+        if task is not None:
+            await task
+        await daemon._reentry_coordinator.stop()
+        store.close()
+        memory.close()
+        config_tools.set_config_context(None)
 
 
 def test_config_set_never_echoes_a_secret(cfg_home) -> None:

@@ -115,6 +115,7 @@ class StreamChunk:
         "final",
         "tool_start",
         "tool_complete",
+        "daemon_shutdown",
         "thinking",
         "status",
         "error",
@@ -348,6 +349,14 @@ class LeapService(Protocol):
         """
         ...
 
+    async def hardware_fleet_reconnect(self, node: str = "") -> Dict[str, Any]:
+        """Retry registering configured fleet nodes that are not registered.
+
+        Daemon-global like ``hardware_rescan``; connects and reads declarations
+        only, never actuates, so it takes no turn-admission slot or approval.
+        """
+        ...
+
     async def hardware_frame(
         self,
         device: str = "",
@@ -448,8 +457,10 @@ class LeapService(Protocol):
         """Cancel a pending approval request."""
         ...
 
-    async def shutdown(self) -> None:
-        """Graceful shutdown."""
+    async def shutdown(
+        self, *, reason: str = "leapd stopping", requested_by: Dict[str, Any] | None = None
+    ) -> None:
+        """Announce the reason to clients before graceful shutdown."""
         ...
 
     # ── Gateway ──────────────────────────────────────────────────────
@@ -522,6 +533,7 @@ METHOD_REGISTRY: Dict[str, str] = {
     "hardware.inventory": "hardware_inventory",
     "hardware.device": "hardware_device",
     "hardware.rescan": "hardware_rescan",
+    "hardware.fleet_reconnect": "hardware_fleet_reconnect",
     "hardware.frame": "hardware_frame",
     "hardware.preview.stream": "hardware_preview_stream",
     "hardware.preview.release": "hardware_preview_release",

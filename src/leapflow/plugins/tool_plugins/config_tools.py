@@ -100,7 +100,8 @@ class ConfigToolsPlugin:
                     "key='llm.model' and key='llm.base_url'. There is no 'llm.provider' key: provider "
                     "behavior is inferred from the endpoint. Values are validated and coerced; credentials "
                     "are stored in the vault automatically. Call config_list or config_get first if unsure "
-                    "of the key. The result states whether a `leap daemon restart` is required. Never edit "
+                    "of the key. The result states whether a `leap daemon restart` is required; that "
+                    "restart is for the user to run after the turn, never from inside it. Never edit "
                     "LeapFlow config files directly."
                 ),
                 parameters_schema={

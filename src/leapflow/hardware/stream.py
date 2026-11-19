@@ -124,6 +124,7 @@ _EVENT_CLASS_MAP: dict[str, str] = {
     "advisory_cleared": HardwareEventClass.RECORD,
     "observation_warning": HardwareEventClass.RECORD,
     "observation_cleared": HardwareEventClass.RECORD,
+    "observation_unknown": HardwareEventClass.RECORD,
 }
 
 
@@ -201,6 +202,7 @@ class EventKind:
     """A monitor-only limit the device protects itself against was breached."""
     OBSERVATION_WARNING = "observation_warning"
     OBSERVATION_CLEARED = "observation_cleared"
+    OBSERVATION_UNKNOWN = "observation_unknown"
     ADVISORY_CLEARED = "advisory_cleared"
     """A breached advisory limit returned inside its hysteresis band."""
 
@@ -376,6 +378,12 @@ class ReadingRing:
         return payload
 
 
+def _observation_now(reading: Reading) -> float:
+    """Use the reception clock when source evidence cannot carry a valid clock."""
+    at = reading.monotonic_at
+    return at if reading.is_trustworthy and math.isfinite(at) and at > 0 else time.monotonic()
+
+
 class HardwareEventDetector:
     """Judge raw hard evidence and separately configured report-only observations.
 
@@ -422,6 +430,7 @@ class HardwareEventDetector:
         events: list[HardwareEvent] = []
         channel = self._channel
         envelope = channel.envelope
+        known_before = {name for name, state in self._observation.states.items() if state.known and state.active}
         self._observation.prepare_epoch(reading)
         self.safety_evidence = {EventKind.THRESHOLD_EXCEEDED: None, EventKind.STALE: None,
                                 EventKind.RATE_EXCEEDED: None, EventKind.QUALITY_DEGRADED: None}
@@ -444,7 +453,7 @@ class HardwareEventDetector:
             # Three in a row rather than one: a lone suspect sample is noise, a run of
             # them is a fault. Reporting every one would reproduce the sampling-rate
             # flood this layer exists to prevent.
-            if self._degraded_streak == 3:
+            if self._degraded_streak == 3 and reading.quality != Quality.STALE.value:
                 events.append(
                     self._event(
                         EventKind.QUALITY_DEGRADED,
@@ -457,7 +466,7 @@ class HardwareEventDetector:
 
         numeric = as_numeric(reading.value)
         if numeric is not None and envelope.declared:
-            events.extend(self._numeric_events(reading, numeric))
+            events.extend(self._numeric_events(reading, numeric, report_continuous=lost == 0))
         elif not reading.is_trustworthy or numeric is None:
             self._observation.invalidate()
         valid = numeric is not None and reading.is_trustworthy
@@ -466,8 +475,8 @@ class HardwareEventDetector:
         self._last_numeric = numeric if valid and continuous else None
         self._last_acquisition = acquisition if valid and math.isfinite(acquisition) else None
         self._acquisition_epoch = reading.acquisition_epoch
-        if reading.is_trustworthy and math.isfinite(reading.monotonic_at):
-            self._last_monotonic = reading.monotonic_at
+        if reading.is_trustworthy:
+            self._last_monotonic = _observation_now(reading)
         notices = self._observation.observe_soft(reading, ring=ring, pending_motion=pending_motion,
                                                  fault_free=fault_free)
         for notice in notices:
@@ -482,13 +491,18 @@ class HardwareEventDetector:
                                         observation=notice))
         # Bad numeric evidence invalidates soft/rate history, not the explicit
         # quality/freshness condition carried by this same reading.
-        self._observation.condition("quality_degraded", breached=self._degraded_streak >= 3,
+        now = _observation_now(reading)
+        self._observation.condition("quality_degraded", breached=self._degraded_streak >= 3 and reading.quality != Quality.STALE.value,
                                     clear=reading.is_trustworthy, reading=reading,
-                                    now=reading.monotonic_at, reason="sampling quality")
+                                    now=now, reason="sampling quality")
         self._observation.condition("stale", breached=reading.quality == Quality.STALE.value,
                                     clear=reading.is_trustworthy, reading=reading,
-                                    now=reading.monotonic_at, reason="sampling freshness")
+                                    now=now, reason="sampling freshness")
         self._stale = not reading.is_trustworthy
+        if any(not self._observation.states[name].known for name in known_before):
+            events.append(replace(self._event(EventKind.OBSERVATION_UNKNOWN, reading,
+                "continuous report evidence is unavailable"), sample_evidence=True,
+                observation={"phase": "unknown"}))
         return tuple(events)
 
     def check_stale(self, *, now: float | None = None) -> tuple[HardwareEvent, ...]:
@@ -527,7 +541,7 @@ class HardwareEventDetector:
         self.safety_evidence[EventKind.STALE] = event
         return (event,) if notice else ()
 
-    def _numeric_events(self, reading: Reading, numeric: float) -> list[HardwareEvent]:
+    def _numeric_events(self, reading: Reading, numeric: float, *, report_continuous: bool = True) -> list[HardwareEvent]:
         events: list[HardwareEvent] = []
         envelope = self._channel.envelope
 
@@ -568,7 +582,7 @@ class HardwareEventDetector:
                                 f"changing at {abs(delta) / elapsed:g}/s, above the declared {envelope.max_rate:g}/s")
             self.safety_evidence[EventKind.RATE_EXCEEDED] = event
             events.append(event)
-        now = reading.monotonic_at
+        now = _observation_now(reading)
         threshold_notice = self._observation.condition(
             "threshold_exceeded", breached=self._breached, clear=not self._breached,
             reading=reading, now=now, valid=reading.is_trustworthy,
@@ -577,9 +591,29 @@ class HardwareEventDetector:
             events = [replace(event, observation=threshold_notice)
                       if event.kind in {EventKind.THRESHOLD_EXCEEDED, EventKind.SETTLED} else event
                       for event in events]
-        self._observation.condition("rate_exceeded", breached=bool(rate_breached), clear=not rate_breached,
-                                    reading=reading, now=now, valid=bool(rate_valid), reason="declared physical rate",
-                                    extra={"rate_available": bool(rate_valid)})
+        report_valid = rate_valid and report_continuous
+        rate_notice = self._observation.condition(
+            "rate_exceeded", breached=bool(rate_breached), clear=not rate_breached,
+            reading=reading, now=at if report_valid else now, valid=bool(report_valid), reason="declared physical rate",
+            extra={"rate_available": bool(rate_valid),
+                   "measured_rate": abs(delta) / elapsed if rate_valid else None,
+                   "declared_max_rate": envelope.max_rate, "rate_delta": delta if rate_valid else None,
+                   "acquisition_interval_s": elapsed if rate_valid else None,
+                   "rate_timebase": reading.rate_timebase})
+        if rate_notice:
+            if rate_notice["phase"] == "recovery":
+                events.append(replace(self._event(EventKind.OBSERVATION_CLEARED, reading,
+                                                 "physical rate returned within its declaration"),
+                                      observation=rate_notice))
+            else:
+                # Raw evidence already reached the reflex path. This confirmed
+                # transition also wakes watches, without sample-rate notification.
+                events = [replace(event, observation=rate_notice)
+                          if event.kind == EventKind.RATE_EXCEEDED else event for event in events]
+                if not any(event.kind == EventKind.RATE_EXCEEDED for event in events):
+                    events.append(replace(self._event(EventKind.OBSERVATION_WARNING, reading,
+                                                     "confirmed physical-rate episode; reported only"),
+                                          sample_evidence=True, observation=rate_notice))
         return events
 
     def _event(self, kind: str, reading: Reading, detail: str) -> HardwareEvent:
@@ -966,7 +1000,7 @@ class HardwareStreamSource:
         - The same kind on the *same* channel is still suppressed for the
           ``MIN_EVENT_INTERVAL_S`` floor, preventing level-triggered floods.
         """
-        if event.observation.get("phase") in {"entry", "recovery", "reminder"}:
+        if event.observation.get("phase") in {"entry", "recovery", "reminder", "unknown"}:
             return True  # episode transitions must survive notification pacing
         now = time.monotonic()
         key = f"{event.kind}:{event.device_id}.{event.channel_id}"
@@ -1323,7 +1357,7 @@ class BatchStreamCoordinator:
 
     def _admit(self, event: HardwareEvent) -> bool:
         """Return whether this event clears the per-kind-per-channel rate floor."""
-        if event.observation.get("phase") in {"entry", "recovery", "reminder"}:
+        if event.observation.get("phase") in {"entry", "recovery", "reminder", "unknown"}:
             return True  # episode transitions must survive notification pacing
         now = time.monotonic()
         key = f"{event.kind}:{event.device_id}.{event.channel_id}"

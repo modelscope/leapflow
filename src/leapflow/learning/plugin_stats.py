@@ -35,6 +35,8 @@ TIER_SKIPPED = "skipped"
 _TIERS = frozenset({TIER_SUCCEEDED, TIER_REPAIRED, TIER_REFUSED, TIER_FAILED, TIER_SKIPPED})
 # How many distinct failure codes a report names per tool, most frequent first.
 _REPORTED_CODES = 5
+# Increment whenever result grading changes; legacy grades are not comparable.
+GRADING_VERSION = 2
 
 
 def _tier(ok: bool, tier: str) -> str:
@@ -88,6 +90,7 @@ class PluginStats:
     refusal_rate: float = 0.0
     repair_rate: float = 0.0
     failure_codes: Dict[str, int] = field(default_factory=dict)
+    failed_codes: Dict[str, int] = field(default_factory=dict)
 
 
 def summarize_samples(samples: Iterable[PluginUsageSample]) -> Optional[PluginStats]:
@@ -115,6 +118,7 @@ def summarize_samples(samples: Iterable[PluginUsageSample]) -> Optional[PluginSt
         refusal_rate=round(tiers[TIER_REFUSED] / total, 4),
         repair_rate=round(tiers[TIER_REPAIRED] / total, 4),
         failure_codes=dict(codes.most_common(_REPORTED_CODES)),
+        failed_codes=dict(Counter(s.failure_code for s in rows if _tier(s.ok, s.tier) == TIER_FAILED)),
     )
 
 
@@ -185,7 +189,7 @@ class PluginUsageTracker:
                     except Exception:  # noqa: BLE001 - never fail a tool call on it
                         logger.debug("quarantine streak not recorded", exc_info=True)
 
-    def stats_for_plugin(self, plugin_id: str) -> Optional[PluginStats]:
+    def stats_for_plugin(self, plugin_id: str, *, since: float | None = None) -> Optional[PluginStats]:
         """Aggregate stats across all tools owned by a plugin."""
         tool_names = self._tools_for_plugin(plugin_id)
         if not tool_names:
@@ -195,6 +199,7 @@ class PluginUsageTracker:
             for tool_name in tool_names
             if tool_name in self._samples
             for sample in self._samples[tool_name]
+            if since is None or sample.timestamp >= since
         )
 
     def stats_for_tool(self, tool_name: str) -> Optional[PluginStats]:
@@ -276,6 +281,7 @@ class PluginUsageTracker:
         reinstalled still inherits the reliability history of the tools it owns.
         """
         return {
+            "grading_version": GRADING_VERSION,
             "max_samples_per_tool": self._max_samples,
             "samples": {
                 tool_name: [
@@ -290,7 +296,8 @@ class PluginUsageTracker:
     @classmethod
     def load_state(cls, state: Dict[str, Any]) -> "PluginUsageTracker":
         """Restore a tracker from serialized state; malformed rows are skipped."""
-        if not state:
+        if not state or state.get("grading_version") != GRADING_VERSION:
+            # Trust lives in a separate ledger and is deliberately not reset here.
             return cls()
         tracker = cls(
             max_samples_per_tool=int(state.get("max_samples_per_tool") or 500)

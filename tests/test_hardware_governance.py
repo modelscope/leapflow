@@ -1911,6 +1911,8 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.preview_quality",
         "hardware.preview_idle_timeout_s",
         "hardware.fleet_nodes",
+        "hardware.fleet_retry_initial_s",
+        "hardware.fleet_retry_max_s",
         "hardware.alert_policies",
         "hardware.advisory_limits",
         "hardware.view_priors",
