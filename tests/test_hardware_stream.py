@@ -1432,3 +1432,74 @@ async def test_batch_judges_every_hard_guard_before_persistence() -> None:
     assert policy.fired_count == 1
     assert source._store.calls == 2
     assert observed_guards == [1, 1]
+
+
+@pytest.mark.parametrize("step", [.02, .04, .06])
+def test_rate_flapping_never_confirms_but_raw_safety_stays_immediate(step: float) -> None:
+    ctx = _context(sample_rate_hz=10, max_rate=1)
+    detector = HardwareEventDetector(ctx, ctx.channel("level"))
+    notices, raw = [], 0
+    value = 20.0
+    for index in range(300):
+        if index % 2:
+            value = 21.0 if value == 20.0 else 20.0
+        events = detector.observe(_reading(value, sequence=index, at=10 + index * step))
+        raw += detector.safety_evidence[EventKind.RATE_EXCEEDED] is not None
+        notices.extend(e.observation for e in events if e.observation.get("condition") == "rate_exceeded")
+    assert raw == 150
+    assert not notices
+    assert not detector._observation.states["rate_exceeded"].active
+
+
+def test_rate_dwell_uses_acquisition_clock_and_delays_recovery() -> None:
+    from dataclasses import replace
+    ctx = _context(sample_rate_hz=50, max_rate=1)
+    detector = HardwareEventDetector(ctx, ctx.channel("level"))
+    notices = []
+    for index in range(27):
+        reading = replace(_reading(20 + index * .1, sequence=index, at=1000 + index * .0001),
+                          acquisition_at=100 + index * .02, acquisition_epoch="node", rate_timebase="source")
+        events = detector.observe(reading)
+        notices.extend(e.observation for e in events if e.observation.get("condition") == "rate_exceeded")
+    assert [n["phase"] for n in notices] == ["entry"]
+    assert notices[0]["duration_s"] == pytest.approx(.5)
+    assert notices[0]["measured_rate"] == pytest.approx(5)
+    for index in range(27, 78):
+        reading = replace(_reading(22.6, sequence=index, at=1000 + index * .0001),
+                          acquisition_at=100 + index * .02, acquisition_epoch="node", rate_timebase="source")
+        events = detector.observe(reading)
+        notices.extend(e.observation for e in events if e.observation.get("condition") == "rate_exceeded")
+        if index < 77:
+            assert detector._observation.states["rate_exceeded"].active
+    assert [n["phase"] for n in notices] == ["entry", "recovery"]
+    assert not detector._observation.states["rate_exceeded"].active
+
+
+@pytest.mark.parametrize("invalid", ["gap", "epoch", "timebase", "sequence", "quality"])
+def test_rate_gap_requalifies_same_episode_without_confirming_unknown(invalid: str) -> None:
+    from dataclasses import replace
+    ctx = _context(sample_rate_hz=10, max_rate=1)
+    detector = HardwareEventDetector(ctx, ctx.channel("level"))
+    for index in range(7):
+        detector.observe(_reading(20 + index, sequence=index, at=10 + index * .1))
+    state = detector._observation.states["rate_exceeded"]
+    assert state.active and state.known
+    episode = state.episode
+    reading = _reading(27, sequence=7, at=10.7 if invalid != "gap" else 11)
+    patches = {"epoch": {"acquisition_epoch": "new"}, "timebase": {"rate_timebase": "unavailable"},
+               "quality": {"quality": "stale"}}
+    reading = replace(reading, **patches.get(invalid, {}))
+    events = detector.observe(reading, lost=1 if invalid == "sequence" else 0)
+    assert not state.known
+    assert any(e.kind == EventKind.OBSERVATION_UNKNOWN for e in events)
+    notices = []
+    for index in range(8, 15):
+        events = detector.observe(replace(_reading(20 + index, sequence=index,
+                                                  at=reading.monotonic_at + (index - 7) * .1),
+                                         acquisition_epoch=reading.acquisition_epoch))
+        notices.extend(e.observation for e in events if e.observation.get("condition") == "rate_exceeded")
+        if index < 13:
+            assert not state.known
+    assert state.known and state.active and state.episode == episode
+    assert [n["phase"] for n in notices] == ["entry"]
+    assert notices[0]["reconfirmed"]

@@ -24,7 +24,9 @@ class _DemoProducer:
         return "demo"
 
     async def observe(self, ctx: ProducerContext) -> list[Finding]:
-        return [Finding(watch_id="", domain="demo", title="hit", severity=Severity.ALERT, dedup_key="d1")]
+        # Unsolicited presentation defaults to the critical floor; alert-level
+        # evidence stays persisted and inspectable on the board.
+        return [Finding(watch_id="", domain="demo", title="hit", severity=Severity.CRITICAL, dedup_key="d1")]
 
 
 def _manager(tmp_path: Path, emit=None) -> MonitorManager:
@@ -55,6 +57,9 @@ async def test_service_watch_rpc_roundtrip(tmp_path: Path) -> None:
 
     result = await service.watch_refresh(watch_id)
     assert result["ok"] is True and result["findings"] == 1
+    # Presentation is bounded and coalesced: the notice is emitted on flush, not
+    # inside the refresh RPC.
+    await service._monitors.delivery.flush()
     assert any(et == "monitor.finding" for et, _ in emitted)
     assert len(await service.watch_findings(watch_id)) == 1
 

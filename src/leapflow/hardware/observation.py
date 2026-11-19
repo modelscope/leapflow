@@ -48,6 +48,8 @@ class ObservationPolicy:
     margin_max: float | None = None
     confirm_s: float = 0.2
     stale_confirm_s: float = 0.5
+    rate_confirm_s: float = 0.5
+    rate_recover_s: float = 1.0
     recover_s: float = 0.5
     adaptive: bool = False
     noise_window_s: float = 5.0
@@ -89,6 +91,8 @@ class ObservationPolicy:
             raise ValueError(
                 "observation window, multiplier and reminder interval must be positive"
             )
+        if self.rate_confirm_s <= 0 or self.rate_recover_s <= 0:
+            raise ValueError("observation rate confirmation and recovery must be positive")
         if self.report_max_s < self.report_after_s:
             raise ValueError("observation.report_max_s must not be below report_after_s")
 
@@ -97,7 +101,7 @@ class ObservationPolicy:
         floor = self.margin_floor
         if floor is None:
             floor = max(envelope.tolerance or 0.0, envelope.quantization or 0.0)
-        stale_window = max(self.stale_confirm_s, 2.0 / channel.sample_rate_hz) if channel.sample_rate_hz > 0 else self.stale_confirm_s
+        stale_window = max(0.5, self.stale_confirm_s, 2.0 / channel.sample_rate_hz) if channel.sample_rate_hz > 0 else max(0.5, self.stale_confirm_s)
         policy = replace(self, margin_floor=floor, stale_confirm_s=stale_window)
         ceiling = policy.margin_max if policy.margin_max is not None else floor
         if ceiling < floor:
@@ -220,6 +224,31 @@ class Episode:
         self.known = False
         self.candidate_at = self.recovering_at = None
 
+    def _revalidate(self, breached: bool, clear: bool, now: float, confirm: float,
+                    recover: float, report_after: float) -> str:
+        """An unknown active episode needs new continuous evidence, not a new UUID."""
+        if breached:
+            self.recovering_at = None
+            if self.candidate_at is None:
+                self.candidate_at = now
+            if now - self.candidate_at + 1e-9 < confirm:
+                return ""
+            self.since, self.candidate_at, self.known = self.candidate_at, None, True
+            self.next_report = now + report_after
+            self.sequence += 1
+            return "entry"
+        self.candidate_at = None
+        if clear:
+            if self.recovering_at is None:
+                self.recovering_at = now
+            if now - self.recovering_at + 1e-9 >= recover:
+                self.active, self.known, self.recovering_at = False, True, None
+                self.sequence += 1
+                return "recovery"
+        else:
+            self.recovering_at = None
+        return ""
+
     def observe(
         self,
         *,
@@ -228,9 +257,12 @@ class Episode:
         now: float,
         confirm_s: float = 0.0,
         recover_s: float = 0.0,
+        revalidate_s: float = 0.0,
         report_after_s: float = DEFAULT_REPORT_AFTER_S,
         report_max_s: float = DEFAULT_REPORT_MAX_S,
     ) -> str:
+        if self.active and not self.known and revalidate_s > 0:
+            return self._revalidate(breached, clear, now, revalidate_s, recover_s, report_after_s)
         self.known = True
         if not self.active:
             self.recovering_at = None
@@ -345,6 +377,11 @@ class ObservationJudgment:
         state = self.states.setdefault(name, Episode())
         policy = self.policy
         phase = ""
+        confirm = (policy.stale_confirm_s if name == "stale" else
+                   policy.rate_confirm_s if name == "rate_exceeded" else
+                   policy.confirm_s if soft else 0.0)
+        recovery = policy.rate_recover_s if name == "rate_exceeded" else policy.recover_s if soft else 0.0
+        revalidating = name == "rate_exceeded" and state.active and not state.known
         if not valid:
             state.unknown()
         else:
@@ -352,8 +389,9 @@ class ObservationJudgment:
                 breached=breached,
                 clear=clear,
                 now=now,
-                confirm_s=policy.stale_confirm_s if name == "stale" else policy.confirm_s if soft else 0.0,
-                recover_s=policy.recover_s if soft else 0.0,
+                confirm_s=confirm,
+                recover_s=recovery,
+                revalidate_s=confirm if name == "rate_exceeded" else 0.0,
                 report_after_s=policy.report_after_s,
                 report_max_s=policy.report_max_s,
             )
@@ -374,6 +412,7 @@ class ObservationJudgment:
             "reason": reason,
             "duration_s": max(0.0, now - state.since) if state.episode else 0.0,
             "observed_at": reading.observed_at,
+            "freshness_s": 2.0 / self.channel.sample_rate_hz if self.channel.sample_rate_hz > 0 else 0.0,
             "margin": self.margin,
             "soft_min": policy.soft_min,
             "soft_max": policy.soft_max,
@@ -381,8 +420,10 @@ class ObservationJudgment:
             "hard_max": self.channel.envelope.max_value,
             "report_after_s": policy.report_after_s,
             "report_max_s": policy.report_max_s,
-            "confirm_s": policy.stale_confirm_s if name == "stale" else policy.confirm_s if soft else 0.0,
+            "confirm_s": confirm,
+            "recover_s": recovery,
             "clear": clear and valid,
+            "reconfirmed": revalidating and phase == "entry",
         }
         data.update(extra or {})
         self.latest[name] = data

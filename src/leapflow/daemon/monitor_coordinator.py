@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional
 
 from leapflow.daemon._transport import RPC_STREAM_LIMIT
 from leapflow.daemon.notifications import Notification
+from leapflow.monitor.delivery import BoundedFindingDelivery, DeliveryConfig
 from leapflow.monitor.signal_noise import SignalNoiseConfig, SignalNoiseGate
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,10 @@ class MonitorCoordinator:
                 services=self._build_services_proxy(ctx, settings),
                 tick_seconds=int(getattr(settings, "scheduler_tick_seconds", 120)),
                 grace_seconds=float(getattr(settings, "scheduler_grace_seconds", 120.0)),
+                run_db=self._off_loop,
+                delivery_factory=lambda store, emit, validate: BoundedFindingDelivery(
+                    store, emit, config=DeliveryConfig.parse(getattr(settings, "monitor_delivery", "{}")),
+                    run_db=self._off_loop, validate=validate),
             )
             self._monitors.producers.register(SessionAnalysisProducer())
             self._monitors.producers.register(SignalObservationProducer())
@@ -277,6 +282,8 @@ class MonitorCoordinator:
 
     def update_settings(self, settings: Any) -> None:
         """Hot-apply signal noise policy settings to the running gate."""
+        if self._monitors is not None:
+            self._monitors.delivery.configure(getattr(settings, "monitor_delivery", "{}"))
         gate = self._signal_noise_gate
         if gate is not None:
             gate.update_config(SignalNoiseConfig.from_settings(settings))
@@ -379,6 +386,7 @@ class MonitorCoordinator:
         # ``hardware.enabled`` so the board has a watch to report against; with the
         # producer unregistered the cycle is a no-op.
         ("hardware-bench", "hardware", "2m", False),
+        ("hardware-live", "hardware", "event:hw.*", False),
         # Framework self-evolution, armed twice on purpose. The domain answers two
         # different questions with two different cadences: a *state* snapshot (what is
         # registered, what trust each plugin holds, which pipeline segments show
@@ -423,8 +431,8 @@ class MonitorCoordinator:
             entry = existing.get(name)
             if entry is not None:
                 view, is_active = entry
-                if is_active:
-                    # Already armed and active — nothing to do.
+                if is_active or str(view.state) == "suspended":
+                    # Preserve existing active watches and deliberate user pauses.
                     continue
                 # Stale (done/failed/suspended) — remove so we can re-arm.
                 try:
@@ -636,6 +644,7 @@ class MonitorCoordinator:
             "active": len(active),
             "standalone_active": len(standalone),
             "client_coupled_active": len(coupled),
+            "delivery": monitors.delivery.stats,
             "active_samples": [
                 {
                     "watch_id": str(watch.get("watch_id", "")),

@@ -124,6 +124,7 @@ _EVENT_CLASS_MAP: dict[str, str] = {
     "advisory_cleared": HardwareEventClass.RECORD,
     "observation_warning": HardwareEventClass.RECORD,
     "observation_cleared": HardwareEventClass.RECORD,
+    "observation_unknown": HardwareEventClass.RECORD,
 }
 
 
@@ -201,6 +202,7 @@ class EventKind:
     """A monitor-only limit the device protects itself against was breached."""
     OBSERVATION_WARNING = "observation_warning"
     OBSERVATION_CLEARED = "observation_cleared"
+    OBSERVATION_UNKNOWN = "observation_unknown"
     ADVISORY_CLEARED = "advisory_cleared"
     """A breached advisory limit returned inside its hysteresis band."""
 
@@ -428,6 +430,7 @@ class HardwareEventDetector:
         events: list[HardwareEvent] = []
         channel = self._channel
         envelope = channel.envelope
+        known_before = {name for name, state in self._observation.states.items() if state.known and state.active}
         self._observation.prepare_epoch(reading)
         self.safety_evidence = {EventKind.THRESHOLD_EXCEEDED: None, EventKind.STALE: None,
                                 EventKind.RATE_EXCEEDED: None, EventKind.QUALITY_DEGRADED: None}
@@ -463,7 +466,7 @@ class HardwareEventDetector:
 
         numeric = as_numeric(reading.value)
         if numeric is not None and envelope.declared:
-            events.extend(self._numeric_events(reading, numeric))
+            events.extend(self._numeric_events(reading, numeric, report_continuous=lost == 0))
         elif not reading.is_trustworthy or numeric is None:
             self._observation.invalidate()
         valid = numeric is not None and reading.is_trustworthy
@@ -496,6 +499,10 @@ class HardwareEventDetector:
                                     clear=reading.is_trustworthy, reading=reading,
                                     now=now, reason="sampling freshness")
         self._stale = not reading.is_trustworthy
+        if any(not self._observation.states[name].known for name in known_before):
+            events.append(replace(self._event(EventKind.OBSERVATION_UNKNOWN, reading,
+                "continuous report evidence is unavailable"), sample_evidence=True,
+                observation={"phase": "unknown"}))
         return tuple(events)
 
     def check_stale(self, *, now: float | None = None) -> tuple[HardwareEvent, ...]:
@@ -534,7 +541,7 @@ class HardwareEventDetector:
         self.safety_evidence[EventKind.STALE] = event
         return (event,) if notice else ()
 
-    def _numeric_events(self, reading: Reading, numeric: float) -> list[HardwareEvent]:
+    def _numeric_events(self, reading: Reading, numeric: float, *, report_continuous: bool = True) -> list[HardwareEvent]:
         events: list[HardwareEvent] = []
         envelope = self._channel.envelope
 
@@ -584,9 +591,29 @@ class HardwareEventDetector:
             events = [replace(event, observation=threshold_notice)
                       if event.kind in {EventKind.THRESHOLD_EXCEEDED, EventKind.SETTLED} else event
                       for event in events]
-        self._observation.condition("rate_exceeded", breached=bool(rate_breached), clear=not rate_breached,
-                                    reading=reading, now=now, valid=bool(rate_valid), reason="declared physical rate",
-                                    extra={"rate_available": bool(rate_valid)})
+        report_valid = rate_valid and report_continuous
+        rate_notice = self._observation.condition(
+            "rate_exceeded", breached=bool(rate_breached), clear=not rate_breached,
+            reading=reading, now=at if report_valid else now, valid=bool(report_valid), reason="declared physical rate",
+            extra={"rate_available": bool(rate_valid),
+                   "measured_rate": abs(delta) / elapsed if rate_valid else None,
+                   "declared_max_rate": envelope.max_rate, "rate_delta": delta if rate_valid else None,
+                   "acquisition_interval_s": elapsed if rate_valid else None,
+                   "rate_timebase": reading.rate_timebase})
+        if rate_notice:
+            if rate_notice["phase"] == "recovery":
+                events.append(replace(self._event(EventKind.OBSERVATION_CLEARED, reading,
+                                                 "physical rate returned within its declaration"),
+                                      observation=rate_notice))
+            else:
+                # Raw evidence already reached the reflex path. This confirmed
+                # transition also wakes watches, without sample-rate notification.
+                events = [replace(event, observation=rate_notice)
+                          if event.kind == EventKind.RATE_EXCEEDED else event for event in events]
+                if not any(event.kind == EventKind.RATE_EXCEEDED for event in events):
+                    events.append(replace(self._event(EventKind.OBSERVATION_WARNING, reading,
+                                                     "confirmed physical-rate episode; reported only"),
+                                          sample_evidence=True, observation=rate_notice))
         return events
 
     def _event(self, kind: str, reading: Reading, detail: str) -> HardwareEvent:
@@ -973,7 +1000,7 @@ class HardwareStreamSource:
         - The same kind on the *same* channel is still suppressed for the
           ``MIN_EVENT_INTERVAL_S`` floor, preventing level-triggered floods.
         """
-        if event.observation.get("phase") in {"entry", "recovery", "reminder"}:
+        if event.observation.get("phase") in {"entry", "recovery", "reminder", "unknown"}:
             return True  # episode transitions must survive notification pacing
         now = time.monotonic()
         key = f"{event.kind}:{event.device_id}.{event.channel_id}"
@@ -1330,7 +1357,7 @@ class BatchStreamCoordinator:
 
     def _admit(self, event: HardwareEvent) -> bool:
         """Return whether this event clears the per-kind-per-channel rate floor."""
-        if event.observation.get("phase") in {"entry", "recovery", "reminder"}:
+        if event.observation.get("phase") in {"entry", "recovery", "reminder", "unknown"}:
             return True  # episode transitions must survive notification pacing
         now = time.monotonic()
         key = f"{event.kind}:{event.device_id}.{event.channel_id}"

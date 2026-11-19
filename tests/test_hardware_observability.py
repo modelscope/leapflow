@@ -897,7 +897,7 @@ def test_episode_notifications_persist_across_watch_recreation_and_chart_churn(t
         _transition(registry, 83, .2)
         first = poll(1)
         assert len(first) == 1
-        assert first[0].severity.value == ("alert" if hard else "notable")
+        assert first[0].severity.value == ("critical" if hard else "notable")
         store.save(first[0])
         registry._events = tuple(_event("sample_loss", observed_at=_WALL + i) for i in range(60))
         registry._windows = _windows(40)
@@ -1003,7 +1003,7 @@ def test_restart_short_stale_closes_old_checkpoint_without_new_alert(tmp_path: A
         sample(registry, 1, True)
         sample(registry, 1.5, True)
         old = asyncio.run(HardwareObservationProducer(lambda: registry).observe(_producer_ctx(_WALL + 2)))[0]
-        assert old.severity.value == "alert"
+        assert old.severity.value == "critical"
         store.save(old)
         registry = _condition_registry()
         producer = HardwareObservationProducer(lambda: registry, finding_store=store)
@@ -1033,9 +1033,9 @@ def test_cross_runtime_short_reminder_is_suppressed_but_recovery_survives() -> N
 
 @pytest.mark.parametrize("value,quality,age,declared,severity", [
     (False, "ok", .1, True, "notable"), (0, "ok", .1, True, "notable"),
-    (True, "ok", .1, True, "alert"), (False, "stale", .1, True, "alert"),
-    (False, "ok", 1, True, "alert"), (False, "ok", -.1, True, "alert"),
-    (False, "ok", .1, False, "alert"), (None, "ok", .1, True, "alert"),
+    (True, "ok", .1, True, "critical"), (False, "stale", .1, True, "critical"),
+    (False, "ok", 1, True, "critical"), (False, "ok", -.1, True, "critical"),
+    (False, "ok", .1, False, "critical"), (None, "ok", .1, True, "critical"),
 ])
 def test_disabled_threshold_severity_requires_fresh_declared_evidence(
     value: Any, quality: str, age: float, declared: bool, severity: str,

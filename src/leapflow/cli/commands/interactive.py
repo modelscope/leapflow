@@ -1709,10 +1709,10 @@ async def cmd_interactive_daemon(
                             console.system("Distillation complete — no skills produced (insufficient signal)")
                         app.invalidate()
                     elif event_type == "monitor.finding":
-                        console.monitor_card(payload)
-                        if str(payload.get("severity")) == "alert":
+                        # Defense in depth for notifications from older daemons.
+                        if payload.get("severity") == "critical" and console.monitor_notice(payload):
                             status.update_monitor_counts(alerts=status.alert_count + 1)
-                        app.invalidate()
+                            app.invalidate()
                     elif event_type == "watch.state":
                         await _refresh_watch_count()
                     elif event_type == "signal.stream":

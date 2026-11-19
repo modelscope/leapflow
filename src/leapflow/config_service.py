@@ -317,10 +317,17 @@ _FIELD_DESCRIPTIONS = {
         "else deletes from that table. Read when sampling starts, so a change needs a "
         "daemon restart."
     ),
+    "monitor.delivery": (
+        "JSON presentation policy: minimum_severity (critical), global_interval_s (5), "
+        "repeat_interval_s (60), max_pending (128), max_items (5), max_bytes (8192), "
+        "updated_interval_s (1), max_state (4096). Persists evidence before gating; "
+        "valid hot reload preserves cooldowns and counters. Recovery is silent."
+    ),
     "hardware.observation": (
         "JSON report-only policy with defaults and exact overrides (device_id/channel_id). "
         "soft_min/soft_max and margin_floor/margin_max are in channel units; confirm_s/recover_s "
-        "require continuous valid evidence. Adaptive defaults off and requires margin_max. "
+        "require continuous valid evidence. rate_confirm_s (0.5) and rate_recover_s (1.0) "
+        "debounce reporting only, never raw safety action. Adaptive defaults off and requires margin_max. "
         "Hard envelope and task accuracy are unchanged. Valid updates hot-reload; invalid "
         "updates retain the last admitted policy. Channel bounds are checked at hardware admission."
     ),
@@ -926,6 +933,9 @@ class ConfigService:
                     raise ValueError(f"{normalized} must be within 0..1")
             elif coerced <= 0:
                 raise ValueError(f"{normalized} must be positive")
+        if normalized == "monitor.delivery":
+            from leapflow.monitor.delivery import DeliveryConfig
+            DeliveryConfig.parse(coerced)
         if normalized == "hardware.observation":
             from leapflow.hardware.observation import ObservationSettings
             policy = ObservationSettings.parse(coerced)

@@ -1821,7 +1821,7 @@ class RuntimeLeapService:
                     metadata=notification.to_dict(),
                 )
         finally:
-            self.notification_bus.unsubscribe(subscriber_id)
+            self.notification_bus.unsubscribe(subscriber_id, queue)
 
     # ── Status ───────────────────────────────────────────────────────
 
@@ -1888,6 +1888,7 @@ class RuntimeLeapService:
             "turn_admission": self._turn_admission_status(),
             "deferred_init": self._deferred_init_status(ctx),
             "watch_summary": await self._monitor_coordinator.get_summary(),
+            "notification_delivery": self.notification_bus.stats,
             "host_backend": host,
             "environment_sources": {
                 "active": list(self._environment_source_manager.source_ids)

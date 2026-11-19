@@ -956,6 +956,7 @@ class Settings:
     dashboard_token_ref: str = ""  # secret ref for the local dashboard access token
 
     # ── Session analysis dashboard (domain=session watch) ──
+    monitor_delivery: str = "{}"
     monitor_session_batch_turns: int = 6
     monitor_session_batch_tokens: int = 4000
     monitor_session_use_model_salience: bool = False
@@ -1889,6 +1890,11 @@ def _build_settings_from_env(
         except Exception:
             logger.warning("Invalid LEAPFLOW_USAGE_PRICING: %s", _raw_pricing)
 
+    # Domain-neutral presentation policy (reporting only, never safety authority).
+    monitor_delivery = os.getenv("LEAPFLOW_MONITOR_DELIVERY", "{}").strip()
+    from leapflow.monitor.delivery import DeliveryConfig
+    DeliveryConfig.parse(monitor_delivery)
+
     # Session analysis dashboard
     monitor_session_batch_turns = int(os.getenv("LEAPFLOW_MONITOR_SESSION_BATCH_TURNS", "6"))
     monitor_session_batch_tokens = int(os.getenv("LEAPFLOW_MONITOR_SESSION_BATCH_TOKENS", "4000"))
@@ -2317,6 +2323,7 @@ def _build_settings_from_env(
         dashboard_token_ref=dashboard_token_ref,
         # Usage Pricing
         usage_pricing=usage_pricing,
+        monitor_delivery=monitor_delivery,
         monitor_session_batch_turns=monitor_session_batch_turns,
         monitor_session_batch_tokens=monitor_session_batch_tokens,
         monitor_session_use_model_salience=monitor_session_use_model_salience,
