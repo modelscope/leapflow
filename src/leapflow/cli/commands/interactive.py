@@ -1234,6 +1234,8 @@ async def cmd_interactive_daemon(
         runtime_source = daemon_status.get("runtime_source")
         if runtime_source:
             console.system(f"Runtime source: {runtime_source}")
+        if daemon_status.get("runtime_installation_error"):
+            console.warning(str(daemon_status["runtime_installation_error"]))
         runtime_executable = daemon_status.get("runtime_executable")
         if runtime_executable:
             console.system(f"Python: {runtime_executable}")
@@ -1274,7 +1276,7 @@ async def cmd_interactive_daemon(
         record_user: bool = True,
     ) -> None:
         nonlocal turn_count, active_turn_request_id
-        from leapflow.daemon.client import DaemonShutdownError, DaemonUnavailableError
+        from leapflow.daemon.client import DaemonRpcError, DaemonShutdownError, DaemonUnavailableError
 
         if record_user:
             exit_stats.record_user_message()
@@ -1332,6 +1334,12 @@ async def cmd_interactive_daemon(
                     if not metadata.get("heartbeat"):
                         console.system(event.content)
             turn_completed = True
+        except DaemonRpcError:
+            console.warning(
+                "leapd returned a request error, not a connection loss. "
+                "The command was not replayed; inspect the error before trying again."
+            )
+            raise
         except DaemonUnavailableError as exc:
             if isinstance(exc, DaemonShutdownError):
                 # A deliberate stop is not a transport fault: replaying the turn would
@@ -1345,8 +1353,9 @@ async def cmd_interactive_daemon(
             if allow_retry and not saw_real_event:
                 retry_error = exc
             else:
+                progress = "after receiving turn output" if saw_real_event else "again before output"
                 console.warning(
-                    "Lost connection to leapd after the turn started; "
+                    f"Lost connection to leapd {progress}; "
                     "the command was not replayed to avoid duplicate side effects."
                 )
                 raise

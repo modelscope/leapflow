@@ -19,8 +19,15 @@ from leapflow.daemon.lifecycle import (
     stop_daemon,
     wait_ready,
 )
-from leapflow.daemon.protocol import RpcRequest
+from leapflow.daemon.protocol import ErrorCode, RpcError, RpcRequest
 from leapflow.engine import StreamEvent
+from leapflow.engine.recovery.failure_envelope import (
+    FailureContext,
+    FailureEnvelope,
+    FailureSource,
+    Recoverability,
+    SideEffectState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,37 @@ StatusCallback = Callable[[str], None]
 
 class DaemonUnavailableError(RuntimeError):
     """Raised when a usable leapd daemon cannot be reached."""
+
+
+class DaemonRpcError(RuntimeError):
+    """A reachable daemon rejected or failed an RPC; reconnecting cannot fix it.
+
+    Keep the wire code/data and a non-replayable failure envelope. A backend
+    response does not prove that no side effects occurred, even before output.
+    """
+
+    def __init__(self, error: object, *, method: str = "", request_id: str = "") -> None:
+        payload = error if isinstance(error, dict) else {}
+        code = payload.get("code")
+        self.error = RpcError(
+            code=code if isinstance(code, int) else ErrorCode.INTERNAL_ERROR,
+            message=str(payload.get("message") or "Daemon request failed"),
+            data=payload.get("data") if payload else error,
+        )
+        self.code = self.error.code
+        self.data = self.error.data
+        message = _format_rpc_error(error)
+        self.failure = FailureEnvelope.create(
+            source=FailureSource.SYSTEM,
+            category="internal_defect" if self.code == ErrorCode.INTERNAL_ERROR else "daemon_rpc",
+            failure_class="daemon_rpc_error",
+            failure_code=str(self.code),
+            message=message,
+            recoverability=Recoverability.NON_RECOVERABLE,
+            side_effect_state=SideEffectState.UNKNOWN,
+            context=FailureContext(tool_name=method, execution_id=request_id),
+        )
+        super().__init__(message)
 
 
 class DaemonShutdownError(DaemonUnavailableError):
@@ -132,7 +170,7 @@ class DaemonClient:
                 if payload.get("id") != request.id:
                     continue
                 if "error" in payload:
-                    raise DaemonUnavailableError(_format_rpc_error(payload["error"]))
+                    raise DaemonRpcError(payload["error"], method=request.method, request_id=request.id)
                 return payload.get("result")
         finally:
             await _close_writer(writer)
@@ -183,7 +221,7 @@ class DaemonClient:
                     continue
                 if payload.get("id") == request.id:
                     if "error" in payload:
-                        raise DaemonUnavailableError(_format_rpc_error(payload["error"]))
+                        raise DaemonRpcError(payload["error"], method=request.method, request_id=request.id)
                     break
         finally:
             await _close_writer(writer)
@@ -211,6 +249,8 @@ class DaemonClient:
                         yield metadata
                     continue
                 if payload.get("id") == request.id:
+                    if "error" in payload:
+                        raise DaemonRpcError(payload["error"], method=request.method, request_id=request.id)
                     break
         finally:
             await _close_writer(writer)
@@ -394,9 +434,10 @@ class DaemonClient:
                             await result
                         continue
                     if event_type == "error":
-                        raise DaemonUnavailableError(
-                            str(metadata.get("error") or params.get("content") or "preview stream failed")
-                        )
+                        raise DaemonRpcError({
+                            "code": ErrorCode.INTERNAL_ERROR,
+                            "message": str(metadata.get("error") or params.get("content") or "preview stream failed"),
+                        }, method=request.method, request_id=request.id)
                     if params.get("done"):
                         continue
                     if event_type == "frame":
@@ -404,7 +445,7 @@ class DaemonClient:
                     continue
                 if payload.get("id") == request.id:
                     if "error" in payload:
-                        raise DaemonUnavailableError(_format_rpc_error(payload["error"]))
+                        raise DaemonRpcError(payload["error"], method=request.method, request_id=request.id)
                     return
         finally:
             await _close_writer(writer)

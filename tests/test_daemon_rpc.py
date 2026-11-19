@@ -15,9 +15,9 @@ import pytest
 
 import leapflow
 from leapflow.daemon._transport import get_transport
-from leapflow.daemon.client import DaemonClient, DaemonUnavailableError, ensure_daemon_client
+from leapflow.daemon.client import DaemonClient, DaemonRpcError, DaemonUnavailableError, ensure_daemon_client
 from leapflow.daemon.lifecycle import DaemonInfo
-from leapflow.daemon.protocol import RpcRequest, StreamChunk
+from leapflow.daemon.protocol import ErrorCode, RpcRequest, StreamChunk
 from leapflow.daemon.server import UnixRpcServer
 
 
@@ -1577,7 +1577,7 @@ async def test_shutdown_reason_reaches_two_workspaces_with_same_rpc_id() -> None
             first = await asyncio.gather(*(anext(stream) for stream in streams))
             assert [event.content for event in first] == ["/tmp/w0", "/tmp/w1"]
             assert [event.metadata["session_id"] for event in first] == ["s0", "s1"]
-            with pytest.raises(DaemonUnavailableError):
+            with pytest.raises(DaemonRpcError):
                 await client.request("daemon.shutdown", {"unknown_argument": True})
             assert not server._shutdown_announced
             assert len(server._streams) == 2
@@ -2005,8 +2005,11 @@ async def test_daemon_client_reports_unknown_method() -> None:
         client = DaemonClient(socket_path)
 
         try:
-            with pytest.raises(DaemonUnavailableError, match="Unknown method"):
+            with pytest.raises(DaemonRpcError, match="Unknown method") as caught:
                 await client.request("missing.method")
+            assert caught.value.code == ErrorCode.METHOD_NOT_FOUND
+            assert not isinstance(caught.value, DaemonUnavailableError)
+            assert (await client.status())["pid"] == 123
         finally:
             task.cancel()
             await server.stop()
@@ -2052,9 +2055,16 @@ async def test_daemon_client_surfaces_stream_errors() -> None:
         events = []
 
         try:
-            with pytest.raises(DaemonUnavailableError, match="Daemon stream failed"):
+            with pytest.raises(DaemonRpcError, match="Daemon stream failed") as caught:
                 async for event in client.engine_chat("world"):
                     events.append(event)
+            assert caught.value.code == ErrorCode.INTERNAL_ERROR
+            assert caught.value.data == "stream exploded"
+            assert not isinstance(caught.value, DaemonUnavailableError)
+            assert caught.value.failure.category == "internal_defect"
+            assert caught.value.failure.side_effect_state.value == "unknown"
+            assert caught.value.failure.recoverability.value == "non_recoverable"
+            assert (await client.status())["pid"] == 123
         finally:
             task.cancel()
             await server.stop()
@@ -2064,6 +2074,119 @@ async def test_daemon_client_surfaces_stream_errors() -> None:
                 pass
 
     assert [(event.type, event.content) for event in events] == [("chunk", "partial")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["engine.chat", "events.subscribe", "hardware.preview.stream", "daemon.status"])
+async def test_backend_errors_do_not_reconnect_or_replay_before_output(method: str) -> None:
+    from leapflow.cli.commands.interactive import _DaemonRuntimeBridge
+
+    class FailingService(_FakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def engine_chat(self, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+            self.calls += 1
+            raise ModuleNotFoundError("No module named 'leapflow.daemon.session_registry'")
+            yield  # pragma: no cover - establishes the production streaming contract
+
+        async def subscribe_notifications(self) -> AsyncIterator[StreamChunk]:
+            async for chunk in self.engine_chat():
+                yield chunk
+
+        async def hardware_preview_stream(self, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+            async for chunk in self.engine_chat():
+                yield chunk
+
+        async def status(self) -> dict[str, Any]:
+            self.calls += 1
+            raise ModuleNotFoundError("No module named 'leapflow.daemon.session_registry'")
+
+    class Console:
+        def warning(self, message: str) -> None:
+            pytest.fail(f"Backend failure entered connection recovery: {message}")
+
+    async def unexpected_recovery(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("A backend failure must not restart or reconnect leapd")
+
+    service = FailingService()
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        server, task, runtime_dir = await _start_server(Path(root) / "runtime", service=service)
+        client = DaemonClient(get_transport().readiness_path(runtime_dir))
+        bridge = _DaemonRuntimeBridge(
+            client, object(), Console(), session_id_getter=lambda: "own-session",
+            session_id_setter=lambda value: pytest.fail("Session identity changed"),
+            metadata_applier=lambda value: None, client_factory=unexpected_recovery,
+        )
+
+        async def operation(current: DaemonClient) -> None:
+            if method == "daemon.status":
+                await current.status()
+                return
+            stream = (
+                current.engine_chat("read-only test", session_id="own-session")
+                if method == "engine.chat" else current.subscribe_notifications()
+                if method == "events.subscribe" else current.hardware_preview_stream("device", "channel")
+            )
+            async for _ in stream:
+                pytest.fail("Unexpected output before the failure")
+
+        try:
+            with pytest.raises(DaemonRpcError, match="session_registry") as caught:
+                await bridge.call(operation, description=method)
+            assert caught.value.code == ErrorCode.INTERNAL_ERROR
+            assert caught.value.failure.context.tool_name == method
+            assert service.calls == 1
+            assert not task.done()
+            assert server._server is not None and server._server.is_serving()
+        finally:
+            task.cancel()
+            await server.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_removed_runtime_package_refuses_chat_before_context_or_admission(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from conftest import make_settings
+    from leapflow.daemon.service import RuntimeLeapService
+
+    settings = make_settings(str(tmp_path))
+    service = RuntimeLeapService(settings, mock_host=True, auto_start_deferred=False)
+    monkeypatch.setattr(leapflow, "__file__", str(tmp_path / "removed-package" / "__init__.py"))
+    before = await service.status()
+    assert "installation changed" in before["runtime_installation_error"]
+    with pytest.raises(RuntimeError, match="leap daemon restart"):
+        await anext(service.engine_chat("do not execute", session_id="own-session"))
+    assert service._ctx is None
+    assert service._session_registry is None
+    assert service._engine_request_ledger == {}
+    after = await service.status()
+    assert after["turn_admission"]["active"] == 0
+    assert after["turn_admission"]["waiting"] == 0
+    service._build_staleness.cancel_pending()
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_runtime_installation_check_uses_loaded_origin_without_lazy_imports(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, available: bool,
+) -> None:
+    from leapflow.daemon._service_helpers import runtime_installation_error
+
+    origin = tmp_path / "package" / "__init__.py"
+    if available:
+        origin.parent.mkdir()
+        origin.write_text("", encoding="utf-8")
+    monkeypatch.setattr(leapflow, "__file__", str(origin))
+    error = runtime_installation_error()
+    assert bool(error) is not available
+    if error:
+        assert "This request was not started" in error
+        assert "own terminal" in error
+    monkeypatch.setattr(leapflow, "__file__", "")
+    assert runtime_installation_error() == ""
 
 
 @pytest.mark.asyncio

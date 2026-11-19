@@ -32,6 +32,7 @@ from leapflow.daemon._service_helpers import (
     memory_entry_to_dict,
     normalize_stream_event,
     persisted_session_workspace,
+    runtime_installation_error,
     runtime_source,
     runtime_version,
 )
@@ -703,6 +704,11 @@ class RuntimeLeapService:
     async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
         request_id = str(kwargs.get("request_id") or uuid.uuid4().hex[:12])
         workspace_arg = str(kwargs.get("workspace_root") or "").strip()
+        installation_error = await asyncio.to_thread(runtime_installation_error)
+        if installation_error:
+            # Refuse before warming, admission, session construction, or engine I/O.
+            # A reinstall changes future imports, not this process's package path.
+            raise RuntimeError(installation_error)
 
         # Ensure deferred init completed. Emit a status chunk first so the
         # server dispatch loop receives an immediate first chunk (keepalive
@@ -1875,6 +1881,7 @@ class RuntimeLeapService:
             "context_budget_snapshot": context_metadata.get("context_budget_snapshot", {}),
             "session_id": str(getattr(engine, "_current_session_id", "") or "") if engine is not None else "",
             "runtime_source": runtime_source(),
+            "runtime_installation_error": await asyncio.to_thread(runtime_installation_error),
             "runtime_executable": sys.executable,
             "runtime_version": runtime_version(),
             "pending_approvals": self._approval_coordinator.pending_count(),
