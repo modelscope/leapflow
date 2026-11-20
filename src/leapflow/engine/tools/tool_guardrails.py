@@ -15,6 +15,7 @@ Implements the Guard Protocol so engine can use any guard implementation (DIP).
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -22,7 +23,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
-from leapflow.engine.tools.tool_execution import exit_code_from
+from leapflow.engine.tools.tool_execution import (
+    TIER_REPAIRED,
+    TIER_SUCCEEDED,
+    exit_code_from,
+    result_tier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,11 +122,14 @@ class GuardrailViolation:
     severity: str = "warning"  # "warning" | "halt"
     suggestion: str = ""
     # A halt the engine must honour regardless of the global stall marker.
-    # Set only when the violation is, by construction, zero forward progress
-    # (e.g. the same tool returned the same result N times), so that the coarse
-    # research/governance progress heuristic cannot keep a genuine no-op loop
-    # spinning until the iteration budget is exhausted.
+    # Used for definitionally zero progress (identical call/result loops) and
+    # resource ceilings. A productive soft ceiling can still be extended, but
+    # the coarse research/governance marker cannot suppress a terminal verdict.
     progress_independent: bool = False
+    # The halt may be lifted by raising a soft ceiling, because the window
+    # that reached it was productive. The engine grants the extension only
+    # when real resource budgets also allow it; otherwise the halt stands.
+    extendable: bool = False
 
 
 @runtime_checkable
@@ -348,7 +357,7 @@ class DominationGuard:
 
 
 class TurnCapGuard:
-    """Enforce a hard ceiling on tool invocations within a single agent turn.
+    """Bound tool invocations within a single agent turn: soft cap, hard cap.
 
     Counts only the tool calls added *during the current turn*, not calls from
     prior turns that may be present in the conversation history.  A deferred
@@ -360,37 +369,111 @@ class TurnCapGuard:
     on the initial message list before any tool calls are executed.  The
     resulting halt is ``progress_independent`` because an unbounded turn is a
     resource hazard regardless of whether the task is making headway.
+
+    Reaching the soft cap (``max_calls``) yields an ``extendable`` halt when
+    the calls since the last checkpoint were productive -- mostly successful
+    and mostly distinct -- so a long multi-step task (e.g. a physical
+    manipulation sequence) is not cut off mid-way while a spinning one still
+    stops. ``hard_max_calls`` is never extended; equal to ``max_calls`` (the
+    default) it restores the flat-cap behaviour.
     """
 
-    def __init__(self, *, max_calls: int = 50) -> None:
+    def __init__(
+        self,
+        *,
+        max_calls: int = 50,
+        hard_max_calls: Optional[int] = None,
+        min_window_success: float = 0.5,
+        min_window_distinct: float = 0.5,
+    ) -> None:
         self._max_calls = max_calls
+        self._hard_max_calls = max(max_calls, hard_max_calls or max_calls)
+        self._min_window_success = min_window_success
+        self._min_window_distinct = min_window_distinct
+        self._cap = max_calls
         # Deferred baseline: set on the first check() after reset() to the
         # number of pre-existing tool calls in the conversation history.
         self._baseline: Optional[int] = None
+        # Absolute call index where the window judged at the next cap starts.
+        self._window_start: Optional[int] = None
+        self._last_total = 0
+
+    @property
+    def cap(self) -> int:
+        """The ceiling currently in force for this turn."""
+        return self._cap
 
     @staticmethod
-    def _count_calls(history: List[Dict[str, Any]]) -> int:
-        return sum(
-            len(msg.get("tool_calls") or [])
-            for msg in history
-            if msg.get("role") == "assistant"
-        )
+    def _call_records(
+        history: List[Dict[str, Any]],
+    ) -> tuple[List[tuple[str, str, Any]], Dict[str, Any]]:
+        """Correlate native records and text-mode call/result pairs without mutation."""
+        from leapflow.skills.tool_call_parser import parse_tool_call
+
+        calls: List[tuple[str, str, Any]] = []
+        results: Dict[str, Any] = {}
+        pending_text_id: str | None = None
+        for index, msg in enumerate(history):
+            content = msg.get("content", "")
+            if msg.get("role") == "assistant":
+                pending_text_id = None
+                native_calls = msg.get("tool_calls") or []
+                for tc in native_calls:
+                    fn = tc.get("function", {}) or {}
+                    raw = fn.get("arguments", "{}")
+                    try:
+                        args = json.loads(raw) if isinstance(raw, str) else raw
+                    except (TypeError, ValueError):
+                        args = raw
+                    calls.append((str(tc.get("id", "")), str(fn.get("name", "")), args))
+                if not native_calls and isinstance(content, str):
+                    text_call = parse_tool_call(content)
+                    if text_call is not None:
+                        pending_text_id = f"text-history-{index}"
+                        calls.append((pending_text_id, text_call.name, text_call.params))
+                continue
+            if msg.get("role") == "tool":
+                call_id = str(msg.get("tool_call_id", ""))
+            elif pending_text_id is not None and StagnationGuard._is_tool_result_message(msg):
+                call_id = pending_text_id
+                content = content.partition("\n")[2]
+                pending_text_id = None
+            else:
+                continue
+            try:
+                results[call_id] = json.loads(content) if isinstance(content, str) else content
+            except (TypeError, ValueError):
+                results[call_id] = content
+        return calls, results
+
+    @classmethod
+    def _count_calls(cls, history: List[Dict[str, Any]]) -> int:
+        return len(cls._call_records(history)[0])
 
     def check(self, history: List[Dict[str, Any]]) -> GuardrailViolation:
         total = self._count_calls(history)
+        self._last_total = total
         if self._baseline is None:
             # First check this turn: snapshot the count of pre-existing calls
             # so only calls added after this point count towards the cap.
             self._baseline = total
+            self._window_start = total
             return GuardrailViolation(violated=False)
         calls_this_turn = total - self._baseline
-        if calls_this_turn >= self._max_calls:
+        if calls_this_turn >= self._cap:
+            extendable = (
+                calls_this_turn < self._hard_max_calls
+                and self._cap < self._hard_max_calls
+                and self._window_productive(history)
+            )
+            limit = self._hard_max_calls if calls_this_turn >= self._hard_max_calls else self._cap
             return GuardrailViolation(
                 violated=True,
                 severity="halt",
                 progress_independent=True,
+                extendable=extendable,
                 reason=(
-                    f"Turn tool-call cap reached ({calls_this_turn}/{self._max_calls})"
+                    f"Turn tool-call cap reached ({calls_this_turn}/{limit})"
                 ),
                 suggestion=(
                     "Provide the best answer with the information gathered so far."
@@ -398,9 +481,45 @@ class TurnCapGuard:
             )
         return GuardrailViolation(violated=False)
 
+    def extend(self, step: int) -> int:
+        """Raise the current cap by ``step`` (bounded by the hard cap).
+
+        The calls made so far become the closed window; the next cap is judged
+        only on calls made after this point, so one productive stretch cannot
+        carry a later spinning one.
+        """
+        reached = max(self._cap, self._last_total - (self._baseline or 0))
+        self._cap = min(self._hard_max_calls, reached + max(1, int(step)))
+        self._window_start = self._last_total
+        return self._cap
+
+    def _window_productive(self, history: List[Dict[str, Any]]) -> bool:
+        """Whether the calls since the last checkpoint mostly succeeded and differed."""
+        calls, results = self._call_records(history)
+        window = calls[self._window_start or 0:]
+        if not window:
+            return False
+        succeeded = sum(
+            1 for call_id, _, _ in window
+            if call_id in results
+            and not (isinstance(results[call_id], dict) and results[call_id].get("ok") is False)
+            and result_tier(results[call_id]) in (TIER_SUCCEEDED, TIER_REPAIRED)
+        )
+        distinct = len({
+            (name, json.dumps(args, sort_keys=True, default=str, separators=(",", ":")))
+            for _, name, args in window
+        })
+        return (
+            succeeded / len(window) >= self._min_window_success
+            and distinct / len(window) >= self._min_window_distinct
+        )
+
     def reset(self) -> None:
-        """Clear the per-turn baseline so the next check() re-snapshots."""
+        """Clear the per-turn baseline and restore the soft cap."""
         self._baseline = None
+        self._window_start = None
+        self._last_total = 0
+        self._cap = self._max_calls
 
 
 class CompositeGuardrail:
@@ -416,13 +535,33 @@ class CompositeGuardrail:
         max_consecutive_same: int = 5,
         argument_scoped_tools: tuple[str, ...] = (),
         max_calls_per_turn: int = 50,
+        max_calls_per_turn_hard: Optional[int] = None,
     ) -> None:
         self._guards: List[ToolLoopGuard] = guards or [
             RepetitionGuard(max_repeats=max_repeats),
             StagnationGuard(window=stagnation_window, min_success_rate=min_success_rate),
             DominationGuard(max_consecutive_same=max_consecutive_same, argument_scoped_tools=argument_scoped_tools),
-            TurnCapGuard(max_calls=max_calls_per_turn),
+            TurnCapGuard(max_calls=max_calls_per_turn, hard_max_calls=max_calls_per_turn_hard),
         ]
+
+    def fresh(self) -> "CompositeGuardrail":
+        """Return an independent copy: same configuration, cleared state.
+
+        Guards carry per-turn state (e.g. ``TurnCapGuard``'s baseline), so each
+        session engine needs its own instance; sharing one lets a turn starting
+        in one session reset the baseline another session is counting against.
+        """
+        guards: List[ToolLoopGuard] = [copy.deepcopy(guard) for guard in self._guards]
+        for guard in guards:
+            guard.reset()
+        return CompositeGuardrail(guards=guards)
+
+    def extend_turn_cap(self, step: int) -> Optional[int]:
+        """Raise the turn tool-call cap; returns the new cap, or None if absent."""
+        for guard in self._guards:
+            if isinstance(guard, TurnCapGuard):
+                return guard.extend(step)
+        return None
 
     def check(self, history: List[Dict[str, Any]]) -> GuardrailViolation:
         worst: Optional[GuardrailViolation] = None
