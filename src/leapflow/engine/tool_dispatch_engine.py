@@ -9,7 +9,8 @@ preserving exact runtime semantics.
 Size note (>800-line registered exception per AGENTS.md): dispatch, catalog
 assembly, side-effect batch gating, and guardrail evaluation share one
 dispatch state machine; splitting them would fork the failure path the
-gating exists to protect.
+gating exists to protect. Productive turn-cap extension remains part of this
+shared evaluation path, before its terminal verdict is handed to the loop.
 """
 
 from __future__ import annotations
@@ -98,9 +99,12 @@ class ToolDispatchEngine:
         # trip, leaving a genuine no-op loop to spin until the budget is spent.
         frame = self._engine._active_frame
         stalled = bool(frame is not None and getattr(frame, "stalled_rounds", 0) >= 1)
+        if violation.severity == "halt" and self._try_extend_turn_cap(violation):
+            return None
         if violation.severity == "halt" and (
             getattr(violation, "progress_independent", False) or stalled
         ):
+            self._engine._last_guardrail_halt = violation
             messages.append(
                 build_user_message_text(
                     f"SYSTEM GUARDRAIL: {violation.reason}. {violation.suggestion}"
@@ -113,6 +117,28 @@ class ToolDispatchEngine:
             build_user_message_text(f"SYSTEM WARNING: {violation.reason}. {violation.suggestion}")
         )
         return None
+
+    def _try_extend_turn_cap(self, violation: Any) -> bool:
+        """Lift a productive soft turn-cap halt while resource budgets allow it.
+
+        Nothing is appended to the conversation: the extension is invisible to
+        the model, so the cached prompt prefix is unaffected.
+        """
+        if not getattr(violation, "extendable", False):
+            return False
+        if not self._engine._within_resource_limits():
+            return False
+        extend = getattr(self._engine._guardrail, "extend_turn_cap", None)
+        if not callable(extend):
+            return False
+        settings = getattr(self._engine, "_settings", None)
+        step = int(getattr(settings, "guardrail_calls_extension_step", 25) or 25)
+        new_cap = extend(step)
+        if new_cap is None:
+            return False
+        logger.info("guardrail: turn tool-call cap extended to %d (progress-gated)", new_cap)
+        return True
+
     def _evaluate_tool_failures(
         self,
         failed_items: List[tuple[str, Dict[str, Any]]],

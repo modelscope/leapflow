@@ -123,6 +123,44 @@ def test_daemon_log_level_config_chain(monkeypatch, tmp_path) -> None:
     assert built.daemon_log_level == "DEBUG"
 
 
+def test_turn_cap_config_chain(monkeypatch, tmp_path) -> None:
+    """Defaults, YAML flattening, env overrides and the catalog agree on new keys."""
+    from conftest import make_settings
+    from leapflow.config import _build_settings_from_env
+    from leapflow.config_service import _build_field_specs
+
+    defaults = make_settings(str(tmp_path))
+    assert defaults.guardrail_max_calls_per_turn == 50
+    assert defaults.guardrail_max_calls_per_turn_hard == 150
+    assert defaults.guardrail_calls_extension_step == 25
+    specs = _build_field_specs()
+    values = {
+        "max_calls_per_turn": 60,
+        "max_calls_per_turn_hard": 180,
+        "calls_extension_step": 30,
+    }
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "home"))
+    layout = build_layout(tmp_path / "home")
+    profile = layout.ensure(profile_id="default")
+    import yaml
+    profile.runtime_config_path.write_text(yaml.safe_dump({"guardrail": values}), encoding="utf-8")
+    for name in values:
+        monkeypatch.delenv(f"LEAPFLOW_GUARDRAIL_{name.upper()}", raising=False)
+    bundle = load_config_bundle(layout, profile, tmp_path)
+    for name, value in values.items():
+        spec = specs[f"guardrail.{name}"]
+        assert spec.setting_name == f"guardrail_{name}"
+        assert spec.description
+        env = f"LEAPFLOW_GUARDRAIL_{name.upper()}"
+        assert bundle.env[env] == str(value)
+        monkeypatch.setenv(env, bundle.env[env])
+    settings = _build_settings_from_env()
+    for name, value in values.items():
+        assert getattr(settings, f"guardrail_{name}") == value
+    monkeypatch.setenv("LEAPFLOW_GUARDRAIL_MAX_CALLS_PER_TURN_HARD", "200")
+    assert _build_settings_from_env().guardrail_max_calls_per_turn_hard == 200
+
+
 def test_hardware_alert_policy_config_chain(monkeypatch, tmp_path) -> None:
     from leapflow.config import _build_settings_from_env
     from leapflow.config_service import _build_field_specs

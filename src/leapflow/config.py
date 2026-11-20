@@ -757,6 +757,8 @@ class Settings:
     guardrail_stagnation_window: int = 10
     guardrail_min_success_rate: float = 0.2
     guardrail_max_calls_per_turn: int = 50
+    guardrail_max_calls_per_turn_hard: int = 150
+    guardrail_calls_extension_step: int = 25
 
     # ── Session Persistence ──
     session_persistence_enabled: bool = True
@@ -1704,6 +1706,8 @@ def _build_settings_from_env(
     guardrail_stagnation_window = int(os.getenv("LEAPFLOW_GUARDRAIL_STAGNATION_WINDOW", "10"))
     guardrail_min_success_rate = float(os.getenv("LEAPFLOW_GUARDRAIL_MIN_SUCCESS_RATE", "0.2"))
     guardrail_max_calls_per_turn = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_CALLS_PER_TURN", "50"))
+    guardrail_max_calls_per_turn_hard = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_CALLS_PER_TURN_HARD", "150"))
+    guardrail_calls_extension_step = int(os.getenv("LEAPFLOW_GUARDRAIL_CALLS_EXTENSION_STEP", "25"))
 
     # Session Persistence
     session_persistence_enabled = _bool("LEAPFLOW_SESSION_PERSISTENCE_ENABLED", "true")
@@ -2229,6 +2233,8 @@ def _build_settings_from_env(
         guardrail_stagnation_window=guardrail_stagnation_window,
         guardrail_min_success_rate=guardrail_min_success_rate,
         guardrail_max_calls_per_turn=guardrail_max_calls_per_turn,
+        guardrail_max_calls_per_turn_hard=guardrail_max_calls_per_turn_hard,
+        guardrail_calls_extension_step=guardrail_calls_extension_step,
         # Session Persistence
         session_persistence_enabled=session_persistence_enabled,
         session_resume_cache_policy=session_resume_cache_policy,

@@ -409,6 +409,16 @@ def build_session_engine(
     engine._usage_tracker = TurnUsageTracker()
     _wire_plugin_stats_sink(engine._usage_tracker)
     engine._recovery_coordinator = RecoveryCoordinator()
+    # Guards hold per-turn baselines; a shared instance lets one session's turn
+    # start reset the tool-call count another session is enforcing.
+    _base_guardrail = getattr(base_engine, "_guardrail", None)
+    if _base_guardrail is not None:
+        if callable(getattr(_base_guardrail, "fresh", None)):
+            engine._guardrail = _base_guardrail.fresh()
+        else:
+            engine._guardrail = copy.deepcopy(_base_guardrail)
+            engine._guardrail.reset()
+    engine._last_guardrail_halt = None
     engine._last_context_snapshot = {}
     engine._last_turn_tool_categories = frozenset()
     # Clean per-turn state slate (each turn also reassigns these, but a fresh

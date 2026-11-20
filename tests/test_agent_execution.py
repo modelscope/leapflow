@@ -1014,6 +1014,230 @@ def test_turn_cap_guard_per_turn_semantics() -> None:
     assert v.progress_independent
 
 
+def _turn_cap_history(results: list, *, start: int = 0, distinct: bool = True) -> list[dict]:
+    """Build correlated native assistant/tool records for a cap evaluation window."""
+    import json
+
+    history = []
+    for index, result in enumerate(results, start):
+        history.append({
+            "role": "assistant",
+            "tool_calls": [{"id": str(index), "function": {
+                "name": "hw_skill_run", "arguments": {"step": index if distinct else 0},
+            }}],
+        })
+        if result is not None:
+            history.append({"role": "tool", "tool_call_id": str(index), "content": json.dumps(result)})
+    return history
+
+
+def test_turn_cap_extension_uses_only_current_window_and_resets() -> None:
+    from leapflow.engine.tools.tool_guardrails import TurnCapGuard
+
+    guard = TurnCapGuard(max_calls=4, hard_max_calls=8)
+    history = _turn_cap_history([{"ok": True}] * 120)
+    assert not guard.check(history).violated
+    history += _turn_cap_history([{"ok": True}] * 4, start=120)
+    assert guard.check(history).extendable
+    assert guard.extend(2) == 6
+    history += _turn_cap_history([{"ok": False}] * 2, start=124)
+    violation = guard.check(history)
+    assert violation.violated and not violation.extendable
+    guard.reset()
+    assert guard.cap == 4
+    assert not guard.check(history).violated
+    history += _turn_cap_history([{"ok": True}] * 4, start=126)
+    assert guard.check(history).extendable
+    assert guard.extend(100) == 8
+    history += _turn_cap_history([{"ok": True}] * 4, start=130)
+    assert not guard.check(history).extendable  # Absolute ceiling.
+
+
+@pytest.mark.parametrize("results,distinct,extendable", [
+    ([{"ok": True}] * 4, True, True),
+    ([{"ok": True}] * 2 + [{"ok": False}] * 2, True, True),
+    ([{"ok": True}] + [{"ok": False}] * 3, True, False),
+    ([{"ok": True}] * 4, False, False),
+    ([None] * 4, True, False),
+    ([{"ok": False, "counts_as_failure": False}] * 4, True, False),
+    ([{"ok": False, "failure_class": "invalid_request"}] * 4, True, False),
+    ([{"ok": False, "side_effect_state": "none"}] * 4, True, False),
+    ([{"ok": False, "duplicate_suppressed": True}] * 4, True, False),
+    ([{"ok": True, "argument_repair": {"field": "x"}}] * 4, True, True),
+])
+def test_turn_cap_window_productivity(results, distinct, extendable) -> None:
+    from leapflow.engine.tools.tool_guardrails import TurnCapGuard
+
+    guard = TurnCapGuard(max_calls=4, hard_max_calls=8)
+    guard.check([])
+    violation = guard.check(_turn_cap_history(results, distinct=distinct))
+    assert violation.violated and violation.progress_independent
+    assert violation.extendable is extendable
+
+
+@pytest.mark.parametrize("hard_cap,count", [(None, 4), (4, 4), (2, 4), (6, 6), (6, 9)])
+def test_turn_cap_absolute_ceiling_including_batch_overshoot(hard_cap, count) -> None:
+    from leapflow.engine.tools.tool_guardrails import TurnCapGuard
+
+    guard = TurnCapGuard(max_calls=4, hard_max_calls=hard_cap)
+    guard.check([])
+    violation = guard.check(_turn_cap_history([{"ok": True}] * count))
+    assert violation.violated and not violation.extendable
+    expected_limit = max(4, hard_cap or 4)
+    assert violation.reason.endswith(f"({count}/{expected_limit})")
+
+
+def test_turn_cap_canonical_arguments_and_configurable_ratios() -> None:
+    from leapflow.engine.tools.tool_guardrails import TurnCapGuard
+
+    history = _turn_cap_history([{"ok": True}] * 4)
+    for index, msg in enumerate(history[::2]):
+        msg["tool_calls"][0]["function"]["arguments"] = (
+            '{"a": 1, "b": 2}' if index % 2 else '{"b": 2, "a": 1}'
+        )
+    guard = TurnCapGuard(max_calls=4, hard_max_calls=8, min_window_distinct=0.5)
+    guard.check([])
+    assert not guard.check(history).extendable  # JSON key order is not progress.
+    guard = TurnCapGuard(max_calls=4, hard_max_calls=8, min_window_distinct=0.25)
+    guard.check([])
+    assert guard.check(history).extendable
+    guard = TurnCapGuard(max_calls=4, hard_max_calls=8, min_window_success=0.75)
+    guard.check([])
+    assert not guard.check(_turn_cap_history([{"ok": True}] * 2 + [{"ok": False}] * 2)).extendable
+
+
+@pytest.mark.parametrize("within_limits", [True, False])
+def test_dispatch_turn_cap_extension_obeys_resources_not_coarse_stall(within_limits) -> None:
+    from types import SimpleNamespace
+    from leapflow.engine.tools.tool_guardrails import CompositeGuardrail, TurnCapGuard
+
+    cap = TurnCapGuard(max_calls=2, hard_max_calls=6)
+    engine = SimpleNamespace(
+        _guardrail=CompositeGuardrail(guards=[cap]),
+        _active_frame=SimpleNamespace(stalled_rounds=8),
+        _settings=SimpleNamespace(guardrail_calls_extension_step=3),
+        _within_resource_limits=lambda: within_limits,
+        _last_guardrail_halt=None,
+    )
+    engine._guardrail.check([])
+    messages = _turn_cap_history([{"ok": True}] * 2)
+    original = list(messages)
+    verdict = ToolDispatchEngine(engine)._check_guardrail(messages)
+    if within_limits:
+        assert verdict is None and cap.cap == 5
+        assert messages == original  # No prompt/cache mutation.
+        assert engine._last_guardrail_halt is None
+    else:
+        assert verdict == "halt" and cap.cap == 2
+        assert engine._last_guardrail_halt.reason.endswith("(2/2)")
+
+
+def test_repetition_halt_cannot_be_lifted_by_productive_turn_cap() -> None:
+    from leapflow.engine.tools.tool_guardrails import CompositeGuardrail
+
+    guard = CompositeGuardrail(max_calls_per_turn=6, max_calls_per_turn_hard=12)
+    guard.check([])
+    history = _turn_cap_history([{"ok": True}] * 3)
+    history += _turn_cap_history([{"ok": True}] * 3, start=3, distinct=False)
+    violation = guard.check(history)
+    assert violation.violated and "same result" in violation.reason
+    assert not violation.extendable
+
+
+def test_guardrail_finalize_prompt_and_fallback_are_actionable(monkeypatch) -> None:
+    from leapflow.engine.tools.tool_guardrails import GuardrailViolation
+    from leapflow.llm.base import LLMChatResponse
+
+    with tempfile.TemporaryDirectory() as td:
+        engine, lt, _ = _adaptive_engine(td)
+        try:
+            reason = "Turn tool-call cap reached (150/150)"
+            engine._last_guardrail_halt = GuardrailViolation(True, reason=reason, severity="halt")
+            engine._llm = AsyncMock()
+            engine._llm.achat.return_value = LLMChatResponse(content="Remaining work needs another turn.")
+            monkeypatch.setattr(engine._prompt_assembler, "_prepare_llm_messages", lambda msgs, **kw: msgs)
+            messages = [{"role": "user", "content": "Complete the task"}]
+            original = list(messages)
+            assert asyncio.run(engine._synthesize_forced_answer(messages, stop_reason=reason))
+            call = engine._llm.achat.call_args
+            prompt = str(call.args[0][-1]["content"])
+            assert reason in prompt and "user's language" in prompt
+            assert "completed steps" in prompt and "not yet executed" in prompt
+            assert "continue" in prompt and "approval gates" in prompt
+            assert "tools" not in call.kwargs and messages == original
+            fallback = engine._budget_exhausted_response(messages)
+            assert reason in fallback and "Reply 'continue'" in fallback
+            assert "reasoning step limit" not in fallback
+            engine._prompt_assembler._begin_turn_context("continue")
+            assert engine._last_guardrail_halt is None
+            assert "reasoning step limit" in engine._budget_exhausted_response(messages)
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize("synthesis_fails", [True, False])
+async def test_turn_cap_extension_and_halt_through_unified_loop(native, streaming, synthesis_fails) -> None:
+    from dataclasses import replace
+    from leapflow.engine.tools.tool_guardrails import CompositeGuardrail
+    from leapflow.llm.base import LLMChatResponse, ToolCallInfo
+
+    class CapLLM(StubLLM):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prompts = []
+
+        async def achat(self, messages, **kwargs):
+            self._call_count += 1
+            self.prompts.append((list(messages), kwargs))
+            if self._call_count <= 4:
+                args = {"step": self._call_count}
+                if native:
+                    return LLMChatResponse(content="", tool_calls=[
+                        ToolCallInfo(id=str(self._call_count), name="time_get", arguments=args),
+                    ])
+                import json
+                return LLMChatResponse(content='<tool_call>' + json.dumps({
+                    "name": "time_get", "arguments": args,
+                }) + '</tool_call>')
+            if synthesis_fails:
+                raise RuntimeError("final synthesis unavailable")
+            return LLMChatResponse(content="Partially complete. Reply 'continue' for the remaining work.")
+
+        async def achat_stream(self, messages, **kwargs):
+            response = await self.achat(messages, **kwargs)
+            yield response.content
+
+    with tempfile.TemporaryDirectory() as td:
+        engine, lt, _ = _adaptive_engine(td)
+        try:
+            engine._settings = replace(
+                engine._settings, native_tool_calling_enabled=native,
+                guardrail_calls_extension_step=2, llm_context_length=1_000_000,
+            )
+            engine._guardrail = CompositeGuardrail(max_calls_per_turn=2, max_calls_per_turn_hard=4)
+            llm = CapLLM()
+            engine._llm = llm
+            if streaming:
+                events = [event async for event in engine.run_stream("Collect several distinct readings")]
+                answer = events[-1].content
+                assert events[-1].type == "final"
+                assert len([event for event in events if event.type == "tool_complete"]) == 4
+            else:
+                answer = await engine._unified_tool_loop("Collect several distinct readings")
+            assert llm.call_count == 5  # Four real calls, then one tool-free finalization.
+            assert engine._last_guardrail_halt.reason.endswith("(4/4)")
+            assert "continue" in answer
+            if synthesis_fails:
+                assert "(4/4)" in answer and "reasoning step limit" not in answer
+            assert "(4/4)" in str(llm.prompts[-1][0])
+            assert "tools" not in llm.prompts[-1][1]
+        finally:
+            lt.close()
+
+
 def test_synthesize_forced_answer_returns_model_answer() -> None:
     """When the loop stops without a written answer, a single tool-free round lets
     the model answer from the gathered context instead of emitting the canned

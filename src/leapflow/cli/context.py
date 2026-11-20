@@ -2354,6 +2354,7 @@ class Context:
                     max_consecutive_same=settings.guardrail_max_consecutive_same,
                     argument_scoped_tools=settings.guardrail_argument_scoped_tools,
                     max_calls_per_turn=settings.guardrail_max_calls_per_turn,
+                    max_calls_per_turn_hard=settings.guardrail_max_calls_per_turn_hard,
                 )
                 logger.debug("Tool loop guardrails enabled")
             else:

@@ -1,4 +1,4 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 """Version information for leapflow."""
 
-__version__ = "0.8.2+main"
+__version__ = "0.8.3+main"

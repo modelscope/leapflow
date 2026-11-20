@@ -107,6 +107,22 @@ def test_health_and_retry_config_persists_in_correct_section(config_env, key, va
     assert yaml.safe_load(mutation.path.read_text())[section][name] == float(value)
 
 
+@pytest.mark.parametrize("key,value", [
+    ("guardrail.max_calls_per_turn", "50"),
+    ("guardrail.max_calls_per_turn_hard", "175"),
+    ("guardrail.calls_extension_step", "30"),
+])
+def test_turn_cap_config_is_discoverable_and_persists(config_env, key, value) -> None:
+    _, service = config_env
+    spec = service.describe(key)
+    assert spec.key == key and spec.value_type == "int"
+    assert spec.description
+    mutation = service.set(key, value)
+    assert mutation.ok and key in mutation.changed_keys
+    name = key.split(".", 1)[1]
+    assert yaml.safe_load(mutation.path.read_text())["guardrail"][name] == int(value)
+
+
 class TestCoerceValue:
     """Test type coercion for config values."""
 
