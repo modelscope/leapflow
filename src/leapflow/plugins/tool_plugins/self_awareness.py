@@ -106,6 +106,7 @@ class SelfAwarenessPlugin:
         # returning the session-scoped daemon status snapshot. Optional — the
         # runtime/evolution/platform facets degrade when it is unbound.
         self._status_provider: Any = None
+        self._model_services: Any = None
 
         # Captured once per process, mirroring how the daemon captures its own
         # build fingerprint at startup, so identity works without any wiring.
@@ -192,7 +193,7 @@ class SelfAwarenessPlugin:
 
     @property
     def dependencies(self) -> list[str]:
-        return ["runtime_status_provider"]
+        return ["runtime_status_provider", "model_services"]
 
     def bind_runtime(self, **deps: Any) -> None:
         """Receive runtime-injected dependencies.
@@ -202,6 +203,8 @@ class SelfAwarenessPlugin:
         """
         if "runtime_status_provider" in deps:
             self._status_provider = deps["runtime_status_provider"]
+        if "model_services" in deps:
+            self._model_services = deps["model_services"]
 
     # ── Tool handlers ────────────────────────────────────────────────────
 
@@ -423,10 +426,13 @@ class SelfAwarenessPlugin:
 
     def _facet_platform(self, status: dict[str, Any]) -> dict[str, Any]:
         """Gateway connections, hardware backend, environment sources, active clients."""
+        services = self._model_services.describe() if self._model_services is not None else {}
+        service_fields = {"model_services": services} if services.get("services") else {}
         if not status:
-            return {"available": False, "reason": "platform status unavailable (no daemon bound)"}
+            return {"available": False, "reason": "platform status unavailable (no daemon bound)", **service_fields}
         return {
             "available": True,
+            **service_fields,
             "active_clients": status.get("active_clients", 0),
             "connected_clients": status.get("connected_clients", 0),
             "host_backend": status.get("host_backend", {}),

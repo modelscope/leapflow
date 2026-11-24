@@ -99,6 +99,7 @@ class AnthropicPlugin:
             max_retries=int(config.get("max_retries", 3)),
             timeout_s=float(config.get("timeout_s", 180.0)),
             max_tokens=int(config.get("max_tokens", 8192)),
+            async_http_client=config.get("async_http_client"),
         )
 
 

@@ -54,6 +54,15 @@ _RUN_SCHEMA: dict[str, Any] = {
                 f"{DEFAULT_RUN_TIMEOUT_S:g}, max {MAX_RUN_TIMEOUT_S:g})"
             ),
         },
+        "export_evidence": {
+            "type": "boolean",
+            "description": (
+                "Opt-in only for a fresh passive perceive.snapshot. Ask before retaining the "
+                "shared image in this private session cache (TTL at most 300s, capped by native "
+                "validity; quota 64 MiB). Returns opaque artifact IDs for model_query; never "
+                "sends an image to the primary chat model. Both frame-sharing switches required."
+            ),
+        },
         "candidates": {
             "type": "array", "minItems": 1, "maxItems": 8,
             "items": {"type": "object", "required": ["id", "args"],

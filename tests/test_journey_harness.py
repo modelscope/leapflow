@@ -85,6 +85,34 @@ def test_context_warning_estimate_is_volatile_but_capacity_and_round_are_not() -
     assert fingerprint(first) != fingerprint(_chat_body("No context warning."))
 
 
+def test_compressed_tool_lengths_are_volatile_but_safety_fields_are_not() -> None:
+    """Real head/tail compression must not leak timestamp width into replay keys."""
+    from leapflow.engine.context.context_compressor import TrimStage
+
+    stage = TrimStage(max_chars=200)
+    template = "failure=not_ready; policy=mutating_once; " + "x" * 200 + "{stamp}" + "y" * 200
+
+    def trimmed(stamp: str) -> str:
+        return stage.apply([
+            {"role": "tool", "content": template.format(stamp=stamp)},
+        ], budget=1000)[0]["content"]
+
+    first, second = trimmed("1700000000.1234"), trimmed("1700000000.12345")
+    assert first != second and "[... trimmed " in first
+    assert fingerprint(_chat_body(first)) == fingerprint(_chat_body(second))
+    for old, new in (("not_ready", "lease_expired"), ("mutating_once", "read_only")):
+        assert fingerprint(_chat_body(first)) != fingerprint(_chat_body(first.replace(old, new)))
+    assert fingerprint(_chat_body(first)) != fingerprint(_chat_body(first.replace("[... trimmed ", "[cut ")))
+
+
+def test_trim_notice_scrubbing_is_narrow_and_idempotent() -> None:
+    """Only the size in the exact compressor notice is normalized."""
+    notice = "[... trimmed 3230 chars ...]"
+    assert scrub(notice) == "[... trimmed <N> chars ...]"
+    assert scrub(scrub(notice)) == scrub(notice)
+    assert scrub("trimmed 3230 chars; sequence=3231") == "trimmed 3230 chars; sequence=3231"
+
+
 def test_fingerprint_is_stable_across_runs_but_sensitive_to_intent() -> None:
     """Equivalent prompts match; a different question does not."""
     first = _chat_body("list files in /var/folders/ab/T/pytest-1/ws at 2026-08-06T00:00:00Z")

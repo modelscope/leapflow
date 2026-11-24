@@ -573,6 +573,12 @@ class Context:
 
         self._config_signature = self._runtime_config_signature(settings)
         self._configure_llm_clients(settings)
+        from leapflow.domain.effect_scope import EffectScope
+        from leapflow.llm.services.runtime import ModelServiceRuntime
+
+        self.model_services = ModelServiceRuntime.from_settings(settings)
+        self._model_service_scope = EffectScope("profile-model-services")
+        self._model_service_scope.async_effect(self.model_services.aclose)
 
         self.audit = AuditLogger(settings.audit_log_path)
 
@@ -657,7 +663,10 @@ class Context:
         from leapflow.hardware.registry import build_registry as _build_hardware_registry
         from leapflow.hardware.risk import build_risk_classifier as _build_risk_classifier
 
-        self._hardware_registry = _build_hardware_registry(settings)
+        from leapflow.llm.services.composition import model_transport_factories
+
+        self._hardware_registry = _build_hardware_registry(settings, transport_factories=model_transport_factories(
+            self.model_services, settings, lambda: self._hardware_registry.evidence_store))
 
         approval_layout = settings.profile_layout.approval
         self._tui_approval = _TUIApprovalGate()
@@ -669,6 +678,30 @@ class Context:
             grants=JsonApprovalGrantStore(approval_layout.grants_path),
             audit=ApprovalAuditLog(approval_layout.audit_path),
         )
+        self._bind_model_services(publish=False)
+
+    def _bind_model_services(self, *, publish: bool = True) -> None:
+        """Refresh dependency-bound publication; no service enumeration calls the network."""
+        from leapflow.plugins import get_registry, get_scoped_registry
+
+        registry = get_registry()
+        registry.bind_runtime(model_services=self.model_services, settings=self.settings,
+                              model_approval_gate=self._approval_orchestrator)
+        get_scoped_registry().adopt_existing_plugins()
+        # Catalog access assembles every plugin. During construction hardware
+        # and other optional dependencies are not yet bound; defer publication
+        # until critical initialization has composed those capabilities.
+        if not publish:
+            return
+        plugin = registry.get_plugin("model_collaboration")
+        if plugin is None:
+            return
+        wanted = {tool.name for tool in plugin.tools}
+        owned = {name for name, owner in registry.tool_owners.items() if owner == plugin.plugin_id}
+        if owned - wanted:
+            registry.unregister_tools(owned - wanted)
+        if wanted - owned:
+            registry.publish_plugin_tools(plugin)
 
     def set_approval_handler(self, handler: Optional[Callable[["ApprovalRequest"], Any]]) -> None:
         """Bind the current interactive surface as the approval renderer."""
@@ -916,7 +949,9 @@ class Context:
         for key, value in bundle.env.items():
             os.environ[key] = value
         try:
-            return _build_settings_from_env(
+            from leapflow.config import settings_with_model_services
+
+            loaded = _build_settings_from_env(
                 layout=self.settings.layout,
                 profile_layout=self.settings.profile_layout,
                 profile_manifest=self.settings.profile_manifest,
@@ -924,6 +959,7 @@ class Context:
                 watched_config_paths=bundle.watched_paths,
                 config_warnings=bundle.warnings,
             )
+            return settings_with_model_services(loaded, bundle.values)
         finally:
             # Restore original env to avoid polluting daemon global state.
             for key in bundle.env:
@@ -1159,7 +1195,15 @@ class Context:
             or previous.vlm_model != updated.vlm_model
             or previous.visual_track_enabled != updated.visual_track_enabled
         )
+        if updated.llm_services_error:
+            from dataclasses import replace
+            updated = replace(updated, llm_services=previous.llm_services)
+            logger.warning("Invalid service catalog; retaining its last admitted generation")
         self.settings = updated
+        owner = getattr(self, "model_services", None)
+        if owner is not None:
+            owner.publish(updated.llm_services, revision=owner.secret_revision(updated))
+            self._bind_model_services()
         self._configure_mcp_manager(updated)
         if not llm_changed:
             if self.engine is not None:
@@ -1660,8 +1704,15 @@ class Context:
                 self._hardware_view_priors = priors
             except Exception:
                 logger.warning("Observation learning unavailable; survey remains unlearned", exc_info=True)
+        evidence = getattr(self, "_hardware_evidence_sink", None)
+        if evidence is None:
+            from leapflow.hardware.snapshot_evidence import SnapshotEvidenceService
+
+            evidence = SnapshotEvidenceService(lambda: self.settings, self.event_bus)
+            self._hardware_evidence_sink = evidence
         _get_tool_registry().bind_runtime(
             hardware_registry=registry,
+            hardware_evidence_sink=evidence,
             hardware_approval_gate=self._approval_orchestrator,
             hardware_trust_gate=self._hardware_trust_gate,
             hardware_view_priors=priors,
@@ -1924,6 +1975,7 @@ class Context:
         logger.info("Desktop semantic plugin bound (perception=%s)", perception is not None)
 
         self._bind_hardware_plugin()
+        self._bind_model_services()
         await self._maybe_start_hardware_streams()
         await self._maybe_start_hardware_fleet()
 
@@ -4036,6 +4088,15 @@ class Context:
                 await registry.close_all()
             except Exception:
                 logger.warning("Hardware teardown failed", exc_info=True)
+
+        evidence = getattr(self, "_hardware_evidence_sink", None)
+        if evidence is not None:
+            await evidence.aclose()
+            self._hardware_evidence_sink = None
+
+        service_scope = getattr(self, "_model_service_scope", None)
+        if service_scope is not None:
+            await service_scope.async_dispose()
 
         priors = getattr(self, "_hardware_view_priors", None)
         if priors is not None:

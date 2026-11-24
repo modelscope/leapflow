@@ -14,6 +14,7 @@ add cost without adding signal.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -70,9 +71,10 @@ def _plaintext_hits(root: Path, needle: str) -> list[str]:
 @pytest.mark.asyncio
 async def test_r3_control_plane(journeys: JourneyFactory) -> None:
     """Slash commands observe, mutate, reload, and cancel through the daemon."""
+    script = scripted(answer("Acknowledged."))
     journey = journeys(
         "r3_control_plane",
-        script=scripted(answer("Acknowledged.")),
+        script=script,
         deadline_s=90.0,
         # One closing turn; the rest of the journey is pure control plane.
         max_llm_calls=6,
@@ -186,7 +188,53 @@ async def test_r3_control_plane(journeys: JourneyFactory) -> None:
         errors = [event.content for event in events if event.type == "error"]
         assert not errors, f"turn broke after config mutations: {errors}"
 
+    with journey.phase("specialist onboarding: profile declaration and approved fixture over RPC"):
+        script.turns.append(answer('{"selected_id":"a","rationale":"eligible fixture choice"}'))
+        await _model_onboarding(journey, client, workspace)
+
     journey.finish()
+
+
+async def _model_onboarding(journey: Any, client: Any, workspace: Path) -> None:
+    """Reuse the real control plane without changing the primary catalog's cassette."""
+    declaration = workspace / "specialist.json"
+    declaration.write_text(json.dumps({"schema_version": 1, "provider": "openai",
+        "base_url": journey.proxy.base_url, "model": "fixture-specialist", "task": "decision",
+        "auth": {"mode": "none"}}))
+    case = workspace / "case.json"
+    case.write_text(json.dumps({"schema_version": 1, "artifact_scope": "synthetic",
+        "input": {"goal": "choose", "candidates": [{"id": "a", "description": "eligible"}]},
+        "expected": {"properties": {"selected_id": {"enum": ["a"]}}}}))
+    result = await client.command_execute("config", f"llm services set fixture --file {declaration}", session_id=SESSION)
+    assert result.get("ok"), result
+    shown = await client.command_execute("config", "llm services show fixture", session_id=SESSION)
+    assert shown["result"]["declarations"]["fixture"]["model"] == "fixture-specialist", shown
+    calls = journey.proxy.stats.call_count
+    checked = await client.command_execute("config", "llm services check fixture", session_id=SESSION)
+    assert checked.get("ok") and checked["result"]["mode"] == "local_only", checked
+    assert checked["result"]["services"] and all(
+        not entry["endpoint_probed"] for entry in checked["result"]["services"]), checked
+    assert journey.proxy.stats.call_count == calls
+    approvals = []
+
+    async def approve(event: Any) -> None:
+        if event.type == "approval_request":
+            request = event.metadata["approval"]
+            approvals.append(request)
+            assert request["action"]["session_id"] == SESSION
+            await client.approval_resolve(request["pending_id"], "allow_once", reason="r3 explicit fixture")
+
+    try:
+        checked = await client.command_execute("config", "llm services check fixture --case case.json",
+                                               session_id=SESSION, on_stream_event=approve)
+        assert checked.get("ok"), checked
+        assert approvals, "Fixture endpoint ran without an observable routed consent prompt"
+        assert checked["result"]["stages"]["fixture_assertions"] == "pass"
+        assert not checked["result"]["physical_authority"]
+        assert journey.proxy.stats.call_count == calls + 1
+    finally:
+        removed = await client.command_execute("config", "llm services unset fixture", session_id=SESSION)
+        assert removed.get("ok"), removed
 
 
 async def _get_value(client: Any, key: str) -> str:

@@ -153,7 +153,9 @@ class SceneViewer:
         changes = self._changes(signatures)
         fusion = self._fuse(rows, state)
         data, spans, placed = await asyncio.to_thread(self._render, rows, fusion.marks, request.overlay)
-        shot = self._result(rows[0][0], placed, data)
+        shot = self._result(
+            rows[0][0], placed, data, frame_ids=tuple(row[0].frame_id for row in rows)
+        )
         if len(placed) > 1:
             shot["tiles"] = [view.to_dict() for view in placed]
             shot["frames"] = self._frames_of(rows, spans)
@@ -566,7 +568,10 @@ class SceneViewer:
         data = tiles.encode_jpeg(tiles.compose(images), int(self._scene._settings.snapshot_quality))
         return data, spans, placed
 
-    def _result(self, primary: _Tile, placed: Sequence[ViewTile], data: str) -> dict[str, Any]:
+    def _result(
+        self, primary: _Tile, placed: Sequence[ViewTile], data: str,
+        *, frame_ids: Sequence[str] = (),
+    ) -> dict[str, Any]:
         """The fields every shared image carries; a mosaic is named ``vN``, one tile ``fN``."""
         scene, settings = self._scene, self._scene._settings
         capture = primary.capture
@@ -588,6 +593,13 @@ class SceneViewer:
                 f"{view.camera} {view.plane}" + (f" {view.frame_id}" if view.frame_id else "")
                 for view in placed
             )
+        # Include every source, including look-only tiles whose public frame id
+        # is empty. A newly named mosaic must not renew its oldest source.
+        source_ids = frame_ids or (primary.frame_id,)
+        remaining = min(
+            scene._memory.frame_remaining_s(frame_id, scene._basis, settings.frame_ttl_s)
+            for frame_id in source_ids
+        )
         shot: dict[str, Any] = {
             "frame": handle,
             "capture_id": capture.capture_id,
@@ -596,7 +608,9 @@ class SceneViewer:
             "width": width,
             "height": height,
             "observed_at": capture.frame.observed_at,
-            "liftable_for_s": settings.frame_ttl_s,
+            "liftable_for_s": remaining,
+            "valid_for_s": remaining,
+            "validity_timebase": "node_remaining_duration",
             "image": image,
         }
         if not capture.liftable:

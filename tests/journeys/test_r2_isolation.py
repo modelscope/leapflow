@@ -15,7 +15,9 @@ refused with an actionable message.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -51,14 +53,12 @@ async def _turn(client: Any, message: str, *, session_id: str, workspace: str) -
 @pytest.mark.asyncio
 async def test_r2_two_workspaces_stay_isolated(journeys: JourneyFactory) -> None:
     """Two clients on one daemon never see each other's session, usage, or turns."""
+    script = scripted(
+        answer("Workspace A acknowledged."), answer("Workspace B acknowledged."),
+        answer("Still workspace A."), answer("Still workspace B."))
     journey = journeys(
         "r2_isolation",
-        script=scripted(
-            answer("Workspace A acknowledged."),
-            answer("Workspace B acknowledged."),
-            answer("Still workspace A."),
-            answer("Still workspace B."),
-        ),
+        script=script,
         deadline_s=90.0,
         # Six turns across two clients. Observed 8 calls against a real provider.
         max_llm_calls=14,
@@ -139,6 +139,11 @@ async def test_r2_two_workspaces_stay_isolated(journeys: JourneyFactory) -> None
             "a concurrent turn from client B landed in client A's session"
         )
 
+    if not journey.is_live:
+        with journey.phase("specialist fixtures: caller workspace, approvals and catalog churn stay isolated"):
+            script.turns.append(answer('{"selected_id":"a","rationale":"workspace A fixture"}'))
+            await _specialist_isolation(journey, client_a, client_b, workspace_a, workspace_b)
+
     with journey.phase("workspace binding: reuse from another workspace is refused"):
         events = await _turn(
             client_b, "Steal A's session.", session_id=SESSION_A, workspace=str(workspace_b)
@@ -159,3 +164,56 @@ async def test_r2_two_workspaces_stay_isolated(journeys: JourneyFactory) -> None
         )
 
     journey.finish()
+
+
+async def _specialist_isolation(journey: Any, client_a: Any, client_b: Any,
+                                workspace_a: Path, workspace_b: Path) -> None:
+    """One session's allow-all cannot approve another client's fixture command."""
+    declaration = workspace_a / "specialist.json"
+    declaration.write_text(json.dumps({"schema_version": 1, "provider": "openai",
+        "base_url": journey.proxy.base_url, "model": "fixture-specialist", "task": "decision",
+        "auth": {"mode": "none"}}))
+    for workspace, candidate in ((workspace_a, "a"), (workspace_b, "b")):
+        (workspace / "case.json").write_text(json.dumps({"schema_version": 1, "artifact_scope": "synthetic",
+            "input": {"goal": "choose", "candidates": [{"id": candidate, "description": "own workspace"}]},
+            "expected": {"properties": {"selected_id": {"enum": [candidate]}}}}))
+    registered = await client_a.command_execute("config", f"llm services set fixture --file {declaration}",
+                                                session_id=SESSION_A)
+    assert registered.get("ok"), registered
+    approvals_a, approvals_b = [], []
+
+    async def approve_a(event: Any) -> None:
+        if event.type == "approval_request":
+            request = event.metadata["approval"]
+            approvals_a.append(request)
+            assert request["action"]["session_id"] == SESSION_A
+            await client_a.approval_resolve(request["pending_id"], "allow_all_session", reason="r2 client A only")
+
+    async def deny_b(event: Any) -> None:
+        if event.type == "approval_request":
+            request = event.metadata["approval"]
+            approvals_b.append(request)
+            assert request["action"]["session_id"] == SESSION_B
+            await client_b.approval_resolve(request["pending_id"], "deny", reason="r2 client B refuses")
+
+    calls = journey.proxy.stats.call_count
+    try:
+        # A earns its own in-memory bypass before B starts; simultaneous status
+        # and catalog mutations still run over their independent RPC clients.
+        result_a = await client_a.command_execute("config", "llm services check fixture --case case.json",
+                                                  session_id=SESSION_A, on_stream_event=approve_a)
+        assert result_a.get("ok") and approvals_a, result_a
+        result_b, status_a = await asyncio.gather(
+            client_b.command_execute("config", "llm services check fixture --case case.json",
+                                     session_id=SESSION_B, on_stream_event=deny_b),
+            client_a.status(SESSION_A))
+        assert not result_b.get("ok") and approvals_b, result_b
+        assert result_b["result"]["failure_code"] == "permission_denied"
+        assert status_a["session_id"] == SESSION_A
+        assert journey.proxy.stats.call_count == calls + 1
+        removed = await client_a.command_execute("config", "llm services unset fixture", session_id=SESSION_A)
+        assert removed.get("ok"), removed
+        shown = await client_b.command_execute("config", "llm services show", session_id=SESSION_B)
+        assert not shown["result"]["declarations"], shown
+    finally:
+        await client_a.command_execute("config", "llm services unset fixture", session_id=SESSION_A)

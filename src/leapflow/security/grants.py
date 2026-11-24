@@ -132,6 +132,27 @@ class ApprovalAuditLog:
     def entries(self) -> tuple[dict[str, Any], ...]:
         return tuple(self._entries)
 
+    def get(self, action_id: str) -> dict[str, Any] | None:
+        """Resolve a unique durable approval without accepting a caller-supplied log."""
+        if not action_id:
+            return None
+        entries = list(self._entries)
+        if self._path is not None and self._path.exists():
+            entries = []
+            with self._path.open("rb") as handle:
+                for line in iter(lambda: handle.readline(65537), b""):
+                    if len(line) > 65536:
+                        raise ValueError("Approval audit entry exceeds its bound")
+                    entry = json.loads(line)
+                    if not isinstance(entry, dict):
+                        raise ValueError("Invalid approval audit entry")
+                    if entry.get("action_id") == action_id:
+                        entries.append(entry)
+                        if len(entries) > 1:
+                            return None
+        matches = [entry for entry in entries if entry.get("action_id") == action_id]
+        return dict(matches[0]) if len(matches) == 1 else None
+
     def record(
         self,
         *,

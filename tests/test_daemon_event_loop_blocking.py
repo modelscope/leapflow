@@ -380,6 +380,8 @@ async def test_the_watch_summary_does_not_block_the_loop() -> None:
     ticks = 0
 
     class _SlowStore:
+        delivery = type("Delivery", (), {"stats": {}})()
+
         def list_watches(self) -> list[Any]:
             # Blocking on purpose: this is what DuckDB does, and it is the reason the
             # read must not happen on the loop thread.
@@ -418,6 +420,8 @@ async def test_the_summary_still_answers_without_an_off_loop_channel() -> None:
     from leapflow.daemon.monitor_coordinator import MonitorCoordinator
 
     class _Store:
+        delivery = type("Delivery", (), {"stats": {}})()
+
         def list_watches(self) -> list[Any]:
             return []
 

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
@@ -98,6 +99,7 @@ from leapflow.hardware.skills.protocol import (
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_UNKNOWN,
 )
+from leapflow.hardware.snapshot_evidence import SessionEvidenceSink, export_snapshot_result
 from leapflow.hardware.view_priors import ViewPriorPort
 from leapflow.hardware.write_governor import WriteGovernanceRequest, WriteGovernor
 from leapflow.security.actions import ActionDescriptor
@@ -186,6 +188,7 @@ class SkillService:
         lease_s: float = DEFAULT_LEASE_S,
         share_frames: bool = False,
         view_priors: ViewPriorPort | None = None,
+        evidence_sink: SessionEvidenceSink | None = None,
     ) -> None:
         self._fleet = fleet_manager
         self._governor = WriteGovernor(gate=gate, audit_log=audit_log)
@@ -196,6 +199,7 @@ class SkillService:
         # The host half of camera-frame consent; a node also needs its workcell's.
         self._share_frames = bool(share_frames)
         self._view_priors = view_priors
+        self._evidence_sink = evidence_sink
         self._links: dict[str, _Link] = {}
         self._runs: dict[str, _HostRun] = {}
         self._background: set[asyncio.Task[Any]] = set()
@@ -207,6 +211,10 @@ class SkillService:
     def set_view_priors(self, priors: ViewPriorPort | None) -> None:
         """Rebind optional ranking without replacing live run-lease ownership."""
         self._view_priors = priors
+
+    def set_evidence_sink(self, sink: SessionEvidenceSink | None) -> None:
+        """Rebind session evidence without replacing connections or live leases."""
+        self._evidence_sink = sink
 
     async def close(self) -> None:
         """Stop renewing and drop every connection; nodes halt runs whose lease lapses."""
@@ -273,6 +281,7 @@ class SkillService:
         Envelope fields nested inside ``args`` are lifted out where the skill's
         schema makes that unambiguous (``skill_arguments``); the result says so.
         """
+        started_at = time.monotonic()
         workcell, skill = routing(kwargs)
         try:
             if not skill:
@@ -285,10 +294,17 @@ class SkillService:
                 )
                 declared = declared_arguments(as_mapping(listed), skill)
             request = split_request(kwargs, declared)
+            if request.export_evidence:
+                if (skill != "perceive.snapshot" or request.candidates is not None
+                        or request.args.get("mode", "passive") != "passive"
+                        or kwargs.get("approved_plan") is not None or request.dry_run):
+                    raise SkillRefusal(FAILURE_INVALID_REQUEST, "Evidence export requires a fresh passive perceive.snapshot")
+                if not self._share_frames or not isinstance(self._evidence_sink, SessionEvidenceSink):
+                    raise SkillRefusal(FAILURE_INVALID_REQUEST, "Evidence export needs hardware.share_frames and a bound session evidence sink")
             planned = await self._plan(target, request, kwargs.get("approved_plan"))
         except SkillRefusal as refusal:
             return refusal_result(refusal.failure_code, refusal.message, skill=skill)
-        result = await self._run(target, request, planned)
+        result = await self._run(target, request, planned, started_at=started_at)
         if "batch" in planned:
             result["batch"] = dict(as_mapping(planned["batch"]))
         if request.lifted:
@@ -363,7 +379,8 @@ class SkillService:
              "share_frames": self._share_frames}, timeout_s=settings.timeout_s + 5.0))
 
     async def _run(
-        self, target: _Target, request: RunRequest, planned: Mapping[str, Any]
+        self, target: _Target, request: RunRequest, planned: Mapping[str, Any],
+        *, started_at: float | None = None,
     ) -> dict[str, Any]:
         """Answer a READ outcome, or verify, approve, start and follow the plan."""
         skill = request.skill
@@ -374,6 +391,14 @@ class SkillService:
                     str(as_mapping(outcome.get('result')).get('observation_scope', '')),
                     'planning', outcome, uuid.uuid4().hex)
             result = outcome_result(target.qualified, skill, as_mapping(planned["outcome"]))
+            if request.export_evidence:
+                exported = await export_snapshot_result(
+                    self._evidence_sink, result, workcell=target.qualified,
+                    started_at=started_at if started_at is not None else time.monotonic(),
+                )
+                status = exported.get("evidence", {}).get("status", "refused")
+                self._audit_record("skill_frames", target.qualified, skill, f"session evidence {status}; no primary-chat image")
+                return exported
             shared = share_frame(result, consent=self._share_frames)
             if shared:
                 self._audit_record("skill_frames", target.qualified, skill, f"shared {shared}")

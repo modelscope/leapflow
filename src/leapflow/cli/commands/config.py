@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 from typing import Any
@@ -57,7 +58,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             _print_result(result.message, result.changed_keys, result.warnings)
             return 0
         if action == "llm":
-            return _cmd_llm(service, args)
+            return _cmd_llm(service, args, settings=settings)
         if action == "secret":
             return _cmd_secret(service, args)
     except (KeyError, ValueError, RuntimeError) as exc:
@@ -67,8 +68,17 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 2
 
 
-def _cmd_llm(service: ConfigService, args: argparse.Namespace) -> int:
+def _cmd_llm(service: ConfigService, args: argparse.Namespace, *, settings: Any = None) -> int:
     llm_action = getattr(args, "llm_action", None) or "show"
+    if llm_action == "services":
+        from leapflow.cli.commands.model_service_config import execute_service_config, execute_fixture
+        result = (asyncio.run(execute_fixture(settings, args)) if getattr(args, "case", "") else
+                  execute_service_config(service, args))
+        if isinstance(result, dict):
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0 if result.get("ok") else 2
+        _print_result(result.message, result.changed_keys, result.warnings)
+        return 0 if result.ok else 2
     if llm_action == "show":
         snapshot = service.snapshot()
         for item in snapshot.values:

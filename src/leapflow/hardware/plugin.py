@@ -40,6 +40,7 @@ class HardwareContextPlugin:
         self._hardware_trust_gate: Any = None
         self._event_bus: Any = None
         self._view_priors: Any = None
+        self._evidence_sink: Any = None
 
         # LHPGateway: bridges hardware state to/from LLM context.
         self._lhp_gateway: Any = None
@@ -114,6 +115,7 @@ class HardwareContextPlugin:
             "session_id",
             "event_bus",
             "hardware_view_priors",
+            "hardware_evidence_sink",
         ]
 
     def bind_runtime(self, **deps: Any) -> None:
@@ -160,6 +162,10 @@ class HardwareContextPlugin:
             self._view_priors = deps.get("hardware_view_priors")
             if self._skill_service is not None:
                 self._skill_service.set_view_priors(self._view_priors)
+        if "hardware_evidence_sink" in deps:
+            self._evidence_sink = deps.get("hardware_evidence_sink")
+            if self._skill_service is not None:
+                self._skill_service.set_evidence_sink(self._evidence_sink)
 
         if registry_changed:
             # The previous manager may own a live heartbeat task; stash it so
@@ -618,6 +624,7 @@ class HardwareContextPlugin:
                 session_id=self._session_id,
                 share_frames=bool(getattr(self._registry.settings, "share_frames", False)),
                 view_priors=self._view_priors,
+                evidence_sink=self._evidence_sink,
             )
         return build_skill_tools(self._skill_service)
 

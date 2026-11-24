@@ -784,7 +784,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 return
 
             if canonical == "config":
-                handle_config(ctx, console, cmd_args)
+                await handle_config(ctx, console, cmd_args)
                 _update_status()
                 return
 

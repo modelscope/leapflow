@@ -1781,6 +1781,13 @@ class RuntimeLeapService:
 
     async def command_execute(self, name: str, args: str = "", session_id: str = "") -> dict[str, Any]:
         from leapflow.cli.commands.slash_handlers import command_execute
+        if name == "config":
+            # A relative fixture belongs to the named caller's workspace, never
+            # the daemon template or whichever client was most recently active.
+            registry = self._session_registry
+            session = registry.get(session_id) if registry is not None and session_id else None
+            root = str(session.workspace_root) if session is not None else ""
+            return await command_execute(self.context, name, args, session_id=session_id, workspace_root=root)
         return await command_execute(self.context, name, args, session_id=session_id)
 
     # ── Delegate: gateway (stubs) ────────────────────────────────────

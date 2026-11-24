@@ -152,6 +152,7 @@ class OpenAIChat(LLMProvider):
         max_retries: int = 3,
         provider: Optional[str] = None,
         timeout_s: float = 180.0,
+        async_http_client: httpx.AsyncClient | None = None,
     ) -> None:
         timeout = httpx.Timeout(
             connect=30.0,
@@ -167,9 +168,18 @@ class OpenAIChat(LLMProvider):
         # assume ``timeout_s`` bounds one attempt. Measured: a 45s timeout failed after
         # 137s. One retry owner, and it is this class.
         self._sync = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0)
-        self._async = AsyncOpenAI(
-            api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0
-        )
+        async_options: Dict[str, Any] = {}
+        if async_http_client is not None:
+            async_options["http_client"] = async_http_client
+        try:
+            self._async = AsyncOpenAI(
+                api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0,
+                **async_options,
+            )
+        except Exception:
+            self._sync.close()
+            raise
+        self._close_task: asyncio.Task[None] | None = None
         self._model = model
         self._max_retries = max(1, int(max_retries))
         self._base_url = base_url
@@ -179,6 +189,18 @@ class OpenAIChat(LLMProvider):
     @property
     def model(self) -> str:
         return self._model
+
+    async def aclose(self) -> None:
+        """Close both SDK clients once, even if the awaiting consumer is canceled."""
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_clients())
+        await asyncio.shield(self._close_task)
+
+    async def _close_clients(self) -> None:
+        try:
+            await self._async.close()
+        finally:
+            self._sync.close()
 
     def _thinking_kwargs(self, enable_thinking: bool) -> Dict[str, Any]:
         if not enable_thinking or not self._profile.thinking_param:
@@ -284,7 +306,10 @@ class OpenAIChat(LLMProvider):
                 fn_args = json.loads(fn_args_raw) if isinstance(fn_args_raw, str) else fn_args_raw
             except (json.JSONDecodeError, TypeError):
                 fn_args = {}
-            tool_calls_parsed.append(ToolCallInfo(id=tc_id, name=fn_name, arguments=fn_args))
+            tool_calls_parsed.append(ToolCallInfo(
+                id=tc_id, name=fn_name, arguments=fn_args,
+                raw_arguments=fn_args_raw if isinstance(fn_args_raw, str) else None,
+            ))
 
         return OpenAIChatResponse(
             content=text or "",
@@ -489,7 +514,10 @@ class OpenAIChat(LLMProvider):
                 fn_args = json.loads(fn_args_raw) if isinstance(fn_args_raw, str) else fn_args_raw
             except (json.JSONDecodeError, TypeError):
                 fn_args = {}
-            tool_calls_parsed.append(ToolCallInfo(id=tc_id, name=fn_name, arguments=fn_args))
+            tool_calls_parsed.append(ToolCallInfo(
+                id=tc_id, name=fn_name, arguments=fn_args,
+                raw_arguments=fn_args_raw if isinstance(fn_args_raw, str) else None,
+            ))
 
         return OpenAIChatResponse(
             content=text or "",

@@ -247,6 +247,29 @@ def render_model_payload(console: "LeapConsole", payload: dict[str, Any]) -> Non
         console.system(f"Context length: {context_length:,}")
 
 
+async def build_config_payload_async(ctx: "Context", args: str = "", *, session_id: str = "",
+                                     workspace_root: str | None = None) -> dict[str, Any]:
+    """Keep local config builders synchronous; only explicit fixtures may call an endpoint."""
+    from leapflow.cli.commands.model_service_config import execute_fixture, parse_service_arguments
+    from leapflow.utils.shell_lex import split_args
+
+    try:
+        tokens = split_args(args)
+        if tokens[:2] == ["llm", "services"]:
+            parsed = parse_service_arguments(tokens[2:])
+            if getattr(parsed, "case", ""):
+                if getattr(ctx, "model_services", None) is None:
+                    return {"ok": False, "view": "config", "message": "Model service runtime unavailable; restart the governed session"}
+                result = await execute_fixture(ctx.settings, parsed, client=getattr(ctx, "model_services", None),
+                                               gate=getattr(ctx, "_approval_orchestrator", None),
+                                               session_id=session_id, workspace_root=workspace_root)
+                return {"ok": result["ok"], "view": "config", "mode": "model_services", "result": result,
+                        "message": result.get("error", "Fixture checked; no actions executed")}
+    except ValueError as exc:
+        return {"ok": False, "message": f"Config error: {exc}"}
+    return build_config_payload(ctx, args)
+
+
 def build_config_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
     """Execute a config command and return a serializable payload."""
     from leapflow.config_service import ConfigService
@@ -403,6 +426,11 @@ def render_config_payload(console: "LeapConsole", payload: dict[str, Any]) -> No
         console.warning(str(payload.get("message") or "Config command failed."))
         return
     mode = str(payload.get("mode") or "show")
+    if mode == "model_services":
+        import json
+        from rich.text import Text
+        console.print(Text(json.dumps(payload.get("result", {}), indent=2, ensure_ascii=False)))
+        return
     if mode in {"sources", "keys"}:
         label = "Writable config keys" if mode == "keys" else "Config sources"
         sources = [str(source) for source in payload.get("sources") or []]
@@ -497,6 +525,12 @@ def _config_field_to_dict(value: Any) -> dict[str, Any]:
 
 def _build_llm_config_payload(ctx: "Context", service: Any, tokens: list[str]) -> dict[str, Any]:
     action = tokens[0] if tokens else "show"
+    if action == "services":
+        from leapflow.cli.commands.model_service_config import execute_service_config, parse_service_arguments
+        result = execute_service_config(service, parse_service_arguments(tokens[1:]))
+        if isinstance(result, dict):
+            return {"ok": True, "view": "config", "mode": "model_services", "result": result}
+        return _config_mutation_payload(ctx, service, result)
     if action == "show":
         payload = _config_snapshot_payload(service)
         payload["values"] = [item for item in payload["values"] if str(item.get("key") or "").startswith("llm.")]
@@ -676,9 +710,10 @@ def handle_model(ctx: "Context", console: "LeapConsole", args: str) -> None:
     render_model_payload(console, build_model_payload(ctx, args))
 
 
-def handle_config(ctx: "Context", console: "LeapConsole", args: str) -> None:
-    """View or update runtime configuration."""
-    render_config_payload(console, build_config_payload(ctx, args))
+async def handle_config(ctx: "Context", console: "LeapConsole", args: str) -> None:
+    """View or update runtime configuration, with opt-in governed fixture checks."""
+    render_config_payload(console, await build_config_payload_async(
+        ctx, args, session_id=str(getattr(getattr(ctx, "session", None), "session_id", ""))))
 
 
 def handle_gateway(ctx: "Context", console: "LeapConsole", args: str) -> None:
@@ -1997,7 +2032,7 @@ async def _execute_doctor(ctx: "Context", args: str = "") -> dict[str, Any]:
 
 
 async def command_execute(
-    ctx: "Context", name: str, args: str = "", session_id: str = "",
+    ctx: "Context", name: str, args: str = "", session_id: str = "", *, workspace_root: str | None = None,
 ) -> dict[str, Any]:
     """Execute a slash command and return a serializable result payload.
 
@@ -2017,7 +2052,7 @@ async def command_execute(
     if name == "model":
         return build_model_payload(ctx, args)
     if name == "config":
-        return build_config_payload(ctx, args)
+        return await build_config_payload_async(ctx, args, session_id=session_id, workspace_root=workspace_root)
     if name == "gateway":
         return build_gateway_payload(ctx)
     if name == "host":

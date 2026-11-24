@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import tempfile
@@ -15,6 +16,7 @@ from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 import yaml
 
 from leapflow.config import Settings
+from leapflow.config_transaction import config_transaction
 from leapflow.security.secrets import ScopedSecretResolver, secret_ref, secret_scope
 
 ConfigScope = Literal["profile", "workspace", "user"]
@@ -98,6 +100,7 @@ _BOOTSTRAP_ONLY_SETTINGS = frozenset(
         "config_sources",
         "watched_config_paths",
         "config_warnings",
+        "llm_services_error",
         "duckdb_path",
         "runtime_dir",
         "audit_log_path",
@@ -453,8 +456,17 @@ _FIELD_DESCRIPTIONS = {
     "hardware.share_frames": (
         "Let the model look at workcell camera frames (perceive.snapshot). Off by default; "
         "the workcell must also declare share_frames. Each shared frame is audited and "
-        "shown to the model only for the current turns, never persisted. Read when the "
-        "skill tools are built, so a change needs a daemon restart."
+        "shown only for the current turns by default. Explicit hw_skill_run export_evidence "
+        "has separate transient-retention approval and returns specialist-only artifact IDs. "
+        "Read when the skill tools are built, so a change needs a daemon restart."
+    ),
+    "hardware.snapshot_evidence": (
+        "JSON bounds for explicit passive snapshot retention: ttl_s (default/max 300), "
+        "quota_bytes (default/max 67108864), max_frame_bytes (default/max 1048576), "
+        "max_pixels (default/max 16777216), cleanup_interval_s (default 5, max 60). "
+        "Does not enable retention or image upload. Export requires both frame-sharing "
+        "switches and separate consent; artifacts are session-owned, sensitive, non-syncable, "
+        "capped by native validity, and invalidated on runtime restart. Read per export."
     ),
     "llm.api_key": "Primary LLM API key stored in the local secret vault.",
     "llm.aux_api_key": "Auxiliary LLM provider API key stored in the local secret vault.",
@@ -769,6 +781,14 @@ _PERCEPTION_SECTIONS = frozenset(
 )
 
 _EXPLICIT_SPECS = {
+    "llm_services": ConfigFieldSpec(
+        "llm.services", "llm", "services", dict, "llm.yaml",
+        setting_name="llm_services", scopes=("profile",),
+        description="Profile-only structured specialist catalog; enabled defaults to true per service. "
+                    "Disabling revokes admitted consumers without stopping serving processes. "
+                    "Credentials are vault references. No network probe occurs on update.",
+        value_hint="v1 service mapping; llm services set <id> --file <declaration.yaml>; enable/disable <id>",
+    ),
     "llm_api_key": ConfigFieldSpec(
         "llm.api_key",
         "llm",
@@ -909,6 +929,9 @@ class ConfigService:
             value = str(getattr(self._settings, spec.setting_name or "", "") or "")
             return ConfigValueView(normalized, _mask_secret(value), secret=True)
         value = getattr(self._settings, spec.setting_name or "", None)
+        if normalized == "llm.services":
+            from leapflow.llm.services.config import declarations
+            return ConfigValueView(normalized, json.dumps(declarations(value), sort_keys=True), source="profile.llm")
         return ConfigValueView(normalized, _format_value(value), secret=False)
 
     def set(
@@ -923,6 +946,9 @@ class ConfigService:
         if spec.secret:
             return self._set_secret_backed_field(spec, str(value), scope=scope)
         coerced = _coerce_value(value, spec.value_type)
+        if normalized == "llm.services":
+            from leapflow.llm.services.config import declarations, parse_services
+            coerced = declarations(parse_services(coerced))
         if normalized in {
             "hardware.fleet_retry_initial_s", "hardware.fleet_retry_max_s",
             "plugin_health.error_window_s", "plugin_health.min_calls",
@@ -935,6 +961,9 @@ class ConfigService:
                     raise ValueError(f"{normalized} must be within 0..1")
             elif coerced <= 0:
                 raise ValueError(f"{normalized} must be positive")
+        if normalized == "hardware.snapshot_evidence":
+            from leapflow.hardware.snapshot_evidence import SnapshotEvidenceSettings
+            SnapshotEvidenceSettings.from_json(coerced)
         if normalized == "monitor.delivery":
             from leapflow.monitor.delivery import DeliveryConfig
             DeliveryConfig.parse(coerced)
@@ -956,11 +985,11 @@ class ConfigService:
 
             PlanningSettings(**{normalized.removeprefix("hardware.skills_planning_"): coerced})
         path = self._path_for_spec(spec, scope)
-        data = _read_yaml(path)
-        section = dict(data.get(spec.section) or {})
-        section[spec.name] = coerced
-        data[spec.section] = section
-        _write_yaml_atomic(path, data)
+        with config_transaction(path, self._settings.layout.config_mutation_lock_path(path)) as data:
+            section = dict(data.get(spec.section) or {})
+            section[spec.name] = coerced
+            data[spec.section] = section
+            _write_yaml_atomic(path, data)
         return ConfigMutationResult(
             True,
             f"Updated {normalized}",
@@ -977,11 +1006,11 @@ class ConfigService:
         if scope not in spec.scopes:
             raise ValueError(f"Config key {normalized} does not support scope: {scope}")
         path = self._path_for_spec(spec, scope)
-        data = _read_yaml(path)
-        section = dict(data.get(spec.section) or {})
-        section.pop(spec.name, None)
-        data[spec.section] = section
-        _write_yaml_atomic(path, data)
+        with config_transaction(path, self._settings.layout.config_mutation_lock_path(path)) as data:
+            section = dict(data.get(spec.section) or {})
+            section.pop(spec.name, None)
+            data[spec.section] = section
+            _write_yaml_atomic(path, data)
         return ConfigMutationResult(
             True,
             f"Unset {normalized}",
@@ -989,6 +1018,76 @@ class ConfigService:
             path,
             _restart_warnings(spec),
         )
+
+    def model_services(self) -> dict[str, Any]:
+        """Read durable declarations, keeping only vault references, without endpoint I/O."""
+        path = self._path_for_spec(_FIELD_SPECS["llm.services"], "profile")
+        data = _read_yaml(path).get("llm", {}).get("services", {})
+        from leapflow.llm.services.config import declarations, parse_services
+        return declarations(parse_services(data))
+
+    def set_model_service(self, service_id: str, declaration: object) -> ConfigMutationResult:
+        """Validate a single declaration, then atomically upsert only its ID."""
+        from leapflow.llm.services.config import declarations, parse_services
+        validated = declarations(parse_services({service_id: declaration}))
+        return self._mutate_model_service(service_id, validated[service_id])
+
+    def unset_model_service(self, service_id: str) -> ConfigMutationResult:
+        return self._mutate_model_service(service_id, None)
+
+    def set_model_service_enabled(self, service_id: str, enabled: bool) -> ConfigMutationResult:
+        """Merge one admission flag under the catalog lock, preserving adjacent writes."""
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be boolean")
+        return self._mutate_model_service(service_id, None, enabled=enabled)
+
+    def _mutate_model_service(self, service_id: str, declaration: dict[str, Any] | None,
+                              *, enabled: bool | None = None) -> ConfigMutationResult:
+        from leapflow.llm.services.config import declarations, parse_services
+
+        path = self._path_for_spec(_FIELD_SPECS["llm.services"], "profile")
+        with config_transaction(path, self._settings.layout.config_mutation_lock_path(path)) as data:
+            section = dict(data.get("llm") or {})
+            catalog = declarations(parse_services(section.get("services", {})))
+            if enabled is not None:
+                if service_id not in catalog:
+                    raise ValueError(f"Unknown model service: {service_id}")
+                if catalog[service_id].get("enabled", True) == enabled:
+                    return ConfigMutationResult(True, f"Model service {service_id} already "
+                                                f"{'enabled' if enabled else 'disabled'}", path=path)
+                catalog[service_id] = declarations(parse_services({service_id: {
+                    **catalog[service_id], "enabled": enabled}}))[service_id]
+            elif declaration is None:
+                if service_id not in catalog:
+                    raise ValueError(f"Unknown model service: {service_id}")
+                del catalog[service_id]
+            else:
+                catalog[service_id] = declaration
+            section["services"] = catalog
+            data["llm"] = section
+            _write_yaml_atomic(path, data)
+        return ConfigMutationResult(True, f"Updated model service {service_id}", ("llm.services",), path)
+
+    def check_model_services(self, service_id: str = "") -> dict[str, Any]:
+        """Local-only validation/discovery; this is not endpoint or hardware qualification."""
+        from leapflow.llm.provider_registry import get_default_registry, get_scoped_default_registry
+        catalog = self.model_services()
+        if service_id and service_id not in catalog:
+            raise ValueError(f"Unknown model service: {service_id}")
+        get_scoped_default_registry()
+        registry = get_default_registry()
+        return {"ok": True, "mode": "local_only", "services": [
+            {"id": name, "provider": item["provider"], "task": item["task"],
+             "configured": True, "enabled": item.get("enabled", True),
+             "provider_available": registry.get_plugin(item["provider"]) is not None,
+             "usable": item.get("enabled", True) and registry.get_plugin(item["provider"]) is not None
+                       and item.get("codec", "json.v1") == "json.v1",
+             "unavailable_reason": "disabled" if not item.get("enabled", True) else
+                                   ("" if registry.get_plugin(item["provider"]) is not None
+                                    and item.get("codec", "json.v1") == "json.v1" else "capability_unavailable"),
+             "qualified_for_hardware": False, "endpoint_probed": False}
+            for name, item in catalog.items() if not service_id or name == service_id
+        ]}
 
     def configure_llm(
         self,
@@ -1064,11 +1163,11 @@ class ConfigService:
         ref = secret_ref("profile", *[part for part in secret_path.split("/") if part])
         self._secrets.set(ref, value, metadata={"source": "config", "owner": spec.section})
         path = self._path_for_spec(spec, scope)
-        data = _read_yaml(path)
-        section = dict(data.get(spec.section) or {})
-        section[spec.name] = ref
-        data[spec.section] = section
-        _write_yaml_atomic(path, data)
+        with config_transaction(path, self._settings.layout.config_mutation_lock_path(path)) as data:
+            section = dict(data.get(spec.section) or {})
+            section[spec.name] = ref
+            data[spec.section] = section
+            _write_yaml_atomic(path, data)
         return ConfigMutationResult(
             True, f"Updated {spec.key}", (spec.key, f"{spec.key}_ref"), path
         )
@@ -1099,7 +1198,7 @@ class ConfigService:
 
 
 def _with_metadata(spec: ConfigFieldSpec) -> ConfigFieldSpec:
-    if spec.key == "hardware.observation":
+    if spec.key in {"hardware.observation", "hardware.snapshot_evidence"}:
         reload_semantics = "yes"
     elif spec.section in _RESTART_REQUIRED_SECTIONS:
         reload_semantics = "restart-required"
@@ -1250,7 +1349,7 @@ def _coerce_value(value: object, value_type: Any) -> object:
             return list(value)
         return [part.strip() for part in str(value).split(",") if part.strip()]
     if origin is dict or value_type is dict:
-        parsed = yaml.safe_load(str(value))
+        parsed = dict(value) if isinstance(value, dict) else yaml.safe_load(str(value))
         if not isinstance(parsed, dict):
             raise ValueError(f"Expected mapping value, got: {value}")
         return parsed

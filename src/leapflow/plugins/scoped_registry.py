@@ -135,6 +135,8 @@ class ScopedToolRegistry:
             self._plugin_files[plugin_id] = Path(str(plugin_path))
         # Register on underlying registry
         self._registry.register(plugin)
+        if "effect_scope" in plugin.dependencies:
+            plugin.bind_runtime(effect_scope=fiber.scope)
 
         # Capture tool names for cleanup
         tool_names = [t.name for t in plugin.tools]
@@ -210,6 +212,8 @@ class ScopedToolRegistry:
                 self._unregister_tools(pid, names)
 
             fiber.scope.effect(_cleanup)
+            if "effect_scope" in plugin.dependencies:
+                plugin.bind_runtime(effect_scope=fiber.scope)
             # Backward-compatible fast path: no declared dependencies means the
             # plugin can activate right away, exactly as before P1.
             if plugin.dependencies:

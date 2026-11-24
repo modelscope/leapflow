@@ -103,6 +103,7 @@ _EVENT_CLASS_MAP: dict[str, str] = {
     # ── Record (informational, store only) ──
     "settled": HardwareEventClass.RECORD,
     "observation_trial": HardwareEventClass.RECORD,
+    "snapshot_evidence": HardwareEventClass.RECORD,
     "sample_loss": HardwareEventClass.RECORD,
     "calibration_started": HardwareEventClass.RECORD,
     "calibration_completed": HardwareEventClass.RECORD,
@@ -172,6 +173,7 @@ class EventKind:
     QUALITY_DEGRADED = "quality_degraded"
     SETTLED = "settled"
     OBSERVATION_TRIAL = "observation_trial"
+    SNAPSHOT_EVIDENCE = "snapshot_evidence"
     UNREACHABLE = "unreachable"
     """A command was refused because the device could not be reached.
 

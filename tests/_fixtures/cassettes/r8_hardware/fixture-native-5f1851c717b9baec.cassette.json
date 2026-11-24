@@ -1,0 +1,41 @@
+{
+  "fingerprint": "5f1851c717b9baec38f955f924f2bfe3019bfb6f682b3675ec8ed4cb5be2ef86",
+  "note": "captured in seed mode",
+  "request": {
+    "model": "fixture-native",
+    "stream": false,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"contract\":\"leapflow.model.v1.1\",\"operation\":\"describe\",\"task\":\"grounding\"}"
+          }
+        ]
+      }
+    ]
+  },
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"fixture-native\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"{\\\"model_info\\\": {\\\"task\\\": \\\"grounding\\\", \\\"name\\\": \\\"r8-fixture\\\", \\\"version\\\": \\\"1\\\", \\\"checksum\\\": \\\"sha256:r8-fixture\\\", \\\"instance\\\": \\\"r8-instance\\\"}}\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"fixture-native\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"{\\\"model_info\\\": {\\\"task\\\": \\\"grounding\\\", \\\"name\\\": \\\"r8-fixture\\\", \\\"version\\\": \\\"1\\\", \\\"checksum\\\": \\\"sha256:r8-fixture\\\", \\\"instance\\\": \\\"r8-instance\\\"}}\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"fixture-native\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"{\\\"model_info\\\": {\\\"task\\\": \\\"grounding\\\", \\\"name\\\": \\\"r8-fixture\\\", \\\"version\\\": \\\"1\\\", \\\"checksum\\\": \\\"sha256:r8-fixture\\\", \\\"instance\\\": \\\"r8-instance\\\"}}\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"fixture-native\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"{\\\"model_info\\\": {\\\"task\\\": \\\"grounding\\\", \\\"name\\\": \\\"r8-fixture\\\", \\\"version\\\": \\\"1\\\", \\\"checksum\\\": \\\"sha256:r8-fixture\\\", \\\"instance\\\": \\\"r8-instance\\\"}}\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
+    }
+  ]
+}

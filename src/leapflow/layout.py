@@ -648,6 +648,11 @@ class PathLayout:
         profile_layout.ensure()
         return profile_layout
 
+    def config_mutation_lock_path(self, config_path: Path) -> Path:
+        """Stable lock identity shared by writers even when YAML is replaced."""
+        digest = hashlib.sha256(str(config_path.resolve()).encode("utf-8")).hexdigest()
+        return self.global_config_dir / ".locks" / f"{digest}.lock"
+
     def workspace_config_path(self, workspace_root: Path) -> Path:
         """Return the opt-in workspace config override path.
 

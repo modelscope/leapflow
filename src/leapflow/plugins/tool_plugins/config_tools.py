@@ -24,6 +24,7 @@ class ConfigToolsPlugin:
 
     @property
     def tools(self) -> list[ToolMetadata]:
+        from leapflow.tools.config_model_service import config_model_service_handler
         from leapflow.tools.config_tools import (
             config_get_handler,
             config_list_handler,
@@ -131,6 +132,54 @@ class ConfigToolsPlugin:
                 },
                 mutates_state=True,
                 provides_capabilities=("config.set",),
+                requires_platform_capabilities=("file.ops",),
+            ),
+            ToolMetadata(
+                name="config_model_service",
+                description=(
+                    "Connect or manage an advisory specialist alongside the unchanged primary chat model. "
+                    "Available with an empty catalog. show reads profile declarations; set saves one bounded "
+                    "declaration after session-routed approval; unset removes only that ID after approval. "
+                    "enable/disable changes only its centralized admission flag after approval, not the serving process. "
+                    "check is local-only unless the user explicitly supplies a text-only schema_version=1 "
+                    "case with artifact_scope=synthetic or recorded, input and expected JSON schema. "
+                    "API checks require endpoint consent. Never supply paths, image data or URLs as evidence; "
+                    "use model_query with owned artifact IDs. No serving-process management or physical qualification."
+                ),
+                parameters_schema={
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "operation": {"type": "string", "enum": ["show", "set", "unset", "check", "enable", "disable"]},
+                        "service_id": {"type": "string", "maxLength": 64},
+                        "declaration": {
+                            "type": "object", "description": "Single v1 specialist declaration; vault refs only.",
+                            "properties": {
+                                "schema_version": {"type": "integer", "enum": [1]},
+                                "provider": {"type": "string"}, "base_url": {"type": "string"},
+                                "model": {"type": "string"}, "task": {"type": "string"},
+                                "codec": {"type": "string", "enum": ["json.v1"]},
+                                "output": {"type": "string", "enum": ["json_text", "json_schema", "tool_call"]},
+                                "auth": {"type": "object", "description": "mode=none or mode=secret with vault ref"},
+                                "processing_location": {"type": "string", "enum": ["local", "remote", "unknown"]},
+                                "allow_remote": {"type": "boolean"},
+                                "enabled": {"type": "boolean", "description": "Admission control; defaults to true. Does not manage serving processes."},
+                                "limits": {"type": "object"}, "identity": {"type": "object"},
+                                "model_info": {"type": "object"}, "deployment": {"type": "object"},
+                                "request_options": {"type": "object"}, "prompt_template": {"type": "string"},
+                            },
+                            "required": ["schema_version", "provider", "base_url", "model", "task", "auth"],
+                            "additionalProperties": False,
+                        },
+                        "case": {"type": "object", "description": "Explicit inline text-only fixture; no artifacts."},
+                    },
+                    "required": ["operation"],
+                },
+                handler=config_model_service_handler,
+                x_leapflow={"category": "config", "risk_level": "medium", "schema_cost": "medium",
+                            "requires_approval": True, "mutates_state": True, "idempotency_scope": "turn"},
+                mutates_state=True,
+                execution_policy="external_side_effect",
+                provides_capabilities=("config.model_service",),
                 requires_platform_capabilities=("file.ops",),
             ),
         ]

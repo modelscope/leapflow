@@ -33,7 +33,6 @@ from leapflow.hardware.skills.protocol import SkillError
 from leapflow.hardware.skills.vision import WorkcellVision
 from leapflow.hardware.skills.runtime import SkillRuntime, SkillRuntimeSettings
 from leapflow.hardware.transport import FrameReading
-from leapflow.layout import build_layout
 from tests._harness.skill_stubs import ARM_ID, piper_context, write_workcell
 from tools.calib_regression import camera_regression
 
@@ -108,8 +107,11 @@ class Camera:
 
 @pytest.fixture
 def production_port(tmp_path: Path, monkeypatch):
-    layout = build_layout(tmp_path / "home").profile("default")
-    cache = CacheManager(layout.cache, profile_id="test_profile")
+    from conftest import make_settings
+
+    settings = make_settings(str(tmp_path / "home"))
+    layout = settings.profile_layout
+    cache = CacheManager(layout.cache, profile_id=settings.profile_manifest.profile_id)
     registry = HardwareRegistry(settings=HardwareSettings(enabled=True))
     registry.bind_persistence(cache_manager=cache)
     declaration = HardwareContext.from_mapping(
@@ -338,11 +340,13 @@ async def test_actual_node_startup_binds_evidence_cache_or_refuses_diagnostics(
     from leapflow.cache import manager as cache_module
     from leapflow.hardware import registry as registry_module
     from leapflow.hardware.lhp.runtime import serve_node
+    from conftest import make_settings
 
     port, cache, camera = production_port
     registry = port._registry
     registry._cache_manager = None
-    layout = build_layout(tmp_path / "home").profile("default")
+    config = replace(make_settings(str(tmp_path / "home")), hardware_providers="yaml", hardware_enabled=True)
+    layout = config.profile_layout
     write_workcell(
         layout.hardware.workcells_dir,
         {
@@ -351,16 +355,10 @@ async def test_actual_node_startup_binds_evidence_cache_or_refuses_diagnostics(
             "skills": ["calib.metric_readiness"],
         },
     )
-    config = SimpleNamespace(
-        profile_layout=layout,
-        runtime_dir=layout.runtime_dir,
-        profile_manifest=SimpleNamespace(profile_id="test_profile"),
-        hardware_providers="yaml",
-        hardware_enabled=True,
-    )
     monkeypatch.setattr(config_module, "load_config", lambda: config)
 
-    def use_admitted_registry(settings):
+    def use_admitted_registry(settings, *, transport_factories):
+        assert "model_service" in transport_factories
         registry._settings = settings
         return registry
 

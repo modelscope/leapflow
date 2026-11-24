@@ -422,6 +422,8 @@ def main(argv: list[str] | None = None) -> int:
     config_llm = config_sub.add_parser("llm", help="Configure the primary LLM provider")
     config_llm_sub = config_llm.add_subparsers(dest="llm_action")
     config_llm_sub.add_parser("show", help="Show LLM configuration")
+    from leapflow.cli.commands.model_service_config import add_service_arguments
+    add_service_arguments(config_llm_sub.add_parser("services", help="Manage profile specialist services"))
     config_llm_set = config_llm_sub.add_parser("set", help="Set LLM provider fields")
     config_llm_set.add_argument("--api-key", help="LLM API key; prefer --ask-api-key for shell history safety")
     config_llm_set.add_argument("--ask-api-key", action="store_true", help="Prompt securely for the LLM API key")

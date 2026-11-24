@@ -49,6 +49,41 @@ class SystemEvent:
 
 
 @dataclass(frozen=True)
+class RecordScope:
+    """Exact caller ownership for private, non-activating observations."""
+
+    profile_id: str
+    workspace_id: str
+    session_id: str
+
+
+@dataclass(frozen=True)
+class RecordAdmission:
+    """Receipt from the unified signal boundary; payload contains metadata only."""
+
+    admitted: bool
+    reason: str
+    scope: RecordScope
+    event_type: str
+    payload_json: str = "{}"
+
+
+@runtime_checkable
+class RecordNoiseGate(Protocol):
+    """Attribute-based noise filtering at private record admission."""
+
+    def should_pass(self, event: SystemEvent) -> bool: ...
+
+
+@runtime_checkable
+class RecordSignalPort(Protocol):
+    async def admit_record(
+        self, event_type: str, payload: Dict[str, Any], *, scope: RecordScope,
+        dedup_key: str, noise_gate: RecordNoiseGate,
+    ) -> RecordAdmission: ...
+
+
+@dataclass(frozen=True)
 class UIElement:
     """One actionable UI element row from a window snapshot.
 

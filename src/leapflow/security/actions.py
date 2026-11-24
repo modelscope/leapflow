@@ -434,6 +434,11 @@ class ActionDescriptor:
             "detail": _normalize_detail(self.kind, self.detail),
             "origin": self.origin,
         }
+        if self.kind == ActionKind.NETWORK_FETCH.value and self.metadata.get("sensitive_payload"):
+            # Consent to read a host is not consent to upload session evidence.
+            payload["disclosure"] = {"method": self.metadata.get("method"),
+                                     "processing_location": self.metadata.get("processing_location"),
+                                     "service_id": self.metadata.get("service_id")}
         encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
 

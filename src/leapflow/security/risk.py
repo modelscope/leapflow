@@ -223,6 +223,17 @@ class DefaultRiskClassifier:
                 metadata={"origin": origin, "target_category": category},
             )
 
+        if action.metadata.get("sensitive_payload"):
+            location = str(action.metadata.get("processing_location") or "unknown")
+            return RiskAssessment(
+                level=RiskLevel.HIGH,
+                score=0.85,
+                reasons=("sensitive_network_disclosure",),
+                explanation=f"Sends sensitive evidence to {origin}; declared processing location: {location}.",
+                allow_permanent=False,
+                metadata={"origin": origin, "target_category": category},
+            )
+
         if category in self._INTERNAL_TARGETS:
             return RiskAssessment(
                 level=RiskLevel.HIGH,

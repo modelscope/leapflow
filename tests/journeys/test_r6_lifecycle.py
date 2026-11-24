@@ -17,6 +17,7 @@ self-message filtering are already covered where they run, in the mock layer
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 from typing import Any
@@ -122,8 +123,10 @@ async def test_r6_daemon_lifecycle(journeys: JourneyFactory) -> None:
         answer("Installed the hermetic DSH plugin."),
         tool_call("fixture_echo", text="before restart"),
         answer("The DSH tool ran before restart."),
+        answer('{"selected_id":"a","rationale":"before restart"}'),
         tool_call("fixture_echo", text="after restart"),
         answer("The DSH tool ran after restart."),
+        answer('{"selected_id":"a","rationale":"after restart"}'),
         tool_call("plugin_remove", plugin_id=DSH_PLUGIN_ID, delete_source=True),
         answer("Removed the hermetic DSH plugin."),
     ]
@@ -174,6 +177,23 @@ async def test_r6_daemon_lifecycle(journeys: JourneyFactory) -> None:
         )
         assert _completed(invoked, "fixture_echo"), [event.type for event in invoked]
         assert not [event for event in invoked if event.type == "error"]
+
+    with journey.phase("specialist lifecycle: cancelled consent releases admission, then fixture succeeds"):
+        declaration = workspace_path / "specialist.json"
+        declaration.write_text(json.dumps({"schema_version": 1, "provider": "openai",
+            "base_url": journey.proxy.base_url, "model": "fixture-specialist", "task": "decision",
+            "auth": {"mode": "none"}}))
+        (workspace_path / "case.json").write_text(json.dumps({"schema_version": 1, "artifact_scope": "synthetic",
+            "input": {"goal": "choose", "candidates": [{"id": "a", "description": "eligible"}]},
+            "expected": {"properties": {"selected_id": {"enum": ["a"]}}}}))
+        registered = await client.command_execute("config", f"llm services set fixture --file {declaration}",
+                                                 session_id=SESSION)
+        assert registered.get("ok"), registered
+        calls = journey.proxy.stats.call_count
+        await _specialist_fixture(client, cancel=True)
+        assert journey.proxy.stats.call_count == calls, "Cancelled consent reached the provider"
+        await _specialist_fixture(client)
+        assert journey.proxy.stats.call_count == calls + 1
 
     with journey.phase("stop: shutdown removes the process and its runtime files"):
         old_pid = journey.daemon.info().pid
@@ -273,6 +293,19 @@ async def test_r6_daemon_lifecycle(journeys: JourneyFactory) -> None:
                 ]
                 assert not [event for event in invoked if event.type == "error"]
 
+            with journey.phase("specialist continuity: declaration reloads without carrying session consent"):
+                shown = await fresh_client.command_execute("config", "llm services show fixture", session_id=SESSION)
+                assert shown["result"]["declarations"]["fixture"]["model"] == "fixture-specialist", shown
+                calls = journey.proxy.stats.call_count
+                await _specialist_fixture(fresh_client)
+                assert journey.proxy.stats.call_count == calls + 1
+                removed = await fresh_client.command_execute("config", "llm services unset fixture", session_id=SESSION)
+                assert removed.get("ok"), removed
+                absent = await fresh_client.command_execute("config", "llm services check fixture --case case.json",
+                                                           session_id=SESSION)
+                assert not absent.get("ok"), absent
+                assert journey.proxy.stats.call_count == calls + 1
+
             with journey.phase("DSH cleanup: removal deletes wrapper and managed bundle"):
                 removed = await _turn(
                     fresh_client,
@@ -292,6 +325,33 @@ async def test_r6_daemon_lifecycle(journeys: JourneyFactory) -> None:
             restarted.stop()
 
     journey.finish()
+
+
+async def _specialist_fixture(client: Any, *, cancel: bool = False) -> None:
+    """Drive the real command approval route before and after process restart."""
+    prompts = []
+
+    async def decide(event: Any) -> None:
+        if event.type == "approval_request":
+            request = event.metadata["approval"]
+            prompts.append(request)
+            assert request["action"]["session_id"] == SESSION
+            if cancel:
+                await client.approval_cancel(request["pending_id"], reason="r6 cancelled fixture")
+            else:
+                await client.approval_resolve(request["pending_id"], "allow_once", reason="r6 explicit fixture")
+
+    checked = await client.command_execute("config", "llm services check fixture --case case.json",
+                                           session_id=SESSION, on_stream_event=decide)
+    assert prompts, "The specialist fixture bypassed its caller's consent route"
+    assert checked.get("ok") is (not cancel), checked
+    if cancel:
+        assert checked["result"]["failure_code"] == "permission_denied", checked
+    else:
+        assert checked["result"]["stages"]["fixture_assertions"] == "pass", checked
+        assert checked["result"]["physical_authority"] is False
+    pending = await client.approval_status()
+    assert not pending.get("pending"), pending
 
 
 async def _not_running(journey: Journey) -> bool:

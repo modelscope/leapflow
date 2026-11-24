@@ -90,8 +90,14 @@ def _build_local_registry(settings: Any) -> Any:
     policy = HardwareSettings.from_settings(settings)
     if not policy.enabled:
         return None
+    from leapflow.llm.services.composition import model_transport_factories
+    from leapflow.llm.services.runtime import ModelServiceRuntime
+
+    owner = ModelServiceRuntime.from_settings(settings)
     policy = replace(policy, persist_readings=False, stream_enabled=False)
-    registry = HardwareRegistry(policy)
+    registry = HardwareRegistry(policy, transport_factories=model_transport_factories(
+        owner, settings, lambda: registry.evidence_store))
+    registry.scope.async_effect(owner.aclose)
     registry.load()
     return registry
 

@@ -77,14 +77,28 @@ class ConfigLoader:
         values: dict[str, Any] = {}
         warnings: list[str] = []
         sources = self.sources()
+        services: Any = {}
         for source in sources:
             loaded = _read_yaml(source.path, warnings=warnings)
+            llm = loaded.get("llm")
+            if isinstance(llm, Mapping) and "services" in llm:
+                if source.scope == "profile.llm":
+                    services = llm["services"]
+                else:
+                    warnings.append(f"{source.path}: llm.services is profile-only; override ignored")
+                loaded = dict(loaded, llm={k: v for k, v in llm.items() if k != "services"})
             if loaded:
                 values = _deep_merge(values, loaded)
         values = _resolve_secret_refs(values, self._layout, self._profile_layout, warnings=warnings)
         values = _deep_merge(values, _env_overrides())
+        # Service credentials remain vault references and never enter scalar/env projection.
+        llm_values = dict(values.get("llm") or {})
+        llm_values["services"] = services
+        values["llm"] = llm_values
         watched = [source.path for source in sources]
         watched.append(self._layout.mcp_servers_path)
+        watched.extend((self._profile_layout.secrets.vault_path, self._profile_layout.secrets.key_path,
+                        self._layout.global_secrets.vault_path, self._layout.global_secrets.key_path))
         return ConfigBundle(
             values=values,
             sources=sources,
@@ -148,6 +162,8 @@ def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str
 
 
 def _flatten_yaml(node: Any, *, prefix: str, env_vars: dict[str, str]) -> None:
+    if prefix == "LEAPFLOW_LLM_SERVICES":
+        return
     if isinstance(node, Mapping):
         for key, value in node.items():
             child_prefix = f"{prefix}_{key}".upper()

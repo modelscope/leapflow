@@ -53,6 +53,8 @@ _BUILTIN_PLUGIN_MODULES = (
     "leapflow.plugins.tool_plugins.bridge",
     # Hardware contributes no tools until a hardware registry is bound.
     "leapflow.hardware.plugin",
+    # Specialist tools remain absent until a nonempty service owner is bound.
+    "leapflow.plugins.tool_plugins.model_services",
 )
 
 

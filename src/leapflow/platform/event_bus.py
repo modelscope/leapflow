@@ -7,11 +7,12 @@ Pipeline: CuaDriver/Observer → EventBus → Normalizer → EpisodicMemory → 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
-from leapflow.domain.events import PRE_NORMALIZED_EVENT_PREFIXES, SystemEvent
+from leapflow.domain.events import PRE_NORMALIZED_EVENT_PREFIXES, RecordAdmission, RecordNoiseGate, RecordScope, SystemEvent
 from leapflow.memory.providers.episodic import EpisodicMemoryProvider
 from leapflow.memory.providers.working import WorkingMemoryProvider
 from leapflow.platform.normalizer import EventNormalizer
@@ -98,6 +99,34 @@ class EventBus:
         else:
             await self._process_event(event_type, payload)
 
+    async def admit_record(
+        self, event_type: str, payload: Dict[str, Any], *, scope: RecordScope,
+        dedup_key: str, noise_gate: RecordNoiseGate,
+    ) -> RecordAdmission:
+        """Use the same admission pipeline without broadcasting private records.
+
+        The caller's receipt is its only delivery. It may be retained in that
+        session's evidence index, never global memory, consumers, or subscribers.
+        RECORD does not activate a decision loop. No bytes enter this boundary.
+        """
+        if not all(isinstance(value, str) and 0 < len(value) <= 256
+                   for value in (scope.profile_id, scope.workspace_id, scope.session_id, dedup_key, event_type)):
+            return RecordAdmission(False, "missing_scope", scope, event_type)
+        try:
+            encoded = json.dumps(payload, allow_nan=False, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return RecordAdmission(False, "invalid_metadata", scope, event_type)
+        if len(encoded.encode("utf-8")) > 16384 or payload.get("event_class") != "record":
+            return RecordAdmission(False, "invalid_record", scope, event_type)
+        if not callable(getattr(noise_gate, "should_pass", None)):
+            return RecordAdmission(False, "noise_gate_unavailable", scope, event_type)
+        receipt = await self._process_event(
+            event_type, json.loads(encoded), scope=scope, dedup_key=dedup_key,
+            noise_gate=noise_gate,
+        )
+        assert receipt is not None
+        return receipt
+
     def register_consumer(self, consumer: "EventConsumer") -> None:
         """Register an event consumer for batch event delivery."""
         if consumer not in self._consumers:
@@ -162,20 +191,45 @@ class EventBus:
                 # No running loop — skip async flush (will flush on next opportunity)
                 pass
 
-    async def _process_event(self, event_type: str, payload: Dict[str, Any]) -> None:
-        """Core processing: normalize → privacy gate → memory → subscribers → consumers."""
+    async def _process_event(
+        self, event_type: str, payload: Dict[str, Any], *,
+        scope: RecordScope | None = None, dedup_key: str = "", noise_gate: RecordNoiseGate | None = None,
+    ) -> RecordAdmission | None:
+        """Normalize → privacy → scoped admission or ordinary global delivery."""
         normalized = self._normalize(event_type, payload)
-
-        # Privacy gate: block excluded apps/paths from the entire pipeline
         if self._privacy_filter is not None:
             if not self._privacy_filter.should_ingest(
                 normalized.event_type, normalized.source, normalized.payload,
             ):
-                return
+                return RecordAdmission(False, "privacy_refused", scope, event_type) if scope else None
+
+        if scope is not None:
+            if normalized.event_type != event_type or normalized.payload.get("event_class") != "record":
+                return RecordAdmission(False, "normalization_refused", scope, event_type)
+            if noise_gate is None or not noise_gate.should_pass(normalized):
+                return RecordAdmission(False, "noise_refused", scope, event_type)
+            key = json.dumps([scope.profile_id, scope.workspace_id, scope.session_id, event_type, dedup_key])
+            now = time.monotonic()
+            previous = self._recent_sources.get(key)
+            if previous is not None and now - previous < _DEDUP_WINDOW_S:
+                return RecordAdmission(False, "duplicate", scope, event_type)
+            sanitized = normalized.payload
+            if self._privacy_filter is not None:
+                sanitized = self._privacy_filter.redact_payload(event_type, sanitized)
+            encoded = json.dumps(sanitized, allow_nan=False, ensure_ascii=False)
+            if len(encoded.encode("utf-8")) > 16384:
+                return RecordAdmission(False, "invalid_metadata", scope, event_type)
+            self._recent_sources[key] = now
+            if len(self._recent_sources) > 500:
+                self._recent_sources = {
+                    k: v for k, v in self._recent_sources.items() if now - v < _DEDUP_WINDOW_S
+                }
+            return RecordAdmission(True, "admitted", scope, event_type, encoded)
 
         self._ingest_to_memory(normalized)
         self._notify_subscribers(normalized)
         self._buffer_event(normalized)
+        return None
 
     def _normalize(self, event_type: str, payload: Dict[str, Any]) -> SystemEvent:
         if self._normalizer is not None:

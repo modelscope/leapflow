@@ -235,6 +235,8 @@ def test_hardware_transports_are_not_named_after_one_device() -> None:
         "media.py",
         "lhp.py",
         "model_service.py",
+        "_model_http.py",  # Internal backend of the same model_service transport kind.
+        "_model_provider.py",  # Standard API mechanism, never a model-name driver.
         "robot_arm.py",
         "robot_channels.py",
         "ros2.py",

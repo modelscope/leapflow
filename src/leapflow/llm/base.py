@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
 MessageDict = Dict[str, Any]
 ChunkCallback = Optional[Callable[[str], None]]
@@ -18,6 +18,7 @@ class ToolCallInfo:
     id: str
     name: str
     arguments: Dict[str, Any]
+    raw_arguments: str | None = None
 
 
 @dataclass
@@ -31,6 +32,15 @@ class LLMChatResponse:
     finish_reason: str | None = None
     thinking_content: str | None = None
     tool_calls: List[ToolCallInfo] = field(default_factory=list)
+
+
+@runtime_checkable
+class AsyncCloseableProvider(Protocol):
+    """Optional lifecycle contract for owned clients; legacy providers are unchanged."""
+
+    async def aclose(self) -> None:
+        """Release all owned clients idempotently."""
+        ...
 
 
 class LLMProvider(ABC):

@@ -95,7 +95,8 @@ class OpenAICompatiblePlugin:
             model=model,
             max_retries=int(config.get("max_retries", 3)),
             timeout_s=float(config.get("timeout_s", 180.0)),
-            provider=config.get("provider"),
+            provider=config.get("wire_profile", config.get("provider")),
+            async_http_client=config.get("async_http_client"),
         )
 
 

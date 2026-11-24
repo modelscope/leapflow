@@ -104,6 +104,11 @@ class LLMProviderRegistry:
         self._plugins: Dict[str, LLMProviderPlugin] = {}
         self._instances: Dict[str, LLMProvider] = {}
         self._version: int = 0
+        self._provider_revisions: Dict[str, int] = {}
+
+    def provider_revision(self, provider_id: str) -> int:
+        """Revocable factory basis for isolated consumers, independent of the primary cache."""
+        return self._provider_revisions.get(provider_id, 0)
 
     @property
     def version(self) -> int:
@@ -113,6 +118,8 @@ class LLMProviderRegistry:
     def notify_mutation(self) -> None:
         """Public API to signal a mutation happened (increments version)."""
         self._version += 1
+        for provider_id in self._plugins:
+            self._provider_revisions[provider_id] = self._version
         # Cached instances become stale on any mutation; drop them so callers
         # re-create providers against the current plugin set.
         self._instances.clear()
@@ -135,6 +142,7 @@ class LLMProviderRegistry:
         # Invalidate cached instance on re-registration.
         self._instances.pop(pid, None)
         self._version += 1
+        self._provider_revisions[pid] = self._version
         logger.debug("llm_registry: registered provider '%s'", pid)
 
     def unregister(self, provider_id: str) -> bool:
@@ -143,6 +151,7 @@ class LLMProviderRegistry:
         self._instances.pop(provider_id, None)
         if removed:
             self._version += 1
+            self._provider_revisions[provider_id] = self._version
             logger.debug("llm_registry: unregistered provider '%s'", provider_id)
         return removed
 
@@ -181,6 +190,17 @@ class LLMProviderRegistry:
                 provider_id, exc,
             )
             return None
+
+    def create_isolated(self, provider_id: str, config: Dict[str, Any]) -> LLMProvider:
+        """Construct a caller-owned instance without reading or changing the primary cache.
+
+        Factory errors propagate to the owning runtime for typed classification. The
+        selector is separate from any provider-specific wire-profile option.
+        """
+        plugin = self._plugins.get(provider_id)
+        if plugin is None:
+            raise LookupError(f"Provider {provider_id!r} is not registered")
+        return plugin.create_provider(dict(config))
 
     def create_from_config(self, config: Dict[str, Any]) -> Optional[LLMProvider]:
         """Create a provider instance from a config dict.

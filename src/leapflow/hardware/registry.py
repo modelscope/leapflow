@@ -20,7 +20,10 @@ import time
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Deque, Iterable, Mapping, Sequence
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Callable, Deque, Iterable, Mapping, Sequence
+
+from leapflow.domain.effect_scope import EffectScope
 
 from leapflow.hardware.context import (
     SUPPORTED_HC_VERSIONS,
@@ -291,7 +294,7 @@ def _provider_rows(
     return tuple(rows)
 
 
-def build_registry(settings: Any) -> HardwareRegistry | None:
+def build_registry(settings: Any, *, transport_factories: Mapping[str, Callable[..., HardwareTransport]] | None = None) -> HardwareRegistry | None:
     """Return a loaded registry, or None when hardware is disabled.
 
     Returning None rather than an empty registry is the whole default-off contract:
@@ -305,7 +308,7 @@ def build_registry(settings: Any) -> HardwareRegistry | None:
     policy = HardwareSettings.from_settings(settings)
     if not policy.enabled:
         return None
-    registry = HardwareRegistry(policy)
+    registry = HardwareRegistry(policy, transport_factories=transport_factories)
     try:
         report = registry.load()
     except (OSError, ValueError) as exc:
@@ -385,7 +388,10 @@ class HardwareRegistry:
         settings: HardwareSettings | None = None,
         *,
         providers: Sequence[HardwareContextProvider] = (),
+        transport_factories: Mapping[str, Callable[..., HardwareTransport]] | None = None,
     ) -> None:
+        self.scope = EffectScope("hardware-registry-resources")
+        self._transport_factories = MappingProxyType(dict(transport_factories or {}))
         self._settings = settings or HardwareSettings()
         from leapflow.hardware.observation import ObservationSettings
         self._observation_settings = ObservationSettings.parse(self._settings.hardware_observation)
@@ -889,7 +895,7 @@ class HardwareRegistry:
             return None
 
         # V4 -- a transport we cannot build makes the device unusable entirely.
-        if context.transport.kind not in available_transports():
+        if context.transport.kind not in set(available_transports()) | set(self._transport_factories):
             notes.append(
                 AdmissionNote(
                     device_id=device_id,
@@ -1144,7 +1150,9 @@ class HardwareRegistry:
             if existing is not None:
                 return existing
             await self._release_orphan(device_id)
-            transport = build_transport(context.transport.kind, context.transport.config)
+            factory = self._transport_factories.get(context.transport.kind)
+            transport = (factory(context.transport.config) if factory is not None else
+                         build_transport(context.transport.kind, context.transport.config))
             status = await transport.open(context)
             if not status.connected:
                 raise TransportError(
@@ -2236,6 +2244,7 @@ class HardwareRegistry:
         self._holds.clear()
         for device_id in list(self._orphans):
             await self._release_orphan(device_id)
+        await self.scope.async_dispose()
 
 
 __all__ = [

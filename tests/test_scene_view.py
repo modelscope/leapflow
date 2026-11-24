@@ -438,6 +438,10 @@ async def test_a_zoom_reshows_a_window_and_lifts_in_the_full_frame(tmp_path: Pat
     box = (u / 2 - 15, v / 2 - 15, u / 2 + 15, v / 2 + 15)  # in the 100x75 image
     zoomed = await scene.zoom(shot["frame"], box, coords=COORDS_PIXEL)
     assert zoomed["frame"] == "f2" and zoomed["zoom_of"] == "f1"
+    assert shot["valid_for_s"] == PerceptionSettings().frame_ttl_s
+    assert zoomed["valid_for_s"] == PerceptionSettings().frame_ttl_s - 10.0
+    assert zoomed["liftable_for_s"] == zoomed["valid_for_s"]
+    assert zoomed["validity_timebase"] == "node_remaining_duration"
     x0, y0, x1, y1 = zoomed["window"]
     assert (x1 - x0, y1 - y0) == pytest.approx((60.0, 60.0))
     assert zoomed["width"] > 30  # shown larger than it was
@@ -460,6 +464,32 @@ async def test_a_zoom_into_a_mosaic_uses_the_tile_under_the_box(tmp_path: Path) 
     with pytest.raises(SkillError) as error:
         await scene.zoom(shot["frame"], (10, 10, 12, 12), coords=COORDS_PIXEL)
     assert error.value.failure_code == FAILURE_INVALID_ARGS
+
+
+async def test_snapshot_validity_includes_rendering_elapsed_and_every_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    scene = _scene(_registry(tmp_path), clock=clock, frame_ttl_s=30.0)
+    render = scene._viewer._render
+
+    def slow_render(*args: Any) -> Any:
+        # Distinct source ages exercise the oldest constituent rather than the
+        # newly named mosaic. This is an I/O boundary (image rendering).
+        scene._memory._frames["f2"] = (
+            scene._memory._frames["f2"][0], clock.now - 8.0,
+        )
+        clock.now += 5.0
+        return render(*args)
+
+    monkeypatch.setattr(scene._viewer, "_render", slow_render)
+    shot = await scene.snapshot(with_cameras=["camera.wrist"])
+    assert shot["valid_for_s"] == 17.0
+    assert shot["liftable_for_s"] == 17.0
+    assert scene._memory.frame_remaining_s("missing", scene._basis, 30.0) == 0.0
+    assert scene._memory.frame_remaining_s("f1", {"changed": 1.0}, 30.0) == 0.0
+    clock.now += 31.0
+    assert scene._memory.frame_remaining_s("f1", scene._basis, 30.0) == 0.0
 
 
 def test_view_sides_are_bounded() -> None:

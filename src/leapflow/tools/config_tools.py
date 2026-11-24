@@ -17,6 +17,7 @@ hot-reload semantics intact.
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import logging
 from typing import Any, Dict
@@ -174,7 +175,10 @@ async def config_get_handler(args: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-async def _approve_write(key: str, *, scope: str, secret: bool, hot_reload: str) -> str:
+async def _approve_write(key: str, *, scope: str, secret: bool, hot_reload: str,
+                         tool: str = "config_set", service_id: str = "",
+                         declaration_keys: tuple[str, ...] = (), require_route: bool = False,
+                         operation: str = "set") -> str:
     """Return a denial reason, or ``""`` when the write may proceed.
 
     Goes through the orchestrator's native ``evaluate(ActionDescriptor)`` rather
@@ -186,8 +190,13 @@ async def _approve_write(key: str, *, scope: str, secret: bool, hot_reload: str)
     model turn off its own guardrails. The value is never included, so a
     credential cannot reach an approval prompt or the audit log.
     """
-    gate = _approval_gate
-    if gate is None:
+    from leapflow.tools.execution_context import current_tool_context
+
+    context = current_tool_context()
+    if require_route and (context is None or not context.session_id or context.orchestrator is None):
+        return "Config change refused: an active session and turn-routed approval orchestrator are required."
+    gate = context.orchestrator if context is not None and context.orchestrator is not None else _approval_gate
+    if not callable(getattr(gate, "evaluate", None)):
         return (
             "Config changes require an approval gate, which is not available in this "
             "session. Ask the user to run `leap config set` / `/config set` instead."
@@ -198,12 +207,16 @@ async def _approve_write(key: str, *, scope: str, secret: bool, hot_reload: str)
         action = ActionDescriptor(
             kind=ActionKind.RUNTIME_CONFIGURE.value,
             summary=f"Change LeapFlow setting {key} (scope={scope})",
-            detail=f"config_set {key} scope={scope}",
+            detail=f"{tool} {operation} {key} scope={scope}",
             effect=ActionEffect.CONFIGURE.value,
             resource=key,
+            session_id=context.session_id if context is not None else "",
+            turn_id=context.task_id if context is not None else "",
             metadata={
-                "tool": "config_set",
+                "tool": tool,
+                "operation": operation,
                 "config_key": key,
+                **({"service_id": service_id, "declaration_keys": list(declaration_keys)} if service_id else {}),
                 "scope": scope,
                 "secret": secret,
                 "hot_reload": hot_reload,
@@ -259,7 +272,7 @@ async def config_set_handler(args: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     try:
-        result = service.set(key, args["value"], scope=scope)  # type: ignore[arg-type]
+        result = await asyncio.to_thread(service.set, key, args["value"], scope=scope)
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "retryable": True}
     except Exception as exc:  # noqa: BLE001

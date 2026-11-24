@@ -359,6 +359,21 @@ class EvidenceStore:
             return []
         return [dict(zip(_COLUMNS, row)) for row in rows]
 
+    async def get(self, operation_id: str) -> dict[str, Any] | None:
+        """Resolve one managed evidence receipt by its opaque operation ID."""
+        return await asyncio.to_thread(self._get_sync, operation_id)
+
+    def _get_sync(self, operation_id: str) -> dict[str, Any] | None:
+        if not operation_id or not self._db_path.exists():
+            return None
+        connection = self._ensure_ready()
+        rows = connection.execute(
+            f"SELECT {', '.join(_COLUMNS)} FROM hardware_evidence "
+            "WHERE operation_id = ? AND schema_version = ? LIMIT 2",
+            [operation_id, EVIDENCE_SCHEMA_VERSION],
+        ).fetchall()
+        return dict(zip(_COLUMNS, rows[0])) if len(rows) == 1 else None
+
     async def get_frame_paths(self, operation_id: str) -> list[Path]:
         """Return file paths for frames associated with an operation."""
         return await asyncio.to_thread(self._get_frame_paths_sync, operation_id)

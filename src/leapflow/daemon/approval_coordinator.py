@@ -133,6 +133,7 @@ class ApprovalCoordinator:
             _tool_registry.bind_runtime(
                 plugin_approval_gate=orchestrator,
                 hardware_approval_gate=orchestrator,
+                model_approval_gate=orchestrator,
                 llm_provider=getattr(ctx, "llm", None),
                 plugin_generation_enabled=bool(
                     getattr(settings, "plugin_generation_enabled", False)

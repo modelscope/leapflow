@@ -1,0 +1,29 @@
+{
+  "fingerprint": "bcdfb003e2ffbf628e30b40540cc19309d23dc4914d7e7f31713d7d0620f6915",
+  "note": "captured in seed mode",
+  "request": {
+    "model": "fixture-native",
+    "stream": false,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"contract\":\"leapflow.model.v1.1\",\"image_order\":[\"image\"],\"input\":{\"queries\":[\"cup\"]},\"operation\":\"infer\",\"task\":\"grounding\"}"
+          },
+          {
+            "type": "image_url"
+          }
+        ]
+      }
+    ]
+  },
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"fixture-native\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"{\\\"detections\\\": [], \\\"infer_ms\\\": 1, \\\"model\\\": {\\\"name\\\": \\\"r8-fixture\\\", \\\"version\\\": \\\"1\\\", \\\"checksum\\\": \\\"sha256:r8-fixture\\\", \\\"instance\\\": \\\"r8-instance\\\"}}\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
+    }
+  ]
+}

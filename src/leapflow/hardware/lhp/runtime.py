@@ -125,9 +125,16 @@ async def serve_node(
     from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
     from leapflow.hardware.skills.runtime import SkillRuntime, SkillRuntimeSettings
 
+    from leapflow.llm.services.composition import model_transport_factories
+    from leapflow.llm.services.runtime import ModelServiceRuntime
+
     config = load_config()
     settings = HardwareSettings.from_settings(config)
-    registry = HardwareRegistry(replace(settings, persist_readings=False, stream_enabled=False))
+    model_services = ModelServiceRuntime.from_settings(config)
+    registry = HardwareRegistry(replace(settings, persist_readings=False, stream_enabled=False),
+                                transport_factories=model_transport_factories(
+                                    model_services, config, lambda: registry.evidence_store))
+    registry.scope.async_effect(model_services.aclose)
     try:
         cache = await asyncio.to_thread(
             CacheManager,

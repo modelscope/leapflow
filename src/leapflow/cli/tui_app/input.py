@@ -46,6 +46,14 @@ _CONFIG_ACTIONS: tuple[tuple[str, str], ...] = (
 _CONFIG_LLM_ACTIONS: tuple[tuple[str, str], ...] = (
     ("show", "Show current LLM configuration"),
     ("set", "Set LLM model, base URL, or API key"),
+    ("services", "Manage profile specialist services"),
+)
+
+_CONFIG_SERVICE_ACTIONS: tuple[tuple[str, str], ...] = (
+    ("show", "Show specialist declarations without endpoint calls"),
+    ("set", "Upsert one declaration: set <id> --file <path>"),
+    ("unset", "Remove future admission: unset <id>"),
+    ("check", "Validate locally; --case checks an approved fixture without execution"),
 )
 
 _CONFIG_LLM_SET_FLAGS: tuple[tuple[str, str], ...] = (
@@ -280,6 +288,20 @@ class SlashCommandCompleter(Completer):
                 return
             if len(parts) == 2 and not ends_space:
                 yield from _complete_pairs(_CONFIG_LLM_ACTIONS, parts[1], -len(parts[1]))
+                return
+            if len(parts) >= 2 and parts[1] == "services":
+                if len(parts) == 2 and ends_space:
+                    yield from _complete_pairs(_CONFIG_SERVICE_ACTIONS, "", 0)
+                elif len(parts) == 3 and not ends_space:
+                    yield from _complete_pairs(_CONFIG_SERVICE_ACTIONS, parts[2], -len(parts[2]))
+                elif len(parts) >= 4 and parts[2] in {"set", "check"}:
+                    flag = (("--file", "YAML/JSON declaration file") if parts[2] == "set" else
+                            ("--case", "Approved synthetic/recorded JSON fixture"))
+                    last = parts[-1]
+                    if not ends_space and last.startswith("-"):
+                        yield from _complete_pairs((flag,), last, -len(last))
+                    elif len(parts) == 4 and ends_space:
+                        yield from _complete_pairs((flag,), "", 0)
                 return
             if len(parts) >= 2 and parts[1] == "set":
                 last = parts[-1]

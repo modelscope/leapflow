@@ -45,8 +45,11 @@ the daemon-exclusive DuckDB file (2.1 LocalConnectionHolder migration).
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import shutil
+import socket
+import time
 from contextlib import AsyncExitStack
 import tempfile
 from pathlib import Path
@@ -54,8 +57,8 @@ from typing import Any
 
 import pytest
 
-from tests._harness.cassette_proxy import answer, scripted, tool_call
-from tests._harness.journey import JourneyFactory
+from tests._harness.cassette_proxy import ScriptedTurn, answer, scripted, tool_call
+from tests._harness.journey import Journey, JourneyFactory
 from tests._harness.leapd import await_for
 from tests._harness.planning import placement
 from tests._harness.skill_stubs import ARM_ID, SEQUENCE, WORKCELL_ID, move_by
@@ -204,12 +207,88 @@ def _detail(events: list[Any], tool_name: str) -> Any:
     return [event.type for event in events]
 
 
+async def _qualified_provider(journey: Journey, stack: AsyncExitStack, root: Path) -> Any:
+    """An offline deployment receipt, real isolated provider and owning node registry.
+
+    The receipt represents synthetic qualification evidence, not live/native parity.
+    All provider traffic shares the journey proxy's unchanged aggregate budget.
+    """
+    from leapflow.config import Settings
+    from leapflow.hardware.context import Channel, ContextProvenance, HardwareContext, TransportRef
+    from leapflow.hardware.model_contract import ModelInfo
+    from leapflow.hardware.model_qualification import deployment_action, qualification_binding
+    from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
+    from leapflow.hardware.verification import EvidenceBundle
+    from leapflow.layout import build_layout
+    from leapflow.llm.services.composition import model_transport_factories
+    from leapflow.llm.services.config import parse_services
+    from leapflow.llm.services.runtime import ModelServiceRuntime
+    from leapflow.security.approval import ApprovalDecision
+    from leapflow.security.grants import ApprovalAuditLog
+    from leapflow.security.orchestrator import ApprovalOrchestrator
+
+    info = ModelInfo("grounding", "r8-fixture", "1", "sha256:r8-fixture", "r8-instance")
+    spec = parse_services({"native": {
+        "schema_version": 1, "provider": "openai", "base_url": journey.proxy.base_url,
+        "model": "fixture-native", "task": "grounding", "auth": {"mode": "none"},
+        "processing_location": "local", "identity": {"mode": "server_reported"},
+        "model_info": info.to_dict(), "deployment": {
+            "engine_version": "offline-fixture-1", "adapter_digest": "sha256:r8-adapter",
+            "qualification_ref": "r8-qualification"},
+    }})[0]
+    layout = build_layout(root)
+    profile = layout.ensure(profile_id="default")
+    settings = Settings("", "", "", 0, True, root / "signals.duckdb", "INFO",
+                        llm_services=(spec,), layout=layout, profile_layout=profile,
+                        profile_manifest=profile.load_manifest(), workspace_root=root)
+    owner = ModelServiceRuntime.from_settings(settings)
+    registry = HardwareRegistry(HardwareSettings(
+        enabled=True, stream_enabled=False, instrument_db_path=str(root / "instrument.duckdb")),
+        providers=(), transport_factories=model_transport_factories(owner, settings, lambda: registry.evidence_store))
+    registry.scope.async_effect(owner.aclose)
+    stack.push_async_callback(registry.close_all)
+    context = HardwareContext(
+        device_id="native_model", display_name="R8 Qualified Fixture", halt_supported=False,
+        transport=TransportRef(kind="model_service", config={
+            "backend": "provider", "service": "native", "task": "grounding"}),
+        channels=(Channel(channel_id="model.info", direction="read", quantity="model_metadata"),),
+        provenance=ContextProvenance(verified_by="offline-qualification-fixture"))
+    registry.register_external_contexts("offline_model", (context,))
+    assert registry.load().admitted == ("native_model",)
+    audit = ApprovalAuditLog(profile.approval.audit_path)
+
+    class Operator:
+        async def request_approval(self, request: Any) -> ApprovalDecision:
+            assert request.action.kind == "device.configure"
+            return ApprovalDecision.ALLOW_ONCE
+
+    action = deployment_action(qualification_binding(spec, info))
+    assert (await ApprovalOrchestrator(Operator(), audit=audit).evaluate(action)).user_consent
+    await registry.evidence_store.record(EvidenceBundle(
+        "r8-qualification", "model_qualification", "native", time.time(), None, None, (),
+        metadata={"model_qualification": {
+            "schema_version": 1, "binding": qualification_binding(spec, info),
+            "expires_at": time.time() + 120, "revoked": False, "identity_insertion": "runtime",
+            "native_parity": True, "approval_action_id": action.action_id}}))
+    transport = await registry.transport("native_model")
+    result = await transport.infer({"image": base64.b64encode(b"\xff\xd8r8-fixture").decode(), "queries": ["cup"]})
+    assert result.detections == () and result.model == info.identity
+    assert transport.model_info.details["service_basis"]["generation"] == 1
+    return registry
+
 
 @pytest.mark.asyncio
 async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
     devices_dir = Path(tempfile.mkdtemp(prefix="lfj-r8dev-"))
     (devices_dir / f"{DEVICE_ID}.yaml").write_text(DEVICE_YAML, encoding="utf-8")
     stack = AsyncExitStack()
+    # Reserve a not-yet-listening loopback endpoint. The daemon keeps it as a
+    # pending fleet node until the final phase; no specialist traffic escapes
+    # the journey's time/call/token accounting during setup.
+    reserved = socket.socket()
+    reserved.bind(("127.0.0.1", 0))
+    native_port = reserved.getsockname()[1]
+    stack.callback(reserved.close)
     try:
         registry, runtime = await stack.enter_async_context(placement(devices_dir / "planning"))
         # Build the declaration-only advisory before the journey's fixed transport budget.
@@ -224,12 +303,12 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
             "r8_hardware",
             script=scripted(
                 # Phase 1: discover
-                tool_call("hw_list"),
-                tool_call("hw_describe", device_id=DEVICE_ID),
-                answer("Discovered the simulated bench and read its channel limits."),
-                # Phase 3: read
-                tool_call("hw_read", device_id=DEVICE_ID, channel_id=SETPOINT),
-                answer("Read the setpoint channel."),
+                ScriptedTurn(tool_calls=(
+                    {"name": "hw_list", "arguments": {}},
+                    {"name": "hw_describe", "arguments": {"device_id": DEVICE_ID}},
+                    {"name": "hw_read", "arguments": {"device_id": DEVICE_ID, "channel_id": SETPOINT}},
+                )),
+                answer("Discovered the bench, its channel limits and current setpoint."),
                 # Phase 4a: readiness hard stop (homed=false)
                 # The engine hard-stops the turn on a permission hard-stop payload,
                 # so the model is never asked for a follow-up answer after this.
@@ -237,9 +316,7 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
                 # Phase 4b: init / homing
                 tool_call("hw_configure", device_id=DEVICE_ID, channel_id=HOMED, value=True),
                 answer("Homed the device; the readiness gate is now satisfied."),
-                # Phase 4c: dry-run preview after homing
-                tool_call("hw_actuate", device_id=DEVICE_ID, channel_id=SETPOINT, value=55.0, dry_run=True),
-                answer("Dry run confirmed the setpoint command is feasible after homing."),
+                # Phase 4c uses the existing board/daemon dry-run RPC without an LLM round.
                 # Phase 5: actuate with approval (homed=true)
                 tool_call("hw_actuate", device_id=DEVICE_ID, channel_id=SETPOINT, value=65.0),
                 answer("Commanded the setpoint through the approval path."),
@@ -255,6 +332,17 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
                                   {"op": "move", "relative": {"dz": -995}}]}},
                           ], selection={"order": ["tcp_distance_mm"]}),
                 answer("Executed exactly the selected simulated sequence through approval."),
+                # Qualified specialist admission (three describes), then describe + infer.
+                *(answer(json.dumps({"model_info": {
+                    "task": "grounding", "name": "r8-fixture", "version": "1",
+                    "checksum": "sha256:r8-fixture", "instance": "r8-instance"}})) for _ in range(4)),
+                answer(json.dumps({"detections": [], "infer_ms": 1, "model": {
+                    "name": "r8-fixture", "version": "1", "checksum": "sha256:r8-fixture",
+                    "instance": "r8-instance"}})),
+                # A concurrent fleet health probe can consume the one remaining call.
+                answer(json.dumps({"model_info": {
+                    "task": "grounding", "name": "r8-fixture", "version": "1",
+                    "checksum": "sha256:r8-fixture", "instance": "r8-instance"}})),
             ),
             deadline_s=90.0,
             max_llm_calls=15,
@@ -269,7 +357,8 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
                 # second device would invalidate the cassette on every new runner.
                 "LEAPFLOW_HARDWARE_PROVIDERS": "yaml",
                 "LEAPFLOW_HARDWARE_FLEET_NODES": json.dumps([
-                    {"node_id": "r8_planning", "endpoint": f"tcp://{host}:{port}"}
+                    {"node_id": "r8_planning", "endpoint": f"tcp://{host}:{port}"},
+                    {"node_id": "r8_native", "endpoint": f"tcp://127.0.0.1:{native_port}"}
                 ]),
                 # Memory prefetch injects a "## Recent Context" block into the
                 # system prompt from the profile's signal store, and that store
@@ -296,7 +385,7 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
         with journey.phase("discover: list and describe the simulated bench"):
             events = await _drive_with_auto_approval(
                 client,
-                "List the connected hardware devices, then describe bench_r8 in full.",
+                "List the connected hardware devices, describe bench_r8, and read its setpoint channel.",
                 session_id=SESSION,
                 workspace=str(workspace),
             )
@@ -304,6 +393,7 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
             # A successful describe proves the device and its channels were admitted:
             # an unknown device would complete with ok=False instead.
             assert _completed_ok(events, "hw_describe"), _detail(events, "hw_describe")
+            assert _completed_ok(events, "hw_read"), _detail(events, "hw_read")
 
         with journey.phase("sample: wait for the sampling loop to land windows"):
             # After 2.1 (ReadingStore → LocalConnectionHolder) the daemon holds an
@@ -316,13 +406,8 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
             await asyncio.sleep(2.0)
 
         with journey.phase("read: setpoint value confirms tool pipeline"):
-            events = await _drive_with_auto_approval(
-                client,
-                "Read the current value of the setpoint channel on bench_r8.",
-                session_id=SESSION,
-                workspace=str(workspace),
-            )
-            assert _completed_ok(events, "hw_read"), _detail(events, "hw_read")
+            reading = await client.hardware_read(DEVICE_ID, SETPOINT)
+            assert reading["ok"] and reading["value"] == 50.0, reading
             # Durable window persistence for the streaming sensor was already
             # verified in the sample phase via board digest (storage.windows_written
             # and counts.series).  A streaming read cannot be scripted because its
@@ -364,19 +449,13 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
             assert _completed_ok(events, "hw_configure"), _detail(events, "hw_configure")
 
         with journey.phase("preview: dry run confirms feasibility without writing"):
-            events = await _drive_with_auto_approval(
-                client,
-                f"Preview an actuate of {DEVICE_ID} setpoint to 55, dry run only.",
-                session_id=SESSION,
-                workspace=str(workspace),
-            )
+            preview = await client.hardware_write_request(DEVICE_ID, SETPOINT, 55.0)
+            assert preview["ok"], preview
+            assert not preview.get("approval_pending"), preview
             # The dry run returns ok=True because the homed interlock now holds,
             # but never reaches the approval gate or the device: ok with no
             # approval_request proves the dry-run short-circuit.
-            assert _completed_ok(events, "hw_actuate"), _detail(events, "hw_actuate")
-            assert not any(e.type == "approval_request" for e in events), (
-                "a dry run must return before consent is sought"
-            )
+            # The next actual write still emits its own routed approval request.
 
         with journey.phase("actuate: setpoint write is routed through daemon approval"):
             events = await _drive_with_auto_approval(
@@ -455,6 +534,27 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
             assert [c["status"] for c in report["candidates"]] == ["feasible", "feasible", "refused"]
             assert report["evidence"]["state_reads"] == 1 and report["evidence"]["llm_calls"] == 0
             assert run.outcome.ok and not runtime._plans
+
+        with journey.phase("provider: qualified inference and metadata cross the existing fleet read RPC"):
+            before = journey.proxy.stats.call_count
+            native_registry = await _qualified_provider(journey, stack, devices_dir / "native")
+            assert journey.proxy.stats.call_count - before == 5
+            reserved.close()
+            native_node = LhpNodeServer(native_registry, node_id="r8_native")
+            await native_node.start(host="127.0.0.1", port=native_port)
+            stack.push_async_callback(native_node.stop)
+            assert (await client.hardware_fleet_reconnect("r8_native"))["ok"]
+            reading = await client.hardware_read("r8_native__native_model", "model.info")
+            assert reading["ok"], reading
+            assert reading["device_id"] == "r8_native__native_model"
+            assert reading["value"]["instance"] == "r8-instance"
+            assert reading["value"]["service_basis"]["qualification_ref"] == "r8-qualification"
+            # No later primary prompt sees the endpoint-bound receipt digest.
+            native_calls = [r for r in journey.proxy.stats.requests if r["model"] == "fixture-native"]
+            assert 5 <= len(native_calls) <= 6
+            assert all(not r.get("stream", False) for r in native_calls)
+            await native_node.stop()
+            await native_registry.close_all()
 
         journey.finish()
     finally:

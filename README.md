@@ -183,7 +183,7 @@ The host sends **goals**; the node decomposes them locally. A skill is planned o
 
 - **Robot arms** (`leapflow.robot`) — LeRobot-derived: serial bus (Feetech), teleop, camera capture, episode export, policy registry (`vla_local` / `position_control`).
 - **Node skills** — calibration (`calib.*`), perception (`perceive.locate`), grasp proposals (`grasp.propose`), model-written motion programs (`motion.sequence`), and learned policies (`policy.run`) run on the node behind the same gate chain; with an episodes directory configured, every actuating run is recorded as a training episode.
-- **Models as devices** — a policy or perception server (`model_service` transport, HTTP) appears as an HCP device; inference never moves anything — only a skill's gated motion writes to actuators.
+- **Models as devices** — a policy or perception server (`model_service` transport) appears as an HCP device. Existing declarations retain HTTP; explicit `backend: provider` uses an owner-injected standard provider and requires managed deployment qualification. Inference never moves anything — only a skill's gated motion writes to actuators.
 - **Depth cameras** — RealSense integration; frames as governed binary channels.
 - **ROS2** — sidecar transport over Unix socket; topics/services/actions map into HCP.
 
@@ -349,6 +349,101 @@ leap config set memory.working_max_tokens 12000
 
 Inside the TUI: `/config list`, `/config set …` — hot-reloads the active session.
 
+#### Optional read-only model specialists
+
+An already supported model needs one declaration, not a Python integration per model.
+In TUI chat, ask: "Connect a read-only decision specialist named chooser at
+http://127.0.0.1:8080/v1 using the OpenAI provider and model your-served-model.
+It processes data locally. Keep my chat model unchanged, show the proposal, and ask before saving."
+The general `config_model_service` tool is discoverable even with an empty specialist catalog.
+It offers `show`, `set`, `enable`, `disable`, `unset`, and `check`; mutations require the originating turn's
+ordinary configuration approval and a denial is terminal. No managed-file editing is needed.
+Checks are local-only unless you explicitly supply a bounded inline text fixture.
+Catalog writes are serialized across processes and preserve unrelated IDs/settings.
+
+For CLI or `/config` onboarding, serve it with a registered OpenAI-compatible or
+Anthropic provider, then save a declaration such as `specialist.yaml`:
+
+```yaml
+schema_version: 1
+provider: openai
+base_url: http://localhost:8080/v1
+model: your-served-model
+task: decision
+auth: {mode: none}
+output: json_text
+processing_location: unknown
+limits:
+  deadline_s: 5
+  attempts: 1
+  max_inflight: 1
+  max_queue: 0
+```
+
+```bash
+leap config llm services set chooser --file specialist.yaml
+leap config llm services show chooser
+leap config llm services check chooser
+leap config llm services disable chooser
+leap config llm services enable chooser
+```
+
+These commands manage the active profile's `llm.services`; workspace overrides are not
+accepted. `set` atomically upserts one ID. `show` and `check` above are local-only and do
+not probe an endpoint. In the TUI, use the same arguments after `/config`.
+Each declaration has one strict boolean `enabled` field (omitted means `true`).
+`disable` preserves the declaration and tool discovery but refuses new calls and revokes
+prior handles; re-enabling cannot deliver their late results. It does not stop external
+serving processes or change primary chat. Configured, enabled, provider-available, and
+usable status are reported separately. A saved toggle is effective only after runtime
+publication succeeds; other processes observe it through their existing reload paths.
+For authentication, use `auth: {mode: secret, ref: secret://profile/models/chooser}` with
+an existing vault entry, never a token in the declaration. Non-loopback endpoints also
+require `allow_remote: true` and normal egress approval.
+
+To explicitly exercise an endpoint, save this bounded synthetic fixture as `case.json`
+in the active workspace:
+
+```json
+{"schema_version":1,"artifact_scope":"synthetic","input":{"goal":"Choose one candidate","candidates":[{"id":"a","description":"Eligible option"}]},"expected":{"properties":{"selected_id":{"enum":["a"]}}}}
+```
+
+```bash
+leap config llm services check chooser --case case.json
+leap config llm services unset chooser
+```
+
+A fixture check uses ordinary file/egress approvals, reports staged validation, and never
+captures live data or executes actions. Its success establishes only the tested API/schema
+subset, not native-head parity, identity provenance, embodiment safety, or latency readiness.
+`model_describe` exposes cached availability and task schemas; `model_query` returns
+read-only grounding/grasp results or advisory decisions, hypothetical predictions, and
+retrospective teacher assessments. Artifacts are caller-owned session cache IDs, never
+paths, URLs, or inline base64. Generated calls never execute, scores are not automatically
+calibrated, and physical policy use remains behind `hw_skill_*` / `policy.run`.
+
+For specialist-only camera analysis, explicitly request a fresh passive `perceive.snapshot`
+through `hw_skill_run` with `export_evidence: true`. This requires the existing workcell
+`share_frames` and host `hardware.share_frames` switches plus separate transient-retention
+consent. The result exposes opaque session artifact IDs, not an image attachment to the
+primary chat model. `model_query` requires separate endpoint and sensitive-read consent.
+Ordinary snapshots remain volatile; export is off by default and adds no capture driver or motion.
+
+`hardware.snapshot_evidence` configures retention bounds: at most 300 seconds (also capped
+by native remaining validity), 64 MiB per session, and 1 MiB per JPEG/PNG/WebP frame.
+Artifacts are private, sensitive, non-syncable, checksum-bound, and inaccessible from another
+workspace/session. Full quota refuses new artifacts without eviction. Expiry, runtime restart,
+and canceled writes cannot renew artifact authority. Sink shutdown removes retained content;
+cancellation returns without waiting for disk writes, whose late content is cleaned up.
+
+Localhost does not prove local processing: a proxy may relay to a cloud service. Unknown
+locality refuses sensitive media/evidence. Native VLA/WAM requires the real processor/head
+and output decoder on the serving side plus separately approved deployment/native/embodiment
+evidence; a client codec cannot add an unsupported native head. No serving-engine launch,
+download, deployment, or live/physical qualification is automated here. See the
+[plugin integration guide](docs/plugins/third_party_plugin_development.md#structured-model-services)
+and [lifecycle contract](docs/plugins/plugin_lifecycle_management.md#specialist-service-lifecycle).
+
 <details>
 <summary>Common keys</summary>
 
@@ -356,6 +451,7 @@ Inside the TUI: `/config list`, `/config set …` — hot-reloads the active ses
 |-----|---------|-------------|
 | `llm.model` | — | Primary model |
 | `llm.base_url` | — | OpenAI-compatible endpoint |
+| `llm.services` | `{}` | Profile-only optional structured specialist declarations |
 | `llm.context_length` | `1000000` | Runtime context budget shown in the TUI status bar |
 | `memory.working_max_tokens` | `12000` | Working memory budget |
 | `tools.terminal_session_enabled` | `false` | Persistent terminal sessions |

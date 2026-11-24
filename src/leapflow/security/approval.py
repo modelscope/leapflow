@@ -112,6 +112,7 @@ class SessionAwareGate:
         self._delegate = delegate
         self._approved_categories: set[str] = set()
         self._bypass_all: bool = False
+        self._session_bypasses: set[str] = set()
         self._decision_log: list[dict[str, Any]] = []
 
     async def check(self, command: str) -> bool:
@@ -138,11 +139,14 @@ class SessionAwareGate:
         # before a request is built, so this branch never weakens that boundary.
         # ``allow_permanent`` controls profile persistence only; it must not turn
         # a session-wide bypass into a misleading partial bypass.
-        if self._bypass_all:
+        session_id = request.action.session_id if request.action is not None else ""
+        # A daemon shares this wrapper across clients. Anonymous legacy callers
+        # retain their local bypass, but it cannot authorize a named session.
+        if (session_id in self._session_bypasses if session_id else self._bypass_all):
             self._log_decision(request, ApprovalDecision.ALLOW, auto=True)
             return ApprovalDecision.ALLOW
 
-        grant_key = request.grant_key
+        grant_key = f"{session_id}:{request.grant_key}" if session_id else request.grant_key
         if grant_key in self._approved_categories:
             self._log_decision(request, ApprovalDecision.ALLOW, auto=True)
             return ApprovalDecision.ALLOW
@@ -168,7 +172,10 @@ class SessionAwareGate:
             return fallback
 
         if decision == ApprovalDecision.ALLOW_ALL_SESSION:
-            self._bypass_all = True
+            if session_id:
+                self._session_bypasses.add(session_id)
+            else:
+                self._bypass_all = True
             self._log_decision(request, decision, session=True)
             return ApprovalDecision.ALLOW
         if decision == ApprovalDecision.ALLOW_SESSION:
@@ -186,6 +193,8 @@ class SessionAwareGate:
     def reset(self) -> None:
         """Clear all session approvals."""
         self._approved_categories.clear()
+        self._bypass_all = False
+        self._session_bypasses.clear()
 
     @property
     def approved_categories(self) -> frozenset[str]:

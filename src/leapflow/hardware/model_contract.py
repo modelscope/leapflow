@@ -63,6 +63,9 @@ TASK_GROUNDING = "grounding"
 TASK_ACTION_CHUNK = "action_chunk"
 TASK_GRASP_PROPOSAL = "grasp_proposal"
 CONTRACT_VERSION = "1.1"
+PROVIDER_CONTRACT = "leapflow.model.v1.1"
+PROVIDER_DESCRIBE_SCHEMA = {"type": "object", "properties": {"model_info": {"type": "object"}},
+                            "required": ["model_info"], "additionalProperties": False}
 MODEL_TASKS = frozenset({TASK_GROUNDING, TASK_ACTION_CHUNK, TASK_GRASP_PROPOSAL})
 GEOMETRY_MASK = "mask"
 GEOMETRY_BOX = "box"
@@ -70,6 +73,18 @@ GEOMETRY_POINT = "point"
 BINDING_KEYS = ("name", "version", "checksum")
 IDENTITY_KEYS = (*BINDING_KEYS, "instance")
 MAX_QUERIES = 16
+
+
+@runtime_checkable
+class ModelBackend(Protocol):
+    """Owned inference binding; domain validation remains in ModelServiceTransport."""
+
+    async def open(self) -> None: ...
+    async def close(self) -> None: ...
+    async def describe(self) -> Mapping[str, Any]: ...
+    async def infer(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+
 _POSE_KEYS = ("x", "y", "z", "rx", "ry", "rz")
 
 
@@ -383,6 +398,30 @@ def _check_grasp_request(request: Mapping[str, Any]) -> dict[str, Any]:
     if top_k < 1:
         raise ValueError("top_k must be at least 1")
     return dict(request)
+
+
+def provider_request(task: str, request: Mapping[str, Any],
+                     images: Mapping[str, Mapping[str, str]]) -> dict[str, Any]:
+    """Canonical standard-API envelope; identity is never synthesized client-side."""
+    ordered = sorted(images)
+    return {"contract": PROVIDER_CONTRACT, "operation": "infer", "task": task,
+            "input": dict(request), "image_order": ordered,
+            "_images": [dict(images[label]) for label in ordered]}
+
+
+def provider_result_schema(task: str) -> dict[str, Any]:
+    """One task result, with server-owned identity and no conflicting result fields."""
+    field = {TASK_GROUNDING: "detections", TASK_GRASP_PROPOSAL: "grasps",
+             TASK_ACTION_CHUNK: "actions"}.get(task)
+    if field is None:
+        raise ValueError("No provider domain envelope for this task")
+    properties = {"model": {"type": "object"}, "infer_ms": {"type": "number", "minimum": 0},
+                  field: {"type": "array"}}
+    if task == TASK_ACTION_CHUNK:
+        properties.update({"done": {"type": "boolean"},
+                           "progress": {"type": "number", "minimum": 0, "maximum": 1}})
+    return {"type": "object", "properties": properties,
+            "required": ["model", "infer_ms", field], "additionalProperties": False}
 
 
 def parse_response(task: str, payload: Any) -> InferenceResult:

@@ -54,12 +54,14 @@ def policy_cell(
     settings: Mapping[str, float] | None = None,
     decl: Mapping[str, Any] | None | object = _DEFAULT,
     episodes: EpisodeSettings | None = None,
+    model_service: Any = None,
 ) -> SkillRuntime:
     """A runtime over the cell; *decl* is ``policies.cube`` (default: bind every group)."""
     registry = SkillNodeRegistry(
         arm or SimArmTransport(travel_reads=1),
         store_path=tmp_path / "instrument.duckdb",
-        devices={CAMERA_ID: SimRgbdCamera(intrinsics=TINY_CAMERA), POLICY_ID: policy},
+        devices={CAMERA_ID: SimRgbdCamera(intrinsics=TINY_CAMERA),
+                 POLICY_ID: policy if model_service is None else model_service},
     )
     registry.calibrate_cell()
     data: dict[str, Any] = {

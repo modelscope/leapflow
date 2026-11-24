@@ -374,6 +374,67 @@ A plugin's state is the **composition** of three independent axes: Runtime, Trus
 
 ---
 
+### Specialist service lifecycle
+
+`model_collaboration` is an ordinary ToolPlugin, with `model_services`, `settings`,
+`model_approval_gate`, and `effect_scope` injected through `bind_runtime`. An empty catalog
+publishes no specialist tools. Cached descriptions perform no endpoint probe; tool results
+and volatile specialist context do not become part of the stable system prompt prefix.
+
+`ModelServiceRuntime` belongs to one profile owner, not the primary LLM cache. Each acquired
+consumer holds a `ServiceHandle` pinned to an immutable service/codec generation and an
+isolated provider/client. Ordinary enabled catalog or secret-reference changes affect future
+admission; an existing handle retains its snapshot until release. Publishing `enabled: false`
+or removing the service ID synchronously revokes all earlier generations for that ID.
+Re-enabling creates fresh admission and cannot resurrect revoked handles or their late results.
+A disabled declaration remains discoverable and refuses before secret/provider/artifact access.
+Revocation is result suppression, not CUDA preemption or shutdown of an external server;
+external busy/uncertain-completion state remains independent. Removing
+or replacing the provider/codec itself refuses pending results rather than silently
+switching capabilities. Acquisition never rediscovers a deliberately disposed provider.
+Built-in provider discovery and `ScopedLLMProviderRegistry.adopt_existing_plugins()` run
+once at composition.
+
+The last handle release closes its generation's provider and HTTP client. Cancellation
+releases the caller's handle and discards late results; thread-backed validation/I/O is not
+forcibly terminated. The owner closes remaining handles on shutdown. Plugin cleanup uses
+its EffectScope, and each owning HardwareRegistry registers its own model-service owner
+cleanup. Stop/drain physical consumers before closing their clients. There is no implicit
+hardware inference queue and no transparent action-model retry/failover; provider hardware
+requires a one-attempt declaration and valid managed qualification before exposing results.
+
+Catalog changes are profile-shared, while artifacts, results, pending approvals, and
+cancellation belong to the originating session/workspace. Checksummed session evidence IDs
+include owner and file identity so identical bytes cannot merge independent evidence.
+Legacy persisted references remain readable. Evidence, TTL/checksum, file consent, and
+sensitive network disclosure are revalidated through existing cache/approval boundaries.
+Deployment qualification uses the existing evidence and audit stores; it is neither plugin
+trust promotion nor run consent. Legacy HTTP model-service declarations remain available.
+
+`config_model_service` remains available in the configuration plugin when the specialist
+catalog is empty. Configuration mutations use the originating session's real orchestrator;
+no missing/broken route or human denial is treated as permission. Concurrent per-ID saves
+and adjacent YAML writers share one cross-process transaction lock, outside approval waits.
+
+The optional `hardware_evidence_sink` is Context-owned and injected into the hardware
+plugin's live SkillService, including rebinding on reload. Its EffectScope owns retention
+calls, expiry sweeping, and canceled-write cleanup. Disposal suppresses late references and
+removes its retained artifacts; an unpreemptible disk write is cleaned after completion.
+The cache enforces quota without eviction, exact session/workspace ownership, native-capped
+monotonic validity, private permissions, and checksum/TTL checks at read admission.
+Snapshot RECORD metadata traverses scoped EventBus normalization/privacy/noise/dedup;
+image bytes never reach subscribers, SignalBuffer, global memory, or the stable prompt.
+Ordinary snapshots stay volatile unless the caller explicitly opts into retention and consents.
+
+Before release, obtain the second human confirmation for changed `/config llm services`
+slash behavior. Exercise real file/egress prompts in both in-process and daemon modes,
+including denial and cancellation, and two simultaneous TUIs in two different workspaces
+sharing one daemon/profile while the catalog changes. Check session identity, usage,
+artifacts, approval routing, results, and independent cancellation. Offline tests do not
+replace these human checks. Live engine/native-head/identity/embodiment and latency
+qualification require separate operator approval; no deployment or motion readiness is
+claimed by a standard API fixture check.
+
 ## 5. Observability & Audit
 
 ### 5.1 Introspection Tools (Agent-accessible)
@@ -447,7 +508,6 @@ The following items are identified from code analysis as **partial or unwired**.
 |---|-----|--------|-----------------|
 | 1 | **Auto-quarantine on health breach** | PluginHealthProducer only advises; a truly misbehaving plugin runs until human acts | Wire `PluginHealthProducer` → `RecoveryCoordinator` with a `plugin_quarantine` strategy that emits `plugin_disable` with `InteractionRequest` for urgent human confirmation |
 | 2 | **ActiveSignalSource not fiber-managed** | Signal sources bypass PluginFiber lifecycle; no EffectScope cleanup | Integrate `ActiveSourceManager` with fiber system (already noted in source as "future extension") |
-| 4 | **ScopedLLMProviderRegistry lacks `adopt_existing_plugins()`** | Built-in LLM providers have no fibers at boot | Add adoption logic mirroring `ScopedToolRegistry` |
 | 5 | **No entry-point discovery for ToolPlugins** | Third-party tools cannot be discovered via `pip install`; profile-dir and marketplace installs are supported | Implement `setuptools` entry_point group `leapflow.tool_plugins` with discovery at boot |
 | 7 | **No per-plugin resource quotas** | A misbehaving plugin can consume unlimited CPU/memory | Add configurable per-plugin timeout and call-rate ceiling |
 | 8 | **Trust unfreeze not exposed** | A hard-failed plugin can never recover without DB intervention | Add `plugin_unfreeze` tool (gated, HIGH risk) or admin slash command |

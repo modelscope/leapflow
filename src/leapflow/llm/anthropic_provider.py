@@ -21,6 +21,8 @@ import random
 import time
 from typing import Any, AsyncIterator, Dict, List
 
+import httpx
+
 from leapflow.llm.base import ChunkCallback, LLMChatResponse, LLMProvider, ToolCallInfo
 
 logger = logging.getLogger(__name__)
@@ -220,6 +222,7 @@ class AnthropicChat(LLMProvider):
         max_retries: int = 3,
         timeout_s: float = 180.0,
         max_tokens: int = 8192,
+        async_http_client: httpx.AsyncClient | None = None,
     ) -> None:
         if not _ANTHROPIC_AVAILABLE:
             raise ImportError(
@@ -236,7 +239,15 @@ class AnthropicChat(LLMProvider):
             client_kwargs["base_url"] = base_url
 
         self._sync = _anthropic_sdk.Anthropic(**client_kwargs)
-        self._async = _anthropic_sdk.AsyncAnthropic(**client_kwargs)
+        async_options = dict(client_kwargs)
+        if async_http_client is not None:
+            async_options["http_client"] = async_http_client
+        try:
+            self._async = _anthropic_sdk.AsyncAnthropic(**async_options)
+        except Exception:
+            self._sync.close()
+            raise
+        self._close_task: asyncio.Task[None] | None = None
         self._model = model
         self._max_retries = max(1, int(max_retries))
         self._max_tokens = max_tokens
@@ -249,6 +260,18 @@ class AnthropicChat(LLMProvider):
     @property
     def model(self) -> str:
         return self._model
+
+    async def aclose(self) -> None:
+        """Close both SDK clients once, even if the awaiting consumer is canceled."""
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_clients())
+        await asyncio.shield(self._close_task)
+
+    async def _close_clients(self) -> None:
+        try:
+            await self._async.close()
+        finally:
+            self._sync.close()
 
     async def _sleep_backoff(self, attempt: int) -> None:
         base = 0.75 * (2 ** attempt)

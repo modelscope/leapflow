@@ -1933,6 +1933,7 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.skills_episode_fps",
         "hardware.skills_episode_min_free_mb",
         "hardware.share_frames",
+        "hardware.snapshot_evidence",
         "hardware.calibration_worker_enabled",
         "hardware.calibration_worker_budgets",
         "hardware.node_log_file",
@@ -1943,9 +1944,10 @@ def test_hardware_config_keys_are_discoverable() -> None:
     for key in keys:
         view = service.describe(key)
         assert view.description, f"{key} has no description in the catalog"
-        # Observation tuning updates existing detectors; hardware construction
+        # Observation and evidence tuning are read at use; hardware construction
         # settings still require a restart.
-        assert view.hot_reload == ("yes" if key == "hardware.observation" else "restart-required")
+        live_keys = {"hardware.observation", "hardware.snapshot_evidence"}
+        assert view.hot_reload == ("yes" if key in live_keys else "restart-required")
 
 
 def test_explicitly_disabled_hardware_leaves_the_classifier_untouched() -> None:

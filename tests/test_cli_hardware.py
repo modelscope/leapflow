@@ -379,17 +379,19 @@ def test_hw_no_action_prints_usage(capsys) -> None:
 # ── Phase 0.5 invariant: the in-process registry never persists or samples ──
 
 
-def test_build_local_registry_forces_persistence_and_streaming_off(monkeypatch) -> None:
+async def test_build_local_registry_forces_persistence_and_streaming_off(monkeypatch, tmp_path) -> None:
     import leapflow.hardware.registry as registry_module
     from leapflow.cli.commands.hardware import _build_local_registry
 
     captured: dict[str, Any] = {}
 
-    class _CapturingRegistry:
+    class _CapturingRegistry(HardwareRegistry):
         def __init__(self, policy: Any, *args: Any, **kwargs: Any) -> None:
+            super().__init__(policy, *args, **kwargs)
             captured["policy"] = policy
 
         def load(self) -> None:
+            super().load()
             captured["loaded"] = True
 
     # from_settings would normally read the profile; pin it to an enabled policy
@@ -401,12 +403,15 @@ def test_build_local_registry_forces_persistence_and_streaming_off(monkeypatch) 
     )
     monkeypatch.setattr(registry_module, "HardwareRegistry", _CapturingRegistry)
 
-    registry = _build_local_registry(object())
+    registry = _build_local_registry(make_settings(str(tmp_path)))
 
     assert registry is not None
-    assert captured["loaded"] is True
-    assert captured["policy"].persist_readings is False
-    assert captured["policy"].stream_enabled is False
+    try:
+        assert captured["loaded"] is True
+        assert captured["policy"].persist_readings is False
+        assert captured["policy"].stream_enabled is False
+    finally:
+        await registry.close_all()
 
 
 def test_build_local_registry_returns_none_when_disabled(monkeypatch) -> None:

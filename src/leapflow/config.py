@@ -14,11 +14,12 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict
 
 from leapflow.config_loader import load_config_bundle
+from leapflow.domain.model_service import ServiceSpec
 from leapflow.domain.trajectory import RecordingMode
 from leapflow.layout import (
     PathLayout,
@@ -105,6 +106,8 @@ class Settings:
     mock_host: bool
     duckdb_path: Path
     log_level: str
+    llm_services: tuple[ServiceSpec, ...] = ()
+    llm_services_error: str = ""
 
     # ── Memory Providers ──
     # ``0`` selects an adaptive fraction of the active model context window;
@@ -356,9 +359,10 @@ class Settings:
     hardware_skills_episode_fps: float = 30.0
     hardware_skills_episode_min_free_mb: float = 2048.0
     # Host consent to let the model look at workcell camera frames (perceive.snapshot).
-    # Both this and the workcell's own share_frames must be on; every frame shared
-    # is audited and none is persisted.
+    # Both this and the workcell's own share_frames must be on; ordinary shared
+    # images are volatile. Explicit evidence export has separate retention consent.
     hardware_share_frames: bool = False
+    hardware_snapshot_evidence: str = "{}"
     runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
@@ -1032,7 +1036,21 @@ def load_config() -> Settings:
                 os.environ[key] = original_env[key]
             else:
                 os.environ.pop(key, None)
-    return settings
+    return settings_with_model_services(settings, bundle.values)
+
+
+def settings_with_model_services(settings: Settings, values: dict) -> Settings:
+    """Decode the nested profile catalog identically at startup and runtime reload."""
+    from leapflow.llm.services.config import parse_services
+    try:
+        services = parse_services(values.get("llm", {}).get("services", {}))
+    except ValueError:
+        # An invalid optional catalog cannot break ordinary conversation. Runtime
+        # reload retains its previous admitted snapshot when this marker is set.
+        error = "Invalid llm.services; use config llm services check to repair the profile catalog"
+        return replace(settings, llm_services_error=error,
+                       config_warnings=(*settings.config_warnings, error))
+    return replace(settings, llm_services=services)
 
 
 def _build_settings_from_env(
@@ -1638,6 +1656,9 @@ def _build_settings_from_env(
     hardware_skills_episode_min_free_mb = float(
         os.getenv("LEAPFLOW_HARDWARE_SKILLS_EPISODE_MIN_FREE_MB", "2048") or 2048.0
     )
+    hardware_snapshot_evidence = os.getenv("LEAPFLOW_HARDWARE_SNAPSHOT_EVIDENCE", "{}").strip()
+    from leapflow.hardware.snapshot_evidence import SnapshotEvidenceSettings
+    SnapshotEvidenceSettings.from_json(hardware_snapshot_evidence)
     hardware_share_frames = os.getenv("LEAPFLOW_HARDWARE_SHARE_FRAMES", "0").strip().lower() in (
         "1",
         "true",
@@ -2194,6 +2215,7 @@ def _build_settings_from_env(
         hardware_skills_episode_fps=hardware_skills_episode_fps,
         hardware_skills_episode_min_free_mb=hardware_skills_episode_min_free_mb,
         hardware_share_frames=hardware_share_frames,
+        hardware_snapshot_evidence=hardware_snapshot_evidence,
         web_transport=web_transport,
         web_timeout_s=web_timeout_s,
         web_max_bytes=web_max_bytes,

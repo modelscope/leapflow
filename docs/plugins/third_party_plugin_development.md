@@ -246,6 +246,102 @@ class LLMProviderPlugin(Protocol):
 
 LLM provider plugins support **entry_point discovery** via setuptools group `"leapflow.llm_providers"`.
 
+#### Structured model services
+
+A supported specialist uses a profile-only `llm.services` declaration and the existing
+`model_describe` / `model_query` tools, not a new provider or tool per model. See the
+[onboarding example](../../README.md#optional-read-only-model-specialists). OpenAI-compatible
+Chat Completions and Anthropic Messages are reused; serving-engine names do not determine
+client routing. Native processor/head execution and decoding belong on the serving side.
+
+The existing configuration plugin also exposes `config_model_service` before any specialist
+is configured. Per-ID `show/set/enable/disable/unset/check` reuse `ConfigService`; validation precedes
+`ApprovalOrchestrator.evaluate(runtime.configure)`, with the active ToolExecutionContext's
+session/turn and ID/key-only metadata. Durable writes reread under a cross-process lock;
+approval waits never hold the lock. File and inline text fixtures share staged validation.
+Runtime publication uses the existing profile-owner reload and per-turn catalog invalidation.
+The declaration's `enabled` is strictly boolean, defaulting to true when omitted. Toggle
+transactions merge only that field, preserving concurrent endpoint/budget/secret-ref edits.
+Disabled declarations remain discoverable; acquisition refuses before secret/provider/artifact
+access. Disabling or removing an ID irreversibly revokes prior handles, including late results;
+re-enabling creates fresh admission. Ordinary enabled edits preserve generation pinning.
+Durable save and effective runtime publication are separate outcomes; external processes reload
+through their existing entry points, not an additional watcher.
+Do not change the primary model or reroute a denied save through shell/file tools.
+
+The extension contracts are `runtime_checkable` Protocols in `llm/services/protocol.py`:
+
+| Contract | Responsibility |
+|----------|----------------|
+| `StructuredModelClient` | Cached `describe`, generation-pinned `acquire`, owned `aclose` |
+| `ServiceHandle` | Immutable `spec`, `generation`, bounded `invoke(request, schema, validate=...)`, `aclose` |
+| `ServiceCodec` | Provider-native messages/options from `encode`; strict structured result from `decode` |
+| `ModelBackend` (`hardware/model_contract.py`) | Owned `open/close/describe/infer` binding behind existing `model_service` |
+
+Camera retention is composed through `SessionEvidenceSink` in `hardware/snapshot_evidence.py`,
+injected as `hardware_evidence_sink` into the hardware plugin. `EvidenceReference` and
+`EvidenceFailure` are frozen values; `EvidenceError` is mutable. Only the fresh passive
+snapshot's explicit `export_evidence` option invokes this sink. No model-supplied path,
+owner, base64, or URL is accepted as an artifact authority.
+
+`RecordSignalPort`, `RecordNoiseGate`, `RecordScope`, and `RecordAdmission` in `domain/events.py`
+define private RECORD admission. The production EventBus uses its normalizer/privacy
+boundary, noise gate, dedup, and redaction, returning a scoped receipt without global memory,
+subscriber delivery, or agent activation. Metadata only crosses that boundary. Bytes are
+validated and retained by the cache only after separate retention approval; refusal and
+no-op statuses remain visible to the hardware caller. `hardware.snapshot_evidence` bounds
+TTL/quota/media/cleanup and is read per export; frame-sharing switch changes still require restart.
+The Context owns the sink's EffectScope and closes it in both runtime modes. Cancellation
+suppresses references and schedules cleanup for disk work that cannot be preempted.
+
+`ServiceSpec`, `ServiceLimits`, and `StructuredResult` are immutable. Expected refusals
+use mutable `ServiceError` carrying a frozen `ServiceFailure`; tool adapters convert them
+into the existing typed failure/recovery boundary. Never execute generated tool calls.
+
+`LLMProviderRegistry.create_isolated(provider_id, config)` bypasses the primary provider
+cache. A specialist-capable provider must accept the supplied bounded HTTP client and
+provider-wrapper `max_retries=1` (one attempt), disable SDK retries (`max_retries=0`),
+and implement `AsyncCloseableProvider.aclose`; unsupported capabilities refuse. The
+service runtime owns retries, total work deadline, byte/decompression limits, concurrency,
+queue admission, and cleanup. Default limits are 5 seconds, one attempt, one
+in-flight request, no queue, 8 MiB request, 2 MiB response, and 1,024 output tokens.
+Approval waits do not consume inference work time. Calls are nonstreaming.
+
+A plugin declares `model_services`, `settings`, `model_approval_gate`, and `effect_scope`
+in `dependencies` and accepts them through `bind_runtime`, without capturing global
+settings or opening clients at import time. Use the existing wrapper in
+`plugins/tool_plugins/model_services.py` as a reference: domain behavior lives in
+`tools/model_tools.py`; publication and cleanup belong to the plugin wrapper.
+Acquire a handle for one consumer and release it in `finally`; register longer-lived
+cleanup with `effect_scope.async_effect(...)`. Register a codec using
+`ModelServiceRuntime.register_codec(name, codec)` and attach its returned undo callback
+to the registering plugin's scope. Removing/replacing its codec or provider invalidates
+calls, including results arriving after removal.
+
+`json.v1` supports `json_text`, OpenAI-compatible `json_schema`, and `tool_call` output;
+duplicate keys, excessive nesting, truncation, malformed results, and schema violations
+refuse. Images are shaped for the chosen provider. Unknown eligible candidate IDs refuse;
+predictions remain hypothetical and evaluations remain teacher assessments. Scores are
+uncalibrated unless separately qualified. `action_chunk` cannot execute via `model_query`.
+
+Artifact IDs resolve only within the caller's profile/workspace/session. Evidence must
+be sensitive, nonsyncable, checksum-bound, TTL-limited, and inside the owned session cache.
+File consent and network disclosure use `ApprovalOrchestrator.evaluate`; missing gates
+fail closed, and ownership/TTL/checksum are rechecked around consent and reads. Do not
+substitute paths, URLs, inline images, or a second approval interface. Localhost alone is
+not processing-locality evidence; unknown locality refuses sensitive media/evidence.
+
+For hardware, retain `kind: model_service` and explicitly choose `backend: provider` with
+`service: <ID>` and an existing model task. Bind `model_transport_factories` at the owning
+CLI/LHP registry; do not mutate process-global factories for one endpoint. The serving
+adapter must implement the `leapflow.model.v1.1` describe/infer envelope, supply actual
+native metadata, and insert checkpoint/instance identity outside generation. Managed
+qualification binds checkpoint, native metadata, effective service declaration, adapter,
+endpoint, locality, expiry, and operator approval. A YAML identity or successful fixture
+check is not qualification. Existing HCP/LHP skill consent, adaptation, SafetyShield,
+permits, leases, and controlled stops continue to govern physical use; no transparent
+native-model failover is permitted.
+
 ### 2.5 SelectionPolicyPlugin Protocol
 
 When several tools provide the same capability, a selection policy decides which one runs.
@@ -397,7 +493,7 @@ def bind_runtime(self, **deps: Any) -> None:
 ```
 
 Available dependency names (wired by the daemon):
-`plugin_approval_gate`, `llm_provider`, `plugin_generation_enabled`, `plugin_install_dir`, `marketplace_client`, `marketplace_trusted_pubkeys`, `memory_manager`, `gateway_server`, `research_ledger`, `reentry_scheduler`, `file_read_gate`, `file_write_gate`, `desktop_gate`, `capability_catalog_provider`, `subagent_manager`.
+`plugin_approval_gate`, `llm_provider`, `plugin_generation_enabled`, `plugin_install_dir`, `marketplace_client`, `marketplace_trusted_pubkeys`, `memory_manager`, `gateway_server`, `research_ledger`, `reentry_scheduler`, `file_read_gate`, `file_write_gate`, `desktop_gate`, `capability_catalog_provider`, `subagent_manager`, `model_services`, `model_approval_gate`, `settings`, `effect_scope`.
 
 ### 3.3 Side-Effect-Free Import
 

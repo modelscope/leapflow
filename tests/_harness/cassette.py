@@ -55,6 +55,7 @@ _SCRUBBERS: tuple[tuple[re.Pattern[str], str], ...] = (
     # run-varying width of whatever it summarised (a float timestamp's repr
     # alone shifts it by a character or two).
     (re.compile(r'(original_chars\\?"\s*:\s*)\d+'), r"\1<N>"),
+    (re.compile(r"(\[\.\.\. trimmed )\d+( chars \.\.\.\])"), r"\1<N>\2"),
     # Used-token estimates shift with description lengths. Preserve the warning,
     # capacity, and round; independent journey budgets still gate prompt growth.
     (re.compile(r"(Context utilization is high \()[\d,]+(?=/[\d,]+ estimated tokens)"), r"\1<N>"),

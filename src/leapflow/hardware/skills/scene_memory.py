@@ -253,6 +253,19 @@ class SceneMemory:
         entry = self._frames.get(frame_id)
         return None if entry is None else entry[1]
 
+    def frame_remaining_s(
+        self, frame_id: str, basis: Mapping[str, float], ttl_s: float
+    ) -> float:
+        """Remaining native validity, never refreshed by rendering or cropping.
+
+        This duration crosses a node boundary; the receiver must additionally
+        subtract its entire request/transport elapsed time, not compare clocks.
+        """
+        entry = self._frames.get(frame_id)
+        if entry is None or dict(basis) != self._basis:
+            return 0.0
+        return max(0.0, min(ttl_s, ttl_s - (self._clock() - entry[1])))
+
     def remember_view(
         self, tiles: Sequence[ViewTile], basis: Mapping[str, float], *, keep: int
     ) -> str:

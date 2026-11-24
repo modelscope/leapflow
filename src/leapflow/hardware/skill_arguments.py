@@ -35,9 +35,9 @@ from leapflow.hardware.skill_tool_defs import DEFAULT_RUN_TIMEOUT_S, MAX_RUN_TIM
 PAYLOAD_FIELD = "args"
 ROUTING_FIELDS: tuple[str, ...] = ("workcell", "skill")
 """Envelope fields the host needs before it can read the skill's schema."""
-OPTION_FIELDS: tuple[str, ...] = ("dry_run", "intent", "wait", "timeout_s")
+OPTION_FIELDS: tuple[str, ...] = ("dry_run", "intent", "wait", "timeout_s", "export_evidence")
 ENVELOPE_FIELDS: tuple[str, ...] = ROUTING_FIELDS + OPTION_FIELDS
-_BOOLEAN_FIELDS = frozenset({"dry_run", "wait"})
+_BOOLEAN_FIELDS = frozenset({"dry_run", "wait", "export_evidence"})
 
 
 @dataclass(frozen=True)
@@ -54,6 +54,7 @@ class RunRequest:
     lifted: Mapping[str, Any] = field(default_factory=dict)
     candidates: list[Any] | None = None
     selection: Any = None
+    export_evidence: bool = False
 
     def repair_view(self) -> dict[str, Any]:
         """What was moved out of ``args``, for the result S2 reads."""
@@ -142,6 +143,8 @@ def split_request(kwargs: Mapping[str, Any], declared: frozenset[str] | None) ->
                 raise SkillRefusal(FAILURE_INVALID_REQUEST, f"{name} must be true or false")
             envelope[name] = value
         lifted[name] = value
+    if envelope["export_evidence"] is not None and type(envelope["export_evidence"]) is not bool:
+        raise SkillRefusal(FAILURE_INVALID_REQUEST, "export_evidence must be true or false")
     return RunRequest(
         workcell=str(envelope["workcell"] or "").strip(),
         skill=str(envelope["skill"] or "").strip(),
@@ -153,6 +156,7 @@ def split_request(kwargs: Mapping[str, Any], declared: frozenset[str] | None) ->
         lifted=lifted,
         candidates=batch,
         selection=kwargs.get("selection"),
+        export_evidence=bool(envelope["export_evidence"]),
     )
 
 

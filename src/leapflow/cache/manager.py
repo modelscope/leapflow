@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import stat
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -23,6 +25,7 @@ logger = logging.getLogger(__name__)
 # Per-process state keyed by index file, shared by every CacheManager instance on it.
 # Callers such as the web cache build a manager per call, so per-instance state would
 # neither serialize their writes nor spare them the schema DDL on every construction.
+_VALIDITY_PROCESS = uuid.uuid4().hex
 _REGISTRY_LOCK = threading.Lock()
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _SCHEMA_READY: set[tuple[str, int]] = set()
@@ -159,6 +162,129 @@ class CacheManager:
             raise ValueError("private cache directory must be owner-controlled")
         os.chmod(directory, 0o700)
         return directory
+
+    def persist_session_content(
+        self, content: bytes, *, workspace_id: str, session_id: str,
+        category: str, source: str, suffix: str, expires_at: float,
+        monotonic_deadline: float, max_session_bytes: int, metadata: dict[str, Any],
+    ) -> CacheEntry:
+        """Atomically reserve quota and index a unique private sensitive artifact.
+
+        No eviction, shared-content authority, or lifetime extension. A process
+        restart invalidates these transient references. DuckDB's exclusive
+        connection and the in-process lock serialize reservation and publication.
+        """
+        if (not content or len(content) > max_session_bytes
+                or not math.isfinite(expires_at) or expires_at <= time.time()
+                or not math.isfinite(monotonic_deadline) or monotonic_deadline <= time.monotonic()):
+            raise ValueError("session evidence is empty, expired, or exceeds its quota")
+        if suffix not in (".jpg", ".png", ".webp"):
+            raise ValueError("unsupported session evidence extension")
+        directory = self._private_session_directory(workspace_id, session_id, category, source)
+        filename = uuid.uuid4().hex + suffix
+        try:
+            with self._connect_lock, self._connect() as con:
+                used = con.execute(
+                    "SELECT COALESCE(SUM(size_bytes), 0) FROM cache_entry WHERE profile_id = ? "
+                    "AND scope = 'session' AND workspace_id = ? AND session_id = ?",
+                    [self._profile_id, workspace_id, session_id],
+                ).fetchone()[0]
+                if used + len(content) > max_session_bytes:
+                    raise ValueError("session evidence quota full; no artifact was admitted or evicted")
+                fd = os.open(filename, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    path = self._layout.category_dir(
+                        scope="session", category=category, workspace_id=workspace_id,
+                        session_id=session_id,
+                    ) / source / filename
+                    entry = CacheEntry(
+                        entry_id=uuid.uuid4().hex, profile_id=self._profile_id,
+                        path=path, scope="session", category=category, source=source,
+                        workspace_id=workspace_id, session_id=session_id, size_bytes=len(content),
+                        content_hash=hashlib.sha256(content).hexdigest(), expires_at=expires_at,
+                        sensitive=True, syncable=False, owner_component=source,
+                        metadata={**metadata, "_validity_process": _VALIDITY_PROCESS,
+                                  "_monotonic_deadline": monotonic_deadline},
+                    )
+                    if time.monotonic() >= monotonic_deadline or time.time() >= expires_at:
+                        raise ValueError("session evidence expired during persistence")
+                    con.execute(_INSERT_SQL, _entry_params(entry))
+                except (OSError, ValueError, duckdb.Error):
+                    os.unlink(filename, dir_fd=directory)
+                    raise
+                return entry
+        finally:
+            os.close(directory)
+
+    def discard_session_content(self, entry: CacheEntry) -> None:
+        """Remove only this process's newly retained artifact after cancellation."""
+        root = self._layout.session_dir(entry.workspace_id, entry.session_id)
+        if (entry.profile_id != self._profile_id or entry.scope != "session"
+                or entry.metadata.get("_validity_process") != _VALIDITY_PROCESS
+                or not entry.path.is_relative_to(root)):
+            raise ValueError("cannot discard foreign session content")
+        with self._connect_lock, self._connect() as con:
+            row = con.execute("SELECT path FROM cache_entry WHERE id = ? AND profile_id = ?",
+                              [entry.entry_id, self._profile_id]).fetchone()
+            if row is not None:
+                if str(row[0]) != str(entry.path):
+                    raise ValueError("session content changed before discard")
+                self._unlink_session_file(entry.path)
+                con.execute("DELETE FROM cache_entry WHERE id = ?", [entry.entry_id])
+
+    @staticmethod
+    def _unlink_session_file(path: Path) -> None:
+        """Unlink via pinned directories; final links are removed, never followed."""
+        directory = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in path.parts[1:-1]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            try:
+                os.unlink(path.name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(directory)
+
+    def _private_session_directory(
+        self, workspace_id: str, session_id: str, category: str, source: str,
+    ) -> int:
+        """Create/open owned directories descriptor-relatively, never follow links."""
+        for part in (workspace_id, session_id, category, source):
+            if not part or Path(part).name != part or part in (".", ".."):
+                raise ValueError("session evidence ownership must contain safe path components")
+        path = self._layout.category_dir(
+            scope="session", category=category, workspace_id=workspace_id, session_id=session_id,
+        ) / source
+        if not path.is_absolute() or os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+            raise ValueError("secure session evidence storage unavailable on this platform")
+        parent = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in path.parts[1:]:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=parent)
+                except FileExistsError:
+                    pass
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                os.close(parent)
+                parent = child
+            info = os.fstat(parent)
+            if info.st_uid != os.getuid():
+                raise ValueError("private session directory is not owner-controlled")
+            os.fchmod(parent, 0o700)
+            return parent
+        except (OSError, ValueError):
+            os.close(parent)
+            raise
 
     def register(
         self,
@@ -330,22 +456,36 @@ class CacheManager:
         cutoff = time.time() if now is None else now
         kept = {str(Path(path).expanduser().resolve()) for path in keep}
         idle_cutoff = cutoff - min_idle_s if min_idle_s > 0 else None
-        sql = "SELECT id, path FROM cache_entry WHERE expires_at IS NOT NULL AND expires_at <= ?"
-        params: list[Any] = [cutoff]
+        sql = "SELECT id, path, expires_at, metadata_json FROM cache_entry WHERE profile_id = ? AND expires_at IS NOT NULL"
+        params: list[Any] = [self._profile_id]
+        monotonic_now = time.monotonic()
         if category is not None:
             sql += " AND category = ?"
             params.append(category)
         with self._connect_lock, self._connect() as con:
             removed: list[str] = []
-            for entry_id, raw_path in con.execute(sql, params).fetchall():
+            for entry_id, raw_path, expiry, metadata_json in con.execute(sql, params).fetchall():
+                metadata = json.loads(metadata_json or "{}")
+                transient = metadata.get("_validity_process") == _VALIDITY_PROCESS
+                deadline = metadata.get("_monotonic_deadline")
+                monotonic_expired = transient and (
+                    type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline <= monotonic_now
+                )
+                if expiry > cutoff and not monotonic_expired:
+                    continue
                 if str(raw_path) in kept:
                     continue
                 path = Path(str(raw_path))
-                if self._is_managed_path(path):
+                if transient or self._is_managed_path(path):
+                    if not path.is_relative_to(self._layout.root):
+                        continue
                     if idle_cutoff is not None and _modified_after(path, idle_cutoff):
                         continue
                     try:
-                        path.unlink(missing_ok=True)
+                        if transient:
+                            self._unlink_session_file(path)
+                        else:
+                            path.unlink(missing_ok=True)
                     except OSError as exc:
                         logger.warning("Could not delete expired cache file %s: %s", path, exc)
                         continue
@@ -380,6 +520,73 @@ class CacheManager:
         with self._connect() as con:
             rows = con.execute(f"SELECT * FROM cache_entry WHERE {where}", params).fetchall()
         return [_entry_from_row(row) for row in rows]
+
+    def resolve_session_entry(self, entry_id: str, *, workspace_id: str,
+                              session_id: str, max_bytes: int) -> CacheEntry:
+        """Resolve an opaque artifact ID within its caller's session, never a path."""
+        if not workspace_id or not session_id or max_bytes < 1:
+            raise ValueError("artifact requires an active workspace/session and byte budget")
+        with self._connect_lock, self._connect() as con:
+            row = con.execute(
+                "SELECT * FROM cache_entry WHERE id = ? AND profile_id = ? AND scope = 'session' "
+                "AND workspace_id = ? AND session_id = ?",
+                [entry_id, self._profile_id, workspace_id, session_id],
+            ).fetchone()
+        if row is None:
+            raise ValueError("artifact unavailable in this session")
+        entry = _entry_from_row(row)
+        root = self._layout.session_dir(workspace_id, session_id)
+        if (entry.expires_at is None or not math.isfinite(entry.expires_at)
+                or entry.expires_at <= time.time()):
+            raise ValueError("artifact expired or lacks a lifetime")
+        if "_monotonic_deadline" in entry.metadata:
+            deadline = entry.metadata["_monotonic_deadline"]
+            if (entry.metadata.get("_validity_process") != _VALIDITY_PROCESS
+                    or type(deadline) not in (int, float) or not math.isfinite(deadline)
+                    or deadline <= time.monotonic()):
+                raise ValueError("transient artifact expired or its producing runtime restarted")
+        if (entry.size_bytes < 1 or entry.size_bytes > max_bytes or entry.syncable or not entry.sensitive
+                or not entry.content_hash):
+            raise ValueError("artifact is not admitted sensitive, checksum-bound session evidence")
+        if not entry.path.is_relative_to(root) or any(p.is_symlink() for p in (entry.path, *entry.path.parents)):
+            raise ValueError("artifact escaped its managed session root")
+        return entry
+
+    def read_session_entry(self, entry: CacheEntry, *, max_bytes: int) -> bytes:
+        """Revalidate ownership/TTL after approval and consume a bounded regular file."""
+        current = self.resolve_session_entry(entry.entry_id, workspace_id=entry.workspace_id,
+                                             session_id=entry.session_id, max_bytes=max_bytes)
+        if current != entry:
+            raise ValueError("artifact changed while awaiting approval")
+        fd = self._open_session_file(entry.path)
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise ValueError("artifact is not a regular file")
+            content = handle.read(max_bytes + 1)
+        if len(content) > max_bytes or len(content) != entry.size_bytes:
+            raise ValueError("artifact content changed or exceeded its budget")
+        if hashlib.sha256(content).hexdigest() != entry.content_hash:
+            raise ValueError("artifact checksum differs from admitted content")
+        current = self.resolve_session_entry(entry.entry_id, workspace_id=entry.workspace_id,
+                                             session_id=entry.session_id, max_bytes=max_bytes)
+        if current != entry:
+            raise ValueError("artifact changed during its read")
+        return content
+
+    @staticmethod
+    def _open_session_file(path: Path) -> int:
+        """Open relative to pinned directory descriptors, refusing symlink/FIFO races."""
+        if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+            raise ValueError("Secure session artifact reads unavailable on this platform")
+        directory = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in path.parts[1:-1]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            return os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        finally:
+            os.close(directory)
 
     def _init_schema(self) -> None:
         """Create the table and drop legacy indexes, once per index file per process.
@@ -451,6 +658,12 @@ class CacheManager:
         resolved = path.expanduser().resolve()
         size = resolved.stat().st_size if resolved.exists() and resolved.is_file() else 0
         entry_id = content_hash or _entry_id(resolved)
+        if scope_value == CacheScope.SESSION.value and content_hash:
+            # Content deduplication must not merge independent session evidence
+            # or distinct files. Unhashed streaming entries retain their path ID;
+            # persisted legacy IDs remain readable without rewriting references.
+            basis = json.dumps([self._profile_id, workspace_id, session_id, str(resolved), content_hash])
+            entry_id = hashlib.sha256(basis.encode("utf-8")).hexdigest()
         now = time.time()
         return CacheEntry(
             entry_id=entry_id,
