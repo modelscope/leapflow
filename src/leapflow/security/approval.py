@@ -147,11 +147,16 @@ class SessionAwareGate:
             return ApprovalDecision.ALLOW
 
         grant_key = f"{session_id}:{request.grant_key}" if session_id else request.grant_key
-        if grant_key in self._approved_categories:
+        orchestrator_owned = request.metadata.get("grant_owner") == "orchestrator"
+        if not orchestrator_owned and grant_key in self._approved_categories:
             self._log_decision(request, ApprovalDecision.ALLOW, auto=True)
             return ApprovalDecision.ALLOW
 
         decision = await self._delegate.request_approval(request)
+        # Cancellation is a terminal control signal, even when not a displayed choice.
+        if decision == ApprovalDecision.CANCEL_WORKFLOW:
+            self._log_decision(request, decision)
+            return decision
 
         # Validate that the delegate's decision is within the declared
         # choices. A choice outside the request contract is either a UI defect
@@ -179,11 +184,13 @@ class SessionAwareGate:
             self._log_decision(request, decision, session=True)
             return ApprovalDecision.ALLOW
         if decision == ApprovalDecision.ALLOW_SESSION:
-            self._approved_categories.add(grant_key)
+            if not orchestrator_owned:
+                self._approved_categories.add(grant_key)
             self._log_decision(request, ApprovalDecision.ALLOW_SESSION, session=True)
             return ApprovalDecision.ALLOW_SESSION
         if decision == ApprovalDecision.ALLOW_ALWAYS:
-            self._approved_categories.add(grant_key)
+            if not orchestrator_owned:
+                self._approved_categories.add(grant_key)
             self._log_decision(request, ApprovalDecision.ALLOW_ALWAYS, session=True)
             return ApprovalDecision.ALLOW_ALWAYS
 

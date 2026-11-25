@@ -2,6 +2,7 @@
 """Approval orchestration: policy, grants, prompting, and audit."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +14,7 @@ from leapflow.security.grants import (
     ApprovalGrantStore,
     ApprovalScope,
     InMemoryApprovalGrantStore,
+    RevocableApprovalGrantStore,
     grant_key,
 )
 from leapflow.security.guardian import DenialBreaker, GuardianConfig, GuardianDecisionAdapter
@@ -76,6 +78,7 @@ class ApprovalOrchestrator:
         self._policy = policy or ApprovalPolicyEngine()
         self._grants = grants or InMemoryApprovalGrantStore()
         self._audit = audit or ApprovalAuditLog()
+        self._persistence_tasks: set[asyncio.Task[ApprovalResult]] = set()
         self._guardian = guardian
         self._guardian_config = guardian_config or (guardian.config if guardian else GuardianConfig())
         self._denial_breaker = DenialBreaker(
@@ -106,28 +109,31 @@ class ApprovalOrchestrator:
         policy = self._policy.evaluate(action, risk)
         if policy.verdict == PolicyVerdict.ALLOW:
             self._denial_breaker.record_approval()
-            return self._approved(action, risk, actor="policy", reason=policy.reason)
+            return await asyncio.to_thread(self._approved, action, risk, actor="policy", reason=policy.reason)
         if policy.verdict == PolicyVerdict.DENY:
             self._denial_breaker.record_denial()
-            return self._denied(action, risk, actor="policy", reason=policy.reason)
+            return await asyncio.to_thread(self._denied, action, risk, actor="policy", reason=policy.reason)
 
         # DenialBreaker: fast-deny if too many consecutive denials
         if self._denial_breaker.is_tripped():
-            return self._denied(
+            return await asyncio.to_thread(self._denied,
                 action, risk, actor="denial_breaker",
                 reason="consecutive denial limit reached",
             )
 
-        existing = self._existing_grant(action)
+        existing = await asyncio.to_thread(self._existing_grant, action)
         if existing is not None:
             if existing.decision.startswith("deny"):
                 self._denial_breaker.record_denial()
-                return self._denied(action, risk, actor="grant", reason=existing.reason)
+                return await asyncio.to_thread(self._denied, action, risk, actor="grant", reason=existing.reason)
             self._denial_breaker.record_approval()
-            return self._approved(action, risk, actor="grant", scope=existing.scope, reason=existing.reason)
+            return await asyncio.to_thread(self._approved, action, risk, actor="grant", scope=existing.scope, reason=existing.reason)
 
-        # Guardian LLM evaluation for ASK-tier requests
-        guardian_result = await self._try_guardian(action, risk)
+        # Model-service consent is an explicit human choice, not a Guardian exemption.
+        model_consent = action.metadata.get("platform") == "model_services" and action.metadata.get("approval_binding")
+        revision = (await asyncio.to_thread(self._grants.revision, model_consent)
+                    if model_consent and isinstance(self._grants, RevocableApprovalGrantStore) else None)
+        guardian_result = None if model_consent else await self._try_guardian(action, risk)
         if guardian_result is not None:
             return guardian_result
 
@@ -139,6 +145,7 @@ class ApprovalOrchestrator:
                 "action": action.to_dict(),
                 "risk": risk.to_dict(),
                 "allow_permanent": policy.allow_permanent,
+                "grant_owner": "orchestrator",
             },
             action=action,
             risk=risk,
@@ -151,6 +158,8 @@ class ApprovalOrchestrator:
             },
         )
         decision = await self._gate.request_approval(request)
+        if decision == ApprovalDecision.ALLOW_ALWAYS and not policy.allow_permanent:
+            decision = ApprovalDecision.DENY
         if decision in {
             ApprovalDecision.ALLOW,
             ApprovalDecision.ALLOW_ONCE,
@@ -160,37 +169,48 @@ class ApprovalOrchestrator:
             self._denial_breaker.record_approval()
             scope = self._scope_from_decision(decision)
             if scope in {ApprovalScope.SESSION.value, ApprovalScope.PROFILE.value}:
-                self._grants.put(ApprovalGrant(
-                    key=grant_key(action, ApprovalScope(scope)),
-                    scope=scope,
-                    decision="allow",
-                    action_kind=action.kind,
-                    effect=action.effect,
-                    resource=action.resource,
-                    reason="user_approved",
-                ))
-            return self._approved(action, risk, actor="user", scope=scope, reason=decision.value)
+                return await self._remember(action, risk, decision.value, scope, revision)
+            return await asyncio.to_thread(self._approved, action, risk, actor="user", scope=scope, reason=decision.value)
 
         if decision == ApprovalDecision.DENY_ALWAYS:
             self._denial_breaker.record_denial()
-            self._grants.put(ApprovalGrant(
-                key=grant_key(action, ApprovalScope.SESSION),
-                scope=ApprovalScope.SESSION.value,
-                decision="deny",
-                action_kind=action.kind,
-                effect=action.effect,
-                resource=action.resource,
-                reason="user_denied",
-            ))
-            return self._denied(
-                action,
-                risk,
-                actor="user",
-                reason=decision.value,
-                scope=ApprovalScope.SESSION.value,
-            )
+            return await self._remember(action, risk, decision.value, ApprovalScope.SESSION.value, revision)
         self._denial_breaker.record_denial()
-        return self._denied(action, risk, actor="user", reason=decision.value)
+        return await asyncio.to_thread(self._denied, action, risk, actor="user", reason=decision.value)
+
+    async def _remember(
+        self, action: ActionDescriptor, risk: RiskAssessment, decision: str,
+        scope: str, revision: tuple[str, ...] | None,
+    ) -> ApprovalResult:
+        """Keep a consent commit and its audit alive together if the caller cancels."""
+        worker = asyncio.create_task(asyncio.to_thread(self._persist_decision, action, risk, decision, scope, revision))
+        self._persistence_tasks.add(worker)
+        worker.add_done_callback(self._persistence_finished)
+        return await asyncio.shield(worker)
+
+    def _persistence_finished(self, worker: asyncio.Task[ApprovalResult]) -> None:
+        self._persistence_tasks.discard(worker)
+        if not worker.cancelled() and (error := worker.exception()) is not None:
+            logger.error("Approval persistence failed", exc_info=(type(error), error, error.__traceback__))
+
+    def _persist_decision(
+        self, action: ActionDescriptor, risk: RiskAssessment, decision: str,
+        scope: str, revision: tuple[str, ...] | None,
+    ) -> ApprovalResult:
+        allowed = decision.startswith("allow")
+        grant = ApprovalGrant(
+            key=grant_key(action, scope), scope=scope, decision="allow" if allowed else "deny",
+            action_kind=action.kind, effect=action.effect, resource=action.resource,
+            reason="user_approved" if allowed else "user_denied",
+            binding=dict(action.metadata.get("approval_binding") or {}),
+        )
+        if revision is not None and isinstance(self._grants, RevocableApprovalGrantStore):
+            if not self._grants.put_if_current(grant, revision):
+                return self._denied(action, risk, actor="user", reason="consent_revoked_during_approval", scope=scope)
+        else:
+            self._grants.put(grant)
+        finish = self._approved if allowed else self._denied
+        return finish(action, risk, actor="user", scope=scope, reason=decision)
 
     async def check(self, command: str) -> bool:
         """Legacy shell approval adapter used by existing tool gates."""
@@ -200,7 +220,8 @@ class ApprovalOrchestrator:
     def _existing_grant(self, action: ActionDescriptor) -> ApprovalGrant | None:
         for scope in (ApprovalScope.TURN, ApprovalScope.SESSION, ApprovalScope.PROFILE):
             existing = self._grants.get(grant_key(action, scope))
-            if existing is not None:
+            binding = action.metadata.get("approval_binding")
+            if existing is not None and (binding is None or existing.binding == binding):
                 return existing
         return None
 
@@ -312,13 +333,13 @@ class ApprovalOrchestrator:
 
         if verdict.recommendation == "approve":
             self._denial_breaker.record_approval()
-            return self._approved(
+            return await asyncio.to_thread(self._approved,
                 action, risk, actor="guardian",
                 reason=f"guardian auto-approve (score={verdict.risk_score:.2f})",
             )
         if verdict.recommendation == "deny":
             self._denial_breaker.record_denial()
-            return self._denied(
+            return await asyncio.to_thread(self._denied,
                 action, risk, actor="guardian",
                 reason=f"guardian auto-deny (score={verdict.risk_score:.2f})",
             )

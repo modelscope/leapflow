@@ -34,6 +34,10 @@ def add_service_arguments(parser: argparse.ArgumentParser) -> None:
     check = actions.add_parser("check", help="Validate locally, or explicitly check an approved --case; never motion")
     check.add_argument("service_id", nargs="?", default="")
     check.add_argument("--case", default="", help="Bounded synthetic/recorded JSON task fixture")
+    permissions = actions.add_parser("permissions", help="List declaration-bound model consent only")
+    permissions.add_argument("service_id", nargs="?", default="")
+    revoke = actions.add_parser("revoke", help="Revoke one service's model consent; never disable or stop it")
+    revoke.add_argument("service_id")
 
 
 def parse_service_arguments(tokens: list[str]) -> argparse.Namespace:
@@ -57,6 +61,10 @@ def read_declaration(path: str) -> Any:
 def execute_service_config(service: ConfigService, args: argparse.Namespace) -> dict[str, Any] | ConfigMutationResult:
     action = args.service_action or "show"
     name = getattr(args, "service_id", "")
+    if action == "permissions":
+        return service.model_service_permissions(name)
+    if action == "revoke":
+        return service.revoke_model_service_permissions(name)
     if action == "set":
         return service.set_model_service(name, read_declaration(args.file))
     if action == "unset":

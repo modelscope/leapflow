@@ -56,6 +56,7 @@ class ModelServicesPlugin:
                 name="model_query",
                 description=("Read-only typed specialist query. Use model_describe for the selected input schema. "
                              "Artifacts map labels to caller-owned session cache IDs, never paths/URLs/base64. "
+                             "Call directly; runtime requests any necessary service consent. Do not ask for duplicate consent in dialogue. "
                              "Decisions are advisory, predictions hypothetical, evaluations teacher assessments. "
                              "Physical actions require hw_skill_* / policy.run; generated calls never execute."),
                 parameters_schema={"type": "object", "properties": {

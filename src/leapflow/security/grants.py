@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
+from leapflow.layout import ApprovalLayout
 from leapflow.security.actions import ActionDescriptor
+from leapflow.utils.file_lock import lock_fd, unlock_fd
 
 
 class ApprovalScope(str, Enum):
@@ -35,6 +41,7 @@ class ApprovalGrant:
     reason: str = ""
     created_at: float = field(default_factory=time.time)
     expires_at: float | None = None
+    binding: dict[str, Any] = field(default_factory=dict)
 
     def is_expired(self, now: float | None = None) -> bool:
         return self.expires_at is not None and (now or time.time()) >= self.expires_at
@@ -54,6 +61,7 @@ class ApprovalGrant:
             reason=str(data.get("reason") or ""),
             created_at=float(data.get("created_at") or time.time()),
             expires_at=data.get("expires_at"),
+            binding=dict(data.get("binding") or {}),
         )
 
 
@@ -66,28 +74,74 @@ class ApprovalGrantStore(Protocol):
     def list(self) -> list[ApprovalGrant]: ...
 
 
+@runtime_checkable
+class RevocableApprovalGrantStore(ApprovalGrantStore, Protocol):
+    """Atomic consent writes bound to the revocation state observed before prompting."""
+
+    def revision(self, binding: dict[str, Any]) -> tuple[str, ...]: ...
+    def put_if_current(self, grant: ApprovalGrant, revision: tuple[str, ...]) -> bool: ...
+    def revoke_where(
+        self, predicate: Callable[[ApprovalGrant], bool], *, binding: dict[str, Any],
+    ) -> list[ApprovalGrant]: ...
+
+
 class InMemoryApprovalGrantStore:
     """Session-local grant store."""
 
     def __init__(self) -> None:
         self._grants: dict[str, ApprovalGrant] = {}
+        self._revocations: dict[str, tuple[dict[str, Any], str]] = {}
+        self._lock = threading.RLock()
 
     def get(self, key: str) -> ApprovalGrant | None:
-        grant = self._grants.get(key)
-        if grant is not None and grant.is_expired():
-            self._grants.pop(key, None)
-            return None
-        return grant
+        with self._lock:
+            grant = self._grants.get(key)
+            if grant is not None and grant.is_expired():
+                self._grants.pop(key, None)
+                return None
+            return grant
 
     def put(self, grant: ApprovalGrant) -> None:
-        self._grants[grant.key] = grant
+        with self._lock:
+            self._grants[grant.key] = grant
 
     def list(self) -> list[ApprovalGrant]:
-        now = time.time()
-        expired = [key for key, grant in self._grants.items() if grant.is_expired(now)]
-        for key in expired:
-            self._grants.pop(key, None)
-        return list(self._grants.values())
+        with self._lock:
+            now = time.time()
+            expired = [key for key, grant in self._grants.items() if grant.is_expired(now)]
+            for key in expired:
+                self._grants.pop(key, None)
+            return list(self._grants.values())
+
+    def remove_where(self, predicate: Callable[[ApprovalGrant], bool]) -> list[ApprovalGrant]:
+        with self._lock:
+            removed = [grant for grant in self.list() if predicate(grant)]
+            for grant in removed:
+                self._grants.pop(grant.key, None)
+            return removed
+
+    def revision(self, binding: dict[str, Any]) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(revision for selector, revision in self._revocations.values()
+                                if all(binding.get(key) == value for key, value in selector.items())))
+
+    def put_if_current(self, grant: ApprovalGrant, revision: tuple[str, ...]) -> bool:
+        with self._lock:
+            if self.revision(grant.binding) != revision:
+                return False
+            self.put(grant)
+            return True
+
+    def revoke_where(
+        self, predicate: Callable[[ApprovalGrant], bool], *, binding: dict[str, Any],
+    ) -> list[ApprovalGrant]:
+        if not binding:
+            raise ValueError("Revocation requires a nonempty binding selector")
+        with self._lock:
+            removed = self.remove_where(predicate)
+            key = json.dumps(binding, sort_keys=True, separators=(",", ":"))
+            self._revocations[key] = (dict(binding), uuid.uuid4().hex)
+            return removed
 
 
 class JsonApprovalGrantStore(InMemoryApprovalGrantStore):
@@ -96,29 +150,133 @@ class JsonApprovalGrantStore(InMemoryApprovalGrantStore):
     def __init__(self, path: Path) -> None:
         super().__init__()
         self._path = path
+        self._stamp: tuple[int, int, int] | None = None
         self._load()
 
-    def put(self, grant: ApprovalGrant) -> None:
-        super().put(grant)
-        self._save()
+    def _file_stamp(self) -> tuple[int, int, int] | None:
+        try:
+            stat = self._path.stat()
+            return stat.st_mtime_ns, stat.st_size, stat.st_ino
+        except FileNotFoundError:
+            return None
 
-    def _load(self) -> None:
+    def _refresh(self) -> None:
+        if self._file_stamp() != self._stamp:
+            self._load()
+
+    def get(self, key: str) -> ApprovalGrant | None:
+        with self._lock:
+            self._refresh()
+            return super().get(key)
+
+    def list(self) -> list[ApprovalGrant]:
+        with self._lock:
+            self._refresh()
+            return super().list()
+
+    def put(self, grant: ApprovalGrant) -> None:
+        self._mutate(lambda: super(JsonApprovalGrantStore, self).put(grant))
+
+    def remove_where(self, predicate: Callable[[ApprovalGrant], bool]) -> list[ApprovalGrant]:
+        return self._mutate(lambda: super(JsonApprovalGrantStore, self).remove_where(predicate))
+
+    def revision(self, binding: dict[str, Any]) -> tuple[str, ...]:
+        with self._lock:
+            self._refresh()
+            return super().revision(binding)
+
+    def put_if_current(self, grant: ApprovalGrant, revision: tuple[str, ...]) -> bool:
+        def commit() -> bool:
+            if super(JsonApprovalGrantStore, self).revision(grant.binding) != revision:
+                return False
+            super(JsonApprovalGrantStore, self).put(grant)
+            return True
+
+        return self._mutate(commit)
+
+    def revoke_where(
+        self, predicate: Callable[[ApprovalGrant], bool], *, binding: dict[str, Any],
+    ) -> list[ApprovalGrant]:
+        def revoke() -> list[ApprovalGrant]:
+            removed = super(JsonApprovalGrantStore, self).remove_where(predicate)
+            if not binding:
+                raise ValueError("Revocation requires a nonempty binding selector")
+            key = json.dumps(binding, sort_keys=True, separators=(",", ":"))
+            self._revocations[key] = (dict(binding), uuid.uuid4().hex)
+            return removed
+
+        return self._mutate(revoke)
+
+    def _mutate(self, operation: Callable[[], Any]) -> Any:
+        with self._lock:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = ApprovalLayout(self._path.parent).grants_lock_path
+            with lock_path.open("a+b") as handle:
+                lock_fd(handle)
+                try:
+                    self._load(strict=True)
+                    result = operation()
+                    self._save()
+                    return result
+                except (OSError, ValueError, TypeError):
+                    self._load()
+                    raise
+                finally:
+                    unlock_fd(handle)
+
+    def _load(self, *, strict: bool = False) -> None:
+        # Capture the stamp before reading so a racing replacement forces another refresh.
+        self._stamp = self._file_stamp()
+        self._grants.clear()
+        self._revocations.clear()
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
-            return
-        if not isinstance(payload, list):
-            return
-        for item in payload:
-            if isinstance(item, dict):
+            revocations = {}
+            if isinstance(payload, dict):
+                records = payload.get("revocations")
+                if not isinstance(records, list):
+                    raise ValueError("Invalid approval revocations")
+                for record in records:
+                    if not isinstance(record, dict):
+                        raise ValueError("Invalid approval revocation")
+                    selector, revision = record.get("binding"), record.get("revision")
+                    if not isinstance(selector, dict) or not selector or not isinstance(revision, str) or not revision:
+                        raise ValueError("Invalid approval revocation")
+                    key = json.dumps(selector, sort_keys=True, separators=(",", ":"))
+                    revocations[key] = (selector, revision)
+                payload = payload.get("grants")
+            if not isinstance(payload, list):
+                raise ValueError("Approval grants must be a list")
+            loaded = {}
+            for item in payload:
+                if not isinstance(item, dict):
+                    raise ValueError("Invalid approval grant")
                 grant = ApprovalGrant.from_dict(item)
                 if grant.key and not grant.is_expired():
-                    self._grants[grant.key] = grant
+                    loaded[grant.key] = grant
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError) as exc:
+            if strict:
+                raise ValueError("Approval grant store is unreadable; refusing to overwrite it") from exc
+            return
+        self._grants = loaded
+        self._revocations = revocations
 
     def _save(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = [grant.to_dict() for grant in self.list()]
-        self._path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        grants = [grant.to_dict() for grant in super().list()]
+        payload = ({"grants": grants, "revocations": [
+            {"binding": binding, "revision": revision} for binding, revision in self._revocations.values()
+        ]} if self._revocations else grants)
+        with tempfile.TemporaryDirectory(dir=self._path.parent) as directory:
+            temporary = Path(directory) / "grants.json"
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.chmod(0o600)
+            os.replace(temporary, self._path)
+        self._stamp = self._file_stamp()
 
 
 class ApprovalAuditLog:
@@ -181,6 +339,9 @@ class ApprovalAuditLog:
             "reason": reason,
             "detail": action.detail[:500],
         }
+        binding = action.metadata.get("approval_binding")
+        if isinstance(binding, dict):
+            entry["binding"] = dict(binding)
         self._entries.append(entry)
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)

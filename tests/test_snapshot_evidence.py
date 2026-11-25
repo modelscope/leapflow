@@ -151,7 +151,9 @@ async def test_retention_then_specialist_uses_opaque_id_and_independent_consent(
         assert answer["ok"], answer
         assert len(requests) == 1 and not answer["provenance"]["physical_authority"]
         kinds = [request.action.kind for request in human.requests]
-        assert "file.write" in kinds and "file.read" in kinds and "network.fetch" in kinds
+        assert kinds == ["file.write", "network.fetch"]
+        assert human.requests[-1].action.metadata["approval_binding"]["evidence_scope"] == "evidence"
+        assert "Call model_query directly" in result["next_step"] and "duplicate consent" in result["next_step"]
         assert all(request.action.session_id == "own" for request in human.requests)
         assert not events._event_buffer and events._immediate.active_count == 0
     finally:

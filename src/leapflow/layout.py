@@ -255,6 +255,10 @@ class ApprovalLayout:
         return self.root / "grants.json"
 
     @property
+    def grants_lock_path(self) -> Path:
+        return self.root / "grants.lock"
+
+    @property
     def audit_path(self) -> Path:
         return self.root / "audit.jsonl"
 

@@ -356,4 +356,5 @@ async def export_snapshot_result(
                 "failure_code": exc.failure.code, "retryable": False,
                 "next_step": exc.failure.next_step}
     return {**result, "evidence": {"status": "retained", **asdict(reference)},
-            "next_step": "Use model_query with this session artifact ID; endpoint and sensitive-read consent are separate."}
+            "next_step": "Call model_query directly with this session artifact ID; runtime requests any necessary "
+                         "service consent. Do not ask for duplicate consent in dialogue."}

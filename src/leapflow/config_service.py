@@ -1026,6 +1026,46 @@ class ConfigService:
         from leapflow.llm.services.config import declarations, parse_services
         return declarations(parse_services(data))
 
+    def model_service_permissions(self, service_id: str = "") -> dict[str, Any]:
+        """List only declaration-bound model-query grants, including removed services."""
+        from leapflow.security.grants import JsonApprovalGrantStore
+
+        store = JsonApprovalGrantStore(self._settings.profile_layout.approval.grants_path)
+        grants = [grant for grant in store.list() if self._model_grant_matches(grant, service_id)]
+        return {"ok": True, "mode": "permissions", "endpoint_probed": False,
+                "permissions": [{"service_id": grant.binding["service_id"], "scope": grant.scope,
+                                 "decision": grant.decision, "binding": grant.binding,
+                                 "created_at": grant.created_at, "expires_at": grant.expires_at} for grant in grants]}
+
+    @staticmethod
+    def _model_grant_matches(grant: Any, service_id: str) -> bool:
+        return (grant.action_kind == "network.fetch" and grant.effect == "read"
+                and grant.binding.get("platform") == "model_services"
+                and bool(grant.binding.get("service_id"))
+                and (not service_id or grant.binding.get("service_id") == service_id))
+
+    def revoke_model_service_permissions(self, service_id: str) -> dict[str, Any]:
+        """Revoke consent only; this operator command never stops or disables a service."""
+        from leapflow.security.actions import ActionDescriptor
+        from leapflow.security.grants import ApprovalAuditLog, JsonApprovalGrantStore
+
+        if not service_id:
+            raise ValueError("revoke requires a service ID")
+        layout = self._settings.profile_layout.approval
+        store = JsonApprovalGrantStore(layout.grants_path)
+        removed = store.revoke_where(lambda grant: self._model_grant_matches(grant, service_id),
+                                     binding={"platform": "model_services", "service_id": service_id})
+        audit = ApprovalAuditLog(layout.audit_path)
+        for grant in removed:
+            audit.record(action=ActionDescriptor(kind=grant.action_kind, effect=grant.effect,
+                summary=f"Revoke model service {service_id} consent", detail="<model-permission>",
+                resource=grant.resource, origin="user", metadata={"approval_binding": grant.binding}),
+                decision="revoke", risk_level="medium", scope=grant.scope, actor="user",
+                reason="operator_revoked_model_consent")
+        return {"ok": True, "mode": "revoke", "service_id": service_id, "revoked": len(removed),
+                "endpoint_probed": False, "service_disabled": False,
+                "message": "Consent revoked; the next matching query asks again. No service was stopped or disabled."}
+
     def set_model_service(self, service_id: str, declaration: object) -> ConfigMutationResult:
         """Validate a single declaration, then atomically upsert only its ID."""
         from leapflow.llm.services.config import declarations, parse_services

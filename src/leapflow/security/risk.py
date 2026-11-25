@@ -223,6 +223,11 @@ class DefaultRiskClassifier:
                 metadata={"origin": origin, "target_category": category},
             )
 
+        if action.metadata.get("platform") == "model_services" and action.metadata.get("approval_binding"):
+            model_risk = self._assess_model_service(action, category, origin)
+            if model_risk is not None:
+                return model_risk
+
         if action.metadata.get("sensitive_payload"):
             location = str(action.metadata.get("processing_location") or "unknown")
             return RiskAssessment(
@@ -262,6 +267,36 @@ class DefaultRiskClassifier:
             score=0.15,
             reasons=("public_network_read",),
             explanation=f"Reads public web content from {origin}.",
+            metadata={"origin": origin, "target_category": category},
+        )
+
+    @staticmethod
+    def _assess_model_service(action: ActionDescriptor, category: str, origin: str) -> RiskAssessment | None:
+        location = str(action.metadata.get("processing_location") or "unknown")
+        service_id = str(action.metadata.get("service_id") or "")
+        restricted = {"metadata", "link_local", "unspecified", "reserved", "unknown"}
+        categories = set(action.metadata.get("resolved_categories") or [category])
+        if category in restricted or categories & restricted:
+            return RiskAssessment(
+                level=RiskLevel.HIGH, score=0.85, reasons=("model_service_restricted_target",),
+                explanation=f"Model service {service_id} at {origin} resolves to {', '.join(sorted(categories | {category}))}; "
+                            f"declared processing location: {location}. Only temporary consent is available.",
+                allow_permanent=False,
+            )
+        if location not in {"local", "remote"}:
+            return None
+        qualified_local = location == "local" and categories == {"loopback"} and not action.metadata.get("allow_remote")
+        scope = action.metadata["approval_binding"].get("evidence_scope", "text")
+        explanation = (f"Query configured model service {service_id} at {origin} ({category}); "
+                       f"declared processing location: {location}. Consent covers {scope.replace('_', ' ')} "
+                       "for this exact declaration and resolved destination. "
+                       "Loopback may be forwarded; it does not establish local processing.")
+        medium = qualified_local or category == "public" and scope == "text"
+        return RiskAssessment(
+            level=RiskLevel.MEDIUM if medium else RiskLevel.HIGH,
+            score=0.5 if medium else 0.8,
+            reasons=("model_service_declared_local" if qualified_local else "model_service_explicit_consent",),
+            explanation=explanation, allow_permanent=True,
             metadata={"origin": origin, "target_category": category},
         )
 

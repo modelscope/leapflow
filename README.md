@@ -386,6 +386,8 @@ leap config llm services show chooser
 leap config llm services check chooser
 leap config llm services disable chooser
 leap config llm services enable chooser
+leap config llm services permissions chooser
+leap config llm services revoke chooser
 ```
 
 These commands manage the active profile's `llm.services`; workspace overrides are not
@@ -426,7 +428,13 @@ For specialist-only camera analysis, explicitly request a fresh passive `perceiv
 through `hw_skill_run` with `export_evidence: true`. This requires the existing workcell
 `share_frames` and host `hardware.share_frames` switches plus separate transient-retention
 consent. The result exposes opaque session artifact IDs, not an image attachment to the
-primary chat model. `model_query` requires separate endpoint and sensitive-read consent.
+primary chat model. Call `model_query` directly; runtime prompts for service consent when needed.
+A declared-local, loopback-only service shares one consent for text and caller-owned evidence.
+Known remote services keep text and evidence consent distinct; SSH loopback forwarding does not
+make processing local. Always allow remembers the exact declaration and resolved destination;
+Once and Session remain narrower. Unknown-location evidence is refused. Inspect or revoke model
+consent with `leap config llm services permissions [SERVICE_ID]` / `revoke SERVICE_ID`, or the
+matching `/config llm services` commands. Revocation asks again without stopping or disabling services.
 Ordinary snapshots remain volatile; export is off by default and adds no capture driver or motion.
 
 `hardware.snapshot_evidence` configures retention bounds: at most 300 seconds (also capped

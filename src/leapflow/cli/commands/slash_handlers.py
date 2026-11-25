@@ -250,6 +250,8 @@ def render_model_payload(console: "LeapConsole", payload: dict[str, Any]) -> Non
 async def build_config_payload_async(ctx: "Context", args: str = "", *, session_id: str = "",
                                      workspace_root: str | None = None) -> dict[str, Any]:
     """Keep local config builders synchronous; only explicit fixtures may call an endpoint."""
+    import asyncio
+
     from leapflow.cli.commands.model_service_config import execute_fixture, parse_service_arguments
     from leapflow.utils.shell_lex import split_args
 
@@ -257,6 +259,8 @@ async def build_config_payload_async(ctx: "Context", args: str = "", *, session_
         tokens = split_args(args)
         if tokens[:2] == ["llm", "services"]:
             parsed = parse_service_arguments(tokens[2:])
+            if parsed.service_action in {"permissions", "revoke"}:
+                return await asyncio.to_thread(build_config_payload, ctx, args)
             if getattr(parsed, "case", ""):
                 if getattr(ctx, "model_services", None) is None:
                     return {"ok": False, "view": "config", "message": "Model service runtime unavailable; restart the governed session"}

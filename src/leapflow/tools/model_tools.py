@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 from dataclasses import asdict, replace
@@ -13,7 +14,7 @@ from typing import Any, Callable, Mapping
 from leapflow.llm.services.codec import validate_schema
 from leapflow.llm.services.protocol import ActiveCallBudget, ServiceError, ServiceSpec, StructuredModelClient, canonical
 from leapflow.security.actions import ActionDescriptor
-from leapflow.security.network import classify_url
+from leapflow.security.network import _category_for_address, classify_url
 from leapflow.tools.execution_context import current_tool_context
 from leapflow.world_model.specialist_contract import (
     INPUT_SCHEMAS, OUTPUT_SCHEMAS, array, eligible_ids, obj, text, validate_result,
@@ -109,10 +110,29 @@ async def authorize_endpoint(spec: ServiceSpec, gate: Any, *, sensitive: bool,
                            code="model_timeout", recoverable=True) from exc
     if check_admission is not None:
         check_admission()
-    await authorize(ActionDescriptor.network_fetch(
+    categories = sorted({_category_for_address(address) for address in target.addresses})
+    qualified_local = spec.processing_location == "local" and categories == ["loopback"] and not spec.allow_remote
+    scope = "text_and_evidence" if qualified_local else ("evidence" if sensitive else "text")
+    binding = {"platform": "model_services", "service_id": spec.service_id,
+               "declaration_digest": hashlib.sha256(canonical(asdict(spec)).encode()).hexdigest(),
+               "origin": target.origin, "target_category": target.category,
+               "resolved_addresses": sorted(set(target.addresses)),
+               "processing_location": spec.processing_location, "evidence_scope": scope}
+    action = ActionDescriptor.network_fetch(
         spec.base_url, origin=target.origin, method="POST",
         metadata={**target.to_metadata(), "platform": "model_services", "service_id": spec.service_id,
-                  "processing_location": spec.processing_location, "sensitive_payload": sensitive}), gate)
+                  "allow_remote": spec.allow_remote, "approval_binding": binding, "resolved_categories": categories,
+                  "processing_location": spec.processing_location, "sensitive_payload": sensitive})
+    await authorize(replace(action, detail="<model-service>",
+                            metadata={key: value for key, value in action.metadata.items() if key != "url"},
+                            summary=f"Query model service {spec.service_id} "
+                                    f"({spec.processing_location}; {scope.replace('_', ' ')})"), gate)
+    if check_admission is not None:
+        check_admission()
+    current = await (budget or ActiveCallBudget(spec.limits.deadline_s)).run(classify_url(spec.base_url))
+    if current.origin != target.origin or current.category != target.category or set(current.addresses) != set(target.addresses):
+        raise ServiceError("Model destination changed during consent; retry to authorize the new destination",
+                           code="permission_denied", category="security")
     if check_admission is not None:
         check_admission()
 
@@ -205,13 +225,14 @@ class ModelTools:
             if (artifacts or data.get("observation_refs") or data.get("episode_ref")) and handle.spec.processing_location == "unknown":
                 raise ServiceError("Image processing locality is unknown; qualify the deployment first",
                                    code="model_privacy_unknown", category="security")
-            # Obtain egress consent before reading snapshots so a long consent
-            # wait cannot turn admitted artifacts into expired evidence at upload.
+            # Admit metadata before consent; no evidence bytes are read until it succeeds.
             sensitive = bool(artifacts or data.get("observation_refs") or data.get("episode_ref"))
+            cache, snapshots = await self._resolve_artifacts(artifacts, data, task,
+                handle.spec.limits.max_request_bytes, budget, check_admission=handle.check_admission)
             await authorize_endpoint(handle.spec, self.gate, sensitive=sensitive, budget=budget,
                                      check_admission=handle.check_admission)
-            media, evidence = await self._artifacts(artifacts, data, task, handle.spec.limits.max_request_bytes,
-                                                   budget, check_admission=handle.check_admission)
+            media, evidence = await self._artifacts(artifacts, cache, snapshots,
+                handle.spec.limits.max_request_bytes, budget, check_admission=handle.check_admission)
             handle.check_admission()
             if task == "grasp_proposal":
                 depth = evidence.pop("depth")
@@ -252,9 +273,9 @@ class ModelTools:
         handle.check_result_eligibility()
         return payload
 
-    async def _artifacts(self, artifacts: dict[str, str], data: dict[str, Any], task: str,
-                         budget: int, deadline: ActiveCallBudget, *,
-                         check_admission: Callable[[], None]) -> tuple[list[dict[str, str]], dict[str, bytes]]:
+    async def _resolve_artifacts(self, artifacts: dict[str, str], data: dict[str, Any], task: str,
+                                 budget: int, deadline: ActiveCallBudget, *,
+                                 check_admission: Callable[[], None]) -> tuple[Any, list[tuple[str, Any]]]:
         from leapflow.cache.manager import CacheManager
         from leapflow.layout import workspace_id_for_path
 
@@ -267,23 +288,40 @@ class ModelTools:
             raise ValueError("Artifact labels collide with observation or episode references")
         references.update(observed)
         if not references:
-            return [], {}
+            return None, []
         if self.settings is None:
             raise ValueError("Session artifact storage is unavailable")
         check_admission()
         cache = await deadline.run(asyncio.to_thread(CacheManager, self.settings.profile_layout.cache,
                                                      profile_id=self.settings.profile))
         check_admission()
-        media, evidence, snapshots = [], {}, []
+        snapshots = []
         for label, entry_id in sorted(references.items()):
             check_admission()
             entry = await deadline.run(asyncio.to_thread(cache.resolve_session_entry, entry_id,
                                             workspace_id=workspace_id_for_path(context.workspace_root),
                                             session_id=context.session_id, max_bytes=budget))
             check_admission()
-            await authorize(ActionDescriptor.file_read(str(entry.path), mode="model_evidence",
-                                                       metadata={"sensitive": True, "sensitivity_category": "cache_sensitive",
-                                                                 "platform": "model_services"}), self.gate)
+            snapshots.append((label, entry))
+            budget -= entry.size_bytes
+        return cache, snapshots
+
+    async def _artifacts(self, artifacts: dict[str, str], cache: Any, snapshots: list[tuple[str, Any]],
+                         budget: int, deadline: ActiveCallBudget, *,
+                         check_admission: Callable[[], None]) -> tuple[list[dict[str, str]], dict[str, bytes]]:
+        async def verify() -> None:
+            for _, entry in snapshots:
+                check_admission()
+                current = await deadline.run(asyncio.to_thread(cache.resolve_session_entry, entry.entry_id,
+                    workspace_id=entry.workspace_id, session_id=entry.session_id, max_bytes=entry.size_bytes))
+                check_admission()
+                if current != entry:
+                    raise ValueError("artifact changed while assembling the request")
+
+        # Check the entire selection after consent before reading even the first entry.
+        await verify()
+        media, evidence = [], {}
+        for label, entry in snapshots:
             check_admission()
 
             def read_entry():
@@ -292,7 +330,6 @@ class ModelTools:
 
             content = await deadline.run(asyncio.to_thread(read_entry))
             check_admission()
-            snapshots.append(entry)
             budget -= len(content)
             if label in artifacts and label != "depth":
                 media.append(await deadline.run(asyncio.to_thread(
@@ -301,15 +338,8 @@ class ModelTools:
             else:
                 evidence[label] = content
             check_admission()
-        # A later file consent may outlive an earlier artifact. Validate the
-        # complete snapshot again before it can be submitted to the provider.
-        for entry in snapshots:
-            check_admission()
-            current = await deadline.run(asyncio.to_thread(cache.resolve_session_entry, entry.entry_id,
-                workspace_id=entry.workspace_id, session_id=entry.session_id, max_bytes=entry.size_bytes))
-            check_admission()
-            if current != entry:
-                raise ValueError("artifact changed while assembling the request")
+        # Assembly may outlive an earlier artifact; preserve the final freshness check.
+        await verify()
         return media, evidence
 
     async def aclose(self) -> None:

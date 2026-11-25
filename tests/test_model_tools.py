@@ -120,8 +120,8 @@ async def test_disable_during_owned_cleanup_discards_success_even_after_reenable
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("boundary", ["network.fetch", "file.read"])
-async def test_disable_during_artifact_consent_never_reads_or_sends(tmp_path, monkeypatch, boundary):
+async def test_disable_during_artifact_consent_never_reads_or_sends(tmp_path, monkeypatch):
+    boundary = "network.fetch"
     monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "data"))
     settings = load_config()
     cache = CacheManager(settings.profile_layout.cache, profile_id=settings.profile)
@@ -525,7 +525,7 @@ async def test_artifact_change_during_consent_refuses_without_provider_call(tmp_
 
     class ChangingHuman(Human):
         async def request_approval(self, request):
-            if request.action.kind == "file.read":
+            if request.action.kind == "network.fetch":
                 if change == "checksum":
                     entry.path.write_bytes(b'x' * len(content))
                 else:
@@ -544,7 +544,7 @@ async def test_artifact_change_during_consent_refuses_without_provider_call(tmp_
             "candidates": [{"id": "a", "description": "eligible"}],
             "observation_refs": [entry.entry_id]})
         assert result["failure_code"] == "model_invalid_request", result
-        assert any(r.action.kind == "file.read" for r in human.requests)
+        assert len(human.requests) == 1 and human.requests[0].action.kind == "network.fetch"
         assert not requests and not owner._handles
     finally:
         reset_tool_context(token)

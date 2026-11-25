@@ -54,6 +54,8 @@ _CONFIG_SERVICE_ACTIONS: tuple[tuple[str, str], ...] = (
     ("set", "Upsert one declaration: set <id> --file <path>"),
     ("unset", "Remove future admission: unset <id>"),
     ("check", "Validate locally; --case checks an approved fixture without execution"),
+    ("permissions", "List model consent: permissions [service_id]"),
+    ("revoke", "Revoke model consent without disabling: revoke <service_id>"),
 )
 
 _CONFIG_LLM_SET_FLAGS: tuple[tuple[str, str], ...] = (
