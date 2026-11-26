@@ -14,6 +14,8 @@ import io
 import json
 import logging
 import math
+from pathlib import Path
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -42,6 +44,8 @@ class SnapshotEvidenceSettings:
     max_frame_bytes: int = 1024 * 1024
     max_pixels: int = 4096 * 4096
     cleanup_interval_s: float = 5.0
+    max_clip_bytes: int = 700 * 1024
+    max_clip_s: float = 10.0
 
     @classmethod
     def from_json(cls, raw: str) -> SnapshotEvidenceSettings:
@@ -51,12 +55,13 @@ class SnapshotEvidenceSettings:
         return cls(**values)
 
     def __post_init__(self) -> None:
-        for name, ceiling in (("ttl_s", 300.0), ("cleanup_interval_s", 60.0)):
+        for name, ceiling in (("ttl_s", 300.0), ("cleanup_interval_s", 60.0), ("max_clip_s", 10.0)):
             value = getattr(self, name)
             if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= ceiling:
                 raise ValueError(f"snapshot evidence {name} must be finite in (0, {ceiling}]")
         for name, ceiling in (("quota_bytes", 64 * 1024 * 1024),
-                              ("max_frame_bytes", 1024 * 1024), ("max_pixels", 4096 * 4096)):
+                              ("max_frame_bytes", 1024 * 1024), ("max_pixels", 4096 * 4096),
+                              ("max_clip_bytes", 700 * 1024)):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= ceiling:
                 raise ValueError(f"snapshot evidence {name} must be an integer in [1, {ceiling}]")
@@ -76,6 +81,8 @@ class EvidenceReference:
     size_bytes: int
     sensitive: bool = True
     syncable: bool = False
+    kind: str = "image"
+    duration_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +117,54 @@ def _text(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value or len(value) > 256:
         raise EvidenceError("evidence_invalid", f"Snapshot lacks bounded {name} identity")
     return value
+
+
+def _decode_video(video: Any, settings: SnapshotEvidenceSettings) -> tuple[bytes, str, str, float]:
+    """Probe bounded embedded clips locally, never fetch a URL or transcode evidence."""
+    if not isinstance(video, Mapping) or set(video) - {"mime", "data", "label"}:
+        raise EvidenceError("evidence_missing", "Clip did not share admitted video")
+    encoded, mime = video.get("data"), video.get("mime")
+    if not isinstance(encoded, str) or len(encoded) > 4 * ((settings.max_clip_bytes + 2) // 3):
+        raise EvidenceError("evidence_invalid", "Clip exceeds its encoded byte bound")
+    try:
+        content = base64.b64decode(encoded, validate=True)
+        suffix = {"video/mp4": ".mp4", "video/webm": ".webm"}.get(mime, "")
+        valid_container = (mime == "video/mp4" and content[4:8] == b"ftyp" or
+                           mime == "video/webm" and content.startswith(b"\x1a\x45\xdf\xa3"))
+        if not suffix or not valid_container or not 0 < len(content) <= settings.max_clip_bytes:
+            raise ValueError("unsupported or mismatched video container")
+    except ValueError as exc:
+        raise EvidenceError("evidence_invalid", "Clip is not bounded embedded MP4 or WebM") from exc
+    try:
+        import cv2
+    except ImportError as exc:
+        raise EvidenceError("evidence_unavailable", "Video validation requires the optional OpenCV dependency") from exc
+    with tempfile.TemporaryDirectory(prefix="leap-evidence-") as directory:
+        path = Path(directory) / f"clip{suffix}"
+        path.write_bytes(content)
+        capture = cv2.VideoCapture(str(path))
+        try:
+            fps = capture.get(cv2.CAP_PROP_FPS)
+            if not capture.isOpened() or not math.isfinite(fps) or not 0 < fps <= 32:
+                raise ValueError("invalid video rate")
+            frames = 0
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                frames += 1
+                if (frames > 32 or frame is None or frame.shape[0] * frame.shape[1] > settings.max_pixels
+                        or frames / fps > settings.max_clip_s + 0.001):
+                    raise ValueError("oversized clip")
+            duration = frames / fps
+            declared_frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+            if frames < 4 or not math.isfinite(declared_frames) or abs(declared_frames - frames) > 0.5:
+                raise ValueError("truncated or too-short clip")
+        except (ValueError, cv2.error) as exc:
+            raise EvidenceError("evidence_invalid", "Clip must decode completely within frame, pixel and duration bounds") from exc
+        finally:
+            capture.release()
+    return content, mime, suffix, duration
 
 
 def _decode(image: Any, settings: SnapshotEvidenceSettings) -> tuple[bytes, str, str]:
@@ -193,11 +248,17 @@ class SnapshotEvidenceService:
             raise EvidenceError("evidence_stale", "Native remaining-validity evidence is missing or expired")
         # Whole host elapsed time is deliberately conservative across node clocks.
         deadline = started_at + min(settings.ttl_s, remaining)
+        kind = "video" if "video" in snapshot else "image"
+        if "video" in snapshot and "image" in snapshot:
+            raise EvidenceError("evidence_invalid", "Export exactly one evidence kind at a time")
         try:
-            content, mime, suffix = await asyncio.wait_for(
-                asyncio.to_thread(_decode, snapshot.get("image"), settings), max(0, deadline - time.monotonic()))
+            decoded = await asyncio.wait_for(
+                asyncio.to_thread(_decode_video if kind == "video" else _decode, snapshot.get(kind), settings),
+                max(0, deadline - time.monotonic()))
+            content, mime, suffix = decoded[:3]
+            duration = decoded[3] if kind == "video" else None
         except TimeoutError as exc:
-            raise EvidenceError("evidence_stale", "Snapshot expired during image validation") from exc
+            raise EvidenceError("evidence_stale", "Evidence expired during media validation") from exc
         if deadline <= time.monotonic():
             raise EvidenceError("evidence_stale", "Snapshot expired during transport or validation")
         workspace = workspace_id_for_path(context.workspace_root)
@@ -210,10 +271,13 @@ class SnapshotEvidenceService:
         observation = uuid.uuid4().hex
         event = HardwareEvent(
             kind=EventKind.SNAPSHOT_EVIDENCE, device_id=workcell, channel_id=camera,
-            quantity="snapshot_reference", detail="Caller-owned transient snapshot reference", observed_at=observed,
+            quantity="clip_reference" if kind == "video" else "snapshot_reference",
+            detail=f"Caller-owned transient {kind} reference", observed_at=observed,
             value={"observation_id": observation, "frame": frame, "capture_id": capture,
                    "camera": camera, "observed_at": observed, "content_hash": digest,
-                   "sensitive": True, "syncable": False},
+                   "kind": kind, "duration_s": duration, "sensitive": True, "syncable": False,
+                   "media_source": snapshot.get("source", "live"),
+                   "run_id": snapshot.get("run_id", ""), "historical": snapshot.get("historical", False)},
         )
         try:
             receipt = await asyncio.wait_for(self._signals.admit_record(
@@ -232,7 +296,7 @@ class SnapshotEvidenceService:
         record = json.loads(receipt.payload_json)
         if record.get("value") != event.value:
             raise EvidenceError("evidence_signal_refused", "Snapshot provenance was removed or changed by admission", category="privacy")
-        await self._consent(context, scope, settings, len(content))
+        await self._consent(context, scope, settings, len(content), kind=kind, duration=duration)
         if deadline <= time.monotonic() or self._closed:
             raise EvidenceError("evidence_stale", "Snapshot expired while awaiting retention consent")
         expires = time.time() + (deadline - time.monotonic())
@@ -241,9 +305,10 @@ class SnapshotEvidenceService:
         entry = await self._persist(cache, content, workspace_id=workspace, session_id=context.session_id,
                                     category=_CATEGORY, source=_SOURCE, suffix=suffix, expires_at=expires,
                                     monotonic_deadline=deadline, max_session_bytes=settings.quota_bytes,
-                                    metadata={"mime": mime, "observation_id": observation, "record": record})
+                                    metadata={"mime": mime, "kind": kind, "duration_s": duration,
+                                              "observation_id": observation, "record": record})
         return EvidenceReference(entry.entry_id, observation, frame, capture, camera, observed,
-                                 expires, digest, mime, len(content))
+                                 expires, digest, mime, len(content), kind=kind, duration_s=duration)
 
     @staticmethod
     async def _preflight(runtime: Any, workspace: str, session: str, size: int, quota: int) -> CacheManager:
@@ -255,18 +320,24 @@ class SnapshotEvidenceService:
             raise EvidenceError("evidence_quota_full", "Session quota is full; no existing artifact is evicted")
         return cache
 
-    async def _consent(self, context: Any, scope: RecordScope, settings: SnapshotEvidenceSettings, size: int) -> None:
+    async def _consent(self, context: Any, scope: RecordScope, settings: SnapshotEvidenceSettings, size: int,
+                       *, kind: str, duration: float | None) -> None:
         evaluate = getattr(context.orchestrator, "evaluate", None)
         if not callable(evaluate):
             raise EvidenceError("evidence_approval_unavailable", "Retention needs an interactive approval route", category="security")
         action = ActionDescriptor(
             kind=ActionKind.FILE_WRITE.value, effect=ActionEffect.WRITE.value,
             summary="Retain passive camera evidence in this session",
-            detail=f"Keep one sensitive snapshot for at most {settings.ttl_s:g} seconds, capped by native validity. No upload or primary-chat image.",
+            detail=f"Keep one sensitive {f'{duration:g}-second clip' if kind == 'video' else 'snapshot'} "
+                   f"for at most {settings.ttl_s:g} seconds, capped by native validity. "
+                   + ("The same snapshot may be shown to the primary model under frame-sharing consent. "
+                      if kind == "image" else "Clip bytes are not attached to primary chat. ")
+                   + "Any specialist-service transfer needs independent destination consent.",
             resource=f"session-evidence:{scope.workspace_id}/{scope.session_id}",
             session_id=scope.session_id, turn_id=context.task_id,
             metadata={"platform": "hardware_snapshot", "sensitivity_category": "cache_sensitive",
-                      "bytes": size, "ttl_s": settings.ttl_s, "syncable": False},
+                      "bytes": size, "ttl_s": settings.ttl_s, "kind": kind, "duration_s": duration,
+                      "syncable": False},
         )
         try:
             decision = await evaluate(action)
@@ -339,10 +410,11 @@ class SnapshotEvidenceService:
 
 async def export_snapshot_result(
     sink: SessionEvidenceSink | None, result: dict[str, Any], *, workcell: str, started_at: float,
+    share_frames: bool = False,
 ) -> dict[str, Any]:
-    """Always consume volatile bytes; specialist-only export never attaches images."""
+    """Consume volatile bytes; attach the exact retained image only under sharing consent."""
     snapshot = dict(result.get("result") or {})
-    result["result"] = {key: value for key, value in snapshot.items() if key != "image"}
+    result["result"] = {key: value for key, value in snapshot.items() if key not in {"image", "video"}}
     result.pop("_attachments", None)
     if not result.get("ok"):
         return {**result, "evidence": {"status": "missing", "reason": "snapshot_failed"}}
@@ -355,6 +427,14 @@ async def export_snapshot_result(
                 "error": str(exc), "failure": asdict(exc.failure),
                 "failure_code": exc.failure.code, "retryable": False,
                 "next_step": exc.failure.next_step}
+    if share_frames and reference.kind == "image":
+        from leapflow.hardware.skill_results import share_frame
+        result["result"] = snapshot
+        share_frame(result, consent=True)
     return {**result, "evidence": {"status": "retained", **asdict(reference)},
-            "next_step": "Call model_query directly with this session artifact ID; runtime requests any necessary "
-                         "service consent. Do not ask for duplicate consent in dialogue."}
+            "next_step": "This is caller-owned evidence, not a decision. You decide whether to use the shared "
+                         "snapshot, consult an advisory service, or gather more context. If consulting, check "
+                         "model_describe capacity, label artifacts by viewpoint (scene, wrist, scene_clip), "
+                         "provide concrete eligible candidates and put measurements in state. "
+                         "Temporal clips can support stability or slip questions; score margins are uncalibrated. "
+                         "Runtime requests service consent; do not ask for duplicate consent in dialogue."}

@@ -11,6 +11,13 @@ assembly, side-effect batch gating, and guardrail evaluation share one
 dispatch state machine; splitting them would fork the failure path the
 gating exists to protect. Productive turn-cap extension remains part of this
 shared evaluation path, before its terminal verdict is handed to the loop.
+Scoped inference receipts are attached at the same execution boundary so
+cancellation and transcript persistence cannot diverge between loop modes.
+Verified-plan lineage uses that same boundary and remains advisory metadata.
+Replay projects consultation identity separately from durable private receipts
+so ordinary result compaction cannot erase the LLM's explicit reference.
+Attachment inference shares live caller accounting, with description reuse
+bounded to the current session/task rather than a process-global visual cache.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import json
 import time
 import uuid
 import logging
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from leapflow.llm.message_builder import build_user_message_text
@@ -74,6 +82,8 @@ class ToolDispatchEngine:
         # Images popped from tool results, keyed by tool_call_id, until the
         # batch that produced them shows them to the model.
         self._attachments: Dict[str, tuple[ToolAttachment, ...]] = {}
+        self._description_cache: OrderedDict[tuple[str, ...], str] = OrderedDict()
+        self._description_scope: tuple[Any, str] | None = None
 
     def _check_guardrail(
         self,
@@ -365,8 +375,22 @@ class ToolDispatchEngine:
     def _compact_tool_result(
         self, tool_name: str, arguments: Dict[str, Any] | None, result: Any
     ) -> Any:
-        """Return compact tool evidence for LLM replay."""
-        return self._engine._context_governance_controller.compact_tool_result(tool_name, arguments, result)
+        """Return compact tool evidence; durable receipts never consume replay budget."""
+        consultation = None
+        if isinstance(result, dict) and "collaboration_signal_receipts" in result:
+            result = {key: value for key, value in result.items() if key != "collaboration_signal_receipts"}
+            raw = result.get("consultation")
+            if isinstance(raw, dict):
+                consultation = {key: raw[key] for key in (
+                    "call_id", "scope", "task_id", "tool_call_id", "service_id", "status",
+                    "failure_code", "elapsed_ms", "result_digest", "adoption") if key in raw}
+                result["consultation"] = consultation
+        compact = self._engine._context_governance_controller.compact_tool_result(tool_name, arguments, result)
+        if consultation is not None and isinstance(compact, dict):
+            # Error compaction strips unknown fields. Identity is still required
+            # to explicitly reference refused/overridden advice; it grants nothing.
+            compact = {**compact, "consultation": consultation}
+        return compact
 
     @staticmethod
     def _head_tail_memory_text(text: str, limit: int) -> str:
@@ -610,10 +634,16 @@ class ToolDispatchEngine:
         )
         registry = getattr(engine, "_model_capabilities", None)
         sees_images = model_sees_images(registry, model)
+        capture = engine._learning_bridge._primary_capture()
+        scope = (capture.scope, capture.task_id)
+        if scope != self._description_scope:
+            self._description_cache.clear()
+            self._description_scope = scope
         resolver = getattr(engine, "_vision_capability", None)
         if resolver is not None:
             sees_images = await resolver.sees_images(
-                llm, model, hint=sees_images, registry=registry
+                llm, model, hint=sees_images, registry=registry,
+                call_provider=engine._learning_bridge.call_primary,
             )
         await present_attachments(
             messages,
@@ -621,6 +651,8 @@ class ToolDispatchEngine:
             keep=int(getattr(engine._settings, "agent_tool_images_kept", 2)),
             sees_images=sees_images,
             vlm=getattr(engine, "_vlm", None),
+            call_provider=engine._learning_bridge.call_primary,
+            description_cache=self._description_cache,
         )
 
     async def _execute_tool_batch(
@@ -995,6 +1027,7 @@ class ToolDispatchEngine:
             task_id=contract.task_id,
             approval_bypass=getattr(self._engine._settings, "approval_bypass", False),
             orchestrator=orchestrator,
+            run_subagent=self._engine._run_subagent_goal,
         )
     async def _execute_tool_scoped(
         self,
@@ -1008,13 +1041,39 @@ class ToolDispatchEngine:
         Images the tool attached are popped here, before the ledger, trace or
         transcript sees the result, and held until the batch shows them.
         """
+        from leapflow.domain.events import RecordScope
+        from leapflow.layout import workspace_id_for_path
+        from leapflow.llm.services.telemetry import InferenceCapture, capture_inference
         from leapflow.tools.execution_context import reset_tool_context, set_tool_context
 
-        token = set_tool_context(self._tool_execution_context())
+        context = self._tool_execution_context()
+        scope = RecordScope(str(getattr(self._engine._settings, "profile", "") or ""),
+            workspace_id_for_path(context.workspace_root) if context else "",
+            context.session_id if context else "")
+        token = set_tool_context(context)
+        result: Dict[str, Any] = {"ok": False, "failure_code": "tool_failed"}
+        completed = False
+        capture: InferenceCapture | None = None
         try:
-            result = await self._execute_general_tool(tool_call, handlers)
+            with capture_inference(scope=scope, task_id=context.task_id if context else "",
+                tool_call_id=tool_call_id, sink=self._engine._usage_tracker) as capture:
+                result = await self._execute_general_tool(tool_call, handlers)
+                completed = True
+        except asyncio.CancelledError:
+            result["failure_code"] = "tool_cancelled"
+            raise
         finally:
             reset_tool_context(token)
+            if capture is not None and (capture.attempts or capture.consultations or capture.plans):
+                try:
+                    await self._engine._learning_bridge._admit_collaboration_records(result, capture)
+                    if not completed:
+                        self._engine._session_persistence._persist_message(
+                            scope.session_id, "tool", "Inference tool terminated without a delivered result",
+                            tool_name=str(tool_call.get("name") or ""), tool_call_id=tool_call_id,
+                            metadata=self._tool_execution_metadata(result))
+                except Exception:  # noqa: BLE001 - telemetry cannot replace an execution failure
+                    logger.warning("Inference tool receipt retention failed", exc_info=True)
         attachments = take_attachments(
             result, tool_call_id=tool_call_id, tool_name=str(tool_call.get("name", ""))
         )
@@ -1376,6 +1435,8 @@ class ToolDispatchEngine:
             "stdout_sha256",
             "stderr_sha256",
             "audit_returncode",
+            "collaboration_signal_receipts",
+            "collaboration_signal_status",
         ):
             if key in result:
                 metadata[key] = result[key]

@@ -400,6 +400,17 @@ class TestClassifyToolResultFailures:
 
 
 class TestClassifySystemError:
+    @pytest.mark.parametrize("exception_type", [
+        AttributeError, NameError, TypeError, IndexError, KeyError,
+        ImportError, AssertionError, NotImplementedError,
+    ])
+    def test_local_defects_bypass_message_taxonomy(self, classifier, exception_type) -> None:
+        env = classifier.classify_system_error(exception_type("context timeout connection refused"))
+        assert env.source == FailureSource.SYSTEM
+        assert env.category == "internal_defect"
+        assert env.recoverability == Recoverability.NON_RECOVERABLE
+        assert env.failure_code == f"internal_{exception_type.__name__.lower()}"
+
     def test_timeout_error(self, classifier: UnifiedErrorClassifier) -> None:
         exc = TimeoutError("Connection timed out")
         env = classifier.classify_system_error(exc)

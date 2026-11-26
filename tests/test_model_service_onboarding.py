@@ -61,7 +61,8 @@ def test_cross_process_toggle_same_and_distinct_ids_preserve_declarations(settin
     for process in processes:
         process.join(timeout=30)
         assert not process.is_alive() and process.exitcode == 0
-    assert service.model_services() == {name: {**declared, "enabled": False} for name in ("a", "b")}
+    assert service.model_services() == {name: {**declared, "enabled": False,
+        "media": {"max_images": 16, "max_videos": 0}} for name in ("a", "b")}
     assert load_config().llm_model == "primary" and load_config().llm_context_length == 54321
 
 
@@ -398,5 +399,73 @@ async def test_cancel_configuration_approval_does_not_write(settings):
         with pytest.raises(asyncio.CancelledError):
             await task
         assert not ConfigService(settings).model_services()
+    finally:
+        reset_tool_context(token)
+
+
+@pytest.mark.asyncio
+async def test_chat_onboards_registered_contract_codec_and_second_endpoint_without_core_edit(settings):
+    from types import SimpleNamespace
+    from leapflow.llm.services.config import parse_services
+    from test_model_tools import NovelContractPlugin
+
+    owner, registry, scoped, _, requests = compose({"selected_id": "a"})
+    plugin = NovelContractPlugin()
+    registry.register(plugin)
+    scoped.adopt_existing_plugins()
+    registry.bind_runtime(model_services=owner)
+    service = ConfigService(settings, model_services=owner)
+
+    def reload(**kwargs):
+        owner.publish(parse_services(service.model_services()))
+        return True
+
+    config_tools.set_config_context(SimpleNamespace(settings=settings, model_services=owner,
+        reload_runtime_config_if_changed=reload))
+    human = Human()
+    token = set_tool_context(ToolExecutionContext.from_strings(workspace_root=str(settings.workspace_root), session_id="own",
+                            orchestrator=ApprovalOrchestrator(human)))
+    try:
+        for name, declared in (
+            ("first", declaration()),
+            ("second", declaration(model="compatible-checkpoint", base_url="http://localhost:8099/v1")),
+            ("novel", declaration(task="test.label_choice.v1", codec="test.json.v1")),
+        ):
+            result = await config_model_service_handler({"operation": "set", "service_id": name, "declaration": declared})
+            assert result["ok"] and result["runtime_publication_confirmed"], result
+            checked = await config_model_service_handler({"operation": "check", "service_id": name})
+            assert checked["services"][0]["usable"] and not checked["services"][0]["endpoint_probed"]
+        assert not requests and len(service.model_services()) == 3
+        scoped.dispose_plugin(plugin.plugin_id)
+        checked = await config_model_service_handler({"operation": "check", "service_id": "novel"})
+        assert not checked["services"][0]["usable"]
+        prompts = len(human.requests)
+        rejected = await config_model_service_handler({"operation": "set", "service_id": "another",
+            "declaration": declaration(task="test.label_choice.v1", codec="test.json.v1")})
+        assert not rejected["ok"] and len(human.requests) == prompts
+        assert "another" not in service.model_services()
+    finally:
+        reset_tool_context(token)
+        config_tools.set_config_context(None)
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changes", [
+    {"task": "prediction", "output": "json_schema"},
+    {"task": "unknown.task.v1"}, {"codec": "unknown.codec.v1"},
+    {"provider": "anthropic", "request_options": {"seed": 3}},
+])
+async def test_incompatible_declarations_refused_before_cli_write_or_chat_consent(settings, changes):
+    service = ConfigService(settings)
+    with pytest.raises(ValueError):
+        service.set_model_service("bad", declaration(**changes))
+    human = Human()
+    token = set_tool_context(ToolExecutionContext.from_strings(workspace_root=str(settings.workspace_root), session_id="s",
+                            orchestrator=ApprovalOrchestrator(human)))
+    try:
+        result = await config_model_service_handler({"operation": "set", "service_id": "bad",
+                                                    "declaration": declaration(**changes)})
+        assert not result["ok"] and not human.requests and not service.model_services()
     finally:
         reset_tool_context(token)

@@ -853,6 +853,7 @@ class SkillRuntime:
             plan=plan,
             calculations=self._calculations,
             planning_settings=self._settings.planning,
+            episode_directory=self._settings.episodes.directory,
             planning_deadline=planning_deadline,
             planning_basis=planning_basis,
         )

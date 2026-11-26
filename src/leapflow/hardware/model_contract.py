@@ -406,7 +406,7 @@ def provider_request(task: str, request: Mapping[str, Any],
     ordered = sorted(images)
     return {"contract": PROVIDER_CONTRACT, "operation": "infer", "task": task,
             "input": dict(request), "image_order": ordered,
-            "_images": [dict(images[label]) for label in ordered]}
+            "_media": [dict(images[label]) for label in ordered]}
 
 
 def provider_result_schema(task: str) -> dict[str, Any]:

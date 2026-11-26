@@ -33,6 +33,10 @@ Size note (over 800 lines): the run path and the lease mechanics it owns
 connection table; splitting them would hand a run's lease to a second object
 that can outlive the service which renews it. Observation learning is delegated
 through a rebound Protocol; it does not acquire connections or own leases here.
+Explicit consultation lineage is recorded at the verified-plan boundary, sharing
+its terminal/cancellation path without introducing an execution or approval path.
+Bounded run bookkeeping retains only frozen lineage identity for later status
+observations, never an owning engine, sink, captured context, or extra sampler.
 """
 
 from __future__ import annotations
@@ -103,6 +107,7 @@ from leapflow.hardware.snapshot_evidence import SessionEvidenceSink, export_snap
 from leapflow.hardware.view_priors import ViewPriorPort
 from leapflow.hardware.write_governor import WriteGovernanceRequest, WriteGovernor
 from leapflow.security.actions import ActionDescriptor
+from leapflow.llm.services.telemetry import GovernedPlanRecord, record_governed_outcome, record_governed_plan
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +207,7 @@ class SkillService:
         self._evidence_sink = evidence_sink
         self._links: dict[str, _Link] = {}
         self._runs: dict[str, _HostRun] = {}
+        self._lineage: dict[str, GovernedPlanRecord] = {}
         self._background: set[asyncio.Task[Any]] = set()
 
     def set_gate(self, gate: Any) -> None:
@@ -221,6 +227,7 @@ class SkillService:
         for tracked in self._runs.values():
             _cancel(tracked.renewer)
         self._runs.clear()
+        self._lineage.clear()
         for task in list(self._background):
             task.cancel()
         links, self._links = self._links, {}
@@ -295,10 +302,16 @@ class SkillService:
                 declared = declared_arguments(as_mapping(listed), skill)
             request = split_request(kwargs, declared)
             if request.export_evidence:
-                if (skill != "perceive.snapshot" or request.candidates is not None
-                        or request.args.get("mode", "passive") != "passive"
+                if (request.candidates is not None or request.args.get("mode", "passive") != "passive"
                         or kwargs.get("approved_plan") is not None or request.dry_run):
-                    raise SkillRefusal(FAILURE_INVALID_REQUEST, "Evidence export requires a fresh passive perceive.snapshot")
+                    raise SkillRefusal(FAILURE_INVALID_REQUEST, "Evidence export requires a fresh passive evidence skill")
+                listed = as_mapping(await self._request(
+                    target.node_id, target.link, "skill.list", {"workcell": target.workcell}))
+                specs = [entry for cell in listed.get("workcells", ())
+                         for entry in cell.get("skills", ()) if entry.get("skill_id") == skill]
+                if (len(specs) != 1 or specs[0].get("evidence_media") not in {"image", "video"}
+                        or specs[0].get("effect") != "read" or specs[0].get("leased", False)):
+                    raise SkillRefusal(FAILURE_INVALID_REQUEST, "Skill does not declare non-leased read evidence_media")
                 if not self._share_frames or not isinstance(self._evidence_sink, SessionEvidenceSink):
                     raise SkillRefusal(FAILURE_INVALID_REQUEST, "Evidence export needs hardware.share_frames and a bound session evidence sink")
             planned = await self._plan(target, request, kwargs.get("approved_plan"))
@@ -395,9 +408,12 @@ class SkillService:
                 exported = await export_snapshot_result(
                     self._evidence_sink, result, workcell=target.qualified,
                     started_at=started_at if started_at is not None else time.monotonic(),
+                    share_frames=self._share_frames,
                 )
                 status = exported.get("evidence", {}).get("status", "refused")
-                self._audit_record("skill_frames", target.qualified, skill, f"session evidence {status}; no primary-chat image")
+                shared = bool(exported.get("_attachments"))
+                self._audit_record("skill_frames", target.qualified, skill,
+                                   f"session evidence {status}; primary snapshot shared={shared}")
                 return exported
             shared = share_frame(result, consent=self._share_frames)
             if shared:
@@ -413,6 +429,25 @@ class SkillService:
             return refusal_result(
                 FAILURE_PLAN_UNVERIFIED, problem, workcell=target.qualified, skill=skill
             )
+        result: dict[str, Any] = {"status": "interrupted", "side_effect_state": SIDE_EFFECT_UNKNOWN}
+        try:
+            result = await self._run_verified(target, request, plan, permit_digest, planned, result)
+            return result
+        finally:
+            lineage = record_governed_plan(workcell=target.qualified, skill_id=skill,
+                plan_digest=str(plan["digest"]), permit_digest=permit_digest,
+                references=request.consultation_refs, result=result)
+            run_id = str(result.get("run_id") or "")
+            if lineage is not None and run_id:
+                self._lineage[run_id] = lineage
+                while len(self._lineage) > _MAX_TRACKED_RUNS:
+                    self._lineage.pop(next(iter(self._lineage)))
+
+    async def _run_verified(self, target: _Target, request: RunRequest, plan: Mapping[str, Any],
+                            permit_digest: str, planned: Mapping[str, Any],
+                            progress: dict[str, Any]) -> dict[str, Any]:
+        """The existing governance path, entered only after digest verification."""
+        skill = request.skill
         if self._view_priors is not None and skill == "perceive.survey":
             self._view_priors.expect_scope(target.qualified, str(as_mapping(plan.get("basis")).get("observation_scope", "")))
         base = {
@@ -443,6 +478,8 @@ class SkillService:
                     str(as_mapping(plan.get('basis')).get('observation_scope', '')),
                     'admission', started, str(plan['digest']))
             return started
+        # Preserve the confirmed run identity even if the waiting caller is cancelled.
+        progress["run_id"] = started.run_id
         if not request.wait:
             return {
                 "ok": True,
@@ -879,7 +916,11 @@ class SkillService:
         view = run_view(node_id, run)
         if self._view_priors is not None:
             self._view_priors.record_run(node_id, run)
-        tracked = self._runs.get(str(run.get("run_id") or ""))
+        run_id = str(run.get("run_id") or "")
+        lineage = self._lineage.get(run_id)
+        if lineage is not None:
+            record_governed_outcome(lineage, view)
+        tracked = self._runs.get(run_id)
         if tracked is None:
             return view
         if tracked.lease_error:

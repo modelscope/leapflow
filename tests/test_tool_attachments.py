@@ -22,7 +22,6 @@ from leapflow.engine.engine import AgentEngine
 from leapflow.engine.prompt_cache import PrefixCacheOptimizer
 from leapflow.engine.tool_dispatch_engine import ToolDispatchEngine
 from leapflow.engine.tools.execution_trace import ExecutionTrace
-from leapflow.engine.tools import tool_attachments
 from leapflow.engine.tools.tool_attachments import (
     ATTACHMENTS_KEY,
     ToolAttachment,
@@ -92,7 +91,6 @@ def test_only_the_newest_tool_images_stay_live() -> None:
 
 
 async def test_a_model_without_vision_gets_a_description() -> None:
-    tool_attachments._DESCRIPTIONS.clear()
     vlm = SimpleNamespace(achat=AsyncMock(return_value=SimpleNamespace(content="A red cube.")))
     messages: list[dict[str, Any]] = []
     await present_attachments(messages, [_attachment("c1")], keep=2, sees_images=False, vlm=vlm)
@@ -177,6 +175,150 @@ async def test_the_dispatcher_strips_the_image_and_shows_it_after_the_batch() ->
             assert engine._tool_dispatch._attachments == {}
         finally:
             lt.close()
+
+
+@pytest.mark.parametrize("terminal", ["returned", "failed", "cancelled", "timed_out"])
+async def test_attachment_inference_retains_owned_receipts(tmp_path, terminal) -> None:
+    import asyncio
+    import json
+    from leapflow.llm.base import LLMChatResponse
+    from leapflow.storage.conversation_store import DuckDBConversationStore
+    from test_tool_dispatch_engine import _collaboration_engine
+
+    class Provider:
+        model = "description-model"
+
+        async def achat(self, messages, **options):
+            assert "inference_tool_call_id" not in options
+            assert messages[0]["content"][1]["type"] == "image_url"
+            if terminal == "failed":
+                raise ValueError("description rejected")
+            if terminal == "cancelled":
+                raise asyncio.CancelledError()
+            if terminal == "timed_out":
+                raise asyncio.TimeoutError()
+            return LLMChatResponse(content="A red cube.", usage={})
+
+    engine, memory = await _collaboration_engine(tmp_path)
+    store = DuckDBConversationStore(tmp_path / "attachments.duckdb")
+    store.create_session("own")
+    engine.set_conversation_store(store)
+    engine._vlm = Provider()
+    dispatch = engine._tool_dispatch
+    dispatch._attachments["camera-call"] = (_attachment("camera-call"),)
+    messages = []
+    try:
+        if terminal == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await dispatch.append_tool_attachments(messages, ["camera-call"])
+        else:
+            await dispatch.append_tool_attachments(messages, ["camera-call"])
+            assert messages[-1]["_volatile_context"]
+            assert ("A red cube." in messages[-1]["content"]) == (terminal == "returned")
+        (attempt,) = engine._usage_tracker.inference_records()
+        assert attempt.scope.session_id == "own" and attempt.tool_call_id == "camera-call"
+        assert attempt.model == "description-model"
+        expected = "failed" if terminal == "timed_out" else terminal
+        assert attempt.status == expected and attempt.usage_json == "{}"
+        combined = engine._usage_tracker.combined_usage()["combined"]
+        assert combined["attempts"] == 1 and combined["unknown_usage_attempts"] == 1
+        (row,) = store.get_messages("own")
+        assert row.role == "record" and row.content == ""
+        (receipt,) = row.metadata["collaboration_signal_receipts"]
+        assert receipt["lineage_eligible"] and receipt["scope"]["session_id"] == "own"
+        value = json.loads(receipt["payload_json"])["value"]
+        assert value["tool_call_id"] == "camera-call" and not value["usage_known"]
+        assert _JPEG not in receipt["payload_json"]
+    finally:
+        store.close()
+        memory.close()
+
+
+async def test_attachment_cache_is_owned_and_provider_accounting_is_deduplicated(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from openai.resources.chat import AsyncCompletions
+    from openai.types.chat import ChatCompletion
+    from leapflow.llm.openai_provider import OpenAIChat
+    from leapflow.engine.session.session_factory import build_session_engine
+    from test_llm_provider_retry_ownership import _provider, _recorded_body
+    from test_tool_dispatch_engine import _collaboration_engine
+
+    first, memory1 = await _collaboration_engine(tmp_path / "first")
+    second = build_session_engine(first, session_id="second", workspace_root=tmp_path / "second",
+                                  working_memory=WorkingMemoryProvider(max_tokens=1024))
+    provider = _provider(max_retries=1)
+    alternate = OpenAIChat(api_key="test", model="another-model", base_url="https://example.invalid/v1",
+                           max_retries=1)
+    async def complete(*args, **kwargs):
+        await asyncio.sleep(0)
+        return ChatCompletion.model_validate(_recorded_body())
+
+    create = AsyncMock(side_effect=complete)
+    monkeypatch.setattr(AsyncCompletions, "create", create)
+    first._vlm = second._vlm = provider
+
+    async def show(engine, call_id="image-call"):
+        engine._tool_dispatch._attachments[call_id] = (_attachment(call_id),)
+        messages = []
+        await engine._tool_dispatch.append_tool_attachments(messages, [call_id])
+        return messages[-1]["content"]
+
+    try:
+        assert first._tool_dispatch._attachments is not second._tool_dispatch._attachments
+        assert first._tool_dispatch._description_cache is not second._tool_dispatch._description_cache
+        a, b = await asyncio.gather(show(first), show(second))
+        assert a == b
+        assert create.await_count == 2  # Same bytes in another workspace require a fresh call.
+        await show(first, "repeat")
+        assert create.await_count == 2
+        first._current_session_id = "fresh-run"
+        await show(first)
+        assert create.await_count == 3
+        first._vlm = alternate
+        await show(first)
+        assert create.await_count == 4
+        first_attempts = first._usage_tracker.inference_records()
+        second_attempts = second._usage_tracker.inference_records()
+        assert len(first_attempts) == 3 and len(second_attempts) == 1
+        assert all(item.accounting_level == "provider_attempt" for item in first_attempts)
+        assert first_attempts[0].scope.workspace_id != second_attempts[0].scope.workspace_id
+        assert first_attempts[1].scope.session_id == "fresh-run"
+        usage = first._usage_tracker.combined_usage()["combined"]
+        assert usage["attempts"] == 3 and usage["unknown_usage_attempts"] == 0
+        first._usage_tracker.record_api_call({}, call_id=first_attempts[0].call_id)
+        assert first._usage_tracker.combined_usage()["combined"]["attempts"] == 3
+    finally:
+        await provider.aclose()
+        await alternate.aclose()
+        memory1.close()
+
+
+async def test_attachment_vision_probe_is_accounted_only_when_called(tmp_path) -> None:
+    from leapflow.llm.base import LLMChatResponse
+    from leapflow.llm.vision_capability import VisionCapability, VisionVerdictStore
+    from test_tool_dispatch_engine import _collaboration_engine
+
+    engine, memory = await _collaboration_engine(tmp_path)
+    resolver = VisionCapability(store=VisionVerdictStore(None))
+    engine.set_vision_capability(resolver)
+
+    class Provider:
+        model = "probe-model"
+
+        async def achat(self, messages, **options):
+            return LLMChatResponse(content="left=unknown right=unknown", usage={})
+
+    engine._llm = Provider()
+    try:
+        for call_id in ("first-frame", "second-frame"):
+            engine._tool_dispatch._attachments[call_id] = (_attachment(call_id),)
+            await engine._tool_dispatch.append_tool_attachments([], [call_id])
+        (attempt,) = engine._usage_tracker.inference_records()
+        assert attempt.scope.session_id == "own" and attempt.model == "probe-model"
+        assert attempt.status == "returned" and attempt.tool_call_id == ""
+        assert resolver.remembered(engine._llm, "probe-model").vision is False
+    finally:
+        memory.close()
 
 
 @pytest.mark.parametrize(

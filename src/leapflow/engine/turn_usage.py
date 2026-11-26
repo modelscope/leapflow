@@ -13,8 +13,11 @@ Design:
 """
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
+import uuid
+from collections import deque
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from leapflow.engine.tools.tool_execution import (
@@ -23,6 +26,9 @@ from leapflow.engine.tools.tool_execution import (
     TIER_REPAIRED,
     TIER_SUCCEEDED,
 )
+
+from leapflow.domain.events import RecordAdmission, RecordScope
+from leapflow.llm.services.telemetry import InferenceAttempt, admitted_record_value, freeze_usage, usage_totals
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +198,7 @@ class TurnUsageTracker:
         self,
         *,
         steady_state_skip_turns: int = DEFAULT_STEADY_STATE_SKIP_TURNS,
+        max_feedback_records: int = 32,
     ) -> None:
         # ── Per-turn (reset each turn) ──
         self._prompt_tokens: int = 0
@@ -205,6 +212,11 @@ class TurnUsageTracker:
         self._provider_name: str = ""
         self._model: str = ""
         self._plugin_stats_sink: Optional[Any] = None
+        self._inference_records: dict[str, InferenceAttempt] = {}
+        # Only admitted, redacted receipts enter retrievable history. Full records
+        # live in the owning transcript; this deque is an explicitly bounded view.
+        self._collaboration_history: deque[RecordAdmission] = deque(maxlen=max(0, max_feedback_records))
+        self._plan_history: deque[RecordAdmission] = deque(maxlen=max(0, max_feedback_records))
 
         # ── Session-level (survive reset) ──
         self._steady_state_skip_turns: int = max(0, steady_state_skip_turns)
@@ -221,6 +233,7 @@ class TurnUsageTracker:
         *,
         provider: str = "",
         model: str = "",
+        call_id: str = "",
     ) -> None:
         """Accumulate usage from an LLM API response.
 
@@ -236,6 +249,17 @@ class TurnUsageTracker:
 
         Detection is structural (key existence), not provider-name matching.
         """
+        call_id = call_id or uuid.uuid4().hex
+        if any(record.call_id == call_id for record in self._inference_records.values()):
+            return
+        self.record_inference(InferenceAttempt(
+            call_id=call_id, attempt_id=call_id, source="primary", provider=provider, model=model,
+            status="returned", elapsed_ms=float(usage.get("latency_ms", 0) or 0),
+            usage_json=freeze_usage(usage), accounting_level="call_boundary",
+        ))
+
+    def _accumulate_primary(self, usage: Dict[str, Any], *, provider: str, model: str) -> None:
+        """Primary cache counters remain separate from specialist compute usage."""
         self._api_calls += 1
         prompt = usage.get("prompt_tokens", 0)
         cached = usage.get("cached_tokens", 0)
@@ -264,6 +288,88 @@ class TurnUsageTracker:
         if self._turn_index >= self._steady_state_skip_turns:
             self._steady_prompt_tokens += prompt
             self._steady_cached_tokens += cached
+
+    def record_inference(self, attempt: InferenceAttempt) -> None:
+        """Count every unique attempt, keeping specialist usage out of primary counters."""
+        if attempt.attempt_id in self._inference_records:
+            return
+        self._inference_records[attempt.attempt_id] = attempt
+        if attempt.source == "primary":
+            usage = json.loads(attempt.usage_json)
+            usage.setdefault("latency_ms", int(attempt.elapsed_ms))
+            self._accumulate_primary(usage, provider=attempt.provider, model=attempt.model)
+
+    def inference_records(self) -> tuple[InferenceAttempt, ...]:
+        return tuple(self._inference_records.values())
+
+    def combined_usage(self) -> dict[str, Any]:
+        return usage_totals(list(self._inference_records.values()))
+
+    def record_collaboration(self, receipt: RecordAdmission) -> None:
+        """Retain private signal receipts, never model-authored success claims."""
+        if not isinstance(receipt, RecordAdmission):
+            return
+        histories = {"model.consultation": self._collaboration_history, "model.plan_link": self._plan_history}
+        history = histories.get(receipt.event_type)
+        if (history is not None
+                and admitted_record_value(receipt, receipt.scope, event_type=receipt.event_type) is not None
+                and receipt not in history):
+            history.append(receipt)
+
+    def consultation_reference(self, scope: RecordScope, task_id: str, call_id: str) -> dict[str, Any] | None:
+        """Resolve an explicit reference only within the owning admitted task."""
+        if not task_id or not scope.session_id or not scope.workspace_id or not scope.profile_id:
+            return None
+        for receipt in reversed(self._collaboration_history):
+            value = admitted_record_value(receipt, scope, event_type="model.consultation", identity=call_id)
+            if value is not None and value.get("task_id") == task_id:
+                return value
+        return None
+
+    def restore_collaboration(self, metadata: dict[str, Any], scope: RecordScope) -> None:
+        """Restore only previously admitted receipts from the owning transcript."""
+        rows = metadata.get("collaboration_signal_receipts", [])
+        if not isinstance(rows, list):
+            return
+        for row in rows:
+            if (not isinstance(row, dict) or row.get("admitted") is not True
+                    or row.get("lineage_eligible") is not True or row.get("scope") != asdict(scope)
+                    or row.get("event_type") not in {"model.consultation", "model.plan_link"}
+                    or not isinstance(row.get("record_id"), str) or not row["record_id"]):
+                continue
+            receipt = RecordAdmission(True, str(row.get("reason") or ""), scope,
+                row["event_type"], row.get("payload_json", "{}"))
+            if admitted_record_value(receipt, scope, event_type=row["event_type"],
+                                     identity=row.get("record_id", "")) is not None:
+                self.record_collaboration(receipt)
+
+    def collaboration_feedback(self, scope: RecordScope, *, service_id: str = "") -> dict[str, Any]:
+        """Bounded caller-only validity/latency history, retrieved outside the prefix."""
+        selected = []
+        for receipt in self._collaboration_history:
+            if receipt.scope != scope:
+                continue
+            value = admitted_record_value(receipt, scope, event_type="model.consultation")
+            if value is None or service_id and value.get("service_id") != service_id:
+                continue
+            selected.append({key: value.get(key) for key in (
+                "call_id", "service_id", "status", "failure_code", "elapsed_ms", "adoption")})
+        call_ids = {item["call_id"] for item in selected}
+        plans = []
+        for receipt in self._plan_history:
+            value = admitted_record_value(receipt, scope, event_type="model.plan_link")
+            if value is None:
+                continue
+            references = value.get("references", [])
+            if not isinstance(references, list):
+                continue
+            if service_id and not any(isinstance(ref, dict) and ref.get("call_id") in call_ids for ref in references):
+                continue
+            plans.append(value)
+        return {"window": "bounded_session", "records": selected, "plan_links": plans,
+                "eligible": sum(item.get("status") == "eligible" for item in selected),
+                "noneligible": sum(item.get("status") != "eligible" for item in selected),
+                "measured_task_outcome": "unverified", "physical_authority": False}
 
     def set_plugin_stats_sink(self, sink: Any) -> None:
         """Install a cross-turn stats accumulator. Receives all record_tool_call data."""
@@ -344,6 +450,7 @@ class TurnUsageTracker:
         self._total_latency_ms = 0
         self._api_calls = 0
         self._tool_records.clear()
+        self._inference_records.clear()
         self._compression_applied = False
 
     def session_cache_stats(self) -> SessionCacheStats:
@@ -392,6 +499,7 @@ class TurnUsageTracker:
             "cache_hit_rate": s.cache_hit_rate,
             "cache_hit_rate_token_weighted": stats.token_weighted_hit_rate,
             "cache_hit_rate_steady_state": stats.steady_state_hit_rate,
+            "inference_usage": self.combined_usage(),
         }
 
     def format_log_line(self) -> str:

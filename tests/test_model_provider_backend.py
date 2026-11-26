@@ -210,6 +210,39 @@ async def test_identity_metadata_and_capability_loss_refuse(tmp_path, change):
         await registry.close_all()
 
 
+@pytest.mark.parametrize("invalid_identity", [False, True])
+async def test_hardware_usage_survives_domain_payload_extraction_and_refusal(tmp_path, invalid_identity):
+    from leapflow.domain.events import RecordScope
+    from leapflow.engine.turn_usage import TurnUsageTracker
+    from leapflow.llm.services.telemetry import capture_inference
+
+    registry, owner, state, _, _ = await compose(tmp_path)
+    tracker = TurnUsageTracker()
+    scope = RecordScope("profile", "workspace", "session")
+    try:
+        with capture_inference(scope=scope, task_id="task", tool_call_id="hardware-call", sink=tracker):
+            transport = await registry.transport("native_model")
+            if invalid_identity:
+                state["echo"]["instance"] = "different-instance"
+                with pytest.raises(TransportError, match="Answering model"):
+                    await transport.infer({"image": base64.b64encode(b"\xff\xd8fixture").decode(), "queries": ["cup"]})
+            else:
+                result = await transport.infer({"image": base64.b64encode(b"\xff\xd8fixture").decode(), "queries": ["cup"]})
+                assert result.detections == ()
+        records = tracker.inference_records()
+        operations = [json.loads(body["messages"][-1]["content"][0]["text"])["operation"]
+                      for body in state["requests"]]
+        assert operations == ["describe"] * 4 + ["infer"]
+        assert len(records) == len(state["requests"])
+        assert all(row.source == "specialist" and row.scope == scope for row in records)
+        assert all(row.tool_call_id == "hardware-call" and row.task_id == "task" for row in records)
+        assert all(json.loads(row.usage_json).get("prompt_tokens", 0) > 0 for row in records)
+        assert tracker.combined_usage()["specialist"]["calls"] == len(state["requests"])
+        assert tracker.combined_usage()["primary"]["calls"] == 0
+    finally:
+        await registry.close_all()
+
+
 async def test_missing_evidence_and_missing_injection_refuse(tmp_path):
     registry, owner, _, _, _ = await compose(tmp_path, receipt=False)
     try:

@@ -41,15 +41,12 @@ def _validate(args: dict[str, Any]) -> tuple[str, str, dict[str, Any] | None]:
     validated = None
     if operation == "set":
         specs = parse_services({service_id: args["declaration"]})
-        from leapflow.llm.provider_registry import get_default_registry, get_scoped_default_registry
-
-        get_scoped_default_registry()
-        if get_default_registry().get_plugin(specs[0].provider) is None:
-            raise ServiceError("Provider is unavailable; choose a discovered provider before saving",
-                               service_id=service_id, code="model_provider_unavailable")
-        # The existing v1 onboarding contract supports the built-in JSON codec.
-        if specs[0].codec != "json.v1":
-            raise ValueError("Chat onboarding requires the supported json.v1 codec")
+        status = config_tools._service().model_service_admission(specs)["services"][0]
+        problem = status["capability_problem"]
+        if problem:
+            raise ServiceError(f"Service admission refused ({problem}); choose a registered compatible capability/output mode",
+                               service_id=service_id, code="model_provider_unavailable" if problem == "provider_unavailable"
+                               else "model_invalid_configuration")
         validated = declarations(specs)[service_id]
     return operation, service_id, validated
 

@@ -879,9 +879,11 @@ def _profile_file_for_section(section: str) -> str:
 class ConfigService:
     """Read and mutate LeapFlow configuration through layout-owned paths."""
 
-    def __init__(self, settings: Settings, *, hardware_registry: Any = None) -> None:
+    def __init__(self, settings: Settings, *, hardware_registry: Any = None,
+                 model_services: Any = None) -> None:
         self._settings = settings
         self._hardware_registry = hardware_registry
+        self._model_services = model_services
         self._secrets = ScopedSecretResolver(settings.layout, settings.profile_layout)
 
     def snapshot(self) -> ConfigSnapshot:
@@ -1069,7 +1071,11 @@ class ConfigService:
     def set_model_service(self, service_id: str, declaration: object) -> ConfigMutationResult:
         """Validate a single declaration, then atomically upsert only its ID."""
         from leapflow.llm.services.config import declarations, parse_services
-        validated = declarations(parse_services({service_id: declaration}))
+        specs = parse_services({service_id: declaration})
+        status = self.model_service_admission(specs)["services"][0]
+        if status["capability_problem"]:
+            raise ValueError(f"Model service admission refused: {status['capability_problem']}")
+        validated = declarations(specs)
         return self._mutate_model_service(service_id, validated[service_id])
 
     def unset_model_service(self, service_id: str) -> ConfigMutationResult:
@@ -1108,26 +1114,22 @@ class ConfigService:
             _write_yaml_atomic(path, data)
         return ConfigMutationResult(True, f"Updated model service {service_id}", ("llm.services",), path)
 
+    def model_service_admission(self, specs: tuple[Any, ...]) -> dict[str, Any]:
+        """Resolve against the active composition, or a resource-free CLI composition."""
+        from leapflow.llm.services.composition import local_service_catalog
+        return local_service_catalog(self._settings, specs, owner=self._model_services)
+
     def check_model_services(self, service_id: str = "") -> dict[str, Any]:
         """Local-only validation/discovery; this is not endpoint or hardware qualification."""
-        from leapflow.llm.provider_registry import get_default_registry, get_scoped_default_registry
+        from leapflow.llm.services.config import parse_services
         catalog = self.model_services()
         if service_id and service_id not in catalog:
             raise ValueError(f"Unknown model service: {service_id}")
-        get_scoped_default_registry()
-        registry = get_default_registry()
+        specs = parse_services({name: item for name, item in catalog.items() if not service_id or name == service_id})
+        result = self.model_service_admission(specs)
         return {"ok": True, "mode": "local_only", "services": [
-            {"id": name, "provider": item["provider"], "task": item["task"],
-             "configured": True, "enabled": item.get("enabled", True),
-             "provider_available": registry.get_plugin(item["provider"]) is not None,
-             "usable": item.get("enabled", True) and registry.get_plugin(item["provider"]) is not None
-                       and item.get("codec", "json.v1") == "json.v1",
-             "unavailable_reason": "disabled" if not item.get("enabled", True) else
-                                   ("" if registry.get_plugin(item["provider"]) is not None
-                                    and item.get("codec", "json.v1") == "json.v1" else "capability_unavailable"),
-             "qualified_for_hardware": False, "endpoint_probed": False}
-            for name, item in catalog.items() if not service_id or name == service_id
-        ]}
+            {**item, "qualified_for_hardware": False, "endpoint_probed": False}
+            for item in result["services"]]}
 
     def configure_llm(
         self,

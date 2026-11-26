@@ -17,6 +17,7 @@ import openai
 from openai import AsyncOpenAI, OpenAI
 
 from leapflow.llm.base import ChunkCallback, LLMChatResponse, LLMProvider, ToolCallInfo
+from leapflow.llm.services.telemetry import ProviderAttempt, new_call_id
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,22 @@ def _extract_cached_tokens(usage: Any) -> int:
     if isinstance(hit, int) and hit > cached:
         cached = hit
     return cached
+
+
+def _parse_provider_usage(usage: Any) -> Dict[str, int]:
+    """Metadata extraction is contained and independent of response payload parsing."""
+    result: Dict[str, int] = {}
+    try:
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = getattr(usage, key, None)
+            if type(value) is int and value >= 0:
+                result[key] = value
+        cached = _extract_cached_tokens(usage)
+        if cached:
+            result["cached_tokens"] = cached
+    except Exception:  # noqa: BLE001 - telemetry never enters provider retry handling
+        logger.warning("OpenAI usage extraction failed", exc_info=True)
+    return result
 
 
 @dataclass(frozen=True)
@@ -238,17 +255,22 @@ class OpenAIChat(LLMProvider):
         **kwargs: Any,
     ) -> OpenAIChatResponse:
         messages = _sanitize_messages(messages)
+        call_id = new_call_id()
         last_err: Optional[BaseException] = None
         for attempt in range(self._max_retries):
             try:
-                if stream:
-                    return await self._achat_stream_collapsed(
-                        messages, enable_thinking=enable_thinking,
-                        on_chunk=on_chunk, **kwargs,
-                    )
-                return await self._achat_nonstream(
-                    messages, enable_thinking=enable_thinking, **kwargs
-                )
+                with ProviderAttempt(call_id, attempt + 1, self._profile.name,
+                                     kwargs.get("model", self._model)) as accounting:
+                    if stream:
+                        response = await self._achat_stream_collapsed(
+                            messages, enable_thinking=enable_thinking,
+                            on_chunk=on_chunk, accounting=accounting, **kwargs,
+                        )
+                    else:
+                        response = await self._achat_nonstream(
+                            messages, enable_thinking=enable_thinking, accounting=accounting, **kwargs
+                        )
+                    return accounting.response(response)
             except _RETRYABLE_ERRORS as exc:
                 last_err = exc
                 if attempt >= self._max_retries - 1:
@@ -266,6 +288,7 @@ class OpenAIChat(LLMProvider):
         messages: List[Dict[str, Any]],
         *,
         enable_thinking: bool,
+        accounting: ProviderAttempt | None = None,
         **kwargs: Any,
     ) -> OpenAIChatResponse:
         create_kwargs = {
@@ -277,19 +300,12 @@ class OpenAIChat(LLMProvider):
         t0 = time.monotonic()
         resp = await self._async.chat.completions.create(**create_kwargs)
         dt_ms = int((time.monotonic() - t0) * 1000)
+        usage_map = _parse_provider_usage(getattr(resp, "usage", None))
+        if accounting is not None:
+            accounting.observe(usage_map, getattr(resp, "model", None))
         choice = resp.choices[0]
         msg = choice.message
         text, thinking = self._extract_text_and_thinking(msg)
-        usage_map: Dict[str, int] = {}
-        u = getattr(resp, "usage", None)
-        if u is not None:
-            for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                v = getattr(u, k, None)
-                if isinstance(v, int):
-                    usage_map[k] = v
-            cached = _extract_cached_tokens(u)
-            if cached:
-                usage_map["cached_tokens"] = cached
         usage_map["latency_ms"] = dt_ms
 
         # Extract native tool_calls from the response message
@@ -327,6 +343,7 @@ class OpenAIChat(LLMProvider):
         *,
         enable_thinking: bool,
         on_chunk: ChunkCallback = None,
+        accounting: ProviderAttempt | None = None,
         **kwargs: Any,
     ) -> OpenAIChatResponse:
         create_kwargs = {
@@ -349,6 +366,9 @@ class OpenAIChat(LLMProvider):
         async for chunk in stream:
             if getattr(chunk, "model", None):
                 model_name = chunk.model
+            usage_map.update(_parse_provider_usage(getattr(chunk, "usage", None)))
+            if accounting is not None:
+                accounting.observe(usage_map, model_name)
             ch0 = chunk.choices[0] if chunk.choices else None
             if ch0 is None:
                 continue
@@ -364,15 +384,6 @@ class OpenAIChat(LLMProvider):
             d_think = getattr(delta, field, None)
             if isinstance(d_think, str) and d_think:
                 thinking_parts.append(d_think)
-            u = getattr(chunk, "usage", None)
-            if u is not None:
-                for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                    v = getattr(u, k, None)
-                    if isinstance(v, int):
-                        usage_map[k] = v
-                cached = _extract_cached_tokens(u)
-                if cached:
-                    usage_map["cached_tokens"] = cached
 
         dt_ms = int((time.monotonic() - t0) * 1000)
         usage_map.setdefault("latency_ms", dt_ms)
@@ -413,19 +424,23 @@ class OpenAIChat(LLMProvider):
             **kwargs,
         }
 
+        call_id = new_call_id()
         last_err: Optional[BaseException] = None
         for attempt in range(self._max_retries):
             try:
-                stream = await self._async.chat.completions.create(**create_kwargs)
-                async for chunk in stream:
-                    ch0 = chunk.choices[0] if chunk.choices else None
-                    if ch0 is None:
-                        continue
-                    delta = ch0.delta
-                    d_content = getattr(delta, "content", None)
-                    if d_content:
-                        yield d_content
-                return
+                with ProviderAttempt(call_id, attempt + 1, self._profile.name, create_kwargs["model"]) as accounting:
+                    stream = await self._async.chat.completions.create(**create_kwargs)
+                    async for chunk in stream:
+                        accounting.observe(_parse_provider_usage(getattr(chunk, "usage", None)),
+                                           getattr(chunk, "model", None))
+                        ch0 = chunk.choices[0] if chunk.choices else None
+                        if ch0 is None:
+                            continue
+                        delta = ch0.delta
+                        d_content = getattr(delta, "content", None)
+                        if d_content:
+                            yield d_content
+                    return
             except _RETRYABLE_ERRORS as exc:
                 last_err = exc
                 if attempt >= self._max_retries - 1:
@@ -447,16 +462,21 @@ class OpenAIChat(LLMProvider):
         """Synchronous chat with retry (uses the synchronous OpenAI client)."""
         messages = _sanitize_messages(messages)
 
+        call_id = new_call_id()
         last_err: Optional[BaseException] = None
         for attempt in range(self._max_retries):
             try:
-                if stream:
-                    return self._chat_stream_collapsed(
-                        messages, enable_thinking=enable_thinking, **kwargs
-                    )
-                return self._chat_nonstream(
-                    messages, enable_thinking=enable_thinking, **kwargs
-                )
+                with ProviderAttempt(call_id, attempt + 1, self._profile.name,
+                                     kwargs.get("model", self._model)) as accounting:
+                    if stream:
+                        response = self._chat_stream_collapsed(
+                            messages, enable_thinking=enable_thinking, accounting=accounting, **kwargs
+                        )
+                    else:
+                        response = self._chat_nonstream(
+                            messages, enable_thinking=enable_thinking, accounting=accounting, **kwargs
+                        )
+                    return accounting.response(response)
             except _RETRYABLE_ERRORS as exc:
                 last_err = exc
                 if attempt >= self._max_retries - 1:
@@ -474,6 +494,7 @@ class OpenAIChat(LLMProvider):
         messages: List[Dict[str, Any]],
         *,
         enable_thinking: bool,
+        accounting: ProviderAttempt | None = None,
         **kwargs: Any,
     ) -> OpenAIChatResponse:
         create_kwargs = {
@@ -485,19 +506,12 @@ class OpenAIChat(LLMProvider):
         t0 = time.monotonic()
         resp = self._sync.chat.completions.create(**create_kwargs)
         dt_ms = int((time.monotonic() - t0) * 1000)
+        usage_map = _parse_provider_usage(getattr(resp, "usage", None))
+        if accounting is not None:
+            accounting.observe(usage_map, getattr(resp, "model", None))
         choice = resp.choices[0]
         msg = choice.message
         text, thinking = self._extract_text_and_thinking(msg)
-        usage_map: Dict[str, int] = {}
-        u = getattr(resp, "usage", None)
-        if u is not None:
-            for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                v = getattr(u, k, None)
-                if isinstance(v, int):
-                    usage_map[k] = v
-            cached = _extract_cached_tokens(u)
-            if cached:
-                usage_map["cached_tokens"] = cached
         usage_map["latency_ms"] = dt_ms
 
         # Extract native tool_calls from the response message (sync path)
@@ -534,6 +548,7 @@ class OpenAIChat(LLMProvider):
         messages: List[Dict[str, Any]],
         *,
         enable_thinking: bool,
+        accounting: ProviderAttempt | None = None,
         **kwargs: Any,
     ) -> OpenAIChatResponse:
         create_kwargs = {
@@ -556,6 +571,9 @@ class OpenAIChat(LLMProvider):
         for chunk in stream:
             if getattr(chunk, "model", None):
                 model_name = chunk.model
+            usage_map.update(_parse_provider_usage(getattr(chunk, "usage", None)))
+            if accounting is not None:
+                accounting.observe(usage_map, model_name)
             ch0 = chunk.choices[0] if chunk.choices else None
             if ch0 is None:
                 continue
@@ -569,15 +587,6 @@ class OpenAIChat(LLMProvider):
             d_think = getattr(delta, field, None)
             if isinstance(d_think, str) and d_think:
                 thinking_parts.append(d_think)
-            u = getattr(chunk, "usage", None)
-            if u is not None:
-                for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                    v = getattr(u, k, None)
-                    if isinstance(v, int):
-                        usage_map[k] = v
-                cached = _extract_cached_tokens(u)
-                if cached:
-                    usage_map["cached_tokens"] = cached
 
         dt_ms = int((time.monotonic() - t0) * 1000)
         usage_map.setdefault("latency_ms", dt_ms)

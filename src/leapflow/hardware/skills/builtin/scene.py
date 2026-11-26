@@ -205,6 +205,7 @@ class Snapshot:
         },
         effect=EFFECT_READ,
         requires=_SNAPSHOT_REQUIRES,
+        evidence_media="image",
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:

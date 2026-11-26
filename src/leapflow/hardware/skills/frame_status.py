@@ -44,11 +44,12 @@ class Accuracy:
 
     def within(self, required: "Accuracy") -> bool:
         """True when this bound is no worse than *required* on every axis it names."""
-        if self.translation_mm > required.translation_mm:
+        if not math.isfinite(self.translation_mm) or not 0 <= self.translation_mm <= required.translation_mm:
             return False
-        if required.rotation_deg is None or self.rotation_deg is None:
+        if required.rotation_deg is None:
             return True
-        return self.rotation_deg <= required.rotation_deg
+        return (self.rotation_deg is not None and math.isfinite(self.rotation_deg)
+                and 0 <= self.rotation_deg <= required.rotation_deg)
 
     def plus(self, other: "Accuracy | None") -> "Accuracy":
         """Errors stacked along a chain (a conservative, additive bound)."""
@@ -56,8 +57,8 @@ class Accuracy:
             return self
         rotation = (
             None
-            if self.rotation_deg is None and other.rotation_deg is None
-            else (self.rotation_deg or 0.0) + (other.rotation_deg or 0.0)
+            if self.rotation_deg is None or other.rotation_deg is None
+            else self.rotation_deg + other.rotation_deg
         )
         return Accuracy(self.translation_mm + other.translation_mm, rotation)
 

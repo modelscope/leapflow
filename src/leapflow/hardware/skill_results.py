@@ -12,6 +12,10 @@ flagged ``effect_uncertain`` and the next step forbids replaying the plan.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
+import math
 from typing import Any, Mapping
 
 from leapflow.hardware.skills.protocol import (
@@ -46,6 +50,8 @@ from leapflow.hardware.skills.protocol import (
     STATUS_SUCCEEDED,
 )
 
+logger = logging.getLogger(__name__)
+
 # Host-side failure codes (the node's own codes live in ``skills.protocol``).
 FAILURE_NODE_UNREACHABLE = "node_unreachable"
 FAILURE_SKILL_UNSUPPORTED = "skill_unsupported"
@@ -69,7 +75,9 @@ _NEXT_STEPS: dict[str, str] = {
         "A frame this skill needs does not hold. hw_skill_list names, for each unavailable "
         "skill, the shortest way to restore it (next; motion=false steps move nothing) -- "
         "often vouching for or installing an existing measurement rather than recalibrating. "
-        "Offer that to the user, run it, then plan again."
+        "Offer a complete step for preview/approval; collect needs_args before previewing it. "
+        "Distinguish missing measurement, legacy evidence, replaced dependencies, unknown "
+        "accuracy, drift, and task-scope mismatch; then plan again."
     ),
     FAILURE_TARGET_NOT_FOUND: (
         "The id is no longer current, or fresh depth shows the object moved/disappeared. "
@@ -125,9 +133,11 @@ _NEXT_STEPS: dict[str, str] = {
     ),
     FAILURE_SKILL_UNAVAILABLE: (
         "A requirement is unmet (the error names it). When result.readiness.next_steps is "
-        "present, offer the user its first step (steps with motion=false move nothing) and "
-        "run it as written, then plan again; otherwise satisfy the requirement the error "
-        "names, or reach the goal with a skill hw_skill_list shows as available."
+        "present, offer its first actionable step for preview and ordinary approval "
+        "(motion=false moves nothing). For actionable=false, collect needs_args first; "
+        "never execute an incomplete step as written. Missing grasp evidence can be inspected "
+        "with grasp.evidence without recalibration. Otherwise satisfy the named requirement "
+        "or use a skill hw_skill_list shows as available."
     ),
     FAILURE_INVALID_ARGS: (
         "Nothing ran. The skill refused its args: the error names each argument it refused "
@@ -267,7 +277,7 @@ def workcell_view(
     for entry in cell.get("skills") or ():
         if not isinstance(entry, Mapping) or (skill and entry.get("skill_id") != skill):
             continue
-        card = {key: entry.get(key) for key in ("skill_id", "version", "effect", "card", "consent")}
+        card = {key: entry.get(key) for key in ("skill_id", "version", "effect", "card", "consent", "evidence_media")}
         if skill:
             card["args_schema"] = entry.get("args_schema")
         else:
@@ -403,6 +413,9 @@ def outcome_fields(outcome: Mapping[str, Any]) -> dict[str, Any]:
     }
     if outcome.get("evidence"):
         fields["evidence"] = outcome["evidence"]
+        verification = _verification_feedback(as_mapping(outcome["evidence"]))
+        if verification is not None:
+            fields["operation_verification"] = verification
     if outcome.get("effect") == EFFECT_READ:
         # A READ skill's answer: the engine lets the rest of a tool batch run
         # after a failed observation, which a refused actuation must not do.
@@ -420,6 +433,58 @@ def outcome_fields(outcome: Mapping[str, Any]) -> dict[str, Any]:
         if side_effect != SIDE_EFFECT_NONE:
             fields["effect_uncertain"] = True
     return fields
+
+
+def _verification_feedback(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Bounded node-verifier observations, not an LLM label or full-task verdict.
+
+    Digests bind the complete retained node notes; replay carries metadata only.
+    The eight-record window is a serialization bound, not a physical acceptance limit.
+    """
+    try:
+        rows = []
+        standalone = as_mapping(evidence.get("grasp_verify"))
+        if standalone:
+            rows.append(standalone)
+        cycle = as_mapping(evidence.get("grasp_cycle"))
+        stages = cycle.get("stages", cycle.get("completed_stages", []))
+        if isinstance(stages, list):
+            rows.extend(as_mapping(stage["verification"]) for stage in stages
+                        if isinstance(stage, Mapping) and isinstance(stage.get("verification"), Mapping))
+        records = []
+        for row in rows[-8:]:
+            identity = as_mapping(row.get("source_identity"))
+            measured = as_mapping(row.get("evidence"))
+            record: dict[str, Any] = {"passed": row.get("passed") if type(row.get("passed")) is bool else None}
+            for key in ("stage", "state", "qualification_digest"):
+                if isinstance(row.get(key), str) and len(row[key]) <= 256:
+                    record[key] = row[key]
+            record["source_identity"] = {key: identity[key] for key in (
+                "session_id", "scene_id", "calibration_digest")
+                if isinstance(identity.get(key), str) and len(identity[key]) <= 256}
+            stamp = identity.get("observed_mono")
+            if type(stamp) in (int, float) and math.isfinite(stamp):
+                record["source_identity"]["observed_mono"] = stamp
+            for key in ("object_on_support", "synchronized", "independent_jaws", "visible",
+                        "uncertainty_mm", "object_rise_mm", "tool_rise_mm", "relative_error_mm"):
+                value = measured.get(key)
+                if type(value) is bool or type(value) in (int, float) and math.isfinite(value):
+                    record[key] = value
+            frames = identity.get("frame_ids")
+            if isinstance(frames, (list, tuple)):
+                record["frame_count"] = len(frames)
+            observations = row.get("observations")
+            if isinstance(observations, list):
+                record["observation_count"] = len(observations)
+            body = json.dumps(row, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            record["evidence_digest"] = hashlib.sha256(body.encode()).hexdigest()
+            records.append(record)
+        if records:
+            return {"source": "node_grasp_verifier", "records": records,
+                    "omitted_records": max(0, len(rows) - 8), "measured_task_outcome": "unverified"}
+    except Exception:  # noqa: BLE001 - feedback must never change a physical result
+        logger.warning("Node verification feedback could not be retained", exc_info=True)
+    return None
 
 
 def outcome_result(workcell: str, skill: str, outcome: Mapping[str, Any]) -> dict[str, Any]:
@@ -463,10 +528,11 @@ def share_frame(result: dict[str, Any], *, consent: bool) -> str:
     lands in the model's text either way.
     """
     payload = result.get("result")
-    if not isinstance(payload, Mapping) or "image" not in payload:
+    if not isinstance(payload, Mapping):
         return ""
     payload = dict(payload)
-    image = payload.pop("image")
+    payload.pop("video", None)  # Primary chat has no video capability verdict.
+    image = payload.pop("image", None)
     result["result"] = payload
     if not consent or not isinstance(image, Mapping):
         return ""

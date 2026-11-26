@@ -779,9 +779,10 @@ class PromptAssembler:
             from leapflow.plugins import get_registry
 
             manager = getattr(get_registry(), "_subagent_manager", None)
-            if manager is None or not manager.has_active():
+            session_id = str(self._engine._current_session_id or "")
+            if manager is None or not session_id or not manager.has_active(parent_session_id=session_id):
                 return ""
-            return manager.render_active_status()
+            return manager.render_active_status(parent_session_id=session_id)
         except Exception:  # noqa: BLE001 - context is an improvement, never a gate
             logger.debug("subagent status section unavailable", exc_info=True)
             return ""

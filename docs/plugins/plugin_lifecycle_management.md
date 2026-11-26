@@ -369,7 +369,7 @@ A plugin's state is the **composition** of three independent axes: Runtime, Trus
 
 **Boundary**:
 - **Process-scope**: Plugin registration, trust ledger, usage tracker, fiber state.
-- **Session-scope**: Per-turn handler snapshot (isolated), `TurnUsageTracker` (per-session, forwards to global).
+- **Session-scope**: Per-turn handler snapshot, prompt/memory/compressor/dispatch state, and `TurnUsageTracker` (per-session, forwards plugin statistics to global). Unified children use the active tool context's owning runner; the shared subagent manager is not a session fallback. Parent prompt status filters delegates by parent session, and parent cancellation targets only its owned child tasks. Failed/canceled child results retain the child's persisted identity and incurred inference attempts; retaining costs does not transfer consultation/artifact authority.
 - **Workspace-scope**: None for plugins today. A workspace cannot have its own plugin set (plugins are profile-scoped).
 
 ---
@@ -382,7 +382,7 @@ publishes no specialist tools. Cached descriptions perform no endpoint probe; to
 and volatile specialist context do not become part of the stable system prompt prefix.
 
 `ModelServiceRuntime` belongs to one profile owner, not the primary LLM cache. Each acquired
-consumer holds a `ServiceHandle` pinned to an immutable service/codec generation and an
+consumer holds a `ServiceHandle` pinned to immutable service/provider/codec/contract revisions and an
 isolated provider/client. Ordinary enabled catalog or secret-reference changes affect future
 admission; an existing handle retains its snapshot until release. Publishing `enabled: false`
 or removing the service ID synchronously revokes all earlier generations for that ID.
@@ -390,10 +390,14 @@ Re-enabling creates fresh admission and cannot resurrect revoked handles or thei
 A disabled declaration remains discoverable and refuses before secret/provider/artifact access.
 Revocation is result suppression, not CUDA preemption or shutdown of an external server;
 external busy/uncertain-completion state remains independent. Removing
-or replacing the provider/codec itself refuses pending results rather than silently
-switching capabilities. Acquisition never rediscovers a deliberately disposed provider.
+or replacing the provider, codec, or domain TaskContract refuses pending results rather than
+silently switching capabilities. Contract and codec registration undo belongs to the
+registering plugin's EffectScope; re-registering the same implementation creates a new
+identity/revision and cannot revive earlier results. Acquisition never rediscovers a deliberately disposed provider.
 Built-in provider discovery and `ScopedLLMProviderRegistry.adopt_existing_plugins()` run
-once at composition.
+once at composition. Task identifiers are parsed structurally at bootstrap, then resolved
+against registered contracts at composed CLI/chat/runtime admission. Unknown or withdrawn
+contracts stay unavailable; actuation classification is refused by the read-only query tool.
 
 The last handle release closes its generation's provider and HTTP client. Cancellation
 releases the caller's handle and discards late results; thread-backed validation/I/O is not
@@ -410,6 +414,17 @@ Legacy persisted references remain readable. Evidence, TTL/checksum, file consen
 sensitive network disclosure are revalidated through existing cache/approval boundaries.
 Deployment qualification uses the existing evidence and audit stores; it is neither plugin
 trust promotion nor run consent. Legacy HTTP model-service declarations remain available.
+
+Consultation and plan lineage are private RECORD signals, admitted through the live
+EventBus normalizer/privacy/noise/dedup boundary and retained as detached transcript
+metadata receipts, not global subscriber events. Retrieval is bounded and caller-scoped.
+Explicit consultation references bind only admitted advice in the owning task; they do not
+change approval or trust. Later run status/stop records preserve original plan lineage
+without retaining an engine or usage sink on the shared hardware service. The bounded
+in-memory late-run table does not survive service restart. Node grasp verification metadata
+and evidence digests remain operation-level observations; full-task outcome is unverified
+until independent evidence adjudication. Child sessions retain their own consultation and
+artifact authority while deduplicated inference accounting returns to the parent.
 
 `config_model_service` remains available in the configuration plugin when the specialist
 catalog is empty. Configuration mutations use the originating session's real orchestrator;

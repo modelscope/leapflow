@@ -408,9 +408,15 @@ async def test_engine_chat_binds_each_session_to_its_client_workspace(tmp_path) 
 
     class WorkspaceEngine:
         def __init__(self) -> None:
+            from leapflow.engine.context.context_compressor import ContextCompressor
+
             self._settings = SimpleNamespace(workspace_root=base_workspace)
             self._wm = FakeWm()
             self._current_session_id = ""
+            self._compressor = ContextCompressor()
+
+        def _make_compression_summarize_fn(self):
+            return None
 
         def _new_governance(self):
             return object()
@@ -472,9 +478,15 @@ async def test_engine_chat_rejects_same_session_from_different_workspace(tmp_pat
 
     class WorkspaceEngine:
         def __init__(self) -> None:
+            from leapflow.engine.context.context_compressor import ContextCompressor
+
             self._settings = SimpleNamespace(workspace_root=work_a)
             self._wm = FakeWm()
             self._current_session_id = ""
+            self._compressor = ContextCompressor()
+
+        def _make_compression_summarize_fn(self):
+            return None
 
         def _new_governance(self):
             return object()

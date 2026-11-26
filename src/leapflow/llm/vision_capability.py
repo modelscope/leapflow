@@ -33,7 +33,7 @@ import time
 import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +203,8 @@ class VisionCapability:
         return verdict if self._clock() - verdict.checked_at <= ttl else None
 
     async def sees_images(
-        self, llm: Any, model: str, *, hint: bool, registry: Any = None
+        self, llm: Any, model: str, *, hint: bool, registry: Any = None,
+        call_provider: Callable[..., Awaitable[Any]] | None = None,
     ) -> bool:
         """Whether *model* (served by *llm*) can see images; *hint* is the static guess.
 
@@ -219,13 +220,18 @@ class VisionCapability:
         if verdict is None and self._clock() >= self._retry_at.get(key, 0.0):
             lock = self._locks.setdefault(key, asyncio.Lock())
             async with lock:
-                verdict = self.remembered(llm, model) or await self._probe(llm, model, key)
+                verdict = self.remembered(llm, model) or await self._probe(
+                    llm, model, key, call_provider=call_provider
+                )
         if verdict is None:
             return hint
         _record(registry, model, verdict.vision)
         return verdict.vision
 
-    async def _probe(self, llm: Any, model: str, key: str) -> Optional[VisionVerdict]:
+    async def _probe(
+        self, llm: Any, model: str, key: str, *,
+        call_provider: Callable[..., Awaitable[Any]] | None = None,
+    ) -> Optional[VisionVerdict]:
         if self._clock() < self._retry_at.get(key, 0.0):
             return None
         left, right = self._rng.sample(sorted(_PALETTE), 2)
@@ -248,12 +254,11 @@ class VisionCapability:
             ],
         }
         started = time.monotonic()
+        options = {"stream": False, "enable_thinking": False, "max_tokens": self._probe_max_tokens}
         try:
             reply = await asyncio.wait_for(
-                llm.achat(
-                    [message], stream=False, enable_thinking=False,
-                    max_tokens=self._probe_max_tokens,
-                ),
+                call_provider(llm, [message], **options)
+                if call_provider is not None else llm.achat([message], **options),
                 timeout=self._probe_timeout_s,
             )
         except asyncio.CancelledError:

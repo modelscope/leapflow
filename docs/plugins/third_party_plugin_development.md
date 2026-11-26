@@ -246,6 +246,22 @@ class LLMProviderPlugin(Protocol):
 
 LLM provider plugins support **entry_point discovery** via setuptools group `"leapflow.llm_providers"`.
 
+Primary inference accounting is caller-scoped. Providers can use `ProviderAttempt`
+from `llm/services/telemetry.py` around each actual request attempt, sharing one
+logical call ID across retries. Observe usage before extracting domain payloads;
+return `LLMChatResponse.inference_call_id` intact through response wrappers so the
+engine can deduplicate response-level accounting. Streaming recorders must not hold
+ContextVar tokens across yields. Accounting sinks and optional usage extraction
+must never change provider retry/failure behavior.
+
+Opaque providers remain supported: the owning LearningBridge records a
+`call_boundary` with unknown inner retry count. Combined usage reports observed
+attempts as a lower bound, `call_boundaries`, and `attempt_count_complete=False`;
+missing token usage stays unknown. Specialist services use runtime-owned accounting
+and suppress nested primary-provider records. Receipts contain no prompts or images,
+are admitted privately through the typed signal boundary, and remain bound to the
+owning profile/workspace/session. Neither usage nor advice grants physical authority.
+
 #### Structured model services
 
 A supported specialist uses a profile-only `llm.services` declaration and the existing
@@ -274,8 +290,9 @@ The extension contracts are `runtime_checkable` Protocols in `llm/services/proto
 | Contract | Responsibility |
 |----------|----------------|
 | `StructuredModelClient` | Cached `describe`, generation-pinned `acquire`, owned `aclose` |
-| `ServiceHandle` | Immutable `spec`, `generation`, bounded `invoke(request, schema, validate=...)`, `aclose` |
+| `ServiceHandle` | Immutable `spec`, `generation`, `contract`, `codec_revision`, bounded `invoke(request, schema, validate=...)`, `aclose` |
 | `ServiceCodec` | Provider-native messages/options from `encode`; strict structured result from `decode` |
+| `TaskContract` (`llm/services/contracts.py`) | Domain schemas, semantic validation, evidence references, revision, description, and read-only/governed-actuation classification |
 | `ModelBackend` (`hardware/model_contract.py`) | Owned `open/close/describe/infer` binding behind existing `model_service` |
 
 Camera retention is composed through `SessionEvidenceSink` in `hardware/snapshot_evidence.py`,
@@ -315,12 +332,31 @@ settings or opening clients at import time. Use the existing wrapper in
 Acquire a handle for one consumer and release it in `finally`; register longer-lived
 cleanup with `effect_scope.async_effect(...)`. Register a codec using
 `ModelServiceRuntime.register_codec(name, codec)` and attach its returned undo callback
-to the registering plugin's scope. Removing/replacing its codec or provider invalidates
-calls, including results arriving after removal.
+to the registering plugin's scope. Register a domain contract with
+`ModelServiceRuntime.register_contract(contract)` and attach its returned undo in the
+same way. `TaskContract.schemas()` returns object input/output schemas;
+`validate_input(request)` and `validate_result(request, result)` enforce domain semantics;
+`evidence_references(request)` maps labels to caller-owned session cache IDs.
+The contract declares `task`, `revision`, `description`, and `classification`
+(`read_only` or `governed_actuation`). Built-in advisory contracts are domain-owned by
+`world_model`, geometry/actuation contracts by `hardware`, and composed with EffectScope
+cleanup. A new text contract can arrive through an ordinary dependency-bound plugin;
+new physical/tensor semantics still need qualified adapters.
+
+Task and codec names are structurally parsed at configuration bootstrap; composed
+CLI/chat/runtime admission resolves the registered provider, codec, and contract.
+Unknown contracts are unavailable, never implicitly advisory. Removing/replacing a
+provider, codec, or contract invalidates calls and late results. Contract registration
+identity and codec revision are pinned even when the same implementation is re-registered.
 
 `json.v1` supports `json_text`, OpenAI-compatible `json_schema`, and `tool_call` output;
 duplicate keys, excessive nesting, truncation, malformed results, and schema violations
-refuse. Images are shaped for the chosen provider. Unknown eligible candidate IDs refuse;
+refuse. Strict OpenAI wire schemas require closed, explicitly typed objects. Optional
+domain fields compile to required nullable wire fields, and only optional nulls normalize
+back to absence before domain validation. Open/unrepresentable strict schemas refuse
+before HTTP; choose `json_text` or an admitted codec explicitly, with no silent downgrade.
+Anthropic seed is refused at admission; portable stop strings/lists become native
+`stop_sequences`. Images are shaped for the chosen provider. Unknown eligible candidate IDs refuse;
 predictions remain hypothetical and evaluations remain teacher assessments. Scores are
 uncalibrated unless separately qualified. `action_chunk` cannot execute via `model_query`.
 
@@ -341,6 +377,40 @@ endpoint, locality, expiry, and operator approval. A YAML identity or successful
 check is not qualification. Existing HCP/LHP skill consent, adaptation, SafetyShield,
 permits, leases, and controlled stops continue to govern physical use; no transparent
 native-model failover is permitted.
+
+Collaboration accounting uses frozen `InferenceAttempt`, `ConsultationRecord`, and
+`GovernedPlanRecord` values in `llm/services/telemetry.py`. `InferenceUsageSink` counts
+unique attempt IDs; `ConsultationLookup` resolves only admitted, exact profile/workspace/
+session/task references. Primary and specialist totals are separate, with a deduplicated
+combined view. Opaque provider boundaries are labeled `call_boundary`; their attempt counts
+are incomplete. Missing token usage stays unknown, including on failure or cancellation.
+Provider usage is retained before hardware payload extraction. Consultation `timing` records
+measured acquisition, approval evaluation/wait, artifact and codec encoding, provider-attempt
+network/inference, validation, queue, and cleanup intervals. Missing/unentered phases stay
+absent; network/inference sums attempts and excludes retry backoff. Nested captures forward
+phase samples only within their owning scope. Client ownership and pooling are unchanged.
+Telemetry defects are logged with tracebacks and never reclassified as provider or physical
+failures.
+
+`model_query` returns a consultation ID and canonical result digest. Optional
+`hw_skill_run.consultation_refs` entries are `{call_id, disposition}`, where disposition is
+`adopted`, `overridden`, or `unused`. This is explicit LLM attribution, not permission:
+unknown/foreign references remain unlinked, and ineligible advice cannot become eligible.
+Only verified node plans establish plan/permit identity. Later owner-scoped status/stop
+observations append immutable records with `origin_record_id` and the same confirmed run,
+workcell, and plan digest. Node grasp-verifier notes supply bounded `operation_verification`
+metadata with sensor/scene/calibration identity and complete-note digests; contact is not
+proof of lifting. Full-task success stays `unverified` pending independent rubric review.
+Model labels and teacher scores do not qualify as measured outcomes.
+
+The owning LearningBridge admits `model.inference_attempt`, `model.consultation`, and
+`model.plan_link` through private RECORD signals. Detached admission receipts are stored in
+transcript metadata even when result text is truncated. Replay excludes bulky receipts but
+retains compact consultation identity. Bounded feedback is retrieved through the normal
+tool surface outside the stable prompt prefix. Unified skill/delegate calls use the same
+governance; child identity is bound before calls, child artifacts/consultation authority
+stay child-owned, and only original-scope inference accounting is merged into parent totals.
+No mandatory consultation, second execution loop, or generated-action dispatch is introduced.
 
 ### 2.5 SelectionPolicyPlugin Protocol
 
@@ -494,6 +564,18 @@ def bind_runtime(self, **deps: Any) -> None:
 
 Available dependency names (wired by the daemon):
 `plugin_approval_gate`, `llm_provider`, `plugin_generation_enabled`, `plugin_install_dir`, `marketplace_client`, `marketplace_trusted_pubkeys`, `memory_manager`, `gateway_server`, `research_ledger`, `reentry_scheduler`, `file_read_gate`, `file_write_gate`, `desktop_gate`, `capability_catalog_provider`, `subagent_manager`, `model_services`, `model_approval_gate`, `settings`, `effect_scope`.
+
+The shared `subagent_manager` does not own a caller's session. Production tool dispatch
+supplies `ToolExecutionContext` through `current_tool_context()`; unified delegation uses
+its live `run_subagent` callback and binds the child's parent to that context's session.
+A scoped call without an owning runner fails closed. This callback is internal execution
+context, not another `bind_runtime` dependency or a sandbox permission grant.
+Children use the same unified loop with fresh prompt, memory, compression, and dispatch
+state. Only explicitly delegated context enters the child; parent artifact references and
+approval authority are not inherited. `delegate_task` returns the persisted child
+`session_id`, `tool_calls`, and terminal status, including failures and cancellation;
+classified failures carry JSON-safe `failure` metadata. An advisory specialist result
+never dispatches model-generated actions or supplies an execution permit.
 
 ### 3.3 Side-Effect-Free Import
 

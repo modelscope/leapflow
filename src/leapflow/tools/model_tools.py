@@ -7,65 +7,24 @@ import base64
 import hashlib
 import json
 import logging
+import time
+import uuid
 from dataclasses import asdict, replace
 from functools import partial
 from typing import Any, Callable, Mapping
 
-from leapflow.llm.services.codec import validate_schema
+from leapflow.llm.services.codec import media_kind, validate_schema
 from leapflow.llm.services.protocol import ActiveCallBudget, ServiceError, ServiceSpec, StructuredModelClient, canonical
+from leapflow.llm.services.telemetry import (
+    ConsultationRecord, InferenceCapture, capture_inference, current_capture, measure_phase,
+)
+from leapflow.domain.events import RecordScope
 from leapflow.security.actions import ActionDescriptor
 from leapflow.security.network import _category_for_address, classify_url
 from leapflow.tools.execution_context import current_tool_context
-from leapflow.world_model.specialist_contract import (
-    INPUT_SCHEMAS, OUTPUT_SCHEMAS, array, eligible_ids, obj, text, validate_result,
-)
+from leapflow.hardware.service_contracts import GEOMETRY_INPUTS
 
 logger = logging.getLogger(__name__)
-
-GEOMETRY_INPUTS = {
-    "grounding": obj({"queries": array(text(256), minimum=1, maximum=16)}, ("queries",)),
-    "grasp_proposal": obj({"depth": obj({"scale_m": {"type": "number", "minimum": 0.000000001}},
-                                        ("scale_m",)),
-                           "intrinsics": obj({
-                               "width": {"type": "integer", "minimum": 1},
-                               "height": {"type": "integer", "minimum": 1},
-                               "fx": {"type": "number", "minimum": 0.000000001},
-                               "fy": {"type": "number", "minimum": 0.000000001},
-                               "ppx": {"type": "number"}, "ppy": {"type": "number"},
-                               "model": text(128), "coeffs": array({"type": "number"}, maximum=5),
-                           }, ("width", "height", "fx", "fy", "ppx", "ppy")),
-                           "object": obj({"label": text(256),
-                               "center": array({"type": "number"}, minimum=3, maximum=3),
-                               "pixel": array({"type": "number", "minimum": 0}, minimum=2, maximum=2),
-                               "size": obj({key: {"type": "number", "minimum": 0} for key in
-                                            ("length", "width", "height")}, ("length", "width", "height")),
-                           }, ("center",)),
-                           "gripper": obj({"max_width_mm": {"type": "number", "minimum": 0.000000001}},
-                                          ("max_width_mm",)),
-                           "top_k": {"type": "integer", "minimum": 1, "maximum": 64}},
-                          ("depth", "intrinsics", "object", "gripper", "top_k")),
-}
-GEOMETRY_OUTPUTS = {
-    "grounding": obj({"detections": array({"type": "object"}, maximum=256)}, ("detections",)),
-    "grasp_proposal": obj({"grasps": array({"type": "object"}, maximum=64)}, ("grasps",)),
-}
-
-
-def task_schemas(task: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    if task in INPUT_SCHEMAS:
-        return INPUT_SCHEMAS[task], OUTPUT_SCHEMAS[task]
-    if task in GEOMETRY_INPUTS:
-        return GEOMETRY_INPUTS[task], GEOMETRY_OUTPUTS[task]
-    raise ValueError("action_chunk is not a read-only query; use admitted hw_skill_* / policy.run")
-
-
-def _validate_geometry(task: str, request: Mapping[str, Any], result: Mapping[str, Any]) -> None:
-    from leapflow.hardware.model_contract import Detection, ProposedGrasp
-
-    parser, field = (Detection, "detections") if task == "grounding" else (ProposedGrasp, "grasps")
-    for item in result[field]:
-        parser.from_mapping(item)
-
 
 async def authorize(action: ActionDescriptor, gate: Any = None) -> None:
     """Use the active turn's orchestrator; no check-only fallback or shared session."""
@@ -123,10 +82,11 @@ async def authorize_endpoint(spec: ServiceSpec, gate: Any, *, sensitive: bool,
         metadata={**target.to_metadata(), "platform": "model_services", "service_id": spec.service_id,
                   "allow_remote": spec.allow_remote, "approval_binding": binding, "resolved_categories": categories,
                   "processing_location": spec.processing_location, "sensitive_payload": sensitive})
-    await authorize(replace(action, detail="<model-service>",
-                            metadata={key: value for key, value in action.metadata.items() if key != "url"},
-                            summary=f"Query model service {spec.service_id} "
-                                    f"({spec.processing_location}; {scope.replace('_', ' ')})"), gate)
+    with measure_phase("approval_wait_ms"):
+        await authorize(replace(action, detail="<model-service>",
+                                metadata={key: value for key, value in action.metadata.items() if key != "url"},
+                                summary=f"Query model service {spec.service_id} "
+                                        f"({spec.processing_location}; {scope.replace('_', ' ')})"), gate)
     if check_admission is not None:
         check_admission()
     current = await (budget or ActiveCallBudget(spec.limits.deadline_s)).run(classify_url(spec.base_url))
@@ -153,7 +113,22 @@ def _media_type(content: bytes) -> str:
         return "image/png"
     if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
         return "image/webp"
-    raise ValueError("artifact is not an admitted JPEG, PNG or WebP")
+    if content[4:8] == b"ftyp":
+        return "video/mp4"
+    if content.startswith(b"\x1a\x45\xdf\xa3"):
+        return "video/webm"
+    raise ValueError("artifact is not an admitted JPEG, PNG, WebP, MP4 or WebM")
+
+
+def check_media_capacity(spec: ServiceSpec, media: list[dict[str, str]]) -> dict[str, int]:
+    """Refuse media the service did not declare, before any byte leaves the host."""
+    counts = {kind: sum(media_kind(item["media_type"]) == kind for item in media) for kind in ("image", "video")}
+    for kind, count in counts.items():
+        if count > spec.media.capacity(kind):
+            raise ServiceError(f"Service {spec.service_id} accepts at most {spec.media.capacity(kind)} {kind}(s) "
+                               f"per request; got {count}. See model_describe media capacity",
+                               service_id=spec.service_id, code="media_unsupported", category="validation")
+    return counts
 
 
 class ModelTools:
@@ -172,19 +147,82 @@ class ModelTools:
         if service_id and not catalog["services"]:
             return {"ok": False, "error": "Unknown service ID; use model_describe without an ID", "retryable": False}
         if service_id:
-            task = catalog["services"][0]["task"]
-            if task != "action_chunk":
-                input_schema, output_schema = task_schemas(task)
-                catalog = {**catalog, "input_schema": input_schema, "output_schema": output_schema}
-        return {"ok": True, **catalog, "read_only": True, "physical_authority": False}
+            selected = catalog["services"][0]
+            catalog = {**catalog, "input_schema": selected.get("input_schema"),
+                       "output_schema": selected.get("output_schema")}
+        catalog["services"] = [{k: v for k, v in entry.items() if k not in {"input_schema", "output_schema"}}
+                               for entry in catalog["services"]]
+        feedback = {}
+        try:
+            capture = current_capture()
+            sink = capture.usage_sink() if capture else None
+            if callable(getattr(sink, "combined_usage", None)):
+                feedback = {"window": "current_turn", "inference_usage": sink.combined_usage(),
+                            "measured_task_outcome": "unverified"}
+            if capture and callable(getattr(sink, "collaboration_feedback", None)):
+                feedback["history"] = sink.collaboration_feedback(capture.scope, service_id=service_id)
+        except Exception:  # noqa: BLE001 - feedback must never fail a catalog read
+            logger.warning("Specialist usage feedback unavailable", exc_info=True)
+        return {"ok": True, **catalog, "read_only": True, "physical_authority": False,
+                "usage_feedback": feedback}
 
     async def query(self, service_id: str, input: dict[str, Any],
                     artifacts: dict[str, str] | None = None, **_: Any) -> dict[str, Any]:
+        from leapflow.layout import workspace_id_for_path
+
+        context = current_tool_context()
+        scope = RecordScope(str(getattr(self.settings, "profile", "") or ""),
+            workspace_id_for_path(context.workspace_root) if context else "",
+            context.session_id if context else "")
+        consultation_id = uuid.uuid4().hex
+        started = time.monotonic()
+        payload: dict[str, Any] = {}
+        status = "failed"
+        with capture_inference(scope=scope, task_id=context.task_id if context else "") as capture:
+            try:
+                payload = await self._query_safe(service_id, input, artifacts or {})
+                status = "eligible" if payload.get("ok") else "refused"
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
+            finally:
+                self._finish_consultation(capture, consultation_id, service_id, status, started, payload)
+        if payload.get("ok") is True:
+            # The tool owns what constitutes sufficient advisory context. Budget
+            # shaping selects these existing fields atomically; audit stays full.
+            payload["_context_fields"] = {
+                "ok": True, "service_id": True, "task": True, "result": True,
+                "provenance": {key: True for key in (
+                    "api_model", "contract_revision", "advisory", "eligible_candidate_ids",
+                    "hypothetical", "teacher_assessment", "scores_calibrated", "physical_authority")},
+                "consultation": {"call_id": True, "status": True},
+            }
+        return payload
+
+    @staticmethod
+    def _finish_consultation(capture: InferenceCapture, identity: str, service_id: str,
+                             status: Any, started: float, payload: dict[str, Any]) -> None:
+        """Retain cancellation/refusal as well as eligible advice; telemetry never raises."""
+        try:
+            record = ConsultationRecord(identity, capture.scope, capture.task_id, capture.tool_call_id,
+                service_id, status, (time.monotonic() - started) * 1000,
+                str(payload.get("failure_code") or ""), capture.provenance_json, tuple(capture.attempts),
+                hashlib.sha256(canonical(payload["result"]).encode()).hexdigest() if "result" in payload else "",
+                timing_json=canonical(capture.phase_timings))
+            capture.record_consultation(record)
+            payload["consultation"] = record.to_dict()
+            provenance = json.loads(record.provenance_json)
+            if provenance:
+                payload["provenance"] = {**provenance, **payload.get("provenance", {})}
+        except Exception:  # noqa: BLE001 - bookkeeping must never change a tool result
+            logger.warning("Consultation provenance recording failed", exc_info=True)
+
+    async def _query_safe(self, service_id: str, data: dict[str, Any], artifacts: dict[str, str]) -> dict[str, Any]:
         task = asyncio.current_task()
         if task is not None:
             self._calls.add(task)
         try:
-            return await self._query(service_id, input, artifacts or {})
+            return await self._query(service_id, data, artifacts)
         except ServiceError as exc:
             return failure_payload(exc)
         except asyncio.TimeoutError:
@@ -205,10 +243,6 @@ class ModelTools:
         if not catalog:
             raise ServiceError("Unknown service; use model_describe", service_id=service_id)
         task = catalog[0]["task"]
-        input_schema, output_schema = task_schemas(task)
-        validate_schema(data, input_schema, "input")
-        if task in INPUT_SCHEMAS:
-            eligible_ids(data, task)
         validate_schema(artifacts, {"type": "object", "properties": {}, "additionalProperties": True})
         if len(artifacts) > 16 or any(not isinstance(k, str) or not isinstance(v, str) for k, v in artifacts.items()):
             raise ValueError("artifacts must map at most 16 labels to session artifact IDs")
@@ -216,24 +250,40 @@ class ModelTools:
             raise ValueError("grounding requires exactly one image artifact")
         if task == "grasp_proposal" and set(artifacts) != {"image", "depth"}:
             raise ValueError("grasp_proposal requires image and depth artifacts")
-        handle = await self.client.acquire(service_id)
+        with measure_phase("acquisition_ms"):
+            handle = await self.client.acquire(service_id)
         budget = ActiveCallBudget(handle.spec.limits.deadline_s)
         try:
             handle.check_admission()
+            contract = handle.contract
+            self._capture_provenance(handle, data, [])
+            if contract.classification != "read_only":
+                raise ValueError("This contract is not a read-only query; use admitted hw_skill_* / policy.run")
+            _, output_schema = contract.schemas()
+            with measure_phase("input_validation_ms"):
+                await budget.run(asyncio.to_thread(contract.validate_input, data))
+            observed = contract.evidence_references(data)
+            handle.check_admission()
             request = await budget.run(asyncio.to_thread(lambda: json.loads(canonical(data))))
             handle.check_admission()
-            if (artifacts or data.get("observation_refs") or data.get("episode_ref")) and handle.spec.processing_location == "unknown":
+            if (artifacts or observed) and handle.spec.processing_location == "unknown":
                 raise ServiceError("Image processing locality is unknown; qualify the deployment first",
                                    code="model_privacy_unknown", category="security")
             # Admit metadata before consent; no evidence bytes are read until it succeeds.
-            sensitive = bool(artifacts or data.get("observation_refs") or data.get("episode_ref"))
-            cache, snapshots = await self._resolve_artifacts(artifacts, data, task,
+            sensitive = bool(artifacts or observed)
+            cache, snapshots = await self._resolve_artifacts(artifacts, observed,
                 handle.spec.limits.max_request_bytes, budget, check_admission=handle.check_admission)
+            self._capture_provenance(handle, data, snapshots)
             await authorize_endpoint(handle.spec, self.gate, sensitive=sensitive, budget=budget,
                                      check_admission=handle.check_admission)
-            media, evidence = await self._artifacts(artifacts, cache, snapshots,
-                handle.spec.limits.max_request_bytes, budget, check_admission=handle.check_admission)
+            with measure_phase("artifact_encoding_ms"):
+                media, evidence = await self._artifacts(artifacts, cache, snapshots,
+                    handle.spec.limits.max_request_bytes, budget, check_admission=handle.check_admission)
             handle.check_admission()
+            labels = sorted(k for k in artifacts if k != "depth")
+            media_counts = check_media_capacity(handle.spec, media)
+            if task in GEOMETRY_INPUTS and media_counts["video"]:
+                raise ValueError(f"{task} requires image evidence, not video")
             if task == "grasp_proposal":
                 depth = evidence.pop("depth")
                 await budget.run(asyncio.to_thread(validate_depth, request, depth))
@@ -241,19 +291,18 @@ class ModelTools:
                 request["depth"]["data"] = base64.b64encode(depth).decode("ascii")
                 from leapflow.hardware.model_contract import check_request
                 check_request(task, {**request, "image": media[0]["data"]})
-            request.update({"_images": media, "artifact_order": sorted(k for k in artifacts if k != "depth"),
+            # Block order equals ``artifact_order`` so the service can bind each view to its label.
+            request.update({"_media": media, "artifact_order": labels,
                             "context": {"session_id": context.session_id,
                                         "run_id": context.task_id}})
             if evidence:
                 request["artifact_evidence"] = {k: json.loads(v) for k, v in evidence.items()}
-            validator = (lambda value: validate_result(task, data, value)) if task in INPUT_SCHEMAS else (
-                lambda value: _validate_geometry(task, data, value))
+            validator = partial(contract.validate_result, data)
             if handle.spec.identity_mode == "server_reported" and task in GEOMETRY_INPUTS:
                 from leapflow.hardware.model_contract import parse_response, provider_request, provider_result_schema
                 # The same domain envelope is used by the qualified hardware
                 # adapter, but this tool's result remains advisory only.
-                labels = sorted(k for k in artifacts if k != "depth")
-                request.pop("_images")
+                request.pop("_media")
                 request.pop("artifact_order")
                 request.pop("context")
                 request = provider_request(task, request, dict(zip(labels, media)))
@@ -265,15 +314,74 @@ class ModelTools:
             payload = {"ok": True, "service_id": service_id, "task": task, "result": result.payload(),
                     "provenance": {"generation": result.generation, "api_model": result.api_model,
                                    "identity_mode": result.identity_mode, "advisory": True,
+                                   "contract_revision": contract.revision, "contract_generation": contract.number,
+                                   "codec_revision": handle.codec_revision,
+                                   "inference_call_id": result.call_id,
+                                   "declaration_digest": hashlib.sha256(canonical(asdict(handle.spec)).encode()).hexdigest(),
+                                   "input_digest": hashlib.sha256(canonical(data).encode()).hexdigest(),
+                                   "eligible_candidate_ids": [candidate["id"] for candidate in data.get("candidates", [])
+                                       if isinstance(candidate, dict) and isinstance(candidate.get("id"), str)],
+                                   "evidence": self._evidence_provenance(snapshots),
+                                   "media": {"images": media_counts["image"], "videos": media_counts["video"],
+                                             "video_s": self._video_seconds(snapshots), "labels": labels},
                                    "hypothetical": task == "prediction", "teacher_assessment": task == "evaluation",
                                    "scores_calibrated": False, "physical_authority": False},
-                    "elapsed_ms": result.elapsed_ms, "usage": json.loads(result.usage_json)}
+                    "elapsed_ms": result.elapsed_ms, "usage": json.loads(result.usage_json),
+                    "timing": json.loads(result.timing_json)}
         finally:
-            await handle.aclose()
+            with measure_phase("cleanup_ms"):
+                await handle.aclose()
         handle.check_result_eligibility()
         return payload
 
-    async def _resolve_artifacts(self, artifacts: dict[str, str], data: dict[str, Any], task: str,
+    @staticmethod
+    def _capture_provenance(handle: Any, data: Any, snapshots: list[tuple[str, Any]]) -> None:
+        """Detach pinned identity before consent/inference so refusals retain lineage."""
+        try:
+            capture = current_capture()
+            if capture is None:
+                return
+            candidates = data.get("candidates", []) if isinstance(data, dict) else []
+            candidates = candidates if isinstance(candidates, list) else []
+            capture.provenance_json = canonical({
+                "generation": handle.generation, "api_model": handle.spec.model,
+                "identity_mode": handle.spec.identity_mode,
+                "contract_revision": handle.contract.revision,
+                "contract_generation": handle.contract.number, "codec_revision": handle.codec_revision,
+                "declaration_digest": hashlib.sha256(canonical(asdict(handle.spec)).encode()).hexdigest(),
+                "input_digest": hashlib.sha256(canonical(data).encode()).hexdigest(),
+                "eligible_candidate_ids": [item["id"] for item in candidates
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)],
+                "evidence": ModelTools._evidence_provenance(snapshots),
+                "media": {"images": sum(entry.metadata.get("kind") == "image" for _, entry in snapshots),
+                          "videos": sum(entry.metadata.get("kind") == "video" for _, entry in snapshots),
+                          "video_s": ModelTools._video_seconds(snapshots),
+                          "labels": [label for label, _ in snapshots if label != "depth"]},
+                "physical_authority": False, "advisory": True,
+            })
+        except Exception:  # noqa: BLE001 - provenance failure is not provider failure
+            logger.warning("Pinned consultation provenance unavailable", exc_info=True)
+
+    @staticmethod
+    def _video_seconds(snapshots: list[tuple[str, Any]]) -> float:
+        return sum(float(entry.metadata.get("duration_s") or 0) for _, entry in snapshots
+                   if entry.metadata.get("kind") == "video")
+
+    @staticmethod
+    def _evidence_provenance(snapshots: list[tuple[str, Any]]) -> list[dict[str, Any]]:
+        records = []
+        for label, entry in snapshots:
+            record = entry.metadata.get("record", {})
+            value = record.get("value", {}) if isinstance(record, dict) else {}
+            value = value if isinstance(value, dict) else {}
+            records.append({"label": label, "artifact_id": entry.entry_id,
+                "content_hash": entry.content_hash, "source": entry.source,
+                "created_at": entry.created_at, "expires_at": entry.expires_at,
+                **{key: value[key] for key in ("observation_id", "frame", "capture_id", "camera",
+                    "observed_at", "calibration_ref", "kind", "duration_s", "media_source", "run_id", "historical") if key in value}})
+        return records
+
+    async def _resolve_artifacts(self, artifacts: dict[str, str], observed: Mapping[str, str],
                                  budget: int, deadline: ActiveCallBudget, *,
                                  check_admission: Callable[[], None]) -> tuple[Any, list[tuple[str, Any]]]:
         from leapflow.cache.manager import CacheManager
@@ -281,9 +389,6 @@ class ModelTools:
 
         context = current_tool_context()
         references = dict(artifacts)
-        observed = {ref: ref for ref in data.get("observation_refs", [])}
-        if task == "evaluation":
-            observed["episode"] = data["episode_ref"]
         if set(references) & set(observed):
             raise ValueError("Artifact labels collide with observation or episode references")
         references.update(observed)

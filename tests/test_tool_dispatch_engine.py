@@ -574,3 +574,250 @@ class TestFailureAndCompletionEvidence:
             result={"ok": True},
         )
         assert tracker.ready_for_final_response() is True
+
+
+async def _collaboration_engine(tmp_path):
+    from leapflow.engine.session.session_factory import build_session_engine
+    from leapflow.platform.event_bus import EventBus
+    from test_session_factory import _build_base_engine, _EchoLLM
+
+    base, memory = _build_base_engine(str(tmp_path), _EchoLLM())
+    engine = build_session_engine(base, session_id="own", workspace_root=str(tmp_path),
+                                  working_memory=base._wm)
+    engine.set_event_bus(EventBus(engine._imm, engine._wm))
+    return engine, memory
+
+
+async def _consultation_capture(engine):
+    from leapflow.domain.events import RecordScope
+    from leapflow.layout import workspace_id_for_path
+    from leapflow.llm.services.telemetry import ConsultationRecord, InferenceCapture
+
+    scope = RecordScope(engine._settings.profile, workspace_id_for_path(engine._settings.workspace_root), "own")
+    capture = InferenceCapture(scope=scope)
+    for identity in ("a", "b", "c"):
+        capture.record_consultation(ConsultationRecord(identity, scope, "t", "tc", "specialist", "eligible", 2))
+    return capture
+
+
+def test_admission_and_transcript_retention_use_real_engine_and_store(tmp_path):
+    import asyncio
+    from leapflow.storage.conversation_store import DuckDBConversationStore
+
+    async def exercise():
+        engine, memory = await _collaboration_engine(tmp_path)
+        store = DuckDBConversationStore(tmp_path / "transcript.duckdb")
+        engine.set_conversation_store(store)
+        store.create_session("own")
+        broadcasts = []
+        engine._event_bus.subscribe(broadcasts.append)
+        try:
+            capture = await _consultation_capture(engine)
+            result = {"ok": True, "consultation": {"call_id": "forged"}}
+            await engine._learning_bridge._admit_collaboration_records(result, capture)
+            rows = result["collaboration_signal_receipts"]
+            assert len(rows) == 3 and all(row["lineage_eligible"] for row in rows)
+            assert not broadcasts
+            metadata = engine._tool_dispatch._tool_execution_metadata(result)
+            engine._session_persistence._persist_message("own", "tool", "x" * 20_000,
+                tool_name="model_query", metadata=metadata)
+            persisted = store.get_messages("own")[0]
+            assert len(persisted.content) == 8000
+            assert persisted.metadata["collaboration_signal_receipts"] == rows
+            from leapflow.engine.turn_usage import TurnUsageTracker
+            engine._usage_tracker = TurnUsageTracker()
+            assert engine.load_session("own")
+            feedback = engine._usage_tracker.collaboration_feedback(capture.scope)
+            assert [item["call_id"] for item in feedback["records"]] == ["a", "b", "c"]
+            assert feedback["measured_task_outcome"] == "unverified"
+        finally:
+            store.close()
+            memory.close()
+    asyncio.run(exercise())
+
+
+def test_admission_faults_are_per_record_and_never_retain_foreign_payload(tmp_path):
+    import asyncio
+    from dataclasses import asdict
+    from leapflow.domain.events import RecordAdmission
+
+    async def exercise():
+        engine, memory = await _collaboration_engine(tmp_path)
+        capture = await _consultation_capture(engine)
+
+        class BrokenPort:
+            async def admit_record(self, event_type, payload, *, scope, dedup_key, noise_gate):
+                if dedup_key == "a":
+                    raise RuntimeError("observation unavailable")
+                if dedup_key == "b":
+                    return RecordAdmission(True, "admitted", scope, event_type, "[]")
+                value = {**payload["value"], "scope": {**asdict(scope), "session_id": "foreign"}}
+                return RecordAdmission(True, "admitted", scope, event_type, json.dumps({"value": value}))
+
+        engine.set_event_bus(BrokenPort())
+        try:
+            result = {"ok": True}
+            await engine._learning_bridge._admit_collaboration_records(result, capture)
+            assert result["ok"]
+            rows = result["collaboration_signal_receipts"]
+            assert len(rows) == 3 and not any(row["lineage_eligible"] for row in rows)
+            assert all(row["payload_json"] == "{}" for row in rows)
+            assert engine._usage_tracker.collaboration_feedback(capture.scope)["records"] == []
+        finally:
+            memory.close()
+    asyncio.run(exercise())
+
+
+def test_feedback_sink_failure_does_not_lose_other_admitted_receipts(tmp_path):
+    import asyncio
+
+    async def exercise():
+        engine, memory = await _collaboration_engine(tmp_path)
+        capture = await _consultation_capture(engine)
+
+        class BrokenSink:
+            def record_collaboration(self, receipt):
+                raise RuntimeError("feedback unavailable")
+
+        engine._usage_tracker = BrokenSink()
+        try:
+            result = {"ok": True}
+            await engine._learning_bridge._admit_collaboration_records(result, capture)
+            assert result["ok"] and result["collaboration_signal_status"] == "feedback_unavailable"
+            assert len(result["collaboration_signal_receipts"]) == 3
+            assert all(row["lineage_eligible"] for row in result["collaboration_signal_receipts"])
+        finally:
+            memory.close()
+    asyncio.run(exercise())
+
+
+def test_primary_stream_capture_is_safe_across_per_chunk_tasks_and_persists(tmp_path, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from openai.resources.chat import AsyncCompletions
+    from leapflow.llm.services.telemetry import current_capture
+    from leapflow.storage.conversation_store import DuckDBConversationStore
+    from test_llm_provider_retry_ownership import _provider, _recorded_chunks
+
+    async def exercise():
+        engine, memory = await _collaboration_engine(tmp_path)
+        provider = _provider()
+        store = DuckDBConversationStore(tmp_path / "primary.duckdb")
+        engine.set_conversation_store(store)
+        store.create_session("own")
+
+        async def stream():
+            for chunk in _recorded_chunks():
+                yield chunk
+
+        monkeypatch.setattr(AsyncCompletions, "create", AsyncMock(return_value=stream()))
+        accounting = {}
+        wrapped = engine._learning_bridge.stream_primary(provider, [], accounting=accounting)
+        try:
+            text = await asyncio.create_task(wrapped.__anext__())
+            assert text and current_capture() is None
+            try:
+                await asyncio.create_task(wrapped.__anext__())
+                assert False, "Expected end of text stream"
+            except StopAsyncIteration:
+                pass
+            attempts = engine._usage_tracker.inference_records()
+            assert len(attempts) == 1 and attempts[0].scope.session_id == "own"
+            assert accounting["inference_call_id"] == attempts[0].call_id
+            engine._usage_tracker.record_api_call(accounting["usage"], call_id=accounting["inference_call_id"])
+            assert engine._usage_tracker.summary().api_calls == 1
+            row = store.get_messages("own")[0]
+            assert row.role == "record" and row.content == ""
+            assert row.metadata["collaboration_signal_receipts"][0]["lineage_eligible"]
+        finally:
+            await wrapped.aclose()
+            await provider.aclose()
+            store.close()
+            memory.close()
+    asyncio.run(exercise())
+
+
+def test_primary_stream_initialization_failure_is_accounted_as_opaque_boundary(tmp_path):
+    import asyncio
+    import pytest
+
+    class BrokenProvider:
+        def achat_stream(self, messages, **options):
+            raise ValueError("initialization failed")
+
+    async def exercise():
+        engine, memory = await _collaboration_engine(tmp_path)
+        try:
+            accounting = {}
+            wrapped = engine._learning_bridge.stream_primary(BrokenProvider(), [], accounting=accounting)
+            with pytest.raises(ValueError, match="initialization failed"):
+                await wrapped.__anext__()
+            attempt = engine._usage_tracker.inference_records()[0]
+            assert attempt.status == "failed" and attempt.accounting_level == "call_boundary"
+            assert engine._usage_tracker.combined_usage()["combined"]["attempt_count_complete"] is False
+        finally:
+            memory.close()
+    asyncio.run(exercise())
+
+
+def test_stream_cleanup_never_replaces_original_failure(tmp_path):
+    import asyncio
+    import pytest
+
+    class BrokenStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise ValueError("original stream failure")
+
+        async def aclose(self):
+            raise RuntimeError("cleanup failure")
+
+    class Provider:
+        def achat_stream(self, messages, **options):
+            return BrokenStream()
+
+    async def exercise():
+        engine, memory = await _collaboration_engine(tmp_path)
+        try:
+            wrapped = engine._learning_bridge.stream_primary(Provider(), [], accounting={})
+            with pytest.raises(ValueError, match="original stream failure"):
+                await wrapped.__anext__()
+            assert engine._usage_tracker.inference_records()[0].error_type == "ValueError"
+        finally:
+            memory.close()
+    asyncio.run(exercise())
+
+
+def test_primary_capture_isolates_workspaces_and_inherits_only_owned_tool_identity(tmp_path):
+    import asyncio
+    from leapflow.domain.events import RecordScope
+    from leapflow.llm.base import LLMChatResponse
+    from leapflow.llm.services.telemetry import capture_inference
+
+    class Provider:
+        async def achat(self, messages, **options):
+            await asyncio.sleep(0)
+            return LLMChatResponse(content="answer", usage={})
+
+    async def exercise():
+        first, memory1 = await _collaboration_engine(tmp_path / "first")
+        second, memory2 = await _collaboration_engine(tmp_path / "second")
+        scope = first._learning_bridge._primary_capture().scope
+        try:
+            with capture_inference(scope=scope, task_id="task", tool_call_id="owned-tool"):
+                await asyncio.gather(first._learning_bridge.call_primary(Provider(), []),
+                                     second._learning_bridge.call_primary(Provider(), []))
+            a = first._usage_tracker.inference_records()[0]
+            b = second._usage_tracker.inference_records()[0]
+            assert a.scope == scope and a.tool_call_id == "owned-tool" and a.task_id == "task"
+            assert b.scope.workspace_id != a.scope.workspace_id and b.tool_call_id == "" and b.task_id == ""
+            with capture_inference(scope=RecordScope(scope.profile_id, scope.workspace_id, "foreign"),
+                                   task_id="foreign-task", tool_call_id="foreign-tool"):
+                await first._learning_bridge.call_primary(Provider(), [])
+            assert first._usage_tracker.inference_records()[1].tool_call_id == ""
+        finally:
+            memory1.close()
+            memory2.close()
+    asyncio.run(exercise())

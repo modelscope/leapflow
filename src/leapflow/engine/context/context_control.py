@@ -7,7 +7,8 @@ interactions get long-task resilience without exposing a separate user mode.
 
 Size note (>800-line registered exception per AGENTS.md): context
 accounting, overflow prevention, exploration-ledger tracking, and
-tool-result compaction (including bounded recovery guidance) share the same
+tool-result compaction (including bounded recovery guidance and atomic
+tool-owned evidence views) share the same
 budget ledger; separating them would duplicate accounting state the
 governance depends on.
 """
@@ -358,6 +359,10 @@ class ToolEvidenceBuilder:
             return self._platform_action_evidence(arguments or {}, result)
         if result.get("ok") is False:
             return self._compact_error(result)
+        if isinstance(result.get("_context_fields"), dict):
+            # Defer atomic tool-owned evidence to the final budget fitter, before
+            # generic string/list compaction can silently change its meaning.
+            return dict(result)
         if tool_name in {"file_read", "gp_file_read"}:
             return self._file_read_evidence(arguments or {}, result)
         if tool_name in {"file_list", "gp_file_list"}:

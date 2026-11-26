@@ -133,7 +133,12 @@ class SyntheticVerifier:
 
 
 @pytest.fixture
-async def cycle_rig(tmp_path, rigs, monkeypatch):
+async def cycle_rig(tmp_path, rigs, monkeypatch, request):
+    approval_gate = None
+    if getattr(request, "param", {}).get("real_gate"):
+        from leapflow.security.orchestrator import ApprovalOrchestrator
+        from test_model_tools import Human
+        approval_gate = ApprovalOrchestrator(Human())
     chain = piper_chain()
     tcp = (
         Transform.from_pose(chain.forward(START))
@@ -190,6 +195,7 @@ async def cycle_rig(tmp_path, rigs, monkeypatch):
     rig = rigs(
         tmp_path,
         write_mode=WRITE_MODE_PERMIT_REQUIRED,
+        gate=approval_gate,
         cell=cell,
         node_skills=(GraspCycle(), GripperQualify(), GraspInspect()),
         devices={CAMERA_ID: SimRgbdCamera(), WRIST: SimRgbdCamera()},
@@ -212,7 +218,9 @@ async def cycle_rig(tmp_path, rigs, monkeypatch):
     # The skills list as available only once these records exist; their content
     # is read by the verifier, which is synthetic here.
     registry.calibrate("grasp.qualification", parameters={"synthetic": True})
-    registry.calibrate("camera.verify", parameters={"synthetic": True})
+    camera_version = registry.calibration_store.latest(WORKCELL_ID, "camera.handeye").recorded_at
+    registry.calibrate("camera.verify", parameters={"synthetic": True, "training_disjoint": True,
+                                                    "p95_mm": 1, "depends_on": {"camera": camera_version}})
     request = {
         "workcell": QUALIFIED,
         "skill": "grasp.cycle",
@@ -233,6 +241,59 @@ async def approved_cycle(setup):
     assert not setup.rig.sim.batches
     request = {**setup.request, "args": preview["plan"]["args"]}
     return preview, request
+
+
+@pytest.mark.parametrize("cycle_rig", [{"real_gate": True}], indirect=True)
+async def test_cycle_measurements_link_to_consultation_without_full_task_success(cycle_rig, tmp_path):
+    from leapflow.engine.turn_usage import TurnUsageTracker
+    from leapflow.llm.services.telemetry import capture_inference
+    from leapflow.storage.conversation_store import DuckDBConversationStore
+    from leapflow.tools.execution_context import ToolExecutionContext, reset_tool_context, set_tool_context
+    from test_tool_dispatch_engine import _collaboration_engine, _consultation_capture
+
+    engine, memory = await _collaboration_engine(tmp_path / "engine")
+    store = DuckDBConversationStore(tmp_path / "measured-lineage.duckdb")
+    engine.set_conversation_store(store)
+    store.create_session("own")
+    setup = cycle_rig
+    source = await _consultation_capture(engine)
+    token = set_tool_context(ToolExecutionContext.from_strings(
+        workspace_root=str(tmp_path / "engine"), session_id="own", task_id="t"))
+    try:
+        await engine._learning_bridge._admit_collaboration_records({}, source)
+        preview, request = await approved_cycle(setup)
+        with capture_inference(scope=source.scope, task_id="t", tool_call_id="cycle",
+                               sink=engine._usage_tracker) as capture:
+            result = await setup.rig.service.hw_skill_run(**request, approved_plan=preview["plan"],
+                consultation_refs=[{"call_id": "a", "disposition": "adopted"}])
+        assert result["ok"], result
+        record = capture.plans[0].to_dict()
+        observed = record["outcome"]["operation_verification"]
+        assert observed == result["operation_verification"]
+        assert observed["source"] == "node_grasp_verifier"
+        assert observed["omitted_records"] == max(0, len(result["result"]["stages"]) - 8)
+        assert {row["state"] for row in observed["records"]} >= {"contact_candidate", "held_verified"}
+        assert all(row["source_identity"]["session_id"].startswith("synthetic-")
+                   and len(row["evidence_digest"]) == 64 for row in observed["records"])
+        assert record["references"][0]["link_status"] == "linked"
+        assert record["plan_digest"] == preview["plan"]["digest"]
+        assert record["outcome"]["run_id"] == result["run_id"]
+        assert record["measured_task_outcome"] == observed["measured_task_outcome"] == "unverified"
+        await engine._learning_bridge._admit_collaboration_records(result, capture)
+        engine._session_persistence._persist_message("own", "tool", "node result",
+            metadata=engine._tool_dispatch._tool_execution_metadata(result))
+        restored = TurnUsageTracker()
+        restored.restore_collaboration(store.get_messages("own")[0].metadata, source.scope)
+        feedback = restored.collaboration_feedback(source.scope)
+        assert feedback["plan_links"][0] == record
+        assert feedback["measured_task_outcome"] == "unverified" and not feedback["physical_authority"]
+        # Later caller mutations cannot rewrite the retained measurements.
+        result["operation_verification"]["records"][0]["passed"] = "forged"
+        assert capture.plans[0].to_dict() == record
+    finally:
+        reset_tool_context(token)
+        store.close()
+        memory.close()
 
 
 async def test_actual_cycle_uses_one_cached_permit_lease_and_observer(cycle_rig):

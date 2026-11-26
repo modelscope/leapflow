@@ -9,13 +9,15 @@ from dataclasses import fields
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-from leapflow.llm.services.protocol import ServiceLimits, ServiceSpec, canonical
+from leapflow.llm.services.protocol import ServiceLimits, ServiceMedia, ServiceSpec, canonical
 
 TASKS = frozenset({"grounding", "grasp_proposal", "action_chunk", "decision", "prediction", "evaluation"})
 _KEYS = frozenset({"schema_version", "provider", "base_url", "model", "task", "codec", "output",
                    "auth", "allow_remote", "processing_location", "limits", "identity",
-                   "model_info", "deployment", "request_options", "prompt_template", "enabled"})
+                   "model_info", "deployment", "request_options", "prompt_template", "enabled", "media"})
 _OPTIONS = frozenset({"temperature", "top_p", "seed", "stop"})
+# Hard ceilings: the tool layer never forwards more than 16 artifacts in one request.
+_MEDIA_CEILINGS = {"max_images": 16, "max_videos": 4}
 
 
 def _object(value: Any, name: str) -> dict[str, Any]:
@@ -78,8 +80,8 @@ def _parse(name: str, value: Any) -> ServiceSpec:
     if not remote and not is_loopback(parts.hostname):
         raise ValueError("non-loopback endpoints require explicit allow_remote and egress approval")
     task = _text(data.get("task"), "task")
-    if task not in TASKS:
-        raise ValueError(f"unsupported task {task!r}")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", task):
+        raise ValueError("task must be a bounded capability identifier")
     auth = _object(data.get("auth"), "auth")
     _only(auth, {"mode", "ref"}, "auth")
     mode = auth.get("mode")
@@ -111,8 +113,11 @@ def _parse(name: str, value: Any) -> ServiceSpec:
         if number is not None and (isinstance(number, bool) or not isinstance(number, (int, float))
                                    or not math.isfinite(number) or not 0 <= number <= (2 if key == "temperature" else 1)):
             raise ValueError(f"request_options.{key} is outside its supported range")
-    if "seed" in options and type(options["seed"]) is not int:
-        raise ValueError("request_options.seed must be an integer")
+    if "seed" in options:
+        if provider == "anthropic":
+            raise ValueError("Anthropic does not support request_options.seed")
+        if type(options["seed"]) is not int:
+            raise ValueError("request_options.seed must be an integer")
     if "stop" in options:
         stop = options["stop"]
         if not (isinstance(stop, str) or isinstance(stop, list) and all(isinstance(s, str) for s in stop)):
@@ -133,11 +138,16 @@ def _parse(name: str, value: Any) -> ServiceSpec:
         _only(deployment, {"engine_version", "adapter_digest", "qualification_ref"}, "deployment")
         for key in ("engine_version", "adapter_digest", "qualification_ref"):
             _text(deployment.get(key), f"deployment.{key}")
+    codec = _text(data.get("codec", "json.v1"), "codec")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", codec):
+        raise ValueError("codec must be a bounded capability identifier")
+    media = _media(data.get("media", {}))
+    data = {**data, "media": media.to_dict()}
     return ServiceSpec(name, provider, url, model, task,
-                       codec=_text(data.get("codec", "json.v1"), "codec"), output=output,
+                       codec=codec, output=output,
                        auth_ref=ref, processing_location=location, allow_remote=remote,
                        identity_mode=identity_mode, limits=limits, declaration_json=canonical(data),
-                       enabled=enabled)
+                       enabled=enabled, media=media)
 
 
 def _limits(value: Any) -> ServiceLimits:
@@ -150,6 +160,15 @@ def _limits(value: Any) -> ServiceLimits:
         elif type(number) is not int or number < (0 if key == "max_queue" else 1):
             raise ValueError(f"{key} must be a valid integer budget")
     return ServiceLimits(**data)
+
+
+def _media(value: Any) -> ServiceMedia:
+    data = _object(value, "media")
+    _only(data, set(_MEDIA_CEILINGS), "media")
+    for key, number in data.items():
+        if type(number) is not int or not 0 <= number <= _MEDIA_CEILINGS[key]:
+            raise ValueError(f"media.{key} must be an integer in [0, {_MEDIA_CEILINGS[key]}]")
+    return ServiceMedia(**data)
 
 
 def declarations(specs: tuple[ServiceSpec, ...]) -> dict[str, Any]:

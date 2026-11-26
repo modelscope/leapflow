@@ -20,10 +20,25 @@ from leapflow.hardware.skills.geometry import Plane, Pose, Transform
 
 
 def snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
-    encoded = json.dumps(data, allow_nan=False, sort_keys=True)
-    if len(encoded.encode()) > 1024 * 1024:
-        raise ValueError("grasp qualification exceeds byte budget")
-    return json.loads(encoded)
+    if not isinstance(data, Mapping):
+        raise ValueError("grasp evidence must be a JSON object")
+    try:
+        encoded = json.dumps(data, allow_nan=False, sort_keys=True)
+        if len(encoded.encode()) > 1024 * 1024:
+            raise ValueError("grasp qualification exceeds byte budget")
+        result = json.loads(encoded)
+    except RecursionError as error:
+        raise ValueError("grasp evidence exceeds structural depth") from error
+    stack = [(result, 0)]
+    while stack:
+        value, depth = stack.pop()
+        if depth > 32:
+            raise ValueError("grasp evidence exceeds structural depth")
+        if isinstance(value, dict):
+            stack.extend((v, depth + 1) for v in value.values())
+        elif isinstance(value, list):
+            stack.extend((v, depth + 1) for v in value)
+    return result
 
 
 def digest(data: Mapping[str, Any]) -> str:
@@ -87,6 +102,8 @@ class EffortReference:
         for split, rows in (("training", training), ("holdout", holdout)):
             counts = {"empty": 0, "contact": 0}
             for row in rows:
+                if not isinstance(row, Mapping) or not isinstance(row.get("flange"), Mapping):
+                    raise ValueError("force observation needs a measured row and flange pose object")
                 label = row["label"]
                 if label not in counts or row.get("stationary") is not True:
                     raise ValueError("stationary independently labeled force rows required")
@@ -157,6 +174,18 @@ class EffortReference:
         return label if characterized else "unknown"
 
 
+def calibration_error_bounds(limits: Mapping[str, float]) -> Mapping[str, float]:
+    """The existing component-specific workcell acceptance bounds."""
+    return {
+        "camera_to_base": limits["max_relative_error_mm"],
+        "flange_tcp": limits["max_relative_error_mm"],
+        "table_plane": limits["support_mm"],
+        "inner_pad_midpoint": limits["pad_midpoint_mm"],
+        "jaw_stroke": limits["jaw_stroke_error_mm"],
+        "fingertip_plane": limits["contact_geometry_mm"],
+    }
+
+
 @dataclass(frozen=True)
 class GraspQualification:
     data: Mapping[str, Any]
@@ -175,14 +204,7 @@ class GraspQualification:
         data = snapshot(raw)
         package = admit_package(data["calibration"], device_id=device_id, recorded_at=recorded_at)
         effort = EffortReference.admit(data["effort"], limits=limits)
-        bounds = {
-            "camera_to_base": limits["max_relative_error_mm"],
-            "flange_tcp": limits["max_relative_error_mm"],
-            "table_plane": limits["support_mm"],
-            "inner_pad_midpoint": limits["pad_midpoint_mm"],
-            "jaw_stroke": limits["jaw_stroke_error_mm"],
-            "fingertip_plane": limits["contact_geometry_mm"],
-        }
+        bounds = calibration_error_bounds(limits)
         for certificate in package.certificates:
             if (
                 certificate.rms_mm + certificate.uncertainty_mm > bounds[certificate.component]
@@ -201,7 +223,8 @@ class GraspQualification:
                 raise ValueError(f"qualified {key} required")
         obj = data["object_reference"]
         if (
-            obj.get("physical") is not True
+            not isinstance(obj, Mapping)
+            or obj.get("physical") is not True
             or not obj.get("independent_reference")
             or not obj.get("measurement_id")
         ):

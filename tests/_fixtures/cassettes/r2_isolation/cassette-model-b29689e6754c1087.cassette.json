@@ -65,7 +65,7 @@
     {
       "status": 200,
       "content_type": "application/json",
-      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"cassette-model\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Still workspace A.\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
+      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"cassette-model\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"Still workspace B.\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
     }
   ]
 }

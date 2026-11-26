@@ -283,6 +283,7 @@ async def test_r6_daemon_lifecycle(journeys: JourneyFactory) -> None:
                 assert plugin_status.get("dsh", {}).get("source_kind") == "dsh_package"
                 assert plugin_status.get("dsh", {}).get("verdict") == "adaptable"
 
+                calls = journey.proxy.stats.call_count
                 invoked = await _turn(
                     fresh_client,
                     "Invoke fixture_echo with the text after restart.",
@@ -292,6 +293,11 @@ async def test_r6_daemon_lifecycle(journeys: JourneyFactory) -> None:
                     event.type for event in invoked
                 ]
                 assert not [event for event in invoked if event.type == "error"]
+                resumed_calls = journey.proxy.stats.requests[calls:]
+                assert len(resumed_calls) == 2, "Rediscovery must not consume recovery attempts"
+                # Restart loads the persisted service declaration alongside the
+                # DSH wrapper. Both must be discoverable through the live catalog.
+                assert {"fixture_echo", "model_describe", "model_query"} <= set(resumed_calls[0]["tools"])
 
             with journey.phase("specialist continuity: declaration reloads without carrying session consent"):
                 shown = await fresh_client.command_execute("config", "llm services show fixture", session_id=SESSION)

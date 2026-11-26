@@ -7,7 +7,11 @@ wrappers. Behavior is progressively extracted into delegate components and
 sub-packages; the remaining length is loop-iteration state shared across
 those components, which resists further splitting without indirection that
 costs more than it saves. Guardrail stop context is handed from that loop to
-its existing tool-free finalization helpers; cap policy stays in tools/."""
+its existing tool-free finalization helpers; cap policy stays in tools/.
+Inference ownership and private receipt retention remain in LearningBridge;
+this orchestrator only routes the existing calls through that delegate. Child
+frames use the session factory before disclosure; tracked child tasks propagate
+cancellation, and only inference costs merge back, never consultation authority."""
 
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ import time
 import types
 from contextlib import aclosing
 from dataclasses import asdict
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Union
 
 from leapflow.platform.protocol import HostRpc
 from leapflow.config import Settings
@@ -140,8 +144,10 @@ from leapflow.engine.skill_dispatcher import SkillDispatcher
 from leapflow.engine.prompt_assembler import PromptAssembler
 from leapflow.engine.tool_dispatch_engine import ToolDispatchEngine
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from leapflow.engine.subagent import SubagentResult
 
+logger = logging.getLogger(__name__)
 
 
 class AgentEngine:
@@ -235,6 +241,7 @@ class AgentEngine:
 
         # Cancellation: tracks active task for interrupt support
         self._active_task: Optional[asyncio.Task] = None
+        self._child_tasks: set[asyncio.Task[str]] = set()
         self._cancel_requested = False
         # Per-turn identity, set at turn start; initialized so reads and the
         # subagent frame save/restore never hit an unset attribute. NOTE:
@@ -869,6 +876,9 @@ class AgentEngine:
         task = self._active_task
         if task is not None and not task.done():
             task.cancel()
+        for child_task in tuple(self._child_tasks):
+            if not child_task.done():
+                child_task.cancel()
 
     @property
     def is_cancelled(self) -> bool:
@@ -1216,6 +1226,7 @@ class AgentEngine:
                 usage,
                 provider=getattr(self._llm, "active_provider_name", ""),
                 model=getattr(resp, "model", "") or "",
+                call_id=getattr(resp, "inference_call_id", "") or "",
             )
             if int(usage.get("prompt_tokens", 0) or 0) > 0:
                 self._record_provider_usage(getattr(resp, "model", "") or "", usage)
@@ -1433,8 +1444,8 @@ class AgentEngine:
             provider = self._compression_provider or self._llm
             if provider is None:
                 return ""
-            resp = await provider.achat(
-                [build_user_message_text(prompt)],
+            resp = await self._learning_bridge.call_primary(
+                provider, [build_user_message_text(prompt)],
                 stream=False,
                 enable_thinking=False,
             )
@@ -1570,31 +1581,8 @@ class AgentEngine:
             parent_session_id=parent_session_id,
         )
 
-    def _install_frame(self, frame: AgentLoopFrame) -> Dict[str, Any]:
-        """Install a frame's per-turn subsystems as the engine's active state.
-
-        Returns the previous per-turn state for restoration. This lets a child
-        frame run the full loop on the shared engine while the parent frame's
-        subsystems stay untouched (see ``_run_child_frame``).
-        """
-        saved: Dict[str, Any] = {
-            "governance": self._context_governance_controller,
-            "ledger": self._research_ledger,
-            "commitment": self._prefix_commitment,
-            "usage": self._usage_tracker,
-            "compressor": self._compressor,
-            "coordinator": self._recovery_coordinator,
-            "snapshot": self._last_context_snapshot,
-            "categories": self._last_turn_tool_categories,
-            # Per-turn identity is turn-start-set and non-propagating, so it is
-            # scoped to the frame (a child that reassigns it must not leak to the
-            # parent). NOTE: _cancel_requested is deliberately NOT saved here — it
-            # is a cross-frame signal that must propagate into a running child.
-            "session_id": self._current_session_id,
-            "turn_id": self._current_turn_id,
-            "command_id": self._current_command_id,
-            "frame": self._active_frame,
-        }
+    def _install_frame(self, frame: AgentLoopFrame) -> None:
+        """Install frame state on its child-owned engine, never on the parent."""
         self._context_governance_controller = frame.governance
         self._research_ledger = frame.ledger
         self._prefix_commitment = frame.commitment
@@ -1605,35 +1593,23 @@ class AgentEngine:
         self._last_context_snapshot = frame.last_context_snapshot
         self._last_turn_tool_categories = frame.last_turn_tool_categories
         self._active_frame = frame
-        return saved
-
-    def _restore_per_turn_state(self, saved: Dict[str, Any]) -> None:
-        """Restore per-turn state previously saved by ``_install_frame``."""
-        self._context_governance_controller = saved["governance"]
-        self._research_ledger = saved["ledger"]
-        self._prefix_commitment = saved["commitment"]
-        self._usage_tracker = saved["usage"]
-        self._compressor = saved["compressor"]
-        self._recovery_coordinator = saved["coordinator"]
-        self._last_context_snapshot = saved["snapshot"]
-        self._last_turn_tool_categories = saved["categories"]
-        self._current_session_id = saved["session_id"]
-        self._current_turn_id = saved["turn_id"]
-        self._current_command_id = saved["command_id"]
-        self._active_frame = saved["frame"]
 
     async def _run_child_frame(self, frame: AgentLoopFrame) -> str:
-        """Run a recursive subagent's isolated frame through the full loop.
+        """Run the same loop on child-owned session state, including concurrent children."""
+        from leapflow.engine.session.session_factory import build_child_session_engine
 
-        Swaps the engine's per-turn state to the child frame for the duration of
-        the child loop, then restores the parent's state — so recursion is fully
-        state-isolated without duplicating the loop body.
-        """
-        saved = self._install_frame(frame)
+        if self._cancel_requested:
+            raise asyncio.CancelledError()
+        child = build_child_session_engine(self, frame)
+        task = asyncio.create_task(child._run_agent_loop(frame))
+        child._active_task = task
+        self._child_tasks.add(task)
         try:
-            return await self._run_agent_loop(frame)
+            return await task
         finally:
-            self._restore_per_turn_state(saved)
+            self._child_tasks.discard(task)
+            child._active_task = None
+            self._learning_bridge._retain_child_inference(frame.usage_tracker)
 
     async def _run_subagent_goal(
         self,
@@ -1642,27 +1618,47 @@ class AgentEngine:
         depth: int,
         tool_filter: "frozenset[str] | None" = None,
         enable_thinking: bool = False,
-    ) -> "tuple[str, int]":
-        """Run a subagent goal as an isolated child frame through the full loop.
+    ) -> tuple[str, int, str] | SubagentResult:
+        """Run an isolated child; preserve its real identity in success and failure.
 
-        Bridge for ``EngineFrameSubagentExecutor`` (opt-in full-loop subagents):
-        the child frame's fresh subsystems + per-frame swap keep the subagent
-        from contaminating the parent turn's state.
-
-        Returns ``(summary_text, tool_calls)`` so the executor can populate
-        ``SubagentResult.tool_calls`` with the real count.
+        The full-loop executor accepts the successful tuple or a typed failed
+        SubagentResult. Cancellation remains cancellation, not a completed child.
         """
         frame = self._build_child_frame(
             goal,
-            depth=depth,
+            depth=max(1, depth),
             tool_filter=tool_filter,
             enable_thinking=enable_thinking,
         )
-        summary = await self._run_child_frame(frame)
+        try:
+            summary = await self._run_child_frame(frame)
+        except asyncio.CancelledError as exc:
+            from leapflow.engine.subagent import ChildFrameCancelled
+
+            raise ChildFrameCancelled(frame.session_id,
+                frame.usage_tracker.summary().tool_calls) from exc
+        except Exception as exc:
+            from dataclasses import replace
+            from leapflow.engine.recovery.failure_envelope import SideEffectState
+            from leapflow.engine.subagent import SubagentResult
+
+            logger.error("Child loop failed (session=%s)", frame.session_id, exc_info=True)
+            failure = replace(self._unified_classifier.classify_system_error(exc),
+                              side_effect_state=SideEffectState.UNKNOWN)
+            return SubagentResult(
+                session_id=frame.session_id, goal=goal, summary=f"Subagent error: {exc}",
+                status="failed", error=str(exc),
+                tool_calls=frame.usage_tracker.summary().tool_calls,
+                metadata={"failure": {
+                    **asdict(failure), "source": failure.source.value,
+                    "recoverability": failure.recoverability.value,
+                    "side_effect_state": failure.side_effect_state.value,
+                }},
+            )
         tool_calls = 0
         if frame.usage_tracker is not None:
             tool_calls = frame.usage_tracker.summary().tool_calls
-        return summary, tool_calls
+        return summary, tool_calls, frame.session_id
 
     def _build_frame(
         self,
@@ -1864,8 +1860,8 @@ class AgentEngine:
             # ── LLM call: native-tools path ─────────────────────────────
             if use_native_tools and tools_kwarg:
                 try:
-                    resp = await self._llm.achat(
-                        compressed,
+                    resp = await self._learning_bridge.call_primary(
+                        self._llm, compressed,
                         stream=False,
                         enable_thinking=planned_enable_thinking,
                         **self._tools_kwarg_with_cache_marker(tools_kwarg),
@@ -2078,10 +2074,11 @@ class AgentEngine:
                 if sink.supports_streaming and self._settings.stream_output:
                     # Real-time streaming
                     content_parts: list[str] = []
+                    stream_accounting: Dict[str, Any] = {}
                     try:
                         _clear_indicator()
-                        raw_stream = self._llm.achat_stream(
-                            compressed,
+                        raw_stream = self._learning_bridge.stream_primary(
+                            self._llm, compressed, accounting=stream_accounting,
                             enable_thinking=planned_enable_thinking,
                         )
                         guarded = stale_guarded_stream(
@@ -2144,18 +2141,15 @@ class AgentEngine:
                     # chunks — no response object carries usage.  Record the
                     # API call so the tracker counts it; token counters stay
                     # at zero when the provider's stream omits usage data.
-                    _stream_resp = types.SimpleNamespace(
-                        usage=None,
-                        model=getattr(self._llm, "model", ""),
-                    )
+                    _stream_resp = types.SimpleNamespace(**stream_accounting)
                     self._record_llm_call_telemetry(
                         _stream_resp, recovery=recovery,
                     )
                 else:
                     # Non-streaming text path
                     try:
-                        resp = await self._llm.achat(
-                            compressed,
+                        resp = await self._learning_bridge.call_primary(
+                            self._llm, compressed,
                             stream=False,
                             enable_thinking=planned_enable_thinking,
                         )
@@ -2573,8 +2567,8 @@ class AgentEngine:
             compressed = self._prompt_assembler._prepare_llm_messages(
                 self._healer.heal(prompt), tools=None, round_number=0
             )
-            resp = await self._llm.achat(
-                compressed, stream=False, enable_thinking=False
+            resp = await self._learning_bridge.call_primary(
+                self._llm, compressed, stream=False, enable_thinking=False
             )
             text = (resp.content or "").strip()
             if self._sanitizer:

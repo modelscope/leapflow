@@ -19,9 +19,9 @@ from leapflow.llm.services.protocol import ActiveCallBudget, ServiceError, Servi
 from leapflow.security.actions import ActionDescriptor
 from leapflow.tools.execution_context import require_workspace_access
 from leapflow.tools.model_tools import (
-    _media_type, _validate_geometry, authorize, authorize_endpoint, failure_payload, task_schemas, validate_depth,
+    _media_type, authorize, authorize_endpoint, failure_payload, validate_depth,
 )
-from leapflow.world_model.specialist_contract import INPUT_SCHEMAS, eligible_ids, validate_result
+from leapflow.hardware.service_contracts import GEOMETRY_INPUTS
 
 def _open_fixture(path: Path) -> int:
     """Walk the approved canonical path without following replacement symlinks."""
@@ -66,6 +66,7 @@ def _validate_fixture(value: Any) -> dict[str, Any]:
 
 def _prepare(handle: ServiceHandle, fixture: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any], Any]:
     task, data = handle.spec.task, dict(fixture["input"])
+    contract = handle.contract
     artifacts = fixture.get("artifacts", {})
     if len(artifacts) > 16:
         raise ValueError("A fixture may contain at most 16 embedded artifacts")
@@ -99,20 +100,19 @@ def _prepare(handle: ServiceHandle, fixture: Mapping[str, Any]) -> tuple[dict[st
         schema = provider_result_schema(task)
         validator = partial(parse_response, task)
     else:
-        input_schema, schema = task_schemas(task)
+        if contract.classification != "read_only":
+            raise ValueError("This actuation contract requires a qualified fixture adapter")
+        _, schema = contract.schemas()
         depth = None
         if task == "grasp_proposal" and isinstance(data.get("depth"), dict):
             data["depth"] = dict(data["depth"])
             depth = data["depth"].pop("data", None)
-        validate_schema(data, input_schema, "input")
-        if task in INPUT_SCHEMAS:
-            eligible_ids(data, task)
-            refs = set(data.get("observation_refs", []))
-            if task == "evaluation":
-                refs.add(data["episode_ref"])
+        contract.validate_input(data)
+        if task not in GEOMETRY_INPUTS:
+            refs = set(contract.evidence_references(data).values())
             if refs != set(evidence):
                 raise ValueError("Fixture evidence must exactly match its declared observation/episode references")
-            validator = partial(validate_result, task, data)
+            validator = partial(contract.validate_result, data)
         else:
             if set(media) != {"image"} or evidence:
                 raise ValueError("Geometry fixture requires exactly one image and no unrelated evidence")
@@ -123,13 +123,13 @@ def _prepare(handle: ServiceHandle, fixture: Mapping[str, Any]) -> tuple[dict[st
                 data["depth"]["data"] = depth
                 data = check_request(task, {**data, "image": media["image"]["data"]})
                 data.pop("image")
-            validator = partial(_validate_geometry, task, data)
-    if handle.spec.identity_mode == "server_reported" and task not in INPUT_SCHEMAS:
+            validator = partial(contract.validate_result, data)
+    if handle.spec.identity_mode == "server_reported" and task in {*GEOMETRY_INPUTS, "action_chunk"}:
         request = provider_request(task, data, media)
         schema = provider_result_schema(task)
         validator = partial(parse_response, task)
     else:
-        request = {**data, "_images": [media[k] for k in sorted(media)], "artifact_order": sorted(media)}
+        request = {**data, "_media": [media[k] for k in sorted(media)], "artifact_order": sorted(media)}
         if evidence:
             request["artifact_evidence"] = evidence
     return request, schema, validator
@@ -190,7 +190,8 @@ async def _check_fixture(client: StructuredModelClient, service_id: str, *, path
             if len(encoded) > min(65536, handle.spec.limits.max_request_bytes):
                 raise ValueError("Inline fixture exceeds its text budget")
             fixture = _validate_fixture(json.loads(encoded))
-            if fixture.get("artifacts") or handle.spec.task not in INPUT_SCHEMAS:
+            if (fixture.get("artifacts") or handle.contract.classification != "read_only"
+                    or handle.spec.task in GEOMETRY_INPUTS):
                 raise ValueError("Inline cases are text-only specialist cases; use model_query for owned images")
         handle.check_admission()
         request, schema, validator = await budget.run(asyncio.to_thread(_prepare, handle, fixture))

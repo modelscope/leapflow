@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List
 
 from leapflow.engine.session.session import SessionMode
 from leapflow.engine.context.context_focus import ContextPlane
@@ -315,6 +315,177 @@ class LearningBridge:
             self._record_coevolution_outcome(
                 item, str(getattr(self._engine._settings, "workspace_root", "") or "")
             )
+
+    def _primary_capture(self) -> Any:
+        from pathlib import Path
+        from leapflow.domain.events import RecordScope
+        from leapflow.layout import workspace_id_for_path
+        from leapflow.llm.services.telemetry import InferenceCapture, current_capture
+
+        engine = self._engine
+        contract = engine._current_task_contract
+        scope = RecordScope(str(engine._settings.profile or ""),
+            workspace_id_for_path(Path(contract.workspace_root if contract else engine._settings.workspace_root)),
+            str(engine._current_session_id or ""))
+        parent = current_capture()
+        owned = parent if parent is not None and parent.scope == scope else None
+        return InferenceCapture(scope=scope, task_id=contract.task_id if contract else owned.task_id if owned else "",
+            tool_call_id=owned.tool_call_id if owned else "", sink=engine._usage_tracker)
+
+    async def call_primary(self, provider: Any, messages: List[Dict[str, Any]], *,
+                           inference_tool_call_id: str | None = None, **options: Any) -> Any:
+        """Capture attempts, including auxiliary inference for an owned tool attachment."""
+        from leapflow.llm.services.telemetry import ProviderAttempt, new_call_id, use_inference_capture
+
+        capture = self._primary_capture()
+        if inference_tool_call_id is not None:
+            capture.tool_call_id = inference_tool_call_id
+        response = None
+        failure: BaseException | None = None
+        with use_inference_capture(capture):
+            fallback = ProviderAttempt(new_call_id(), 1, str(getattr(provider, "active_provider_name", "")),
+                                       str(getattr(provider, "model", "")), accounting_level="call_boundary")
+            try:
+                response = await provider.achat(messages, **options)
+                return response
+            except BaseException as exc:
+                failure = exc
+                raise
+            finally:
+                if not capture.attempts:
+                    if response is not None:
+                        fallback.response(response)
+                    fallback.__exit__(type(failure) if failure else None, failure, None)
+                await self._retain_primary_capture(capture)
+
+    async def stream_primary(self, provider: Any, messages: List[Dict[str, Any]], *,
+                             accounting: Dict[str, Any], **options: Any) -> AsyncIterator[str]:
+        """Capture each generator await in its own ContextVar scope (stale-guard safe)."""
+        from leapflow.llm.services.telemetry import ProviderAttempt, new_call_id, use_inference_capture
+
+        capture = self._primary_capture()
+        with use_inference_capture(capture):
+            fallback = ProviderAttempt(new_call_id(), 1, str(getattr(provider, "active_provider_name", "")),
+                                       str(getattr(provider, "model", "")), accounting_level="call_boundary")
+        stream = None
+        failure: BaseException | None = None
+        try:
+            with use_inference_capture(capture):
+                stream = provider.achat_stream(messages, **options).__aiter__()
+            while True:
+                with use_inference_capture(capture):
+                    try:
+                        chunk = await stream.__anext__()
+                    except StopAsyncIteration:
+                        break
+                yield chunk
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            try:
+                with use_inference_capture(capture):
+                    close = getattr(stream, "aclose", None)
+                    if callable(close):
+                        await close()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+                    raise
+                logger.warning("Provider stream cleanup failed after terminal failure", exc_info=True)
+            finally:
+                if not capture.attempts:
+                    fallback.__exit__(type(failure) if failure else None, failure, None)
+                try:
+                    last = capture.attempts[-1]
+                    import json
+                    accounting.update(usage=json.loads(last.usage_json), model=last.model,
+                                      inference_call_id=last.call_id)
+                except Exception:  # noqa: BLE001 - stream metadata must not change completion
+                    logger.warning("Streaming usage metadata unavailable", exc_info=True)
+                await self._retain_primary_capture(capture)
+
+    def _retain_child_inference(self, tracker: Any) -> None:
+        """Include delegated costs once without transferring child artifact/advice authority."""
+        if tracker is None or tracker is self._engine._usage_tracker:
+            return
+        try:
+            for attempt in tracker.inference_records():
+                self._engine._usage_tracker.record_inference(attempt)
+        except Exception:  # noqa: BLE001 - accounting cannot replace child completion/cancellation
+            logger.warning("Child inference accounting retention failed", exc_info=True)
+
+    async def _retain_primary_capture(self, capture: Any) -> None:
+        try:
+            result: Dict[str, Any] = {}
+            await self._admit_collaboration_records(result, capture)
+            if result:
+                self._engine._session_persistence._persist_message(capture.scope.session_id, "record", "",
+                    metadata=self._engine._tool_dispatch._tool_execution_metadata(result))
+        except Exception:  # noqa: BLE001 - accounting cannot replace a provider exception
+            logger.warning("Primary inference receipt retention failed", exc_info=True)
+
+    async def _admit_collaboration_records(self, result: Any, capture: Any) -> None:
+        """Retain private admitted receipts in the existing ledger/trace result.
+
+        No subscriber broadcast, trust promotion, or physical-success inference.
+        The capture is supplied by the owning tool dispatcher, not resolved from
+        daemon-global state. Redacted receipts, including refusals, stay visible.
+        """
+        if not isinstance(result, dict) or not (capture.attempts or capture.consultations or capture.plans):
+            return
+        try:
+            from dataclasses import asdict
+            from leapflow.domain.events import RecordAdmission, RecordSignalPort
+            from leapflow.llm.services.telemetry import admitted_record_value
+            from leapflow.monitor.signal_noise import SignalNoiseConfig, SignalNoiseGate
+
+            signals = self._engine._event_bus
+            if not isinstance(signals, RecordSignalPort):
+                result["collaboration_signal_status"] = "unavailable"
+                return
+            records = [("model.inference_attempt", attempt.attempt_id, attempt.to_dict())
+                       for attempt in capture.attempts if attempt.scope == capture.scope]
+            for consultation in capture.consultations:
+                if consultation.scope == capture.scope:
+                    metadata = consultation.to_dict()
+                    metadata.pop("attempts")
+                    records.append(("model.consultation", consultation.call_id, metadata))
+            records.extend(("model.plan_link", plan.record_id, plan.to_dict())
+                           for plan in capture.plans if plan.scope == capture.scope)
+            receipts = []
+            result["collaboration_signal_receipts"] = receipts
+            gate = SignalNoiseGate(SignalNoiseConfig.from_settings(self._engine._settings))
+            for event_type, identity, metadata in records:
+                item = {"event_type": event_type, "record_id": identity,
+                        "scope": asdict(capture.scope), "admitted": False,
+                        "lineage_eligible": False, "reason": "admission_unavailable", "payload_json": "{}"}
+                receipts.append(item)
+                try:
+                    receipt = await signals.admit_record(event_type,
+                        {"event_class": "record", "value": metadata}, scope=capture.scope,
+                        dedup_key=identity, noise_gate=gate)
+                    owned = (isinstance(receipt, RecordAdmission) and receipt.scope == capture.scope
+                             and receipt.event_type == event_type)
+                    admitted = owned and receipt.admitted is True
+                    eligible = admitted_record_value(receipt, capture.scope,
+                        event_type=event_type, identity=identity) is not None
+                    item.update(admitted=admitted, lineage_eligible=eligible,
+                        reason=receipt.reason if owned else "ownership_mismatch",
+                        payload_json=receipt.payload_json if eligible else "{}")
+                except Exception:  # noqa: BLE001 - one broken admission cannot hide other records
+                    logger.warning("Collaboration record admission failed", exc_info=True)
+                    result["collaboration_signal_status"] = "unavailable"
+                    continue
+                if eligible:
+                    try:
+                        self._engine._usage_tracker.record_collaboration(receipt)
+                    except Exception:  # noqa: BLE001 - feedback failure cannot lose durable receipts
+                        logger.warning("Collaboration feedback retention failed", exc_info=True)
+                        result["collaboration_signal_status"] = "feedback_unavailable"
+        except Exception:  # noqa: BLE001 - observation must never affect execution
+            logger.warning("Collaboration record admission failed", exc_info=True)
+            result["collaboration_signal_status"] = "unavailable"
 
     @staticmethod
     def _record_coevolution_outcome(item: Any, workspace: str = "") -> None:

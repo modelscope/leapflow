@@ -788,3 +788,186 @@ async def test_survey_host_governance_refusals_are_observed_without_motion(rigs,
     assert priors.decisions[-1][3] == phase
     assert len(priors.decisions[-1][2]) == 64
     assert priors.lookups == ([QUALIFIED] if phase == 'planning' else [])
+
+
+@pytest.mark.parametrize("disposition", ["adopted", "overridden", "unused"])
+async def test_explicit_consultation_lineage_uses_verified_plan_and_real_admission(tmp_path, rigs, disposition):
+    from leapflow.engine.turn_usage import TurnUsageTracker
+    from leapflow.llm.services.telemetry import capture_inference
+    from leapflow.security.orchestrator import ApprovalOrchestrator
+    from leapflow.storage.conversation_store import DuckDBConversationStore
+    from leapflow.tools.execution_context import ToolExecutionContext, reset_tool_context, set_tool_context
+    from test_model_tools import Human
+    from test_tool_dispatch_engine import _collaboration_engine, _consultation_capture
+
+    engine, memory = await _collaboration_engine(tmp_path / "engine")
+    store = DuckDBConversationStore(tmp_path / "lineage.duckdb")
+    engine.set_conversation_store(store)
+    store.create_session("own")
+    human = Human()
+    rig = rigs(tmp_path / "node", write_mode=WRITE_MODE_PERMIT_REQUIRED,
+               gate=ApprovalOrchestrator(human))
+    source = await _consultation_capture(engine)
+    context = ToolExecutionContext.from_strings(workspace_root=str(tmp_path / "engine"),
+                                               session_id="own", task_id="t")
+    token = set_tool_context(context)
+    try:
+        await engine._learning_bridge._admit_collaboration_records({}, source)
+        with capture_inference(scope=source.scope, task_id="t", tool_call_id="plan-call",
+                               sink=engine._usage_tracker) as capture:
+            preview = await rig.service.hw_skill_run(**MOVE, dry_run=True,
+                consultation_refs=[{"call_id": "a", "disposition": disposition}])
+        assert preview["ok"] and not human.requests and not rig.sim.batches
+        assert len(capture.plans) == 1
+        snapshot = capture.plans[0].to_dict()
+        assert snapshot["references"][0]["link_status"] == "linked"
+        assert snapshot["plan_digest"] == preview["plan"]["digest"]
+        assert snapshot["outcome"]["dry_run"]
+        assert snapshot["measured_task_outcome"] == "unverified" and not snapshot["physical_authority"]
+        with capture_inference(scope=source.scope, task_id="t", tool_call_id="run-call",
+                               sink=engine._usage_tracker) as executed:
+            result = await rig.service.hw_skill_run(
+                workcell=MOVE["workcell"], skill=MOVE["skill"], args=preview["plan"]["args"],
+                approved_plan=preview["plan"],
+                consultation_refs=[{"call_id": "a", "disposition": disposition}])
+        assert result["ok"], result.get("error", result)
+        assert len(human.requests) == 1 and rig.sim.batches
+        run = executed.plans[0].to_dict()
+        assert run["outcome"]["run_id"] == result["run_id"]
+        assert run["outcome"]["status"] == STATUS_SUCCEEDED
+        assert run["outcome"]["evidence_level"] == "node_execution"
+        permit = next(row["value"] for row in rig.audit.records if row["action"] == "skill_permit")
+        assert run["permit_digest"] == permit["request_digest"]
+        assert run["plan_digest"] == permit["plan_digest"]
+        await engine._learning_bridge._admit_collaboration_records(result, executed)
+        metadata = engine._tool_dispatch._tool_execution_metadata(result)
+        engine._session_persistence._persist_message("own", "tool", "x" * 20_000, metadata=metadata)
+        row = store.get_messages("own")[0]
+        assert row.metadata["collaboration_signal_receipts"][0]["event_type"] == "model.plan_link"
+        restored = TurnUsageTracker()
+        restored.restore_collaboration(row.metadata, source.scope)
+        feedback = restored.collaboration_feedback(source.scope)
+        assert feedback["plan_links"][0] == run
+        assert feedback["measured_task_outcome"] == "unverified"
+        # Serialization is detached; a caller cannot rewrite the recorded attribution.
+        run["references"][0]["disposition"] = "forged"
+        assert executed.plans[0].to_dict()["references"][0]["disposition"] == disposition
+    finally:
+        reset_tool_context(token)
+        store.close()
+        memory.close()
+
+
+@pytest.mark.parametrize("cancel_wait", [False, True])
+async def test_later_run_observations_preserve_owned_lineage(tmp_path, rigs, cancel_wait):
+    from dataclasses import replace
+    from leapflow.llm.services.telemetry import capture_inference
+    from leapflow.security.orchestrator import ApprovalOrchestrator
+    from leapflow.tools.execution_context import ToolExecutionContext, reset_tool_context, set_tool_context
+    from test_model_tools import Human
+    from test_tool_dispatch_engine import _collaboration_engine, _consultation_capture
+
+    engine, memory = await _collaboration_engine(tmp_path / "engine")
+    source = await _consultation_capture(engine)
+    rig = rigs(tmp_path / "node", stall=True, gate=ApprovalOrchestrator(Human()))
+    token = set_tool_context(ToolExecutionContext.from_strings(
+        workspace_root=str(tmp_path / "engine"), session_id="own", task_id="t"))
+    try:
+        await engine._learning_bridge._admit_collaboration_records({}, source)
+        with capture_inference(scope=source.scope, task_id="t", tool_call_id="start",
+                               sink=engine._usage_tracker) as initial:
+            task = asyncio.create_task(rig.service.hw_skill_run(**MOVE, wait=cancel_wait,
+                consultation_refs=[{"call_id": "a", "disposition": "adopted"}]))
+            await _until(lambda: rig.service._runs)
+            if cancel_wait:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                await _until(lambda: _run_ended(rig.runtime))
+            else:
+                await task
+        original = initial.plans[0].to_dict()
+        run_id = original["outcome"]["run_id"]
+        assert original["outcome"]["status"] == ("interrupted" if cancel_wait else "running")
+        with capture_inference(scope=replace(source.scope, session_id="foreign"), task_id="t") as foreign:
+            await rig.service.hw_skill_status(run_id=run_id)
+        assert not foreign.plans
+        with capture_inference(scope=source.scope, task_id="t", tool_call_id="later",
+                               sink=engine._usage_tracker) as observed:
+            if cancel_wait:
+                terminal = await rig.service.hw_skill_status(run_id=run_id)
+            else:
+                terminal = await rig.service.hw_skill_stop(run_id=run_id)
+        assert terminal["ok"] and len(observed.plans) == 1
+        latest = observed.plans[0].to_dict()
+        assert latest["origin_record_id"] == original["record_id"]
+        assert latest["references"] == original["references"]
+        assert latest["plan_digest"] == original["plan_digest"]
+        assert latest["outcome"]["failure_code"] == FAILURE_STOPPED
+        assert latest["outcome"]["run_id"] == run_id
+        assert latest["measured_task_outcome"] == "unverified"
+        await engine._learning_bridge._admit_collaboration_records(terminal, observed)
+        assert terminal["collaboration_signal_receipts"][0]["lineage_eligible"]
+        assert initial.plans[0].to_dict() == original
+    finally:
+        reset_tool_context(token)
+        memory.close()
+
+
+def test_verification_feedback_is_bounded_metadata_not_model_success():
+    from leapflow.hardware.skill_results import outcome_fields
+
+    row = {"stage": "hold", "state": "held_verified", "passed": True,
+           "qualification_digest": "q", "source_identity": {"session_id": "sensor", "scene_id": "scene",
+           "calibration_digest": "calibration", "observed_mono": 12.5, "frame_ids": ["f1", "f2"]},
+           "evidence": {"uncertainty_mm": 1.0, "object_on_support": False, "image": "never replay"}}
+    fields = outcome_fields({"status": "succeeded", "evidence": {
+        "grasp_cycle": {"stages": [{"verification": row}] * 20}, "teacher_success": True}})
+    feedback = fields["operation_verification"]
+    assert len(feedback["records"]) == 8 and feedback["omitted_records"] == 12
+    assert feedback["records"][0]["frame_count"] == 2
+    assert feedback["records"][0]["uncertainty_mm"] == 1.0
+    assert "never replay" not in json.dumps(feedback)
+    assert feedback["measured_task_outcome"] == "unverified"
+    assert "operation_verification" not in outcome_fields({"status": "succeeded", "evidence": {"teacher_success": True}})
+
+
+@pytest.mark.parametrize("malformed", [float("nan"), object()])
+def test_verification_telemetry_defect_cannot_fail_physical_result(malformed):
+    from leapflow.hardware.skill_results import outcome_fields
+
+    fields = outcome_fields({"status": "succeeded", "side_effect_state": "committed",
+        "evidence": {"grasp_verify": {"passed": True, "evidence": {"invalid": malformed}}}})
+    assert fields["ok"] and fields["side_effect_state"] == "committed"
+    assert "operation_verification" not in fields
+
+
+@pytest.mark.parametrize("references", [
+    [{"call_id": "a", "disposition": "adopted"}] * 2,
+    [{"call_id": "", "disposition": "adopted"}],
+    [{"call_id": "a", "disposition": "execute"}],
+    [{"call_id": "a", "disposition": "adopted", "actions": []}],
+    "a",
+])
+async def test_invalid_consultation_references_refuse_without_motion(tmp_path, rigs, references):
+    rig = rigs(tmp_path)
+    result = await rig.service.hw_skill_run(**MOVE, consultation_refs=references)
+    assert not result["ok"] and result["failure_code"] == "invalid_request"
+    assert not rig.gate.seen and not rig.sim.batches
+
+
+async def test_tampered_plan_never_produces_verified_lineage(tmp_path, rigs):
+    from leapflow.llm.services.telemetry import capture_inference
+
+    def wrap(client):
+        def tamper(method, reply):
+            if method == "skill.plan" and "plan" in reply:
+                reply["plan"]["digest"] = "tampered"
+            return reply
+        return _Tampering(client, on_reply=tamper)
+
+    rig = rigs(tmp_path, wrap=wrap)
+    with capture_inference() as capture:
+        result = await rig.service.hw_skill_run(**MOVE, consultation_refs=[{"call_id": "a", "disposition": "adopted"}])
+    assert result["failure_code"] == FAILURE_PLAN_UNVERIFIED
+    assert not capture.plans and not rig.sim.batches

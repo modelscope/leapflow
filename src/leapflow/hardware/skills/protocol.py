@@ -245,8 +245,13 @@ class SkillSpec:
     provides: tuple[str, ...] = ()
     provides_when: tuple[str, ...] = ()
     bounded_planning: bool = False
+    evidence_media: str = ""
 
     def __post_init__(self) -> None:
+        if self.evidence_media not in {"", "image", "video"}:
+            raise ValueError("evidence_media must be empty, image, or video")
+        if self.evidence_media and (self.effect != EFFECT_READ or self.leased):
+            raise ValueError("evidence export requires a non-leased read skill")
         if type(self.bounded_planning) is not bool:
             raise ValueError("bounded planning must be an explicit boolean")
         if type(self.motion_allowed) is not bool:

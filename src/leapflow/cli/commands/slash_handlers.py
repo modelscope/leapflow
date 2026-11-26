@@ -278,7 +278,8 @@ def build_config_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
     """Execute a config command and return a serializable payload."""
     from leapflow.config_service import ConfigService
 
-    service = ConfigService(ctx.settings, hardware_registry=getattr(ctx, "_hardware_registry", None))
+    service = ConfigService(ctx.settings, hardware_registry=getattr(ctx, "_hardware_registry", None),
+                            model_services=getattr(ctx, "model_services", None))
     try:
         from leapflow.utils.shell_lex import split_args
 

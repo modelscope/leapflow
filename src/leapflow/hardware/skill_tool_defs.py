@@ -83,6 +83,20 @@ _RUN_SCHEMA: dict[str, Any] = {
             },
             "description": "Lexicographic advertised metrics, default joint_margin max, joint_travel min, tcp_distance_mm min. Verified candidates rank first.",
         },
+        "consultation_refs": {
+            "type": "array", "maxItems": 8,
+            "items": {"type": "object", "additionalProperties": False,
+                      "required": ["call_id", "disposition"],
+                      "properties": {
+                          "call_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                          "disposition": {"type": "string", "enum": ["adopted", "overridden", "unused"]},
+                      }},
+            "description": (
+                "Optional explicit attribution to consultation.call_id from this session/task. "
+                "Declare adopted, overridden, or unused advice for this plan. Metadata only: "
+                "does not execute advice, grant permission, or establish measured task success."
+            ),
+        },
         "approved_plan": {
             "type": "object",
             "description": "Reuse the exact full selected preview plan with its exact args; still requires approval and freshness. Expired/consumed plans refuse without replanning; incompatible with candidates.",

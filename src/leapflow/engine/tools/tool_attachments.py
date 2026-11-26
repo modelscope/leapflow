@@ -23,7 +23,7 @@ import hashlib
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +35,8 @@ IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/webp"})
 _MAX_DATA_CHARS = 8_000_000
 _MAX_LABEL_CHARS = 200
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
-# Descriptions are keyed by image content, so a frame shown twice is described once.
+# The caller owns the bounded cache; sensitive descriptions never cross sessions.
 _DESCRIPTION_CACHE_SIZE = 64
-_DESCRIPTIONS: "OrderedDict[str, str]" = OrderedDict()
 # Reasoning models spend tokens before answering even with thinking off.
 _DESCRIPTION_MAX_TOKENS = 600
 
@@ -214,6 +213,8 @@ async def present_attachments(
     keep: int,
     sees_images: bool,
     vlm: Any = None,
+    call_provider: Callable[..., Awaitable[Any]] | None = None,
+    description_cache: OrderedDict[tuple[str, ...], str] | None = None,
 ) -> None:
     """Append one message showing a batch's images, or describing them in text.
 
@@ -231,7 +232,11 @@ async def present_attachments(
         retire_tool_images(messages, keep=budget - len(shown))
         messages.append(attachment_message(shown, omitted=omitted, repeated=repeated))
         return
-    descriptions = [await describe_image(vlm, item) for item in attachments]
+    cache = description_cache if description_cache is not None else OrderedDict()
+    descriptions = [
+        await describe_image(vlm, item, call_provider=call_provider, description_cache=cache)
+        for item in attachments
+    ]
     messages.append(described_message(attachments, descriptions))
 
 
@@ -295,13 +300,20 @@ def model_sees_images(registry: Any, model: str) -> bool:
         return False
 
 
-async def describe_image(vlm: Any, item: ToolAttachment) -> str:
-    """A short VLM description of one attached image, or ``""`` when unavailable."""
+async def describe_image(
+    vlm: Any, item: ToolAttachment, *,
+    call_provider: Callable[..., Awaitable[Any]] | None = None,
+    description_cache: OrderedDict[tuple[str, ...], str] | None = None,
+) -> str:
+    """Describe an image with caller-owned accounting and session-local reuse."""
     if vlm is None:
         return ""
-    cached = _DESCRIPTIONS.get(item.digest)
+    key = (str(getattr(vlm, "active_provider_name", "")), str(getattr(vlm, "model", "")),
+           str(getattr(vlm, "base_url", "") or getattr(vlm, "_base_url", "")),
+           item.mime, item.digest, item.tool_name, item.label)
+    cached = description_cache.get(key) if description_cache is not None else None
     if cached is not None:
-        _DESCRIPTIONS.move_to_end(item.digest)
+        description_cache.move_to_end(key)
         return cached
     from leapflow.llm.message_builder import build_user_message_multimodal
 
@@ -312,18 +324,20 @@ async def describe_image(vlm: Any, item: ToolAttachment) -> str:
         "image, with approximate pixel coordinates when you can estimate them."
     )
     message = build_user_message_multimodal(prompt, images_base64=[item.data], image_mime=item.mime)
+    options = {"stream": False, "enable_thinking": False, "max_tokens": _DESCRIPTION_MAX_TOKENS}
     try:
-        reply = await vlm.achat(
-            [message], stream=False, enable_thinking=False, max_tokens=_DESCRIPTION_MAX_TOKENS
+        reply = (
+            await call_provider(vlm, [message], inference_tool_call_id=item.tool_call_id, **options)
+            if call_provider is not None else await vlm.achat([message], **options)
         )
     except Exception:  # noqa: BLE001 - a failed description degrades to "unavailable"
         logger.debug("tool image description failed", exc_info=True)
         return ""
     text = str(getattr(reply, "content", "") or "")
-    if text.strip():
-        _DESCRIPTIONS[item.digest] = text
-        while len(_DESCRIPTIONS) > _DESCRIPTION_CACHE_SIZE:
-            _DESCRIPTIONS.popitem(last=False)
+    if text.strip() and description_cache is not None:
+        description_cache[key] = text
+        while len(description_cache) > _DESCRIPTION_CACHE_SIZE:
+            description_cache.popitem(last=False)
     return text
 
 

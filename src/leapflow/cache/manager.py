@@ -178,7 +178,7 @@ class CacheManager:
                 or not math.isfinite(expires_at) or expires_at <= time.time()
                 or not math.isfinite(monotonic_deadline) or monotonic_deadline <= time.monotonic()):
             raise ValueError("session evidence is empty, expired, or exceeds its quota")
-        if suffix not in (".jpg", ".png", ".webp"):
+        if suffix not in (".jpg", ".png", ".webp", ".mp4", ".webm"):
             raise ValueError("unsupported session evidence extension")
         directory = self._private_session_directory(workspace_id, session_id, category, source)
         filename = uuid.uuid4().hex + suffix

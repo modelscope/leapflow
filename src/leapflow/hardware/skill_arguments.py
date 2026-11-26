@@ -30,12 +30,14 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from leapflow.hardware.skill_results import FAILURE_INVALID_REQUEST, SkillRefusal, as_mapping
-from leapflow.hardware.skill_tool_defs import DEFAULT_RUN_TIMEOUT_S, MAX_RUN_TIMEOUT_S
+from leapflow.hardware.skill_tool_defs import DEFAULT_RUN_TIMEOUT_S, MAX_RUN_TIMEOUT_S, _RUN_SCHEMA
+from leapflow.llm.services.codec import validate_schema
+from leapflow.llm.services.telemetry import ConsultationReference
 
 PAYLOAD_FIELD = "args"
 ROUTING_FIELDS: tuple[str, ...] = ("workcell", "skill")
 """Envelope fields the host needs before it can read the skill's schema."""
-OPTION_FIELDS: tuple[str, ...] = ("dry_run", "intent", "wait", "timeout_s", "export_evidence")
+OPTION_FIELDS: tuple[str, ...] = ("dry_run", "intent", "wait", "timeout_s", "export_evidence", "consultation_refs")
 ENVELOPE_FIELDS: tuple[str, ...] = ROUTING_FIELDS + OPTION_FIELDS
 _BOOLEAN_FIELDS = frozenset({"dry_run", "wait", "export_evidence"})
 
@@ -55,6 +57,7 @@ class RunRequest:
     candidates: list[Any] | None = None
     selection: Any = None
     export_evidence: bool = False
+    consultation_refs: tuple[ConsultationReference, ...] = ()
 
     def repair_view(self) -> dict[str, Any]:
         """What was moved out of ``args``, for the result S2 reads."""
@@ -157,7 +160,20 @@ def split_request(kwargs: Mapping[str, Any], declared: frozenset[str] | None) ->
         candidates=batch,
         selection=kwargs.get("selection"),
         export_evidence=bool(envelope["export_evidence"]),
+        consultation_refs=_consultation_refs(envelope["consultation_refs"]),
     )
+
+
+def _consultation_refs(raw: Any) -> tuple[ConsultationReference, ...]:
+    if raw is None:
+        return ()
+    try:
+        validate_schema(raw, _RUN_SCHEMA["properties"]["consultation_refs"])
+        if len({item["call_id"] for item in raw}) != len(raw):
+            raise ValueError("consultation_refs must not repeat a call_id")
+        return tuple(ConsultationReference(item["call_id"], item["disposition"]) for item in raw)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise SkillRefusal(FAILURE_INVALID_REQUEST, f"Invalid consultation_refs: {exc}") from exc
 
 
 def _timeout(raw: Any) -> float:

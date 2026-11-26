@@ -65,7 +65,9 @@ def journey_root(journey_id: str, *, prefix: str = "lfj-") -> Path:
     base = Path("/tmp")
     if not (base.is_dir() and os.access(base, os.W_OK)):
         base = Path(tempfile.gettempdir())
-    root = base / f"{prefix}{journey_id}"
+    # macOS exposes /tmp through /private/tmp. Resolve the OS scratch root before
+    # creating our owned directory; private evidence correctly refuses symlink ancestry.
+    root = base.resolve() / f"{prefix}{journey_id}"
 
     live = _live_daemon_in(root)
     if live is not None:

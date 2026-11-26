@@ -47,15 +47,19 @@ class ModelServicesPlugin:
         return [
             ToolMetadata(
                 name="model_describe",
-                description="Describe configured specialist services and selected input/result schemas. Cached; no network probe.",
+                description="Describe configured specialist services, per-kind image/video capacity and selected "
+                            "input/result schemas. Cached; no network probe.",
                 parameters_schema={"type": "object", "properties": {"service_id": {"type": "string"}}},
                 handler=self._behavior.describe, x_leapflow={**metadata, "summary": "describe specialist services"},
                 provides_capabilities=("model.describe",),
             ),
             ToolMetadata(
                 name="model_query",
-                description=("Read-only typed specialist query. Use model_describe for the selected input schema. "
-                             "Artifacts map labels to caller-owned session cache IDs, never paths/URLs/base64. "
+                description=("Read-only typed specialist query. Use model_describe for schemas and media capacity. "
+                             "Artifacts map viewpoint labels (scene, wrist, scene_clip) to caller-owned session "
+                             "cache IDs, never paths/URLs/base64. Measurements can go in decision.state. "
+                             "Concrete eligible alternatives support meaningful comparison; clips support temporal "
+                             "questions. Candidate scores/margins are uncalibrated advice, not measured outcomes. "
                              "Call directly; runtime requests any necessary service consent. Do not ask for duplicate consent in dialogue. "
                              "Decisions are advisory, predictions hypothetical, evaluations teacher assessments. "
                              "Physical actions require hw_skill_* / policy.run; generated calls never execute."),

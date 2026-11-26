@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -189,6 +190,13 @@ class CalibrationStore:
         rows = self._query(device_id, procedure_id, limit=1)
         return rows[0] if rows else None
 
+    def get_version(self, device_id: str, procedure_id: str, recorded_at: float) -> CalibrationRecord | None:
+        """Read one exact stored identity; never substitute a newer or nearby version."""
+        if type(recorded_at) not in (int, float) or not math.isfinite(recorded_at):
+            raise ValueError("finite calibration version required")
+        rows = self._query(device_id, procedure_id, limit=1, recorded_at=float(recorded_at))
+        return rows[0] if rows else None
+
     def latest_time(self, device_id: str, procedure_id: str | None = None) -> float | None:
         """Return the instant of the most recent calibration, or None if never calibrated.
 
@@ -209,7 +217,7 @@ class CalibrationStore:
         return self._query(device_id, procedure_id, limit=limit)
 
     def _query(
-        self, device_id: str, procedure_id: str | None, *, limit: int
+        self, device_id: str, procedure_id: str | None, *, limit: int, recorded_at: float | None = None
     ) -> tuple[CalibrationRecord, ...]:
         if self._holder is None:
             return ()
@@ -222,9 +230,12 @@ class CalibrationStore:
         except Exception as exc:  # noqa: BLE001
             logger.debug("Could not read calibration history: %s", exc)
             return ()
-        if procedure_id is None:
+        if recorded_at is not None:
+            sql = _SELECT_BY_VERSION
+            params: tuple[Any, ...] = (device_id, procedure_id, recorded_at, CALIBRATION_SCHEMA_VERSION)
+        elif procedure_id is None:
             sql = _SELECT_BY_DEVICE
-            params: tuple[Any, ...] = (device_id, CALIBRATION_SCHEMA_VERSION, int(limit))
+            params = (device_id, CALIBRATION_SCHEMA_VERSION, int(limit))
         else:
             sql = _SELECT_BY_PROCEDURE
             params = (device_id, procedure_id, CALIBRATION_SCHEMA_VERSION, int(limit))
@@ -339,6 +350,14 @@ FROM calibration_records
 WHERE device_id = ? AND procedure_id = ? AND schema_version >= ?
 ORDER BY recorded_at DESC
 LIMIT ?
+"""
+
+
+_SELECT_BY_VERSION = f"""
+SELECT {", ".join(_COLUMNS)}
+FROM calibration_records
+WHERE device_id = ? AND procedure_id = ? AND recorded_at = ? AND schema_version >= ?
+LIMIT 1
 """
 
 

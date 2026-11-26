@@ -17,7 +17,10 @@ Fits leapflow's architecture:
 Size note (>800-line registered exception per AGENTS.md): isolation policy,
 context construction, lifecycle, and EventBus reporting form one delegation
 contract; the pieces share the subagent session lineage and stay together
-to keep that lineage's invariants in one place.
+to keep that lineage's invariants in one place. The full-loop adapter reports
+the engine-owned child session so consent, receipts, and terminal results agree;
+its runner comes from the active tool context, not a daemon template engine.
+Cancellation carries the child identity; prompt status is parent-session scoped.
 """
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ import contextvars
 import logging
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Deque, Dict, FrozenSet, List, Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,15 @@ DELEGATE_BLOCKED_TOOLS: FrozenSet[str] = frozenset({
     "research_note", "gp_research_note",
     "schedule_reentry", "gp_schedule_reentry",
 })
+
+
+class ChildFrameCancelled(asyncio.CancelledError):
+    """Preserve persisted child ownership while propagating asyncio cancellation."""
+
+    def __init__(self, session_id: str, tool_calls: int = 0) -> None:
+        super().__init__("Subagent execution was cancelled.")
+        self.session_id = session_id
+        self.tool_calls = tool_calls
 
 
 # ── Lifecycle events (frozen; safe to pass across asyncio tasks) ──
@@ -284,13 +296,14 @@ class SubagentManager:
             try:
                 raw_result = await task
                 result = self._trim_summary(raw_result, config.summary_max_chars)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as exc:
                 result = SubagentResult(
-                    session_id=session_id,
+                    session_id=exc.session_id if isinstance(exc, ChildFrameCancelled) else session_id,
                     goal=config.goal,
                     summary="Subagent execution was cancelled.",
                     status="cancelled",
                     elapsed_s=time.monotonic() - t0,
+                    tool_calls=exc.tool_calls if isinstance(exc, ChildFrameCancelled) else 0,
                 )
             except Exception as e:
                 result = SubagentResult(
@@ -371,15 +384,18 @@ class SubagentManager:
         tasks = [self.delegate(config) for config in configs]
         return list(await asyncio.gather(*tasks, return_exceptions=False))
 
-    def has_active(self) -> bool:
+    def has_active(self, *, parent_session_id: str | None = None) -> bool:
         """Return True when at least one subagent task is in-flight.
 
         Designed for zero-cost prompt-assembly gating: callers skip all
         formatting work when this returns False.
         """
-        return bool(self._active)
+        if parent_session_id is None:
+            return bool(self._active)
+        return any(self._active_meta.get(key, {}).get("parent_session_id") == parent_session_id
+                   for key in self._active)
 
-    def render_active_status(self) -> str:
+    def render_active_status(self, *, parent_session_id: str | None = None) -> str:
         """Render a compact Markdown section describing in-flight subagents.
 
         Returns an empty string when no subagents are active (zero cost).
@@ -390,11 +406,14 @@ class SubagentManager:
             return ""
         lines: list[str] = ["## Active Delegated Tasks"]
         for task_key, task in self._active.items():
+            if (parent_session_id is not None
+                    and self._active_meta.get(task_key, {}).get("parent_session_id") != parent_session_id):
+                continue
             task_name = getattr(task, "get_name", lambda: task_key)()
             # Extract goal from task name pattern "subagent:<key>"
             label = task_name.replace("subagent:", "") if task_name.startswith("subagent:") else task_key
             lines.append(f"- {label}: running")
-        return "\n".join(lines)
+        return "\n".join(lines) if len(lines) > 1 else ""
 
     def cancel_all(self) -> int:
         """Cancel all active subagent tasks. Returns count cancelled."""
@@ -755,7 +774,7 @@ class EngineFrameSubagentExecutor:
     Where :class:`DefaultSubagentExecutor` runs a deliberately lightweight loop,
     this delegates to the engine's own ``_run_child_frame`` so the subagent gains
     the full loop (progressive disclosure, compression, recovery, research
-    ledger) while staying state-isolated via the engine's per-frame state swap.
+    ledger) while using the existing session factory for child-owned loop state.
     Tool access is still restricted by :func:`build_subagent_tool_filter`, and
     recursion depth stays gated by the shared ``_current_depth`` contract.
     """
@@ -783,17 +802,33 @@ class EngineFrameSubagentExecutor:
         goal = config.goal
         if config.context:
             goal = f"{config.goal}\n\nContext:\n{config.context}"
+        from leapflow.tools.execution_context import current_tool_context
+
+        context = current_tool_context()
+        # Production dispatch carries the owning session runner. Direct adapters
+        # without a tool context retain their explicitly injected runner.
+        run_child = context.run_subagent if context is not None else self._run_child
+        if not callable(run_child):
+            return SubagentResult(session_id="", goal=config.goal,
+                summary="Subagent execution requires an owning session runner.",
+                status="failed", error="subagent_owner_unavailable")
         try:
-            child_result = await self._run_child(
+            child_result = await run_child(
                 goal,
                 depth=config.depth,
                 tool_filter=frozenset(available),
                 enable_thinking=False,
             )
-            # _run_subagent_goal returns (summary, tool_calls); gracefully
-            # handle the legacy str return for backward compatibility.
+            if isinstance(child_result, SubagentResult):
+                return replace(child_result, goal=config.goal,
+                    summary=child_result.summary[:config.summary_max_chars],
+                    elapsed_s=time.monotonic() - t0)
+            # The engine returns its real child identity; retain compatibility
+            # with adapters returning only (summary, tool_calls) or plain text.
             if isinstance(child_result, tuple):
-                summary_text, child_tool_calls = child_result
+                summary_text, child_tool_calls = child_result[:2]
+                if len(child_result) == 3:
+                    session_id = child_result[2]
             else:
                 summary_text = child_result
                 child_tool_calls = 0

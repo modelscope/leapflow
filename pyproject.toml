@@ -147,6 +147,7 @@ builtin_survey = "leapflow.hardware.skills.builtin.survey:skills"
 builtin_sequence = "leapflow.hardware.skills.builtin.sequence:skills"
 builtin_policy = "leapflow.hardware.skills.builtin.policy:skills"
 builtin_episode = "leapflow.hardware.skills.builtin.episode:skills"
+builtin_clip = "leapflow.hardware.skills.builtin.clip:skills"
 
 [project.entry-points."leapflow.hardware.view_planners"]
 ring = "leapflow.hardware.skills.view_planner:RingViewPlanner"

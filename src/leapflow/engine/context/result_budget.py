@@ -13,6 +13,11 @@ A result over budget is reduced in the order that loses the least meaning:
    from inside, never replaced by an empty list that reads as "nothing here".
 3. The remaining strings are capped again into whatever room is left.
 
+Successful tools may declare ``_context_fields`` as a nested mapping of existing
+field names to True leaves. If the full payload does not fit, this atomic view
+is selected before any lossy shaping. An unfittable view is explicitly omitted,
+never partially pruned; declarations and durable payloads are not mutated.
+
 When nothing fits, a minimal valid-JSON sentinel is returned; a raw cut that
 leaves unparseable JSON never is. The functions are pure and never raise.
 """
@@ -49,6 +54,9 @@ def head_tail_truncate(text: str, allow: int) -> str:
 
 def fit_result_to_budget(payload: Any, budget: int) -> str:
     """Serialize a tool result to JSON within ``budget``, preserving structure."""
+    fields = payload.get("_context_fields") if isinstance(payload, dict) else None
+    if fields is not None:
+        payload = {key: value for key, value in payload.items() if key != "_context_fields"}
     try:
         text = _dumps(payload)
     except (TypeError, ValueError):
@@ -59,6 +67,22 @@ def fit_result_to_budget(payload: Any, budget: int) -> str:
         # A bare value has no structure to shrink; the cut is unavoidable.
         return text[:budget]
     original_chars = len(text)
+    if payload.get("ok") is True and isinstance(fields, dict):
+        # A domain declares an atomic evidence view by selecting existing fields.
+        # Never prune its alternatives, scores, identifiers, or safety qualifiers.
+        projected = _select_context_fields(payload, fields)
+        if projected is not None and "ok" in projected:
+            # Execution/recovery facts are never optional presentation fields.
+            for key in ("execution_policy", "side_effect_state", "failure", "failure_code",
+                        "failure_class", "retryable", "counts_as_failure"):
+                if key in payload:
+                    projected[key] = payload[key]
+            projected["context_compacted"] = True
+            fitted = _dumps(projected)
+            if len(fitted) <= budget:
+                return fitted
+            return _dumps({"ok": True, "truncated": True, "context_fields_omitted": True,
+                           "original_chars": original_chars, "budget_chars": budget})
     # An independent, JSON-normal copy: shrinking never mutates the caller's payload.
     shrunk: Any = json.loads(text)
 
@@ -82,6 +106,33 @@ def fit_result_to_budget(payload: Any, budget: int) -> str:
             "budget_chars": budget,
         }
     )
+
+
+def _select_context_fields(payload: dict[str, Any], fields: dict[str, Any]) -> dict[str, Any] | None:
+    """Select a tool-owned atomic view without synthesizing or changing any value.
+
+    Selectors are nested mappings with literal True leaves. Invalid selectors
+    fall back to ordinary budgeting; they cannot change success/failure state.
+    """
+    selected = {}
+    for key, selector in fields.items():
+        if not isinstance(key, str) or key == "_context_fields":
+            return None
+        if selector is not True and not isinstance(selector, dict):
+            return None
+        if key not in payload:
+            continue
+        value = payload[key]
+        if selector is True:
+            selected[key] = value
+        elif isinstance(value, dict):
+            nested = _select_context_fields(value, selector)
+            if nested is None:
+                return None
+            selected[key] = nested
+        else:
+            return None
+    return selected
 
 
 def _cap_strings(root: Any, budget: int) -> Any:

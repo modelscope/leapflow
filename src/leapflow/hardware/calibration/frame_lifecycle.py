@@ -270,7 +270,7 @@ class WorkcellFrameLifecycle:
         if frame == reference:
             raise SkillError(FAILURE_INVALID_ARGS, "a frame cannot attest itself; name another camera as reference")
         subject, version = self._subject(frame)
-        anchor = self._reference(reference)
+        anchor = self._reference(reference, self._ctx.frames.required_accuracy(frame))
         flange = await self._flange(subject, anchor)
         preview = await self._compare(subject, anchor, flange, samples=1)
         required = self._ctx.frames.required_accuracy(frame)
@@ -290,7 +290,7 @@ class WorkcellFrameLifecycle:
         basis = plan.basis.get("attestation", {})
         frame, reference = self._frame(basis.get("frame")), self._frame(basis.get("reference"))
         subject, version = self._subject(frame)
-        anchor = self._reference(reference)
+        anchor = self._reference(reference, self._ctx.frames.required_accuracy(frame))
         if version != basis.get("version") or self._ctx.frames.versions.get(reference) != basis.get("reference_version"):
             raise SkillError(FAILURE_PLAN_STALE, "a frame was recalibrated since planning; plan again")
         start = Pose.from_mapping(basis["flange"]) if basis.get("flange") else None
@@ -393,15 +393,25 @@ class WorkcellFrameLifecycle:
             raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"{frame}'s record is malformed: {exc}") from exc
         return _Chain(frame, self._ctx.frames.parent(frame), mount), float(record.recorded_at)
 
-    def _reference(self, reference: str) -> _Chain:
+    def _reference(self, reference: str, required: Accuracy | None = None) -> _Chain:
         mount = self._ctx.frames.transform(reference)
-        if mount is None:
+        diagnosis = self._ctx.frames.diagnosis(reference)
+        accuracy = diagnosis.achieved
+        if mount is None or not diagnosis.ok:
             raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"reference {reference} does not hold; verify it first")
+        if (accuracy is None or not math.isfinite(accuracy.translation_mm)
+                or accuracy.translation_mm <= 0 or not diagnosis.verified_by):
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE,
+                             f"reference {reference} needs independent evidence with a known positive accuracy bound; verify it first")
+        if required is not None and required.rotation_deg is not None and accuracy.rotation_deg is None:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE,
+                             f"reference {reference} has unknown rotational accuracy; independently verify its rotation first")
         return _Chain(reference, self._ctx.frames.parent(reference), mount)
 
     def _bound(self, measured: "_Comparison", reference: str) -> Accuracy:
         stats = _summary(measured)
         disagreement = Accuracy(stats["p95_mm"], stats["rotation_p95_deg"])
+        self._reference(reference)  # never substitute zero for unknown reference error
         return disagreement.plus(self._ctx.frames.diagnosis(reference).achieved)
 
     async def _flange(self, *chains: _Chain) -> Pose | None:

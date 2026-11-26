@@ -3,8 +3,8 @@
 
 Builds a per-session ``AgentEngine`` that SHARES the base engine's stateless /
 already-wired services (LLM client, DuckDB stores, skill registry, tool bridge,
-compressor config, guardrail, subagent manager, ...) by reference, but owns a
-FRESH per-session working memory and idempotency ledger and starts from a clean
+subagent manager, ...) by reference, but owns fresh working memory, compressor
+configuration, guardrails, and idempotency ledger, starting from a clean
 per-turn state slate.
 
 This isolates exactly the substrate that concurrent turns corrupt — the working
@@ -12,8 +12,8 @@ memory (a single unkeyed deque) and the engine's per-turn state — without
 duplicating the engine wiring (which is scattered across the context setup) or
 changing the engine's single-turn internals.
 
-Phase P3-1: additive only. The factory is not yet used by the daemon (that is
-P3-2's SessionRegistry); this phase adds the mechanism and proves isolation.
+SessionRegistry uses this factory for daemon clients; unified delegates reuse
+it for child-owned loop and prompt state without inheriting parent evidence.
 """
 from __future__ import annotations
 
@@ -363,10 +363,9 @@ def build_session_engine(
     governance tracks exploration rounds) and must not be shared with the base or
     other sessions, or concurrent turns would trigger each other's nudges.
 
-    Stateless / session-keyed shared services (LLM, DuckDB stores, registry, tool
-    bridge, and the context compressor — which operates on passed messages and
-    keeps its archive_fn wiring) are shared by reference. The engine's single-turn
-    internals are unchanged.
+    Stateless / session-keyed services (LLM, DuckDB stores, registry, and tool
+    bridge) are shared. Compression keeps its injected configuration and archive
+    wiring, with a fresh instance and an owning-session summarize callback.
 
     When ``resume_session_id`` is supplied the factory applies the PCD
     cache-aware resume path (5c): if a persisted prefix snapshot exists and
@@ -387,13 +386,18 @@ def build_session_engine(
     # state injected via ``set_*`` while fixing the back-reference.
     for _attr in (
         "_session_persistence", "_calibration_manager", "_learning_bridge",
-        "_skill_dispatcher", "_prompt_assembler", "_tool_dispatch",
+        "_skill_dispatcher", "_prompt_assembler",
     ):
         _delegate = getattr(engine, _attr, None)
         if _delegate is not None and hasattr(_delegate, "_engine"):
             _rebound = copy.copy(_delegate)
             _rebound._engine = engine
             setattr(engine, _attr, _rebound)
+    # Dispatch owns transient attachments and sensitive description reuse. A
+    # shallow copy would share those mutable stores across session engines.
+    from leapflow.engine.tool_dispatch_engine import ToolDispatchEngine
+
+    engine._tool_dispatch = ToolDispatchEngine(engine)
     engine._settings = _settings_for_workspace(
         getattr(base_engine, "_settings", None),
         workspace_root,
@@ -430,6 +434,8 @@ def build_session_engine(
     engine._cancel_requested = False
     engine._active_task = None
     engine._session_turn_count = 0
+    engine._child_tasks = set()
+    _reset_session_context(engine)
     # PCD cache-aware resume (5c): freeze the persisted prefix so the first
     # resumed turn reproduces the committed system prompt / tool schema and hits
     # the provider prefix cache. Best-effort — a missing snapshot, an
@@ -440,3 +446,60 @@ def build_session_engine(
         except Exception:  # noqa: BLE001 - resume freeze is an optimization, never fatal
             logger.debug("session.resume cache snapshot apply failed", exc_info=True)
     return engine
+
+
+def _reset_session_context(engine: Any) -> None:
+    """Discard private prompt substrate before any explicit resume is applied."""
+    from leapflow.engine.context.context_compressor import ContextCompressor
+    from leapflow.engine.context.context_disclosure import CacheBoundary
+    from leapflow.engine.context.context_focus import SessionFocusState
+    from leapflow.learning.capability_observation import CapabilityObservationBuffer
+
+    engine._memory_context_snapshot = None
+    engine._current_task_contract = None
+    engine._focus_state = SessionFocusState()
+    engine._last_reference_resolution = None
+    engine._frozen_system_prompt = None
+    engine._frozen_tool_schema = None
+    engine._last_system_prompt = ""
+    engine._last_tool_definitions_json = ""
+    engine._last_disclosure_level = ""
+    engine._last_disclosure_metadata = {}
+    engine._current_cache_boundary = CacheBoundary.NONE
+    engine._prev_context_posture = "baseline"
+    engine._last_context_tokens = 0
+    engine._active_capability_plan = None
+    engine._capability_observation_buffer = CapabilityObservationBuffer()
+    # Copy resolved configuration without rerunning legacy alias/adaptive
+    # initialization, which can overwrite live thresholds and their base values.
+    config = copy.copy(engine._compressor._config)
+    config.enabled_stages = list(config.enabled_stages)
+    config.summarize_fn = engine._make_compression_summarize_fn()
+    engine._compressor = ContextCompressor(config)
+
+
+def build_child_session_engine(base_engine: Any, frame: Any) -> Any:
+    """Own child prompt/loop state without copying parent evidence or authority."""
+    from leapflow.memory.providers.working import (
+        WorkingMemoryProvider, resolve_working_memory_max_tokens,
+    )
+
+    settings = base_engine._settings
+    child = build_session_engine(
+        base_engine, session_id=str(base_engine._current_session_id or ""),
+        working_memory=WorkingMemoryProvider(max_tokens=resolve_working_memory_max_tokens(
+            settings.memory_working_max_tokens, settings.llm_context_length,
+        )),
+    )
+    # Only the delegated goal/context enters the child. Session retrieval and
+    # inherited distilled knowledge are not implicit disclosure grants.
+    child._memory_context_snapshot = ""
+    child._knowledge_store = None
+    from leapflow.engine.context.context_compressor import ContextCompressor
+
+    config = child._compressor._config
+    config.archive_fn = None  # No inherited parent archive authority.
+    frame.compressor = ContextCompressor(config)
+    child._install_frame(frame)
+    child._session_persistence._bind_child_frame_identity(frame)
+    return child

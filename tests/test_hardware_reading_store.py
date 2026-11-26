@@ -1281,6 +1281,34 @@ def test_calibration_latest_returns_the_most_recent_version(tmp_path: Path) -> N
     store.close()
 
 
+def test_calibration_exact_version_read_is_bounded_parameterized_and_persistent(tmp_path: Path) -> None:
+    store = _calibration_store(tmp_path)
+    assert store.get_version("cell", "frame", 1000) is None
+    assert not (tmp_path / "instrument.duckdb").exists()
+    old = _calibration_record(device_id="cell' OR 1=1 --", procedure_id="frame'", recorded_at=1000)
+    new = _calibration_record(device_id=old.device_id, procedure_id=old.procedure_id, recorded_at=2000)
+    assert store.record(old) and store.record(new)
+    assert store.get_version(old.device_id, old.procedure_id, 1000) == old
+    assert store.get_version(old.device_id, old.procedure_id, 1000.000001) is None
+    assert store.get_version("other", old.procedure_id, 1000) is None
+    assert store.get_version(old.device_id, "other", 1000) is None
+    assert store.records_written == 2
+    store.close()
+    reopened = _calibration_store(tmp_path)
+    assert reopened.get_version(old.device_id, old.procedure_id, 1000) == old
+    assert reopened.latest(old.device_id, old.procedure_id) == new
+    reopened.close()
+
+
+@pytest.mark.parametrize("version", [True, "1000", None, float("nan"), float("inf")])
+def test_calibration_exact_version_refuses_nonfinite_or_ambiguous_identity(tmp_path: Path, version: Any) -> None:
+    store = _calibration_store(tmp_path)
+    with pytest.raises(ValueError, match="finite calibration version"):
+        store.get_version("cell", "frame", version)
+    assert not (tmp_path / "instrument.duckdb").exists()
+    store.close()
+
+
 def test_calibration_latest_time_is_none_until_a_calibration_exists(tmp_path: Path) -> None:
     """hw_describe reads this: a device never calibrated reports no instant, not zero."""
     store = _calibration_store(tmp_path)
@@ -1374,6 +1402,10 @@ def test_registry_shares_one_instrument_connection_across_both_stores(tmp_path: 
     assert reading is not None and calibration is not None
     assert reading._holder is calibration._holder  # noqa: SLF001
     assert reading._holder is registry._instrument_conn  # noqa: SLF001
+    record = _calibration_record()
+    assert calibration.record(record)
+    assert calibration.get_version(record.device_id, record.procedure_id, record.recorded_at) == record
+    assert calibration._holder is reading._holder  # noqa: SLF001
 
 
 def test_registry_calibration_store_is_independent_of_reading_persistence(tmp_path: Path) -> None:

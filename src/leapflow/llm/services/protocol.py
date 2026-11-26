@@ -6,9 +6,13 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Mapping, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Protocol, TypeVar, runtime_checkable
 
-from leapflow.domain.model_service import ServiceLimits, ServiceSpec  # noqa: F401
+if TYPE_CHECKING:
+    from leapflow.llm.services.contracts import RegisteredContract
+    from leapflow.llm.services.telemetry import InferenceAttempt
+
+from leapflow.domain.model_service import ServiceLimits, ServiceMedia, ServiceSpec  # noqa: F401
 from leapflow.llm.base import LLMChatResponse
 
 
@@ -48,6 +52,9 @@ class StructuredResult:
     identity_mode: str
     elapsed_ms: float
     usage_json: str = "{}"
+    call_id: str = ""
+    attempts: tuple[InferenceAttempt, ...] = ()
+    timing_json: str = "{}"
 
     def payload(self) -> dict[str, Any]:
         return json.loads(self.payload_json)
@@ -89,6 +96,10 @@ class ServiceHandle(Protocol):
     def spec(self) -> ServiceSpec: ...
     @property
     def generation(self) -> int: ...
+    @property
+    def contract(self) -> RegisteredContract: ...
+    @property
+    def codec_revision(self) -> int: ...
     def check_admission(self) -> None: ...
     def check_result_eligibility(self) -> None: ...
     async def invoke(self, request: Mapping[str, Any], schema: Mapping[str, Any],

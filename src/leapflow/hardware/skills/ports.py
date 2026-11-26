@@ -458,6 +458,14 @@ class GraspVerificationPort(Protocol):
 
     def admit(self, data: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
+    async def installation(self, args: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Validate supplied or stored evidence for the existing governed installation."""
+        ...
+
+    async def evidence(self, *, include_package: bool = False, max_bytes: int = 65536) -> Mapping[str, Any]:
+        """Stored metadata only, available without valid calibration or capture."""
+        ...
+
     def qualification(self) -> Mapping[str, Any]: ...
 
     async def inspect(self) -> Mapping[str, Any]: ...
@@ -515,6 +523,15 @@ class CalibrationRollbackPort(Protocol):
 
 
 @runtime_checkable
+class ClipPort(Protocol):
+    """Bounded camera-only temporal evidence from live frames or recorded episodes."""
+
+    async def capture(
+        self, camera: str, *, source: str, run_id: str, seconds: float, max_side: int,
+    ) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
 class SkillContext(Protocol):
     """Everything a skill may touch. Nothing else is reachable from a skill."""
 
@@ -545,6 +562,11 @@ class SkillContext(Protocol):
     @property
     def scene(self) -> ScenePort:
         """Perception; raises ``SkillError`` when the workcell has no camera or locator."""
+        ...
+
+    @property
+    def clips(self) -> ClipPort:
+        """Passive clips; optional encoder failures are typed skill outcomes."""
         ...
 
     @property

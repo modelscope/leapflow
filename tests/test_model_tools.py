@@ -40,13 +40,15 @@ class Human:
         return ApprovalDecision.ALLOW_ONCE if self.allow else ApprovalDecision.DENY
 
 
-def compose(payload, *, task="decision", **changes):
+def compose(payload, *, task="decision", transport_error=None, **changes):
     providers = LLMProviderRegistry()
     providers.discover_builtin()
     requests = []
 
     async def respond(request):
         requests.append(json.loads(request.content))
+        if transport_error is not None:
+            raise transport_error
         return httpx.Response(200, json=recorded_response(payload))
 
     owner = ModelServiceRuntime(providers, parse_services({"specialist": declaration(task=task, **changes)}),
@@ -195,10 +197,26 @@ async def test_query_real_approval_and_registry(tmp_path):
             "goal": "choose", "candidates": [{"id": "a", "description": "eligible"}]})
         assert result["ok"] and result["provenance"]["physical_authority"] is False
         assert result["provenance"]["scores_calibrated"] is False
+        from leapflow.llm.services.protocol import canonical
+        assert result["consultation"]["result_digest"] == hashlib.sha256(canonical(result["result"]).encode()).hexdigest()
+        from leapflow.engine.context.context_control import ToolEvidenceBuilder
+        from leapflow.engine.context.result_budget import fit_result_to_budget
+        fitted = json.loads(fit_result_to_budget(ToolEvidenceBuilder().build("model_query", {}, result), 819))
+        assert fitted["result"] == result["result"]
+        assert fitted["provenance"]["scores_calibrated"] is False
+        assert fitted["provenance"]["physical_authority"] is False
+        assert fitted["consultation"]["call_id"] == result["consultation"]["call_id"]
+        assert "attempts" in result["consultation"], "budget fitting cannot mutate audit evidence"
         assert not requests[0].get("stream", False)
         envelope = json.loads(requests[0]["messages"][-1]["content"][0]["text"])
         assert envelope["context"]["session_id"] == "own"
         assert gate.audit.entries
+        timing = result["consultation"]["timing"]
+        assert {"acquisition_ms", "approval_wait_ms", "encoding_ms", "network_inference_ms",
+                "validation_ms", "cleanup_ms"} <= timing.keys()
+        assert all(value >= 0 for value in timing.values())
+        assert timing["network_inference_ms"] == sum(
+            item["elapsed_ms"] for item in result["consultation"]["attempts"])
         owner.publish(())
         registry.unregister_tools(registry.tool_owners)
         assert plugin.tools == []
@@ -603,4 +621,641 @@ async def test_action_query_and_upload_bypass_refuse(tmp_path):
         assert not result["ok"] and not requests
     finally:
         reset_tool_context(token)
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["allow", "deny", "invalid", "timeout", "cancel"])
+async def test_query_phase_timing_retains_failed_and_cancelled_consultations(tmp_path, mode):
+    from leapflow.domain.events import RecordScope
+    from leapflow.llm.services.telemetry import capture_inference
+
+    waiting = asyncio.Event()
+
+    class DeliberatingHuman(Human):
+        async def request_approval(self, request):
+            waiting.set()
+            if mode == "cancel":
+                await asyncio.Event().wait()
+            await asyncio.sleep(.02)
+            return await super().request_approval(request)
+
+    owner, registry, _, _, requests = compose(
+        {"selected_id": "foreign" if mode == "invalid" else "a", "rationale": "advisory"},
+        transport_error=httpx.ReadTimeout("offline timeout") if mode == "timeout" else None)
+    scope = RecordScope("", workspace_id_for_path(tmp_path), "own")
+    token = set_tool_context(ToolExecutionContext.from_strings(workspace_root=str(tmp_path),
+        session_id="own", orchestrator=ApprovalOrchestrator(DeliberatingHuman(allow=mode != "deny"))))
+    try:
+        with capture_inference(scope=scope) as capture:
+            pending = asyncio.create_task(registry.tool_handlers["model_query"]("specialist", {
+                "goal": "choose", "candidates": [{"id": "a", "description": "eligible"}]}))
+            await asyncio.wait_for(waiting.wait(), timeout=2)
+            if mode == "cancel":
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            else:
+                payload = await pending
+                assert payload["ok"] is (mode == "allow"), payload
+        (consultation,) = capture.consultations
+        timing = consultation.to_dict()["timing"]
+        assert {"acquisition_ms", "approval_wait_ms", "cleanup_ms"} <= timing.keys()
+        assert all(value >= 0 for value in timing.values())
+        assert not owner._handles
+        if mode in {"deny", "cancel"}:
+            assert not requests and "network_inference_ms" not in timing
+            assert "encoding_ms" not in timing and "validation_ms" not in timing
+        else:
+            assert len(requests) == 1
+            assert timing["network_inference_ms"] == sum(item.elapsed_ms for item in capture.attempts)
+            assert ("validation_ms" in timing) is (mode != "timeout")
+        if mode != "cancel":
+            assert timing["approval_wait_ms"] >= 10
+        assert consultation.status == ("cancelled" if mode == "cancel" else
+                                       "eligible" if mode == "allow" else "refused")
+    finally:
+        reset_tool_context(token)
+        await owner.aclose()
+
+
+class NovelTaskContract:
+    task = "test.label_choice.v1"
+    revision = "test.v1"
+    classification = "read_only"
+    description = "Select exactly one caller-declared label; advisory only."
+
+    def schemas(self):
+        return ({"type": "object", "properties": {"labels": {"type": "array", "minItems": 1,
+                    "items": {"type": "string"}}}, "required": ["labels"], "additionalProperties": False},
+                {"type": "object", "properties": {"selected_id": {"type": "string"}},
+                 "required": ["selected_id"], "additionalProperties": False})
+
+    def validate_input(self, request):
+        if len(request["labels"]) != len(set(request["labels"])):
+            raise ValueError("Labels must be unique")
+
+    def validate_result(self, request, result):
+        if result["selected_id"] not in request["labels"]:
+            raise ValueError("Selected label must be caller-eligible")
+
+    def evidence_references(self, request):
+        return {}
+
+
+class NovelContractPlugin:
+    plugin_id = "test_contract_plugin"
+    category = "model"
+    dependencies = ["model_services", "effect_scope"]
+    tools = []
+
+    def __init__(self):
+        self.scope = None
+        self.owner = None
+        self.registered = False
+
+    def bind_runtime(self, **deps):
+        self.scope = deps.get("effect_scope", self.scope)
+        self.owner = deps.get("model_services", self.owner)
+        if self.scope is not None and self.owner is not None and not self.registered:
+            from leapflow.llm.services.codec import JsonCodec
+            self.scope.effect(self.owner.register_contract(NovelTaskContract()))
+            self.scope.effect(self.owner.register_codec("test.json.v1", JsonCodec()))
+            self.registered = True
+
+
+@pytest.mark.asyncio
+async def test_new_contract_and_codec_plugin_share_query_fixture_and_cli_admission(tmp_path, monkeypatch):
+    from leapflow.config_service import ConfigService
+    from leapflow.tools.model_fixture import check_inline_fixture
+    from leapflow.cli.commands.model_service_config import execute_service_config
+
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "home"))
+    settings = load_config()
+    declared = declaration(task="test.label_choice.v1", codec="test.json.v1")
+    owner, registry, scoped, tools_plugin, requests = compose({"selected_id": "a"},
+        task="test.label_choice.v1", codec="test.json.v1")
+    contract_plugin = NovelContractPlugin()
+    registry.register(contract_plugin)
+    scoped.adopt_existing_plugins()
+    registry.bind_runtime(model_services=owner)
+    registry.publish_plugin_tools_atomic(tools_plugin)
+    service = ConfigService(settings, model_services=owner)
+    token = set_tool_context(ToolExecutionContext.from_strings(workspace_root=str(tmp_path), session_id="s",
+                            orchestrator=ApprovalOrchestrator(Human())))
+    try:
+        assert service.set_model_service("specialist", declared).ok
+        checked = execute_service_config(service, parse_service_arguments(["check", "specialist"]))
+        assert checked["services"][0]["usable"] and not checked["services"][0]["endpoint_probed"]
+        described = await registry.tool_handlers["model_describe"]("specialist")
+        assert "labels" in described["input_schema"]["properties"]
+        result = await registry.tool_handlers["model_query"]("specialist", {"labels": ["a", "b"]})
+        assert result["ok"] and result["provenance"]["contract_revision"] == "test.v1"
+        case = {"schema_version": 1, "artifact_scope": "synthetic", "input": {"labels": ["a", "b"]},
+                "expected": {"properties": {"selected_id": {"enum": ["a"]}}}}
+        assert (await check_inline_fixture(owner, "specialist", case))["ok"]
+        invalid = await registry.tool_handlers["model_query"]("specialist", {"labels": ["a", "a"]})
+        assert not invalid["ok"] and len(requests) == 2
+        scoped.dispose_plugin(contract_plugin.plugin_id)
+        assert not service.check_model_services("specialist")["services"][0]["usable"]
+        refused = await registry.tool_handlers["model_query"]("specialist", {"labels": ["a"]})
+        assert not refused["ok"] and len(requests) == 2 and not owner._handles
+        with pytest.raises(ValueError, match="admission"):
+            service.set_model_service("unavailable", declared)
+    finally:
+        reset_tool_context(token)
+        await owner.aclose()
+
+
+class UnifiedConsultationScript:
+    """Script only the primary I/O boundary; dispatch, governance and admission are real."""
+
+    def __init__(self, behavior, *, artifact="", consultation_input=None):
+        self.behavior = behavior
+        self.artifact = artifact
+        self.consultation_input = consultation_input
+        self.calls = []
+        self.scopes = []
+        self.catalogs = []
+
+    async def achat(self, messages, **kwargs):
+        from leapflow.llm.base import LLMChatResponse, ToolCallInfo
+        from leapflow.llm.services.telemetry import current_capture
+
+        self.calls.append(json.loads(json.dumps(messages)))
+        self.scopes.append(current_capture().scope)
+        self.catalogs.append(kwargs.get("tools", []))
+        step = len(self.calls)
+        if step == 1 or step == 3:
+            call = ToolCallInfo(id=f"describe-{step}", name="model_describe", arguments={"service_id": "specialist"})
+        elif step == 2 and self.behavior != "decline":
+            args = {"service_id": "specialist", "input": {"goal": "Choose a safe next observation",
+                "candidates": [{"id": "a", "description": "Inspect again"},
+                               {"id": "b", "description": "Stop and request clarification"}]}}
+            if self.consultation_input is not None:
+                args["input"] = json.loads(json.dumps(self.consultation_input))
+            if self.artifact:
+                args["artifacts"] = {"evidence": self.artifact}
+            call = ToolCallInfo(id="consult-2", name="model_query", arguments=args)
+        else:
+            return LLMChatResponse(content="I choose b independently." if self.behavior == "override"
+                else "Read-only analysis completed without physical action.",
+                usage={"prompt_tokens": 20, "completion_tokens": 5})
+        return LLMChatResponse(content="", tool_calls=[call],
+                               usage={"prompt_tokens": 20, "completion_tokens": 5})
+
+    async def achat_stream(self, messages, **kwargs):
+        if False:
+            yield ""
+
+
+def unified_model_engine(tmp_path, monkeypatch, registry, llm):
+    from dataclasses import replace
+    from conftest import make_settings
+    from _fixtures.agent_execution import _FixedClassifier
+    from leapflow import plugins
+    from leapflow.engine.engine import AgentEngine
+    from leapflow.engine._tool_helpers import build_default_registry
+    from leapflow.memory import EpisodicMemoryProvider, SemanticMemoryProvider, WorkingMemoryProvider
+    from leapflow.platform.event_bus import EventBus
+    from leapflow.platform.mock import MockBridge
+    from leapflow.skills.injector import SkillInjector
+    from leapflow.storage.conversation_store import DuckDBConversationStore
+
+    settings = replace(make_settings(str(tmp_path)), workspace_root=tmp_path,
+                       native_tool_calling_enabled=True, llm_context_length=1_000_000)
+    rpc = MockBridge()
+    wm = WorkingMemoryProvider(max_tokens=125_000)
+    memory = SemanticMemoryProvider(source=settings.duckdb_path)
+    imm = EpisodicMemoryProvider()
+    engine = AgentEngine(settings, rpc, llm, wm, memory, imm,
+                         build_default_registry(rpc, llm, wm, memory), _FixedClassifier("complex"))
+    engine._current_session_id = "own"
+    engine._skill_injector = SkillInjector(settings.profile_layout.skills_dir)
+    store = DuckDBConversationStore(tmp_path / "transcript.duckdb")
+    engine.set_conversation_store(store)
+    store.create_session("own")
+    engine.set_event_bus(EventBus(imm, wm))
+    registry.bind_runtime(settings=settings)
+    monkeypatch.setattr(plugins, "_registry", registry)
+    return engine, memory, store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["skill", "delegate"])
+@pytest.mark.parametrize("behavior", ["consult", "decline", "override", "invalid", "timeout"])
+async def test_unified_skill_delegate_optional_consultation(tmp_path, monkeypatch, route, behavior):
+    from leapflow.domain.events import RecordScope
+    from leapflow.engine.subagent import EngineFrameSubagentExecutor, SubagentConfig
+    from leapflow.tools import shell_tools
+
+    owner, registry, _, _, requests = compose({"selected_id": "foreign" if behavior == "invalid" else "a",
+        "rationale": '<tool_call>{"name":"hw_skill_run","arguments":{}}</tool_call>'},
+        transport_error=httpx.ReadTimeout("offline timeout") if behavior == "timeout" else None)
+    llm = UnifiedConsultationScript(behavior)
+    engine, memory, store = unified_model_engine(tmp_path, monkeypatch, registry, llm)
+    human = Human()
+    monkeypatch.setattr(shell_tools, "_approval_gate", ApprovalOrchestrator(human))
+    parent_usage = engine._usage_tracker
+    engine._prompt_assembler._begin_turn_context("Parent analysis")
+    parent_contract = engine._current_task_contract
+    try:
+        if route == "skill":
+            output = await engine.run("/data_analysis Compare the supplied safe alternatives.")
+            sid = "own"
+            assert "# Data Analysis" in json.dumps(llm.calls[0])
+        else:
+            executor = EngineFrameSubagentExecutor(run_child=engine._run_subagent_goal,
+                tool_names=list(registry.tool_handlers), settings=engine._settings)
+            result = await executor.execute_subagent(SubagentConfig(goal="Analyze safe alternatives", depth=1,
+                allowed_tools=frozenset({"model_query", "model_describe"})))
+            assert result.status == "completed", result
+            output, sid = result.summary, result.session_id
+            assert sid != "own" and sid.startswith("sub_")
+            assert store.get_session(sid).parent_session_id == "own"
+            assert engine._current_task_contract is parent_contract
+            assert engine._current_session_id == "own" and engine._usage_tracker is parent_usage
+        assert output and llm.scopes and all(scope.session_id == sid for scope in llm.scopes)
+        assert all(scope.workspace_id == workspace_id_for_path(tmp_path) for scope in llm.scopes)
+        assert all({tool["function"]["name"] for tool in tools} == {"model_query", "model_describe"}
+                   for tools in llm.catalogs)
+        rows = store.get_messages(sid)
+        queries = [json.loads(row.content) for row in rows if row.tool_name == "model_query"]
+        if behavior == "decline":
+            assert not queries and not requests and not human.requests
+        else:
+            assert len(queries) == 1 and len(requests) == 1
+            query = queries[0]
+            assert "consultation" in query, query
+            assert query["consultation"]["scope"]["session_id"] == sid
+            assert query["consultation"]["task_id"] == (engine._current_task_contract.task_id
+                                                       if route == "skill" else f"{sid}:turn")
+            assert query["consultation"]["adoption"] == "unlinked"
+            assert query["ok"] is (behavior not in {"invalid", "timeout"}), query
+            assert human.requests and all(request.action.session_id == sid for request in human.requests)
+            assert any(row.metadata.get("collaboration_signal_receipts") for row in rows if row.tool_name == "model_query")
+            assert len(llm.calls) == 4  # failure returns to the same primary loop
+        usage = parent_usage.combined_usage()
+        assert usage["primary"]["calls"] == len(llm.calls)
+        assert usage["specialist"]["calls"] == len(requests)
+        assert len(parent_usage.inference_records()) == len(llm.calls) + len(requests)
+        assert not any(row.tool_name == "hw_skill_run" for row in rows)
+        if route == "delegate":
+            scope = RecordScope(engine._settings.profile, workspace_id_for_path(tmp_path), "own")
+            assert parent_usage.collaboration_feedback(scope)["records"] == []
+            # Retention is idempotent and includes cancelled/failed boundaries too.
+            before = parent_usage.combined_usage()
+            for attempt in parent_usage.inference_records():
+                parent_usage.record_inference(attempt)
+            assert parent_usage.combined_usage() == before
+    finally:
+        store.close()
+        memory.close()
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["skill", "delegate"])
+@pytest.mark.parametrize("perturbation", ["expired", "contradictory", "unreachable", "order"])
+async def test_replay_complex_observation_perturbations_keep_advice_non_authoritative(
+    tmp_path, monkeypatch, route, perturbation,
+):
+    """Replay boundary tests, not semantic qualification or a physical task script."""
+    from leapflow.engine.subagent import EngineFrameSubagentExecutor, SubagentConfig
+    from leapflow.llm.services.telemetry import current_capture
+    from leapflow.tools import shell_tools
+
+    observations = {
+        "expired": ["Replay: initial placement evidence has expired; current pose is unknown."],
+        "contradictory": ["Replay view 1: the object is supported.", "Replay view 2: support is unverified."],
+        "unreachable": ["Replay: the proposed outward corridor failed the workspace reachability gate."],
+        "order": ["Replay: candidate ordering is presentation, not identity or execution priority."],
+    }[perturbation]
+    candidates = [{"id": "a", "description": "Inspect current geometry without motion"},
+                  {"id": "b", "description": "Ask for independent evidence and refuse unsupported motion"}]
+    if perturbation == "order":
+        candidates.reverse()
+    request = {"goal": "Reassess an uncertain pickup, exhibition, placement, and return goal; advisory only",
+               "observations": observations, "candidates": candidates}
+    owner, registry, _, _, requests = compose({"selected_id": "a", "rationale": "Advisory hypothesis only"},
+        processing_location="local")
+
+    class PerturbedPrimary(UnifiedConsultationScript):
+        async def achat(self, messages, **options):
+            if perturbation == "expired" and len(self.calls) == 1:
+                scope = current_capture().scope
+                cache = CacheManager(engine._settings.profile_layout.cache, profile_id=scope.profile_id)
+                entry = session_artifact(cache, tmp_path, scope.session_id, "expired.json", b'{}', expires_at=0)
+                self.artifact = entry.entry_id
+            return await super().achat(messages, **options)
+
+    llm = PerturbedPrimary("override", consultation_input=request)
+    engine, memory, store = unified_model_engine(tmp_path, monkeypatch, registry, llm)
+    human = Human()
+    monkeypatch.setattr(shell_tools, "_approval_gate", ApprovalOrchestrator(human))
+    try:
+        if route == "skill":
+            output = await engine.run("/data_analysis Assess uncertainty and safe alternatives; do not actuate.")
+            sid = "own"
+        else:
+            result = await EngineFrameSubagentExecutor(run_child=engine._run_subagent_goal,
+                tool_names=list(registry.tool_handlers), settings=engine._settings).execute_subagent(
+                    SubagentConfig(goal="Assess uncertainty without actuation", depth=1,
+                        allowed_tools=frozenset({"model_describe", "model_query"})))
+            assert result.status == "completed"
+            output, sid = result.summary, result.session_id
+        assert "I choose b independently." in output
+        rows = store.get_messages(sid)
+        (query,) = [json.loads(row.content) for row in rows if row.tool_name == "model_query"]
+        assert not any(row.tool_name == "hw_skill_run" for row in rows)
+        assert len(llm.calls) == 4
+        if perturbation == "expired":
+            assert not query["ok"] and not requests and not human.requests
+            assert query["failure_code"] == "model_invalid_request"
+            assert "expired" in query["error"]
+        else:
+            assert query["ok"] and query["result"]["selected_id"] == "a"
+            assert query["consultation"]["adoption"] == "unlinked"
+            assert len(requests) == 1
+            envelope = json.loads(requests[0]["messages"][-1]["content"][0]["text"])
+            assert {key: envelope[key] for key in request} == request
+            assert envelope["context"]["session_id"] == sid
+            assert envelope["artifact_order"] == []
+            assert query["provenance"]["physical_authority"] is False
+        usage = engine._usage_tracker.combined_usage()
+        assert usage["primary"]["calls"] == 4 and usage["specialist"]["calls"] == len(requests)
+    finally:
+        store.close()
+        memory.close()
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist", [False, True])
+async def test_cancelled_delegate_retains_cost_without_parent_authority(tmp_path, monkeypatch, persist):
+    import asyncio
+    from leapflow.domain.events import RecordScope
+    from leapflow.engine.subagent import EngineFrameSubagentExecutor, SubagentConfig
+    from leapflow.tools import shell_tools
+
+    class PausedScript(UnifiedConsultationScript):
+        def __init__(self):
+            super().__init__("consult")
+            self.paused = asyncio.Event()
+
+        async def achat(self, messages, **kwargs):
+            response = await super().achat(messages, **kwargs)
+            if len(self.calls) == 3:
+                self.paused.set()
+                await asyncio.Event().wait()
+            return response
+
+    owner, registry, _, _, requests = compose({"selected_id": "a", "rationale": "inspect"})
+    llm = PausedScript()
+    engine, memory, store = unified_model_engine(tmp_path, monkeypatch, registry, llm)
+    if not persist:
+        engine.set_conversation_store(None)
+    monkeypatch.setattr(shell_tools, "_approval_gate", ApprovalOrchestrator(Human()))
+    engine._prompt_assembler._begin_turn_context("Parent analysis")
+    parent_contract, parent_usage = engine._current_task_contract, engine._usage_tracker
+    executor = EngineFrameSubagentExecutor(run_child=engine._run_subagent_goal,
+        tool_names=list(registry.tool_handlers), settings=engine._settings)
+    task = asyncio.create_task(executor.execute_subagent(SubagentConfig(goal="Read-only analysis", depth=1,
+        allowed_tools=frozenset({"model_query", "model_describe"}))))
+    try:
+        await asyncio.wait_for(llm.paused.wait(), timeout=5)
+        child_scope = llm.scopes[0]
+        assert child_scope.session_id != "own"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert engine._current_session_id == "own" and engine._current_task_contract is parent_contract
+        assert engine._usage_tracker is parent_usage and len(requests) == 1
+        totals = parent_usage.combined_usage()
+        assert totals["primary"]["calls"] == 3 and totals["specialist"]["calls"] == 1
+        assert totals["primary"]["failed_attempts"] == 1
+        assert all(attempt.scope == child_scope for attempt in parent_usage.inference_records())
+        parent_scope = RecordScope(engine._settings.profile, workspace_id_for_path(tmp_path), "own")
+        assert parent_usage.collaboration_feedback(parent_scope)["records"] == []
+        assert parent_usage.consultation_reference(child_scope, f"{child_scope.session_id}:turn",
+            next(attempt.call_id for attempt in parent_usage.inference_records() if attempt.source == "specialist")) is None
+        if persist:
+            assert store.get_session(child_scope.session_id).parent_session_id == "own"
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        store.close()
+        memory.close()
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unified_delegate_cannot_borrow_parent_artifact(tmp_path, monkeypatch):
+    from leapflow.engine.subagent import EngineFrameSubagentExecutor, SubagentConfig
+    from leapflow.tools import shell_tools
+
+    owner, registry, _, _, requests = compose({"selected_id": "a", "rationale": "inspect"}, processing_location="local")
+    llm = UnifiedConsultationScript("consult")
+    engine, memory, store = unified_model_engine(tmp_path, monkeypatch, registry, llm)
+    cache = CacheManager(engine._settings.profile_layout.cache, profile_id=engine._settings.profile)
+    entry = session_artifact(cache, tmp_path, "own", "observation.json", b'{"owner":"parent"}')
+    llm.artifact = entry.entry_id
+    human = Human()
+    monkeypatch.setattr(shell_tools, "_approval_gate", ApprovalOrchestrator(human))
+    try:
+        executor = EngineFrameSubagentExecutor(run_child=engine._run_subagent_goal,
+            tool_names=list(registry.tool_handlers), settings=engine._settings)
+        result = await executor.execute_subagent(SubagentConfig(goal="Inspect evidence", depth=1,
+            allowed_tools=frozenset({"model_query", "model_describe"})))
+        query = next(json.loads(row.content) for row in store.get_messages(result.session_id)
+                     if row.tool_name == "model_query")
+        assert not query["ok"] and query["failure_code"] == "model_invalid_request"
+        assert not requests and not human.requests  # feasibility before consent/read/HTTP
+        assert result.status == "completed" and len(llm.calls) == 4
+        assert all(scope.session_id != "own" for scope in llm.scopes)
+    finally:
+        store.close()
+        memory.close()
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_unified_delegates_keep_parent_prompt_and_memory_private(tmp_path, monkeypatch):
+    import asyncio
+    from leapflow.engine.subagent import EngineFrameSubagentExecutor, SubagentConfig
+    from leapflow.llm.base import LLMChatResponse
+    from leapflow.llm.services.telemetry import current_capture
+
+    class ConcurrentScript:
+        model = "offline-primary"
+
+        def __init__(self):
+            self.calls = []
+            self.both_started = asyncio.Event()
+
+        async def achat(self, messages, **options):
+            self.calls.append((json.dumps(messages), current_capture().scope))
+            if len(self.calls) == 2:
+                self.both_started.set()
+            await asyncio.wait_for(self.both_started.wait(), timeout=3)
+            return LLMChatResponse(content="Independent analysis complete.", usage={})
+
+    owner, registry, _, _, requests = compose({"selected_id": "a", "rationale": "inspect"})
+    llm = ConcurrentScript()
+    engine, memory, store = unified_model_engine(tmp_path, monkeypatch, registry, llm)
+    engine._prompt_assembler._begin_turn_context("Parent-only work")
+    engine._wm.remember_chat({"role": "user", "content": "PARENT_PRIVATE_HISTORY"})
+    engine._memory_context_snapshot = "PARENT_PRIVATE_RETRIEVAL"
+    engine._frozen_system_prompt = "PARENT_PRIVATE_FROZEN_PREFIX"
+    engine._frozen_tool_schema = json.dumps([{"type": "function", "function": {"name": "hw_skill_run"}}])
+    parent_contract, parent_usage = engine._current_task_contract, engine._usage_tracker
+    parent_messages = engine._wm.as_chat_messages()
+    executor = EngineFrameSubagentExecutor(run_child=engine._run_subagent_goal,
+        tool_names=list(registry.tool_handlers), settings=engine._settings)
+    try:
+        results = await asyncio.gather(*(executor.execute_subagent(SubagentConfig(goal=goal, depth=1,
+            allowed_tools=frozenset({"model_describe"}))) for goal in ("Child alpha", "Child beta")))
+        assert all(result.status == "completed" for result in results), results
+        assert len({result.session_id for result in results}) == 2
+        assert {scope.session_id for _, scope in llm.calls} == {result.session_id for result in results}
+        assert len(llm.calls) == 2 and not requests
+        assert all("PARENT_PRIVATE" not in prompt for prompt, _ in llm.calls)
+        for result in results:
+            assert store.get_session(result.session_id).parent_session_id == "own"
+            assert store.get_messages(result.session_id)
+        assert engine._current_session_id == "own" and engine._current_task_contract is parent_contract
+        assert engine._usage_tracker is parent_usage
+        assert parent_usage.combined_usage()["primary"]["calls"] == 2
+        assert engine._wm.as_chat_messages() == parent_messages
+        assert engine._memory_context_snapshot == "PARENT_PRIVATE_RETRIEVAL"
+        assert engine._frozen_system_prompt == "PARENT_PRIVATE_FROZEN_PREFIX"
+    finally:
+        store.close()
+        memory.close()
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_unified_delegate_reports_actual_persisted_child_identity(tmp_path, monkeypatch):
+    from leapflow.engine.subagent import EngineFrameSubagentExecutor, SubagentConfig
+    from leapflow.llm.base import LLMChatResponse
+    from leapflow.llm.services.telemetry import current_capture
+
+    scopes = []
+
+    class BrokenAdapter:
+        model = "offline-primary"
+
+        async def achat(self, messages, **options):
+            scopes.append(current_capture().scope)
+            return LLMChatResponse(content=42, usage={})  # Adapter violates the text contract.
+
+    owner, registry, _, _, _ = compose({"selected_id": "a", "rationale": "inspect"})
+    engine, memory, store = unified_model_engine(tmp_path, monkeypatch, registry, BrokenAdapter())
+    executor = EngineFrameSubagentExecutor(run_child=engine._run_subagent_goal,
+        tool_names=list(registry.tool_handlers), settings=engine._settings)
+    try:
+        result = await executor.execute_subagent(SubagentConfig(goal="Analyze", depth=1,
+            allowed_tools=frozenset({"model_describe"})))
+        assert result.status == "failed", result
+        assert result.session_id == scopes[0].session_id
+        assert store.get_session(result.session_id).parent_session_id == "own"
+        assert engine._current_session_id == "own"
+        assert engine._usage_tracker.combined_usage()["primary"]["calls"] == 1
+        assert result.metadata["failure"]["category"] == "internal_defect"
+        assert result.metadata["failure"]["side_effect_state"] == "unknown"
+        wire = json.loads(json.dumps(result.metadata))
+        assert wire["failure"]["source"] == "system"
+        assert wire["failure"]["recoverability"] == "non_recoverable"
+    finally:
+        store.close()
+        memory.close()
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_first", [False, True])
+async def test_shared_delegate_plugin_uses_owning_session_runner(tmp_path, monkeypatch, cancel_first):
+    import asyncio
+    from leapflow.engine.context.context_disclosure import DisclosureLevel, PromptAssemblyPlan
+    from leapflow.engine.session.session_factory import build_session_engine
+    from leapflow.engine.subagent import EngineFrameSubagentExecutor, SubagentManager
+    from leapflow.llm.base import LLMChatResponse
+    from leapflow.llm.services.telemetry import current_capture
+    from leapflow.memory import WorkingMemoryProvider
+    from leapflow.plugins.tool_plugins.orchestration import OrchestrationPlugin
+
+    class PausedPrimary:
+        model = "offline-primary"
+
+        def __init__(self):
+            self.calls = []
+            self.both_started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def achat(self, messages, **options):
+            self.calls.append((json.dumps(messages), current_capture().scope))
+            if len(self.calls) == 2:
+                self.both_started.set()
+            await self.release.wait()
+            return LLMChatResponse(content="Independent analysis complete.", usage={})
+
+    owner, registry, _, _, requests = compose({"selected_id": "a", "rationale": "inspect"})
+    llm = PausedPrimary()
+    base, memory, store = unified_model_engine(tmp_path, monkeypatch, registry, llm)
+    manager = SubagentManager(executor=EngineFrameSubagentExecutor(
+        run_child=base._run_subagent_goal, tool_names=list(registry.tool_handlers), settings=base._settings))
+    plugin = OrchestrationPlugin()
+    registry.register(plugin)
+    registry.bind_runtime(subagent_manager=manager)
+    registry.publish_plugin_tools_atomic(plugin)
+    registry.set_subagent_manager(manager)
+    engines = [build_session_engine(base, session_id=sid,
+        working_memory=WorkingMemoryProvider(max_tokens=512), workspace_root=tmp_path / sid)
+        for sid in ("parent-a", "parent-b")]
+    for engine in engines:
+        store.create_session(engine._current_session_id)
+        engine._prompt_assembler._begin_turn_context("Parent-private task")
+    tasks = [asyncio.create_task(engine._tool_dispatch._execute_tool_scoped(
+        {"name": "delegate_task", "arguments": {"goal": f"Analyze {engine._current_session_id}"}},
+        registry.tool_handlers, tool_call_id=f"delegate-{index}"))
+        for index, engine in enumerate(engines)]
+    try:
+        await asyncio.wait_for(llm.both_started.wait(), timeout=5)
+        active = manager.get_active_state()["active"]
+        assert {item["parent_session_id"] for item in active} == {"parent-a", "parent-b"}
+        plan = PromptAssemblyPlan(level=DisclosureLevel.EXPANDED)
+        for engine in engines:
+            section = engine._prompt_assembler._active_subagent_status_section(plan)
+            for item in active:
+                assert (item["subagent_id"] in section) is (item["parent_session_id"] == engine._current_session_id)
+        if cancel_first:
+            engines[0].cancel()
+            first = await asyncio.wait_for(tasks[0], timeout=5)
+            assert first["status"] == "cancelled" and not first["ok"]
+            assert not tasks[1].done()  # Cancellation never crosses to the other workspace.
+        llm.release.set()
+        results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+        assert results[1]["status"] == "completed"
+        assert results[0]["status"] == ("cancelled" if cancel_first else "completed")
+        assert len({result["session_id"] for result in results}) == 2
+        for engine, result in zip(engines, results):
+            sid = result["session_id"]
+            assert store.get_session(sid).parent_session_id == engine._current_session_id
+            assert engine._usage_tracker.combined_usage()["primary"]["calls"] == 1
+            attempts = engine._usage_tracker.inference_records()
+            assert len(attempts) == 1 and attempts[0].scope.session_id == sid
+            assert attempts[0].scope.workspace_id == workspace_id_for_path(engine._settings.workspace_root)
+        assert base._current_session_id == "own"
+        assert not base._usage_tracker.inference_records() and not base._child_tasks
+        assert not requests and not manager.has_active()
+    finally:
+        llm.release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        store.close()
+        memory.close()
         await owner.aclose()

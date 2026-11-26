@@ -77,6 +77,52 @@ def persist(manager, content=b"content", *, session="own", workspace="workspace"
         max_session_bytes=quota, metadata={"mime": "image/png"})
 
 
+def clip_snapshot():
+    from leapflow.hardware.skills.clips import _encode
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("cv2")
+    shot = snapshot()
+    shot.pop("image")
+    content = _encode([np.zeros((48, 64, 3), dtype=np.uint8)] * 4, 2, 64)
+    shot["video"] = {"mime": "video/mp4", "data": base64.b64encode(content).decode()}
+    return shot
+
+
+@pytest.mark.parametrize("fault", ["none", "denied", "stale", "quota", "oversize", "missing_cv2"])
+async def test_video_retention_obeys_same_session_gates(settings, monkeypatch, fault):
+    import sys
+    shot = clip_snapshot()
+    runtime = settings
+    if fault == "stale":
+        shot["valid_for_s"] = 0
+    if fault == "quota":
+        runtime = replace(settings, hardware_snapshot_evidence=json.dumps({"quota_bytes": 1}))
+    if fault == "oversize":
+        shot["video"]["data"] = base64.b64encode(bytes(701 * 1024)).decode()
+    if fault == "missing_cv2":
+        monkeypatch.setitem(sys.modules, "cv2", None)
+    human = Human(allow=fault != "denied")
+    token = context(settings, ApprovalOrchestrator(human))
+    sink = SnapshotEvidenceService(lambda: runtime, bus())
+    try:
+        result = await export_snapshot_result(sink, {"ok": True, "result": shot},
+            workcell="node/cell", started_at=time.monotonic(), share_frames=True)
+        assert "video" not in result["result"] and "_attachments" not in result
+        if fault == "none":
+            assert result["ok"] and result["evidence"]["kind"] == "video"
+            assert result["evidence"]["duration_s"] == pytest.approx(2)
+            entry = cache(settings).resolve_session_entry(result["evidence"]["artifact_id"],
+                workspace_id=workspace_id_for_path(settings.workspace_root), session_id="own", max_bytes=700 * 1024)
+            assert entry.metadata["record"]["quantity"] == "clip_reference"
+            assert "Clip bytes are not attached" in human.requests[0].action.detail
+        else:
+            assert not result["ok"] and not cache(settings).list_entries(category="snapshot_evidence")
+    finally:
+        reset_tool_context(token)
+        await sink.aclose()
+    assert not cache(settings).list_entries(category="snapshot_evidence")
+
+
 @pytest.mark.parametrize("format", ["PNG", "JPEG", "WEBP"])
 def test_bounded_media(format):
     shot = snapshot(format)
@@ -133,9 +179,9 @@ async def test_retention_then_specialist_uses_opaque_id_and_independent_consent(
     registry.bind_runtime(settings=settings, model_approval_gate=gate)
     try:
         result = await export_snapshot_result(sink, {"ok": True, "result": snapshot()},
-                                               workcell="node/cell", started_at=time.monotonic())
+                                               workcell="node/cell", started_at=time.monotonic(), share_frames=True)
         assert result["ok"], result
-        assert "image" not in result["result"] and "_attachments" not in result
+        assert "image" not in result["result"] and result["_attachments"]
         reference = result["evidence"]
         assert reference["sensitive"] and not reference["syncable"]
         entry = cache(settings).resolve_session_entry(reference["artifact_id"],
@@ -153,7 +199,7 @@ async def test_retention_then_specialist_uses_opaque_id_and_independent_consent(
         kinds = [request.action.kind for request in human.requests]
         assert kinds == ["file.write", "network.fetch"]
         assert human.requests[-1].action.metadata["approval_binding"]["evidence_scope"] == "evidence"
-        assert "Call model_query directly" in result["next_step"] and "duplicate consent" in result["next_step"]
+        assert "You decide" in result["next_step"] and "duplicate consent" in result["next_step"]
         assert all(request.action.session_id == "own" for request in human.requests)
         assert not events._event_buffer and events._immediate.active_count == 0
     finally:
@@ -391,7 +437,7 @@ async def test_real_passive_node_snapshot_exports_without_motion(settings, tmp_p
                                                 args={"camera": "camera"}, export_evidence=True)
         assert result["ok"] is node_share, json.dumps(result)
         assert result["evidence"]["status"] == ("retained" if node_share else "missing")
-        assert "image" not in result["result"] and "_attachments" not in result
+        assert "image" not in result["result"] and bool(result.get("_attachments")) is node_share
         assert not rig.sim.batches and not rig.gate.seen
         if node_share:
             ordinary = await rig.service.hw_skill_run(workcell=WORKCELL_ID, skill="perceive.snapshot", args={})

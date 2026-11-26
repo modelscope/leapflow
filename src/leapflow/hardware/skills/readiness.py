@@ -12,7 +12,7 @@ the solver chains providers whose own requirements are met or can be met in
 turn.
 
 Options are ranked by what they cost the operator: no-motion options first,
-then fewer steps, then fewer arguments a human still has to supply. A
+then complete argument sets, fewer steps, and fewer missing arguments. A
 requirement no skill can provide (a role, a model, a sharing flag) is a
 declaration the operator edits; it is named, never guessed at.
 """
@@ -66,8 +66,15 @@ class ReadinessStep:
     def key(self) -> tuple[str, tuple[tuple[str, str], ...]]:
         return self.skill_id, tuple(sorted((k, str(v)) for k, v in self.args.items()))
 
+    @property
+    def actionable(self) -> bool:
+        """Complete arguments permit a preview, not an approval or execution exemption."""
+        return not self.needs_args
+
     def describe(self) -> str:
-        text = "run " + " ".join([self.skill_id, *(f"{k}={v}" for k, v in self.args.items())])
+        text = ("run " if self.actionable else "supply evidence/arguments for ") + " ".join(
+            [self.skill_id, *(f"{k}={v}" for k, v in self.args.items())]
+        )
         if self.needs_args:
             text += f" (needs {', '.join(self.needs_args)})"
         return text
@@ -78,6 +85,7 @@ class ReadinessStep:
             "args": dict(self.args),
             "addresses": self.addresses,
             "motion": self.motion,
+            "actionable": self.actionable,
         }
         if self.needs_args:
             out["needs_args"] = list(self.needs_args)
@@ -293,9 +301,7 @@ class WorkcellReadiness:
             spec.skill_id,
             {name: value for name, value in chosen.items()},
             token,
-            needs_args=tuple(
-                name for name in (spec.args_schema.get("required") or ()) if name not in args
-            ),
+            needs_args=_missing_args(spec, args),
             motion=spec.uses_motion,
             consent=spec.consent if spec.is_actuating else "",
             expected=expected,
@@ -406,9 +412,22 @@ def _defaults(spec: SkillSpec) -> dict[str, Any]:
     }
 
 
-def _rank(option: ReadinessOption) -> tuple[int, int, int, int]:
+def _missing_args(spec: SkillSpec, args: Mapping[str, Any]) -> tuple[str, ...]:
+    missing = [name for name in spec.args_schema.get("required", ()) if name not in args]
+    for alternatives in spec.args_schema.get("anyOf", ()):
+        if all(name in args for name in alternatives.get("required", ())):
+            break
+    else:
+        choices = spec.args_schema.get("anyOf", ())
+        if choices:
+            missing.extend(choices[0].get("required", ()))
+    return tuple(dict.fromkeys(missing))
+
+
+def _rank(option: ReadinessOption) -> tuple[int, int, int, int, int]:
     return (
         int(option.motion),
+        int(any(not step.actionable for step in option.steps)),
         len(option.steps),
         sum(len(step.needs_args) for step in option.steps),
         option.rank,

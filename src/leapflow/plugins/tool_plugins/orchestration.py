@@ -91,17 +91,23 @@ class OrchestrationPlugin:
             return {"ok": False, "error": "Subagent system not configured"}
         try:
             from leapflow.engine.subagent import SubagentConfig, current_subagent_depth
+            from leapflow.tools.execution_context import current_tool_context
 
+            context = current_tool_context()
             config = SubagentConfig(
                 goal=params.get("goal", ""),
                 context=params.get("context", ""),
                 depth=current_subagent_depth() + 1,
+                parent_session_id=context.session_id if context is not None else None,
             )
             result = await self._subagent_manager.delegate(config)
             return {
                 "ok": result.status == "completed",
                 "summary": result.summary,
                 "status": result.status,
+                "session_id": result.session_id,
+                "tool_calls": result.tool_calls,
+                **({"failure": result.metadata["failure"]} if "failure" in result.metadata else {}),
             }
         except Exception as e:
             return {"ok": False, "error": str(e)}

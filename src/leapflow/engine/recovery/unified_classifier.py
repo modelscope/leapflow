@@ -460,6 +460,8 @@ class UnifiedErrorClassifier:
         Uses a combination of type-based dispatch (for Python exception types)
         and data-driven keyword rules (for message-based classification).
         """
+        if isinstance(exc, _INTERNAL_DEFECT_TYPES):
+            return self.classify_internal_defect(exc)
         msg = str(exc).lower()
         exc_type = type(exc).__name__
 

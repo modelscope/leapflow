@@ -234,6 +234,9 @@ async def test_engine_cancel_interrupts_an_in_flight_loop_await() -> None:
         _active_task = None
         _cancel_requested = False
 
+        def __init__(self) -> None:
+            self._child_tasks = set()
+
         def _build_root_frame(self, user_text: str, *, enable_thinking: bool = False) -> object:
             return object()
 

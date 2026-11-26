@@ -111,6 +111,65 @@ def test_build_session_engine_isolates_substrate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_and_child_compressors_preserve_config_and_live_owner() -> None:
+    from leapflow.engine.context.context_compressor import CompressorConfig, ContextCompressor
+    from leapflow.engine.session.session_factory import build_child_session_engine, build_session_engine
+    from leapflow.llm.base import LLMChatResponse
+    from leapflow.llm.services.telemetry import current_capture
+    from leapflow.memory import WorkingMemoryProvider
+    from leapflow.layout import workspace_id_for_path
+
+    class CompressionBoundary(_EchoLLM):
+        def __init__(self):
+            self.scopes = []
+
+        async def achat(self, messages, **options):
+            self.scopes.append(current_capture().scope)
+            return LLMChatResponse(content="Summary", usage={})
+
+    async def archive(messages):
+        raise AssertionError("Child must not borrow parent archive authority")
+
+    with tempfile.TemporaryDirectory() as td:
+        llm = CompressionBoundary()
+        base, lt = _build_base_engine(td, llm)
+        try:
+            config = CompressorConfig(context_length=128_000, trim_threshold_chars=2700,
+                summarize_threshold_messages=19, archive_fn=archive,
+                summarize_fn=base._make_compression_summarize_fn())
+            # Runtime overrides and the unscaled base must survive cloning.
+            config.trim_threshold_chars = 7100
+            config.summarize_threshold_messages = 21
+            base._compressor = ContextCompressor(config)
+            original = {key: value for key, value in vars(config).items() if key != "summarize_fn"}
+            engines = [build_session_engine(base, session_id=sid,
+                working_memory=WorkingMemoryProvider(max_tokens=512), workspace_root=Path(td) / sid)
+                for sid in ("parent-a", "parent-b")]
+            for engine in engines:
+                cloned = engine._compressor._config
+                assert cloned is not config and cloned.enabled_stages is not config.enabled_stages
+                assert {key: value for key, value in vars(cloned).items() if key != "summarize_fn"} == original
+                assert cloned.archive_fn is archive
+            engines[0]._compressor._config.enabled_stages.remove("archive")
+            assert "archive" in engines[1]._compressor._config.enabled_stages
+            assert "archive" in config.enabled_stages
+            frame = engines[0]._build_child_frame("Independent analysis", depth=1)
+            child = build_child_session_engine(engines[0], frame)
+            assert child._compressor._config.archive_fn is None
+            assert child._compressor._config.trim_threshold_chars == 7100
+            assert child._compressor._config._base_trim_threshold == config._base_trim_threshold
+            assert engines[0]._compressor._config.archive_fn is archive
+            for engine in [*engines, child]:
+                assert await engine._compressor._config.summarize_fn("Summarize") == "Summary"
+                assert engine._usage_tracker.combined_usage()["primary"]["calls"] == 1
+            assert [scope.session_id for scope in llm.scopes] == ["parent-a", "parent-b", frame.session_id]
+            assert llm.scopes[2].workspace_id == workspace_id_for_path(engines[0]._settings.workspace_root)
+            assert not base._usage_tracker.inference_records()
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_session_engines_are_isolated() -> None:
     from leapflow.engine.session.session_factory import build_session_engine
     from leapflow.memory import WorkingMemoryProvider

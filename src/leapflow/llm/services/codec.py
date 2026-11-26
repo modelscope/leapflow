@@ -92,6 +92,67 @@ def validate_schema_definition(schema: Any, depth: int = 0) -> None:
             raise ValueError("Schema bounds are reversed")
 
 
+def strict_wire_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Compile closed domain schemas without changing their optional-field semantics.
+
+    Open objects and untyped values cannot be represented by OpenAI strict output.
+    Nullable unions exist only on the wire, not in the domain schema language.
+    """
+    validate_schema_definition(dict(schema))
+    if schema.get("type") != "object":
+        raise ValueError("Strict output requires an object root")
+
+    def compile_node(node: Mapping[str, Any]) -> dict[str, Any]:
+        kind = node.get("type")
+        if kind is None:
+            raise ValueError("Strict output cannot represent untyped values")
+        allowed = {"type", "enum"} | {
+            "object": {"properties", "required", "additionalProperties"},
+            "array": {"items", "minItems", "maxItems"},
+            "string": {"minLength", "maxLength"},
+            "number": {"minimum", "maximum"}, "integer": {"minimum", "maximum"},
+        }.get(kind, set())
+        if set(node) - allowed or kind in {"object", "array"} and "enum" in node:
+            raise ValueError("Strict output cannot represent this schema shape")
+        for item in node.get("enum", []):
+            validate_schema(item, {k: v for k, v in node.items() if k != "enum"})
+        result = dict(node)
+        if kind == "object":
+            if node.get("additionalProperties") is not False:
+                raise ValueError("Strict output cannot represent open objects; select an explicit compatible codec/output mode")
+            required = set(node.get("required", ()))
+            properties = {}
+            for name, child in node.get("properties", {}).items():
+                compiled = compile_node(child)
+                if name not in required:
+                    if child.get("type") == "null":
+                        raise ValueError("Strict output cannot distinguish optional null from absence")
+                    compiled = {"anyOf": [compiled, {"type": "null"}]}
+                properties[name] = compiled
+            result.update(properties=properties, required=list(properties), additionalProperties=False)
+        elif kind == "array":
+            if "items" not in node:
+                raise ValueError("Strict output requires typed array items")
+            result["items"] = compile_node(node["items"])
+        return result
+
+    return compile_node(schema)
+
+
+def normalize_strict_result(value: Any, schema: Mapping[str, Any]) -> Any:
+    """Remove only compiled optional nulls, enforcing the complete wire shape first."""
+    if schema.get("type") == "object" and isinstance(value, dict):
+        properties = schema.get("properties", {})
+        if set(value) != set(properties):
+            raise ValueError("Strict result must contain exactly all declared wire fields")
+        required = set(schema.get("required", ()))
+        return {name: normalize_strict_result(item, properties[name])
+                for name, item in value.items() if item is not None or name in required}
+    if schema.get("type") == "array" and isinstance(value, list):
+        return [normalize_strict_result(item, schema["items"]) for item in value]
+    return value
+
+
 def _pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in items:
@@ -108,16 +169,38 @@ def _load_result(content: str) -> Any:
         raise ValueError("model result exceeds the JSON nesting limit") from exc
 
 
-def image_block(image: Mapping[str, Any], provider: str) -> dict[str, Any]:
-    """Only embedded, declared images are portable; never dereference image URLs."""
-    mime, data = image.get("media_type"), image.get("data")
-    if mime not in {"image/jpeg", "image/png", "image/webp"} or not isinstance(data, str):
-        raise ValueError("image requires an embedded JPEG, PNG or WebP")
+IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+VIDEO_TYPES = frozenset({"video/mp4", "video/webm"})
+
+
+def media_kind(mime: Any) -> str:
+    """Classify a declared embedded media type; unknown types have no kind."""
+    return "image" if mime in IMAGE_TYPES else "video" if mime in VIDEO_TYPES else ""
+
+
+def media_block(item: Mapping[str, Any], provider: str, *, service_id: str = "") -> dict[str, Any]:
+    """Only embedded, declared media are portable; never dereference media URLs."""
+    mime, data = item.get("media_type"), item.get("data")
+    kind = media_kind(mime)
+    if not kind or not isinstance(data, str):
+        raise ValueError("media requires an embedded JPEG, PNG, WebP, MP4 or WebM")
     if not base64.b64decode(data, validate=True):
-        raise ValueError("image is empty")
+        raise ValueError(f"{kind} is empty")
+    if kind == "video":
+        if provider == "anthropic":
+            raise ServiceError("This provider cannot carry video; send image evidence instead",
+                               service_id=service_id, code="media_unsupported", category="validation")
+        return {"type": "video_url", "video_url": {"url": f"data:{mime};base64,{data}"}}
     if provider == "anthropic":
         return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}
     return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
+
+
+def image_block(image: Mapping[str, Any], provider: str) -> dict[str, Any]:
+    """Image-only shaping retained for callers that must never carry video."""
+    if media_kind(image.get("media_type")) != "image":
+        raise ValueError("image requires an embedded JPEG, PNG or WebP")
+    return media_block(image, provider)
 
 
 class JsonCodec:
@@ -126,14 +209,21 @@ class JsonCodec:
     def encode(self, spec: ServiceSpec, request: Mapping[str, Any],
                schema: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         body = dict(request)
-        images = body.pop("_images", [])
-        if not isinstance(images, list):
-            raise ValueError("images must be an ordered list")
-        if images and spec.processing_location == "unknown":
-            raise ServiceError("Declare and authorize the actual image processing location first",
+        # ``_media`` is the single ordered, kind-neutral carrier set by the tool layer.
+        media = body.pop("_media", [])
+        if not isinstance(media, list):
+            raise ValueError("media must be an ordered list")
+        if media and spec.processing_location == "unknown":
+            raise ServiceError("Declare and authorize the actual media processing location first",
                                service_id=spec.service_id, code="model_privacy_unknown", category="security")
+        kinds = [media_kind(item.get("media_type")) if isinstance(item, Mapping) else "" for item in media]
+        for kind in ("image", "video"):
+            if kinds.count(kind) > spec.media.capacity(kind):
+                raise ServiceError(f"Service {spec.service_id} accepts at most {spec.media.capacity(kind)} "
+                                   f"{kind}(s) per request", service_id=spec.service_id,
+                                   code="media_unsupported", category="validation")
         content = [{"type": "text", "text": canonical(body)}]
-        content.extend(image_block(image, spec.provider) for image in images)
+        content.extend(media_block(item, spec.provider, service_id=spec.service_id) for item in media)
         messages: list[dict[str, Any]] = []
         declaration = spec.declaration()
         if spec.identity_mode == "unverified":
@@ -145,7 +235,7 @@ class JsonCodec:
         options["max_tokens"] = spec.limits.max_output_tokens
         if spec.output == "json_schema":
             options["response_format"] = {"type": "json_schema", "json_schema": {
-                "name": "result", "schema": dict(schema), "strict": True}}
+                "name": "result", "schema": strict_wire_schema(schema), "strict": True}}
         elif spec.output == "tool_call":
             options["tools"] = [{"type": "function", "function": {
                 "name": "submit_result", "description": "Submit one structured inference result",
@@ -170,6 +260,9 @@ class JsonCodec:
             result = _load_result(response.content)
         if not isinstance(result, dict):
             raise ValueError("model result must be one JSON object")
+        if spec.output == "json_schema":
+            strict_wire_schema(schema)
+            result = normalize_strict_result(result, schema)
         validate_schema(result, schema)
         canonical(result)
         return result

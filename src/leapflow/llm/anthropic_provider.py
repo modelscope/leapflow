@@ -24,6 +24,7 @@ from typing import Any, AsyncIterator, Dict, List
 import httpx
 
 from leapflow.llm.base import ChunkCallback, LLMChatResponse, LLMProvider, ToolCallInfo
+from leapflow.llm.services.telemetry import ProviderAttempt, new_call_id
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +202,36 @@ def _parse_usage(usage: Any) -> Dict[str, int]:
     return result
 
 
+def _safe_provider_usage(usage: Any) -> Dict[str, int]:
+    try:
+        return _parse_usage(usage)
+    except Exception:  # noqa: BLE001 - telemetry never becomes a provider failure
+        logger.warning("Anthropic usage extraction failed", exc_info=True)
+        return {}
+
+
+def _observe_stream_snapshot(stream: Any, accounting: ProviderAttempt) -> None:
+    """Optional SDK snapshot access is bookkeeping, not a retryable API operation."""
+    try:
+        snapshot = getattr(stream, "current_message_snapshot", None)
+        accounting.observe(_safe_provider_usage(getattr(snapshot, "usage", None)),
+                           getattr(snapshot, "model", None))
+    except Exception:  # noqa: BLE001 - an optional snapshot cannot fail delivered text
+        logger.warning("Anthropic stream snapshot unavailable", exc_info=True)
+
+
+async def _observe_stream_final(stream: Any, accounting: ProviderAttempt) -> None:
+    """Retain final usage after text completion without retrying on telemetry defects."""
+    try:
+        final = getattr(stream, "get_final_message", None)
+        if callable(final):
+            message = await final()
+            accounting.observe(_safe_provider_usage(getattr(message, "usage", None)),
+                               getattr(message, "model", None))
+    except Exception:  # noqa: BLE001 - cancellation still propagates
+        logger.warning("Anthropic final stream usage unavailable", exc_info=True)
+
+
 class AnthropicChat(LLMProvider):
     """Native Anthropic Messages API client with retries and streaming.
 
@@ -289,19 +320,24 @@ class AnthropicChat(LLMProvider):
         on_chunk: ChunkCallback = None,
         **kwargs: Any,
     ) -> AnthropicChatResponse:
+        call_id = new_call_id()
         last_err: BaseException | None = None
         for attempt in range(self._max_retries):
             try:
-                if stream:
-                    return await self._achat_stream_collapsed(
-                        messages,
-                        enable_thinking=enable_thinking,
-                        on_chunk=on_chunk,
-                        **kwargs,
-                    )
-                return await self._achat_nonstream(
-                    messages, enable_thinking=enable_thinking, **kwargs,
-                )
+                with ProviderAttempt(call_id, attempt + 1, "anthropic",
+                                     kwargs.get("model", self._model)) as accounting:
+                    if stream:
+                        response = await self._achat_stream_collapsed(
+                            messages,
+                            enable_thinking=enable_thinking,
+                            on_chunk=on_chunk,
+                            accounting=accounting, **kwargs,
+                        )
+                    else:
+                        response = await self._achat_nonstream(
+                            messages, enable_thinking=enable_thinking, accounting=accounting, **kwargs,
+                        )
+                    return accounting.response(response)
             except _RETRYABLE_ERRORS as exc:
                 last_err = exc
                 if attempt >= self._max_retries - 1:
@@ -330,13 +366,17 @@ class AnthropicChat(LLMProvider):
         create_kwargs = self._build_create_kwargs(
             messages, enable_thinking=enable_thinking, **kwargs,
         )
+        call_id = new_call_id()
         last_err: BaseException | None = None
         for attempt in range(self._max_retries):
             try:
-                async with self._async.messages.stream(**create_kwargs) as stream:
-                    async for text in stream.text_stream:
-                        yield text
-                return
+                with ProviderAttempt(call_id, attempt + 1, "anthropic", create_kwargs["model"]) as accounting:
+                    async with self._async.messages.stream(**create_kwargs) as stream:
+                        async for text in stream.text_stream:
+                            _observe_stream_snapshot(stream, accounting)
+                            yield text
+                        await _observe_stream_final(stream, accounting)
+                    return
             except _RETRYABLE_ERRORS as exc:
                 last_err = exc
                 if attempt >= self._max_retries - 1:
@@ -363,6 +403,17 @@ class AnthropicChat(LLMProvider):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Build kwargs dict for ``messages.create`` / ``messages.stream``."""
+        if "seed" in kwargs:
+            raise ValueError("Anthropic does not support seed")
+        if "stop" in kwargs:
+            stop = kwargs.pop("stop")
+            if "stop_sequences" in kwargs:
+                raise ValueError("Supply stop or stop_sequences, not both")
+            if stop is not None:
+                if not (isinstance(stop, str) or isinstance(stop, list)
+                        and all(isinstance(item, str) for item in stop)):
+                    raise ValueError("stop must be text or a list of text")
+                kwargs["stop_sequences"] = [stop] if isinstance(stop, str) else list(stop)
         system_content, conversation = _convert_messages(messages)
 
         create_kwargs: Dict[str, Any] = {
@@ -397,6 +448,7 @@ class AnthropicChat(LLMProvider):
         messages: List[Dict[str, Any]],
         *,
         enable_thinking: bool = False,
+        accounting: ProviderAttempt | None = None,
         **kwargs: Any,
     ) -> AnthropicChatResponse:
         create_kwargs = self._build_create_kwargs(
@@ -405,6 +457,9 @@ class AnthropicChat(LLMProvider):
         t0 = time.monotonic()
         resp = await self._async.messages.create(**create_kwargs)
         dt_ms = int((time.monotonic() - t0) * 1000)
+        usage = _safe_provider_usage(getattr(resp, "usage", None))
+        if accounting is not None:
+            accounting.observe(usage, getattr(resp, "model", None))
 
         text_parts: List[str] = []
         thinking_parts: List[str] = []
@@ -423,7 +478,6 @@ class AnthropicChat(LLMProvider):
                     arguments=getattr(block, "input", {}),
                 ))
 
-        usage = _parse_usage(getattr(resp, "usage", None))
         usage["latency_ms"] = dt_ms
 
         return AnthropicChatResponse(
@@ -442,6 +496,7 @@ class AnthropicChat(LLMProvider):
         *,
         enable_thinking: bool = False,
         on_chunk: ChunkCallback = None,
+        accounting: ProviderAttempt | None = None,
         **kwargs: Any,
     ) -> AnthropicChatResponse:
         create_kwargs = self._build_create_kwargs(
@@ -470,7 +525,9 @@ class AnthropicChat(LLMProvider):
                         model_name = getattr(msg, "model", None)
                         u = getattr(msg, "usage", None)
                         if u:
-                            usage.update(_parse_usage(u))
+                            usage.update(_safe_provider_usage(u))
+                            if accounting is not None:
+                                accounting.observe(usage, model_name)
 
                 elif event_type == "content_block_start":
                     cb = getattr(event, "content_block", None)
@@ -523,7 +580,9 @@ class AnthropicChat(LLMProvider):
                             stop_reason = sr
                     u = getattr(event, "usage", None)
                     if u:
-                        usage.update(_parse_usage(u))
+                        usage.update(_safe_provider_usage(u))
+                        if accounting is not None:
+                            accounting.observe(usage, model_name)
 
         dt_ms = int((time.monotonic() - t0) * 1000)
         usage.setdefault("latency_ms", dt_ms)

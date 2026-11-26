@@ -153,6 +153,7 @@ def test_builtin_skills_satisfy_the_protocol_with_unique_ids() -> None:
         "episode.record",
         "grasp.verify",
         "grasp.inspect",
+        "grasp.evidence",
     }
     assert all(skill.spec.effect in (EFFECT_ACTUATE, EFFECT_READ) for skill in found)
 

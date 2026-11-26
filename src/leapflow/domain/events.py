@@ -15,7 +15,7 @@ PRIORITY_NORMAL: int = 3     # Default: clipboard, scroll, etc.
 PRIORITY_LOW: int = 2        # Background: filesystem changes
 PRIORITY_DEFERRED: int = 1   # System: unmapped / internal
 
-PRE_NORMALIZED_EVENT_PREFIXES: tuple[str, ...] = ("gateway.", "daemon.", "hw.")
+PRE_NORMALIZED_EVENT_PREFIXES: tuple[str, ...] = ("gateway.", "daemon.", "hw.", "model.")
 """Event-type prefixes whose producers already emit normalized types.
 
 Every normalizer passes these through unchanged, because downstream consumers --

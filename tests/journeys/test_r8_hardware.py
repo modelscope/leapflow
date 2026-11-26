@@ -34,7 +34,10 @@ Replay determinism is the load-bearing design constraint, and two facts shape it
 
 The model touches static ``setpoint``/``homed`` channels and one simulated
 multi-candidate sequence. Its selected digest-bound plan is also checked directly
-on the node, independently of the model-facing result budget.
+on the node, independently of the model-facing result budget. Further phases
+capture consented snapshot/clip evidence and exercise both primary adoption and
+override of visible advisory scores through the same daemon and aggregate budget.
+Only provider responses and cameras are simulated; this proves wiring, not quality.
 Persistence of the streaming channel's durable windows is verified through the
 daemon's board digest (``storage.windows_written``, ``counts.series``), which
 reads ``channel_history()`` — the identical data path that populates
@@ -46,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.util
 import json
 import shutil
 import socket
@@ -68,6 +72,8 @@ SUBJECT_PATHS = (
     "src/leapflow/hardware/",
     "src/leapflow/dashboard/",
     "src/leapflow/monitor/",
+    "src/leapflow/llm/",
+    "src/leapflow/tools/model_tools.py",
 )
 
 # The journey exercises the hardware data/approval/observation wiring across a
@@ -277,6 +283,120 @@ async def _qualified_provider(journey: Journey, stack: AsyncExitStack, root: Pat
     return registry
 
 
+def _media_script() -> tuple[ScriptedTurn, ...]:
+    """Both choices share one daemon but retain evidence in their own sessions."""
+    declaration = {
+        "goal": "Compare these two options using the admitted evidence.",
+        "candidates": [{"id": "a", "description": "Keep the current option."},
+                       {"id": "b", "description": "Use the alternative."}],
+        "state": {"measured": False},
+    }
+    recommendation = {"selected_id": "a", "ranking": ["a", "b"],
+                      "candidate_scores": [{"id": "a", "score": 0.8}, {"id": "b", "score": 0.2}]}
+    captures = (
+        tool_call("hw_skill_run", workcell="r9/piper_cell", skill="perceive.snapshot",
+                  args={"camera": "camera", "overlay": False}, share_frames=True, export_evidence=True),
+        answer("SNAPSHOT_RETAINED"),
+        tool_call("hw_skill_run", workcell="r9/piper_cell", skill="perceive.clip",
+                  args={"camera": "camera", "seconds": 2, "max_side": 64},
+                  share_frames=True, export_evidence=True),
+        answer("CLIP_RETAINED"),
+    )
+    turns = []
+    for final in ("PRIMARY_ADOPTS_A", "PRIMARY_OVERRIDES_WITH_B"):
+        turns.extend((*captures,
+            tool_call("model_query", service_id="fixture", input=declaration,
+                      artifacts={"snapshot": "CURRENT_IMAGE", "clip": "CURRENT_VIDEO"}),
+            answer(json.dumps(recommendation)), answer(final),
+        ))
+    return tuple(turns)
+
+
+async def _media_node(root: Path, stack: AsyncExitStack) -> tuple[Any, str, int]:
+    """An observe-only camera owner, sharing the hardware journey's lifecycle."""
+    from leapflow.hardware.lhp.permit import PermitIssuer, generate_keypair
+    from leapflow.hardware.lhp.server import WRITE_MODE_OBSERVE_ONLY
+    from leapflow.hardware.skills.builtin.clip import Clip
+    from leapflow.hardware.skills.builtin.scene import Snapshot
+    from tests._harness.skill_stubs import CAMERA_ID, WORKCELL_YAML, SimRgbdCamera
+    from test_skill_tools import _Node
+
+    private, _ = generate_keypair()
+    cell = {**WORKCELL_YAML, "roles": {**WORKCELL_YAML["roles"], "camera": CAMERA_ID}, "share_frames": True}
+    node = _Node(root, PermitIssuer(private), node_id="r9", write_mode=WRITE_MODE_OBSERVE_ONLY,
+                 cell=cell, node_skills=(Snapshot(), Clip()), devices={CAMERA_ID: SimRgbdCamera()})
+    stack.callback(node.registry.calibration_store.close)
+    stack.push_async_callback(node.runtime.close)
+    stack.push_async_callback(node.server.stop)
+    host, port = await node.server.start(host="127.0.0.1", port=0)
+    return node, host, port
+
+
+def _media_blocks(request: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    return [block for message in request.get("messages", [])
+            if isinstance(message.get("content"), list) for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == kind]
+
+
+def _assert_media_advice(requests: list[dict[str, Any]], session: str) -> None:
+    primary = [request for request in requests if request["model"] == "cassette-model"]
+    specialist = [request for request in requests if request["model"] == "fixture-specialist"]
+    assert len(specialist) == 1
+    advice = [json.loads(message["content"]) for message in primary[-1]["messages"]
+              if message.get("role") == "tool" and isinstance(message.get("content"), str)
+              and '"selected_id"' in message["content"]]
+    assert len(advice) == 1, "primary must receive actual advice before adopting or overriding it"
+    assert advice[-1]["result"] == {"selected_id": "a", "ranking": ["a", "b"],
+        "candidate_scores": [{"id": "a", "score": 0.8}, {"id": "b", "score": 0.2}]}
+    assert advice[-1]["provenance"]["advisory"] is True
+    assert advice[-1]["provenance"]["scores_calibrated"] is False
+    assert advice[-1]["provenance"]["physical_authority"] is False
+    assert advice[-1]["consultation"]["call_id"]
+    assert not any(_media_blocks(request, "video_url") for request in primary)
+    images = [block["image_url"]["url"] for request in requests
+              if request["model"] == "cassette-model" for block in _media_blocks(request, "image_url")]
+    specialist_images = _media_blocks(specialist[0], "image_url")
+    assert len(specialist_images) == 1 and specialist_images[0]["image_url"]["url"] in images
+    assert len(_media_blocks(specialist[0], "video_url")) == 1
+    envelope = json.loads(specialist[0]["messages"][-1]["content"][0]["text"])
+    assert envelope["context"]["session_id"] == session
+    assert set(envelope["artifact_order"]) == {"snapshot", "clip"}
+
+
+async def _media_phases(journey: Journey, node: Any, requests: list[dict[str, Any]]) -> None:
+    client = journey.client()
+    workspace = journey.workspace("media")
+    session = "r8-media-adopt"
+    declaration = workspace / "service.json"
+    declaration.write_text(json.dumps({"schema_version": 1, "provider": "openai", "base_url": journey.proxy.base_url,
+        "model": "fixture-specialist", "task": "decision", "auth": {"mode": "none"},
+        "processing_location": "local", "media": {"max_images": 4, "max_videos": 1}}))
+    configured = await client.command_execute("config", f"llm services set fixture --file {declaration}", session_id=session)
+    assert configured.get("ok"), configured
+    for choice, final in (("adopt", "PRIMARY_ADOPTS_A"), ("override", "PRIMARY_OVERRIDES_WITH_B")):
+        with journey.phase(f"advisory discretion: {final}"):
+            session = f"r8-media-{choice}"
+            workspace = journey.workspace(f"media-{choice}")
+            offset = len(requests)
+            before = journey.proxy.stats.call_count
+            for prompt in ("Capture and retain a snapshot without motion.", "Capture and retain a bounded clip without motion."):
+                with journey.phase(prompt):
+                    events = await _drive_with_auto_approval(client, prompt, session_id=session, workspace=str(workspace))
+                    assert _completed_ok(events, "hw_skill_run"), journey.daemon.tail_log()
+                    assert any(event.type == "approval_request" for event in events)
+            assert journey.proxy.stats.call_count - before == 4  # No automatic specialist consultation.
+            before = journey.proxy.stats.call_count
+            events = await _drive_with_auto_approval(client, "Compare the alternatives; you decide what to adopt.",
+                                                    session_id=session, workspace=str(workspace))
+            assert _completed_ok(events, "model_query"), _detail(events, "model_query")
+            assert any(event.type == "approval_request" for event in events)  # Distinct egress consent.
+            assert journey.proxy.stats.call_count - before == 3
+            history = await client.session_history(session_id=session)
+            assert final in json.dumps(history)
+            _assert_media_advice(requests[offset:], session)
+            assert not node.sim.batches and not node.runtime.status()
+
+
 @pytest.mark.asyncio
 async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
     devices_dir = Path(tempfile.mkdtemp(prefix="lfj-r8dev-"))
@@ -298,6 +418,11 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
                              write_mode=WRITE_MODE_TRUSTED_V1)
         host, port = await node.start(host="127.0.0.1", port=0)
         stack.push_async_callback(node.stop)
+        media = None
+        media_endpoints = []
+        if all(importlib.util.find_spec(name) is not None for name in ("cv2", "numpy")):
+            media, media_host, media_port = await _media_node(devices_dir / "media", stack)
+            media_endpoints.append({"node_id": "r9", "endpoint": f"tcp://{media_host}:{media_port}"})
         # Startup fetches the actual socket declaration; keep its owner loop responsive.
         journey = await asyncio.to_thread(lambda: journeys(
             "r8_hardware",
@@ -345,7 +470,9 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
                     "checksum": "sha256:r8-fixture", "instance": "r8-instance"}})),
             ),
             deadline_s=90.0,
-            max_llm_calls=15,
+            # Aggregate of the existing 15-call hardware and two 7-call media
+            # paths; one daemon/deadline, with no increase to the combined ceiling.
+            max_llm_calls=29 if media is not None else 15,
             max_llm_tokens=300_000,
             requires_scripted_responses=True,
             extra_env={
@@ -358,8 +485,11 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
                 "LEAPFLOW_HARDWARE_PROVIDERS": "yaml",
                 "LEAPFLOW_HARDWARE_FLEET_NODES": json.dumps([
                     {"node_id": "r8_planning", "endpoint": f"tcp://{host}:{port}"},
-                    {"node_id": "r8_native", "endpoint": f"tcp://127.0.0.1:{native_port}"}
+                    {"node_id": "r8_native", "endpoint": f"tcp://127.0.0.1:{native_port}"},
+                    *media_endpoints,
                 ]),
+                "LEAPFLOW_HARDWARE_SHARE_FRAMES": "true",
+                "LEAPFLOW_LLM_SUPPORTS_VISION": "true",
                 # Memory prefetch injects a "## Recent Context" block into the
                 # system prompt from the profile's signal store, and that store
                 # picks up ambient desktop events (a focus switch to loginwindow)
@@ -379,6 +509,11 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
                 "LEAPFLOW_HARDWARE_DOWNSAMPLE_INTERVAL_S": "1",
             },
         ))
+        from tests._harness.media_replay import bind_media_response
+
+        raw_requests: list[dict[str, Any]] = []
+        if media is not None:
+            bind_media_response(journey.proxy, raw_requests)
         workspace = journey.workspace("bench")
         client = journey.client(timeout_s=120.0)
 
@@ -535,26 +670,46 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
             assert report["evidence"]["state_reads"] == 1 and report["evidence"]["llm_calls"] == 0
             assert run.outcome.ok and not runtime._plans
 
-        with journey.phase("provider: qualified inference and metadata cross the existing fleet read RPC"):
+        with journey.phase("provider: qualified isolated inference"):
             before = journey.proxy.stats.call_count
             native_registry = await _qualified_provider(journey, stack, devices_dir / "native")
             assert journey.proxy.stats.call_count - before == 5
+
+        if media is not None:
+            with journey.phase("media: scoped capture and optional advice without motion authority"):
+                # The native fleet endpoint stays reserved until all primary
+                # requests finish, so disconnect timing cannot change their context.
+                # Reset only synthetic responses, never aggregate accounting.
+                journey.proxy._script = scripted(*_media_script())
+                await _media_phases(journey, media, raw_requests)
+
+        with journey.phase("provider: qualified metadata crosses the existing fleet read RPC"):
+            journey.proxy._script = scripted(answer(json.dumps({"model_info": {
+                "task": "grounding", "name": "r8-fixture", "version": "1",
+                "checksum": "sha256:r8-fixture", "instance": "r8-instance"}})))
             reserved.close()
             native_node = LhpNodeServer(native_registry, node_id="r8_native")
             await native_node.start(host="127.0.0.1", port=native_port)
             stack.push_async_callback(native_node.stop)
             assert (await client.hardware_fleet_reconnect("r8_native"))["ok"]
-            reading = await client.hardware_read("r8_native__native_model", "model.info")
-            assert reading["ok"], reading
+
+            async def _native_metadata() -> dict[str, Any] | None:
+                reading = await client.hardware_read("r8_native__native_model", "model.info")
+                # Reconnect may report a registration already in flight. Wait
+                # only for that admission, not for a failed provider inference.
+                if reading.get("code") == "unknown_channel":
+                    return None
+                assert reading["ok"], reading
+                return reading
+
+            reading = await await_for(_native_metadata, timeout_s=10.0, interval_s=0.1,
+                                      what="native fleet channel admission")
             assert reading["device_id"] == "r8_native__native_model"
             assert reading["value"]["instance"] == "r8-instance"
             assert reading["value"]["service_basis"]["qualification_ref"] == "r8-qualification"
-            # No later primary prompt sees the endpoint-bound receipt digest.
             native_calls = [r for r in journey.proxy.stats.requests if r["model"] == "fixture-native"]
             assert 5 <= len(native_calls) <= 6
             assert all(not r.get("stream", False) for r in native_calls)
-            await native_node.stop()
-            await native_registry.close_all()
 
         journey.finish()
     finally:

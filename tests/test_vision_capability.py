@@ -267,7 +267,8 @@ async def test_a_blind_model_gets_a_hint_on_how_to_show_images() -> None:
 
 
 async def test_an_image_is_described_once() -> None:
-    tool_attachments._DESCRIPTIONS.clear()
+    from collections import OrderedDict
+    cache = OrderedDict()
     calls: list[int] = []
 
     async def achat(messages: list[Any], **kwargs: Any) -> Any:
@@ -276,8 +277,8 @@ async def test_an_image_is_described_once() -> None:
 
     vlm = SimpleNamespace(achat=achat)
     item = _item("c1", 0)
-    assert await describe_image(vlm, item) == "a cup on a table"
-    assert await describe_image(vlm, item) == "a cup on a table"
+    assert await describe_image(vlm, item, description_cache=cache) == "a cup on a table"
+    assert await describe_image(vlm, item, description_cache=cache) == "a cup on a table"
     assert len(calls) == 1 and calls[0] >= 400
 
 

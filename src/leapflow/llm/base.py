@@ -32,6 +32,7 @@ class LLMChatResponse:
     finish_reason: str | None = None
     thinking_content: str | None = None
     tool_calls: List[ToolCallInfo] = field(default_factory=list)
+    inference_call_id: str = ""
 
 
 @runtime_checkable

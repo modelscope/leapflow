@@ -98,6 +98,40 @@ def test_an_unfittable_result_becomes_a_valid_sentinel() -> None:
     assert fitted["original_chars"] == len(json.dumps(payload))
 
 
+def test_atomic_context_view_keeps_values_and_qualifiers_without_mutation() -> None:
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
+
+    payload = {"ok": True, "result": {"selected": "b", "scores": [0.2, 0.8]},
+               "provenance": {"advisory": True, "physical_authority": False, "trace": "x" * 5000},
+               "_context_fields": {"ok": True, "result": True,
+                                   "provenance": {"advisory": True, "physical_authority": True}}}
+    original = copy.deepcopy(payload)
+    compact = ToolEvidenceBuilder().build("extension_query", {}, payload)
+    fitted = json.loads(fit_result_to_budget(compact, 300))
+    assert fitted["result"] == original["result"]
+    assert fitted["provenance"] == {"advisory": True, "physical_authority": False}
+    assert fitted["context_compacted"] is True and "_context_fields" not in fitted
+    assert payload == original
+    full = json.loads(fit_result_to_budget(payload, 10000))
+    assert full == {key: value for key, value in payload.items() if key != "_context_fields"}
+
+
+def test_atomic_view_too_large_is_explicitly_omitted_not_pruned() -> None:
+    payload = {"ok": True, "result": {"scores": list(range(100))},
+               "_context_fields": {"ok": True, "result": True}}
+    fitted = json.loads(fit_result_to_budget(payload, 140))
+    assert fitted["context_fields_omitted"] is True and "result" not in fitted
+
+
+def test_context_selector_cannot_replace_values_or_turn_failure_into_success() -> None:
+    for fields in ({"ok": True, "result": "invented"}, {"ok": True, "missing": True}):
+        payload = {"ok": False, "failure_code": "denied", "retryable": False,
+                   "trace": "x" * 5000, "_context_fields": fields}
+        fitted = json.loads(fit_result_to_budget(payload, 400))
+        assert fitted["ok"] is False and fitted["failure_code"] == "denied"
+        assert fitted["retryable"] is False and "context_compacted" not in fitted
+
+
 def test_a_bare_value_is_cut_and_long_text_keeps_its_tail() -> None:
     assert fit_result_to_budget("z" * 50, 10) == json.dumps("z" * 50)[:10]
     text = "head " + "." * 1_000 + " Traceback: the real error"

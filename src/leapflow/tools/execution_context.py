@@ -12,7 +12,7 @@ import contextvars
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,9 @@ class ToolExecutionContext:
     task_id: str = ""
     approval_bypass: bool = False
     orchestrator: Any = field(default=None, compare=False, hash=False, repr=False)
+    run_subagent: Callable[..., Awaitable[Any]] | None = field(
+        default=None, compare=False, hash=False, repr=False,
+    )
 
     @classmethod
     def from_strings(
@@ -38,6 +41,7 @@ class ToolExecutionContext:
         task_id: str = "",
         approval_bypass: bool = False,
         orchestrator: Any = None,
+        run_subagent: Callable[..., Awaitable[Any]] | None = None,
     ) -> "ToolExecutionContext":
         root = Path(workspace_root).expanduser().resolve()
         roots = tuple(Path(item).expanduser().resolve() for item in allowed_roots if item)
@@ -48,6 +52,7 @@ class ToolExecutionContext:
             task_id=task_id,
             approval_bypass=approval_bypass,
             orchestrator=orchestrator,
+            run_subagent=run_subagent,
         )
 
 

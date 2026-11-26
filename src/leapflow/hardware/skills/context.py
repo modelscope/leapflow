@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from leapflow.hardware.model_contract import ModelService
@@ -71,7 +72,10 @@ class RunContext:
         planning_settings: PlanningSettings | None = None,
         planning_deadline: float = float("inf"),
         planning_basis: Callable[[], Awaitable[Mapping[str, Any]]] | None = None,
+        episode_directory: Path | None = None,
     ) -> None:
+        self._episode_directory = episode_directory
+        self._clips: Any = None
         self._calculations = calculations
         self._planning_basis = planning_basis
         self._planning_settings = planning_settings or PlanningSettings()
@@ -172,6 +176,20 @@ class RunContext:
                 note=self.note,
             )
         return self._scene
+
+    @property
+    def clips(self) -> Any:
+        if self._clips is None:
+            from leapflow.hardware.skills.clips import WorkcellClips
+
+            async def capture(role: str, bound: float) -> Any:
+                return await self.camera_vision(role).capture_metric(after_monotonic=bound)
+
+            self._clips = WorkcellClips(
+                self._spec, capture, directory=self._episode_directory,
+                deadline=self._planning_deadline,
+            )
+        return self._clips
 
     @property
     def grasp_planner(self) -> GraspPlanner:

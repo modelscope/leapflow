@@ -65,12 +65,28 @@ class SessionPersistence:
                     self._engine._wm.remember_chat(build_assistant_message(
                         _persisted_tool_evidence(str(getattr(msg, "tool_name", "") or ""), content)
                     ))
+                    self._restore_collaboration_receipts(msg, session_id)
             logger.info("session.resume loaded %d messages from %s", len(messages), session_id)
             self.apply_resume_cache_snapshot(session_id)
             return True
         except Exception:
             logger.debug("session.resume failed", exc_info=True)
             return False
+
+    def _restore_collaboration_receipts(self, message: Any, session_id: str) -> None:
+        """Rehydrate a bounded private view without re-ingestion or trust promotion."""
+        try:
+            from leapflow.domain.events import RecordScope
+            from leapflow.layout import workspace_id_for_path
+
+            metadata = getattr(message, "metadata", None)
+            if not isinstance(metadata, dict):
+                return
+            scope = RecordScope(str(self._engine._settings.profile or ""),
+                workspace_id_for_path(self._engine._settings.workspace_root), session_id)
+            self._engine._usage_tracker.restore_collaboration(metadata, scope)
+        except Exception:  # noqa: BLE001 - auxiliary history cannot prevent session resume
+            logger.warning("Collaboration receipt resume failed", exc_info=True)
 
     def freeze_prefix_for_resume(
         self,
@@ -134,6 +150,19 @@ class SessionPersistence:
         logger.info("session.resume applied cache-priority prefix freeze for %s", session_id)
         return True
 
+    def _bind_child_frame_identity(self, frame: "AgentLoopFrame") -> None:
+        """Install child ownership before prompt retrieval or any provider/tool call."""
+        from dataclasses import replace
+
+        frame.parent_session_id = self._engine._current_session_id
+        self._engine._current_session_id = self._ensure_session_for_frame(frame, frame.user_text)
+        contract = self._engine._prompt_assembler._build_task_contract(frame.user_text)
+        self._engine._current_task_contract = replace(contract, task_id=f"{frame.session_id}:turn")
+        self._engine._current_turn_id = self._engine._current_task_contract.task_id
+        self._engine._current_command_id = self._engine._current_turn_id
+        frame.turn_id = self._engine._current_turn_id
+        frame.command_id = self._engine._current_command_id
+
     def _ensure_session_for_frame(
         self, frame: "AgentLoopFrame", user_text: str
     ) -> Optional[str]:
@@ -146,26 +175,31 @@ class SessionPersistence:
         """
         if frame.is_root:
             return self._ensure_session(user_text)
+        if frame.session_id:
+            return frame.session_id
+        import uuid as _uuid
+
+        child_session = f"sub_{_uuid.uuid4().hex[:12]}"
+        frame.session_id = child_session
         if (
             not self._engine._conversation_store
             or not self._engine._settings.session_persistence_enabled
         ):
-            return None
+            return child_session
         try:
-            import uuid as _uuid
-
-            child_session = f"sub_{_uuid.uuid4().hex[:12]}"
             title = user_text[:80].replace("\n", " ").strip() or "subagent"
             self._engine._conversation_store.create_session(
                 child_session,
                 title=title,
+                parent_session_id=frame.parent_session_id,
                 model=self._engine._settings.llm_model,
                 source="subagent",
+                cwd=str(self._engine._settings.workspace_root),
             )
             return child_session
         except Exception:
             logger.debug("child session creation failed; skipping child persistence", exc_info=True)
-            return None
+            return child_session
 
     def _ensure_session(self, user_text: str) -> Optional[str]:
         """Create or reuse a conversation session. Returns session_id or None."""

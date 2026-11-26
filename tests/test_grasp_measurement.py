@@ -386,7 +386,9 @@ async def test_standalone_verify_remains_read_only_and_returns_failure_state():
 async def test_installation_requires_matching_read_only_admission_before_recording():
     ctx = SimpleNamespace(
         grasp_verification=SimpleNamespace(
-            admit=lambda data: {"qualification_digest": "digest", "parameters": dict(data)}
+            installation=AsyncMock(return_value={
+                "qualification_digest": "digest", "parameters": {"physical": True},
+            })
         ),
         record_calibration=lambda *args, **kw: 123,
     )
@@ -394,9 +396,9 @@ async def test_installation_requires_matching_read_only_admission_before_recordi
     plan = await skill.plan(ctx, {"qualification": {"physical": True}})
     result = await skill.execute(ctx, plan)
     assert result.ok and result.result["recorded_at"] == 123
-    ctx.grasp_verification.admit = lambda data: {
+    ctx.grasp_verification.installation.return_value = {
         "qualification_digest": "changed",
-        "parameters": dict(data),
+        "parameters": {"physical": True},
     }
     with pytest.raises(SkillError):
         await skill.execute(ctx, plan)

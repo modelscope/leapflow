@@ -382,3 +382,112 @@ class TestAnthropicChatMocked:
         assert result.usage["cache_read_input_tokens"] == 1200
         assert result.usage["cache_creation_input_tokens"] == 200
         assert "latency_ms" in result.usage
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("isolated", [False, True])
+@pytest.mark.parametrize("stop,expected", [("END", ["END"]), (["END", "STOP"], ["END", "STOP"]),
+                                            ([], []), (None, None)])
+async def test_portable_stop_reaches_native_sdk_on_primary_and_isolated_routes(monkeypatch, isolated, stop, expected):
+    from leapflow.llm import anthropic_provider
+    from leapflow.llm.provider_registry import LLMProviderRegistry
+
+    sdk = MagicMock()
+    sdk.AsyncAnthropic.return_value.messages.create = AsyncMock(side_effect=RuntimeError("capture boundary"))
+    sdk.AsyncAnthropic.return_value.close = AsyncMock()
+    monkeypatch.setattr(anthropic_provider, "_ANTHROPIC_AVAILABLE", True)
+    monkeypatch.setattr(anthropic_provider, "_anthropic_sdk", sdk)
+    registry = LLMProviderRegistry()
+    with patch.dict("sys.modules"):
+        from leapflow.llm._anthropic_plugin import AnthropicPlugin
+        registry.register(AnthropicPlugin())
+    config = {"api_key": "test-only", "model": "test-model", "max_retries": 1}
+    chat = registry.create_isolated("anthropic", config) if isolated else registry.get_provider("anthropic", config)
+    try:
+        with pytest.raises(RuntimeError, match="capture boundary"):
+            await chat.achat([{"role": "system", "content": "Stable"}, {"role": "user", "content": "Hi"}],
+                             stream=False, stop=stop, temperature=0.2)
+        captured = sdk.AsyncAnthropic.return_value.messages.create.call_args.kwargs
+        assert "stop" not in captured
+        assert captured.get("stop_sequences") == expected
+        assert captured["system"] == "Stable" and captured["temperature"] == 0.2
+        assert captured["model"] == "test-model"
+        if isinstance(stop, list):
+            assert captured["stop_sequences"] is not stop
+        sdk.AsyncAnthropic.return_value.messages.create.reset_mock()
+        for options in ({"seed": 1}, {"stop": "END", "stop_sequences": ["STOP"]}, {"stop": 3}):
+            with pytest.raises(ValueError):
+                await chat.achat([{"role": "user", "content": "Hi"}], stream=False, **options)
+        assert not sdk.AsyncAnthropic.return_value.messages.create.called
+        native = chat._build_create_kwargs([{"role": "user", "content": "Hi"}], stop_sequences=["NATIVE"])
+        assert native["stop_sequences"] == ["NATIVE"]
+    finally:
+        await chat.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["snapshot", "final", "missing_final", "cancel_final", "none"])
+async def test_raw_stream_optional_telemetry_never_retries_delivered_text(monkeypatch, fault):
+    import asyncio
+    from types import SimpleNamespace
+    from leapflow.llm import anthropic_provider
+    from leapflow.llm.services.telemetry import capture_inference
+    from test_llm_provider_retry_ownership import _recorded_body
+
+    body = _recorded_body()
+    usage = body["usage"]
+    message = SimpleNamespace(model=body["model"], usage=SimpleNamespace(
+        input_tokens=usage["prompt_tokens"], output_tokens=usage["completion_tokens"],
+        cache_read_input_tokens=0, cache_creation_input_tokens=0))
+
+    class Stream:
+        @property
+        def current_message_snapshot(self):
+            if fault == "snapshot":
+                raise AttributeError("optional context snapshot")
+            return message
+
+        @property
+        def text_stream(self):
+            async def text():
+                yield body["choices"][0]["message"]["content"]
+            return text()
+
+        async def get_final_message(self):
+            if fault == "final":
+                raise RuntimeError("optional final usage")
+            if fault == "cancel_final":
+                raise asyncio.CancelledError()
+            return message
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    stream = Stream()
+    if fault == "missing_final":
+        stream.get_final_message = None
+    sdk = MagicMock()
+    sdk.AsyncAnthropic.return_value.messages.stream.return_value = stream
+    sdk.AsyncAnthropic.return_value.close = AsyncMock()
+    monkeypatch.setattr(anthropic_provider, "_ANTHROPIC_AVAILABLE", True)
+    monkeypatch.setattr(anthropic_provider, "_anthropic_sdk", sdk)
+    chat = anthropic_provider.AnthropicChat(api_key="test-only", model="test-model", max_retries=3)
+    try:
+        with capture_inference() as capture:
+            response = chat.achat_stream([{"role": "user", "content": "hello"}])
+            assert await response.__anext__() == body["choices"][0]["message"]["content"]
+            if fault == "cancel_final":
+                with pytest.raises(asyncio.CancelledError):
+                    await response.__anext__()
+            else:
+                with pytest.raises(StopAsyncIteration):
+                    await response.__anext__()
+        assert sdk.AsyncAnthropic.return_value.messages.stream.call_count == 1
+        assert len(capture.attempts) == 1
+        assert capture.attempts[0].status == ("cancelled" if fault == "cancel_final" else "returned")
+        assert capture.attempts[0].to_dict()["usage"]["prompt_tokens"] == usage["prompt_tokens"]
+    finally:
+        await chat.aclose()

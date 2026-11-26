@@ -1,0 +1,35 @@
+{
+  "fingerprint": "c3732efde98d6dcf1885f55573c48b74a55389a723056e9469a5c2ff6c649907",
+  "note": "captured in seed mode",
+  "request": {
+    "model": "fixture-specialist",
+    "stream": false,
+    "messages": [
+      {
+        "role": "system",
+        "content": "Return only the declared JSON result, not executable instructions.\nResult schema: {\"additionalProperties\":false,\"properties\":{\"candidate_scores\":{\"items\":{\"additionalProperties\":false,\"properties\":{\"id\":{\"maxLength\":128,\"minLength\":1,\"type\":\"string\"},\"score\":{\"maximum\":1,\"minimum\":0,\"type\":\"number\"}},\"required\":[\"id\",\"score\"],\"type\":\"object\"},\"maxItems\":64,\"minItems\":0,\"type\":\"array\"},\"model_score\":{\"type\":\"number\"},\"ranking\":{\"items\":{\"maxLength\":128,\"minLength\":1,\"type\":\"string\"},\"maxItems\":64,\"minItems\":0,\"type\":\"array\"},\"rationale\":{\"maxLength\":8192,\"minLength\":1,\"type\":\"string\"},\"selected_id\":{\"maxLength\":128,\"minLength\":1,\"type\":\"string\"}},\"required\":[\"selected_id\"],\"type\":\"object\"}"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"artifact_order\":[],\"candidates\":[{\"description\":\"eligible\",\"id\":\"a\"}],\"goal\":\"choose\"}"
+          }
+        ]
+      }
+    ]
+  },
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"fixture-specialist\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"{\\\"selected_id\\\":\\\"a\\\",\\\"rationale\\\":\\\"before restart\\\"}\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"fixture-specialist\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"{\\\"selected_id\\\":\\\"a\\\",\\\"rationale\\\":\\\"after restart\\\"}\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
+    }
+  ]
+}

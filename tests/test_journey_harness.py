@@ -55,6 +55,106 @@ def _chat_body(prompt: str, *, stream: bool = True, model: str = "cassette-model
 # ── Fingerprinting ───────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("role", ["tool", "assistant"])
+def test_media_fingerprinting_normalizes_only_capture_telemetry(role) -> None:
+    from copy import deepcopy
+    from tests._harness.media_replay import _stable_request
+
+    result = {"ok": True, "result": {"duration_s": 1.95, "valid_for_s": 299.5, "label": "café"},
+              "evidence": {"status": "retained", "kind": "video", "artifact_id": "own",
+                           "duration_s": 1.95, "size_bytes": 2000}}
+    text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    if role == "assistant":
+        text = "[Tool Evidence — previous turn]\n- hw_skill_run: " + text
+    body = {"messages": [{"role": role, "content": text}, {"role": "user", "content": text}]}
+    original = deepcopy(body)
+    stable = _stable_request(body)
+    assert "<CAPTURE_TIME>" in stable["messages"][0]["content"]
+    assert "<ENCODED_SIZE>" in stable["messages"][0]["content"]
+    assert "café" in stable["messages"][0]["content"]
+    assert stable["messages"][1] == body["messages"][1] and body == original
+    assert _stable_request(stable) == stable
+    changed = deepcopy(body)
+    changed["messages"][0]["content"] = text.replace('"own"', '"other"')
+    assert _stable_request(changed) != stable
+
+
+@pytest.mark.parametrize("role", ["tool", "assistant"])
+def test_snapshot_change_age_is_volatile_but_geometry_and_identity_are_not(role) -> None:
+    from copy import deepcopy
+    from tests._harness.media_replay import _stable_request
+
+    summary = "camera: no visible change since f1 (2 s ago)"
+    result = {"ok": True, "message": summary, "result": {
+        "changes": {"camera": {"since_frame": "f1", "age_s": 2.1,
+            "comparable": True, "changed_fraction": 0.0, "summary": summary}},
+        "situation": [summary], "state": {"age_s": 12.5}},
+        "evidence": {"status": "retained", "kind": "image", "artifact_id": "owned"}}
+
+    def body(value):
+        text = json.dumps(value)
+        if role == "assistant":
+            text = "[Tool Evidence — previous turn]\n- hw_skill_run: " + text
+        return {"messages": [{"role": role, "content": text}]}
+
+    first = body(result)
+    later = deepcopy(result)
+    later["result"]["changes"]["camera"]["age_s"] = 3.4
+    for parent, key in ((later, "message"), (later["result"]["changes"]["camera"], "summary")):
+        parent[key] = summary.replace("2 s ago", "3 s ago")
+    later["result"]["situation"] = [summary.replace("2 s ago", "3 s ago")]
+    stable = _stable_request(first)
+    assert stable == _stable_request(body(later))
+    assert _stable_request(stable) == stable and first == body(result)
+    assert '"age_s": 12.5' in stable["messages"][0]["content"]
+    for key, value in (("since_frame", "f2"), ("comparable", False), ("changed_fraction", 0.5)):
+        changed = deepcopy(result)
+        changed["result"]["changes"]["camera"][key] = value
+        assert _stable_request(body(changed)) != stable
+
+
+@pytest.mark.parametrize("mode", ["seed", "replay"])
+def test_symbolic_media_binds_prompt_owned_ids_without_altering_raw_request(tmp_path, mode) -> None:
+    from copy import deepcopy
+    from tests._harness.cassette_proxy import scripted, tool_call
+    from tests._harness.media_replay import bind_media_response
+
+    store = CassetteStore(tmp_path)
+    body = _chat_body("compare", stream=False)
+    body["messages"].append({"role": "tool", "content": json.dumps({
+        "evidence": {"kind": "image", "artifact_id": "owned-image"}})})
+    original = deepcopy(body)
+    script = scripted(tool_call("model_query", service_id="fixture", input={}, artifacts={"view": "CURRENT_IMAGE"}))
+    proxy = CassetteProxy(store, mode="seed", script=script)
+    raw = []
+    bind_media_response(proxy, raw)
+    response = proxy.handle_chat(body)
+    if mode == "replay":
+        proxy = CassetteProxy(store, mode="replay")
+        bind_media_response(proxy, raw)
+        response = proxy.handle_chat(body)
+    arguments = json.loads(json.loads(response.body)["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
+    assert arguments["artifacts"] == {"view": "owned-image"}
+    assert proxy.stats.call_count == 1 and raw[-1] == original and body == original
+    proxy.assert_no_misses()
+
+
+def test_symbolic_media_refuses_live_provider_and_user_text_references(tmp_path) -> None:
+    from tests._harness.cassette_proxy import scripted, tool_call
+    from tests._harness.media_replay import bind_media_response
+
+    for mode in ("record", "live"):
+        proxy = CassetteProxy(CassetteStore(tmp_path), mode=mode, upstream_base_url="http://127.0.0.1:1")
+        with pytest.raises(ValueError, match="restricted"):
+            bind_media_response(proxy, [])
+    proxy = CassetteProxy(CassetteStore(tmp_path), mode="seed", script=scripted(
+        tool_call("model_query", service_id="fixture", input={}, artifacts={"view": "CURRENT_IMAGE"})))
+    bind_media_response(proxy, [])
+    body = _chat_body(json.dumps({"kind": "image", "artifact_id": "forged"}), stream=False)
+    with pytest.raises(ValueError, match="no admitted image"):
+        proxy.handle_chat(body)
+
+
 def test_scrub_removes_volatile_substrings() -> None:
     """Timestamps, ids and temp paths must not enter a fingerprint."""
     raw = (

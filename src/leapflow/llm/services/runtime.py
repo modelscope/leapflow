@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable, Mapping
 
 import httpx
 
 from leapflow.llm.base import AsyncCloseableProvider, LLMChatResponse, LLMProvider
 from leapflow.llm.provider_registry import LLMProviderRegistry
-from leapflow.llm.services.codec import JsonCodec
+from leapflow.domain.effect_scope import EffectScope
+from leapflow.llm.services.codec import JsonCodec, strict_wire_schema
+from leapflow.llm.services.contracts import RegisteredContract, TaskContract, TaskContractRegistry
 from leapflow.llm.services.http_client import build_client
+from leapflow.llm.services.telemetry import (
+    InferenceAttempt, capture_inference, current_capture, freeze_usage, record_attempt, record_phase,
+)
 from leapflow.llm.services.protocol import (
     ServiceCodec, ServiceError, ServiceSpec, StructuredResult, Validator, canonical,
 )
@@ -52,6 +59,8 @@ class _Generation:
     client: httpx.AsyncClient
     semaphore: asyncio.Semaphore
     provider_revision: int
+    contract: RegisteredContract
+    codec_revision: int
     revocation_epoch: int = 0
     references: int = 0
     admitted: int = 0
@@ -81,7 +90,8 @@ class ModelServiceRuntime:
     def __init__(self, registry: LLMProviderRegistry, specs: tuple[ServiceSpec, ...] = (), *,
                  resolve_secret: SecretResolver | None = None,
                  client_factory: ClientFactory = build_client,
-                 revision: object = None) -> None:
+                 revision: object = None,
+                 contracts: TaskContractRegistry | None = None) -> None:
         self._registry = registry
         self._specs = {spec.service_id: spec for spec in specs}
         self._resolve_secret = resolve_secret
@@ -90,6 +100,13 @@ class ModelServiceRuntime:
         self._registry_version = registry.version
         self._number = 1
         self._codecs: dict[str, ServiceCodec] = {"json.v1": JsonCodec()}
+        self._codec_revisions = {"json.v1": 1}
+        self._contract_scope = EffectScope("model-task-contracts")
+        if contracts is None:
+            from leapflow.llm.services.composition import compose_task_contracts
+            contracts = compose_task_contracts(self._contract_scope)
+        self.contracts = contracts
+        self._contract_version = contracts.version
         self._generations: dict[tuple[str, int], _Generation] = {}
         # Persist revocation even after the last handle releases its generation.
         self._revocations: dict[str, tuple[int, str]] = {}
@@ -123,6 +140,7 @@ class ModelServiceRuntime:
             raise ValueError("Codec registration requires a unique name and a live codec")
         self._codecs[name] = codec
         self._number += 1
+        self._codec_revisions[name] = self._number
 
         def undo() -> None:
             if self._codecs.get(name) is codec:
@@ -130,6 +148,33 @@ class ModelServiceRuntime:
                 self._number += 1
 
         return undo
+
+    def register_contract(self, contract: TaskContract) -> Callable[[], None]:
+        """Registration undo is owned by the caller's plugin EffectScope."""
+        if self._closed:
+            raise ValueError("Task registration requires a live service owner")
+        return self.contracts.register(contract)
+
+    def admission_problem(self, spec: ServiceSpec) -> str:
+        """Single composed capability check for runtime, CLI, and chat; no I/O."""
+        if self._closed:
+            return "owner_closed"
+        if self._registry.get_plugin(spec.provider) is None:
+            return "provider_unavailable"
+        codec = self._codecs.get(spec.codec)
+        if codec is None:
+            return "codec_unavailable"
+        contract = self.contracts.get(spec.task)
+        if contract is None:
+            return "contract_unavailable"
+        if spec.provider == "anthropic" and "seed" in spec.declaration().get("request_options", {}):
+            return "provider_options_unsupported"
+        if spec.output == "json_schema" and isinstance(codec, JsonCodec):
+            try:
+                strict_wire_schema(contract.schemas()[1])
+            except ValueError:
+                return "strict_schema_unrepresentable"
+        return ""
 
     def publish(self, specs: tuple[ServiceSpec, ...], *, revision: object = None) -> bool:
         """Atomically publish a previously validated immutable snapshot without probing."""
@@ -156,23 +201,37 @@ class ModelServiceRuntime:
         if self._registry_version != self._registry.version:
             self._registry_version = self._registry.version
             self._number += 1
+        if self._contract_version != self.contracts.version:
+            self._contract_version = self.contracts.version
+            self._number += 1
 
-    def describe(self, service_id: str = "") -> dict[str, Any]:
+    def describe(self, service_id: str = "", *, specs: tuple[ServiceSpec, ...] | None = None) -> dict[str, Any]:
         """Describe configuration availability, not live endpoint health or session usage."""
         self._refresh_registry()
         catalog = []
-        for name, spec in sorted(self._specs.items()):
+        entries = self._specs if specs is None else {spec.service_id: spec for spec in specs}
+        for name, spec in sorted(entries.items()):
             if service_id and name != service_id:
                 continue
             provider_available = self._registry.get_plugin(spec.provider) is not None
-            available = not self._closed and spec.enabled and provider_available and spec.codec in self._codecs
+            problem = self.admission_problem(spec)
+            contract = self.contracts.get(spec.task)
+            available = spec.enabled and not problem
             catalog.append({"id": name, "provider": spec.provider, "model": spec.model,
                             "task": spec.task, "codec": spec.codec, "identity_mode": spec.identity_mode,
                             "processing_location": spec.processing_location,
+                            "media": spec.media.to_dict(),
                             "configured": True, "enabled": spec.enabled,
                             "provider_available": provider_available, "available": available, "usable": available,
-                            "unavailable_reason": "disabled" if not spec.enabled else ("" if available else "capability_unavailable"),
-                            "generation": self._number,
+                            "unavailable_reason": "disabled" if not spec.enabled else problem,
+                            "capability_problem": problem,
+                            "generation": self._number, "codec_revision": self._codec_revisions.get(spec.codec),
+                            "contract_revision": contract.revision if contract else None,
+                            "contract_generation": contract.number if contract else None,
+                            "classification": contract.classification if contract else None,
+                            "capability_description": contract.description if contract else None,
+                            "input_schema": contract.schemas()[0] if contract else None,
+                            "output_schema": contract.schemas()[1] if contract else None,
                             "health": "not_probed"})
         return {"services": catalog, "generation": self._number}
 
@@ -185,8 +244,10 @@ class ModelServiceRuntime:
         if not spec.enabled:
             raise ServiceError("Service is disabled; use config llm services enable to admit new calls",
                                service_id=service_id, code="model_service_disabled")
-        if self._registry.get_plugin(spec.provider) is None or spec.codec not in self._codecs:
-            raise ServiceError("Provider or codec unavailable; install/enable its plugin", service_id=service_id)
+        problem = self.admission_problem(spec)
+        if problem:
+            raise ServiceError(f"Service admission refused ({problem}); select a registered compatible capability/output mode",
+                               service_id=service_id)
         key = (service_id, self._number)
         generation = self._generations.get(key)
         if generation is None:
@@ -205,6 +266,9 @@ class ModelServiceRuntime:
             if not api_key:
                 raise ServiceError("Service credential unavailable; repair its vault reference",
                                    service_id=spec.service_id, code="model_auth_unavailable")
+        contract = self.contracts.get(spec.task)
+        if contract is None:
+            raise ServiceError("Task contract withdrawn before construction", service_id=spec.service_id)
         client = self._client_factory(spec)
         try:
             provider = self._registry.create_isolated(spec.provider, {
@@ -226,6 +290,7 @@ class ModelServiceRuntime:
         return _Generation(spec, self._number, self._codecs[spec.codec], provider, client,
                            asyncio.Semaphore(spec.limits.max_inflight),
                            self._registry.provider_revision(spec.provider),
+                           contract, self._codec_revisions[spec.codec],
                            self._revocations.get(spec.service_id, (0, ""))[0])
 
     async def _release(self, handle: ModelServiceHandle) -> None:
@@ -249,6 +314,7 @@ class ModelServiceRuntime:
         for result in results:
             if isinstance(result, BaseException):
                 logger.warning("Model service cleanup failed", exc_info=(type(result), result, result.__traceback__))
+        self._contract_scope.dispose()
 
 
 class ModelServiceHandle:
@@ -269,8 +335,23 @@ class ModelServiceHandle:
     def generation(self) -> int:
         return self._generation.number
 
+    @property
+    def contract(self) -> RegisteredContract:
+        return self._generation.contract
+
+    @property
+    def codec_revision(self) -> int:
+        return self._generation.codec_revision
+
     async def invoke(self, request: Mapping[str, Any], schema: Mapping[str, Any], *,
                      validate: Validator | None = None) -> StructuredResult:
+        call_id = uuid.uuid4().hex
+        with capture_inference(provider_accounting=False) as capture:
+            result = await self._invoke_bounded(request, schema, validate=validate, call_id=call_id)
+        return replace(result, call_id=call_id, attempts=tuple(capture.attempts))
+
+    async def _invoke_bounded(self, request: Mapping[str, Any], schema: Mapping[str, Any], *,
+                              validate: Validator | None, call_id: str) -> StructuredResult:
         start = time.monotonic()
         gen = self._generation
         if self._closed or gen.closed:
@@ -280,7 +361,7 @@ class ModelServiceHandle:
             raise ServiceError("Service busy; wait for the admitted request to finish",
                                service_id=self.spec.service_id, code="model_busy", recoverable=True)
         gen.admitted += 1
-        task = asyncio.create_task(self._invoke(request, schema, validate, start))
+        task = asyncio.create_task(self._invoke(request, schema, validate, start, call_id))
         self._tasks.add(task)
         try:
             result = await asyncio.wait_for(task, timeout=self.spec.limits.deadline_s)
@@ -310,14 +391,19 @@ class ModelServiceHandle:
             raise ServiceError("Service owner closed; result delivery refused", service_id=self.spec.service_id)
         if (self._owner._registry.get_plugin(self.spec.provider) is None
                 or self._owner._registry.provider_revision(self.spec.provider) != self._generation.provider_revision
-                or self._owner._codecs.get(self.spec.codec) is not self._generation.codec):
+                or self._owner._codecs.get(self.spec.codec) is not self._generation.codec
+                or self._owner._codec_revisions.get(self.spec.codec) != self._generation.codec_revision
+                or self._owner.contracts.get(self.spec.task) is not self._generation.contract):
             raise ServiceError("Pinned service capability was removed or replaced; stop and re-admit the consumer",
                                service_id=self.spec.service_id, code="model_capability_removed")
 
     async def _invoke(self, request: Mapping[str, Any], schema: Mapping[str, Any],
-                      validate: Validator | None, start: float) -> StructuredResult:
+                      validate: Validator | None, start: float, call_id: str) -> StructuredResult:
         spec, gen = self.spec, self._generation
         async with gen.semaphore:
+            queue_ms = (time.monotonic() - start) * 1000
+            record_phase("queue_ms", queue_ms)
+            encoding_started = time.monotonic()
             self.check_admission()
             try:
                 # Bound input before expensive provider shaping/decoding; worker results
@@ -328,9 +414,13 @@ class ModelServiceHandle:
             except ValueError as exc:
                 raise ServiceError("Invalid or oversized model request", service_id=spec.service_id,
                                    code="model_invalid_request") from exc
+            finally:
+                encoding_ms = (time.monotonic() - encoding_started) * 1000
+                record_phase("encoding_ms", encoding_ms)
             self.check_admission()
-            response = await self._call(messages, options)
+            response = await self._call(messages, options, call_id)
             self.check_admission()
+            validation_started = time.monotonic()
             try:
                 payload = await asyncio.to_thread(gen.codec.decode, spec, response, schema)
                 self.check_admission()
@@ -343,19 +433,30 @@ class ModelServiceHandle:
             except ValueError as exc:
                 raise ServiceError("Invalid model result; check the task codec and serving adapter",
                                    service_id=spec.service_id, code="model_invalid_output") from exc
+            finally:
+                validation_ms = (time.monotonic() - validation_started) * 1000
+                record_phase("validation_ms", validation_ms)
             self.check_admission()
             if time.monotonic() - start >= spec.limits.deadline_s:
                 raise asyncio.TimeoutError()
             return StructuredResult(encoded, spec.service_id, gen.number, response.model or spec.model,
                                     spec.identity_mode, (time.monotonic() - start) * 1000,
-                                    canonical(response.usage))
+                                    freeze_usage(response.usage),
+                                    timing_json=canonical({"queue_ms": queue_ms, "encoding_ms": encoding_ms,
+                                        "validation_ms": validation_ms}))
 
-    async def _call(self, messages: list[dict[str, Any]], options: dict[str, Any]) -> LLMChatResponse:
+    async def _call(self, messages: list[dict[str, Any]], options: dict[str, Any],
+                    call_id: str) -> LLMChatResponse:
         for attempt in range(self.spec.limits.attempts):
             self.check_admission()
+            started = time.monotonic()
             try:
                 response = await self._generation.provider.achat(messages, stream=False, **options)
+            except asyncio.CancelledError:
+                self._record_attempt(call_id, attempt, started, status="cancelled")
+                raise
             except Exception as exc:
+                self._record_attempt(call_id, attempt, started, status="failed", error_type=type(exc).__name__)
                 self.check_admission()
                 failure = _provider_failure(exc, self.spec.service_id)
                 if failure is None:
@@ -364,9 +465,30 @@ class ModelServiceHandle:
                     raise failure from exc
                 await asyncio.sleep(min(0.1 * 2 ** min(attempt, 6), 1.0))
             else:
+                self._record_attempt(call_id, attempt, started, status="returned", response=response)
                 self.check_admission()
                 return response
         raise AssertionError("positive attempt budget exhausted without a result")
+
+    def _record_attempt(self, call_id: str, attempt: int, started: float, *,
+                        status: Any, response: LLMChatResponse | None = None, error_type: str = "") -> None:
+        try:
+            capture = current_capture()
+            elapsed_ms = (time.monotonic() - started) * 1000
+            record_phase("network_inference_ms", elapsed_ms)
+            record_attempt(InferenceAttempt(
+                call_id=call_id, attempt_id=f"{call_id}:{attempt + 1}", source="specialist",
+                provider=self.spec.provider, model=(response.model if response else None) or self.spec.model,
+                status=status, elapsed_ms=elapsed_ms,
+                usage_json=freeze_usage(response.usage if response else None),
+                service_id=self.spec.service_id, generation=self.generation,
+                declaration_digest=hashlib.sha256(canonical(asdict(self.spec)).encode()).hexdigest(),
+                contract_revision=self.contract.revision, codec_revision=self.codec_revision,
+                **({"scope": capture.scope, "task_id": capture.task_id,
+                    "tool_call_id": capture.tool_call_id} if capture else {}), error_type=error_type,
+            ))
+        except Exception:  # noqa: BLE001 - telemetry is outside provider classification
+            logger.warning("Model attempt telemetry failed", exc_info=True)
 
     async def aclose(self) -> None:
         self._closed = True

@@ -1,0 +1,29 @@
+{
+  "fingerprint": "e4a626b75f58bb2fc989eb265fb4a5865769622b894a344626ce09ba3ae02241",
+  "note": "captured in seed mode",
+  "request": {
+    "model": "cassette-model",
+    "stream": false,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "The image has a left half and a right half, each one solid colour. Reply with exactly one line: left=<colour> right=<colour>"
+          },
+          {
+            "type": "image_url"
+          }
+        ]
+      }
+    ]
+  },
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"cassette-model\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"SNAPSHOT_RETAINED\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
+    }
+  ]
+}

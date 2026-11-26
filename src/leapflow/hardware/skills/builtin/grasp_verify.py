@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Mapping
 
 from leapflow.hardware.skills.ports import SkillContext
@@ -12,6 +13,7 @@ from leapflow.hardware.skills.protocol import (
     EFFECT_READ,
     FAILURE_GUARD_FAILED,
     FAILURE_PLAN_STALE,
+    FAILURE_SKILL_UNAVAILABLE,
     SIDE_EFFECT_NONE,
     SkillError,
     SkillOutcome,
@@ -66,10 +68,12 @@ class GraspVerify:
             grasp=args.get("grasp"),
         )
         if not result["passed"]:
-            return SkillOutcome.failed(
+            outcome = SkillOutcome.failed(
                 FAILURE_GUARD_FAILED, "grasp evidence did not pass", result=result
             )
-        return SkillOutcome.succeeded(result, side_effect_state=SIDE_EFFECT_NONE)
+        else:
+            outcome = SkillOutcome.succeeded(result, side_effect_state=SIDE_EFFECT_NONE)
+        return replace(outcome, evidence={"grasp_verify": result})
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
         return await self.plan(ctx, plan.args)
@@ -81,25 +85,29 @@ class InstallGraspEvidence:
         version="1.0.0",
         effect=EFFECT_ACTUATE,
         consent=CONSENT_EACH_RUN,
+        motion_allowed=False,
         requires=_REQUIRES,
         provides=("record:grasp.qualification",),
         card="Validate and persist independently measured geometry and stationary N-unit "
         "force qualification bound to current calibrations. No arm or gripper motion. "
-        "Incomplete, synthetic or mismatched certificates are refused.",
+        "Supply exactly one of qualification or reuse_from (an exact stored version). "
+        "Identical valid evidence is a no-op; changed-version reuse requires historical "
+        "content and installation scope equality. Incomplete or mismatched certificates are refused.",
         args_schema={
             "type": "object",
             "properties": {
                 "qualification": {"type": "object", "additionalProperties": True},
+                "reuse_from": {"type": "number", "minimum": 0},
             },
-            "required": ["qualification"],
+            "anyOf": [{"required": ["qualification"]}, {"required": ["reuse_from"]}],
         },
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
         try:
-            admitted = ctx.grasp_verification.admit(args["qualification"])
+            admitted = await ctx.grasp_verification.installation(args)
         except (KeyError, TypeError, ValueError) as error:
-            raise SkillError(FAILURE_GUARD_FAILED, str(error)) from error
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, str(error)) from error
         return SkillPlan(
             self.spec.skill_id,
             args,
@@ -109,19 +117,58 @@ class InstallGraspEvidence:
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
         try:
-            admitted = ctx.grasp_verification.admit(plan.args["qualification"])
+            admitted = await ctx.grasp_verification.installation(plan.args)
         except (KeyError, TypeError, ValueError) as error:
             raise SkillError(
                 FAILURE_PLAN_STALE, f"qualification no longer matches the approved plan: {error}"
             ) from error
         if any(admitted[key] != plan.basis.get(key) for key in admitted):
             raise SkillError(FAILURE_PLAN_STALE, "qualified geometry changed before installation")
+        if admitted.get("no_op") is not None:
+            return SkillOutcome.succeeded(
+                {"no_op": True, "recorded_at": admitted["no_op"],
+                 "qualification_digest": admitted["qualification_digest"]},
+                side_effect_state=SIDE_EFFECT_NONE,
+                message="Identical valid qualification already installed; no record changed",
+            )
         recorded_at = ctx.record_calibration(
-            "grasp.qualification", parameters=admitted["parameters"]
+            "grasp.qualification", parameters=admitted["parameters"],
+            notes=f"reused stored qualification {admitted['source']['recorded_at']}" if admitted.get("source") else "",
         )
         return SkillOutcome.succeeded(
             {"recorded_at": recorded_at, "qualification_digest": admitted["qualification_digest"]}
         )
+
+
+class GraspEvidence:
+    """Stored evidence diagnostics remain usable when fresh verification is blocked."""
+
+    spec = SkillSpec(
+        skill_id="grasp.evidence",
+        version="1.0.0",
+        effect=EFFECT_READ,
+        motion_allowed=False,
+        card="Inspect stored grasp certificates, force evidence, dependencies and task/profile scope. "
+        "No calibration prerequisites, sensor capture, motion or installation. Metadata success "
+        "does not establish execution readiness. include_package discloses bounded redacted JSON; "
+        "reuse_from on calib.grasp_evidence previews a stored version under ordinary approval.",
+        args_schema={"type": "object", "properties": {
+            "include_package": {"type": "boolean", "default": False},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536},
+        }},
+    )
+
+    async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillOutcome:
+        try:
+            report = await ctx.grasp_verification.evidence(
+                include_package=args.get("include_package", False), max_bytes=args.get("max_bytes", 65536)
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise SkillError(FAILURE_GUARD_FAILED, f"stored evidence inspection refused: {error}") from error
+        return SkillOutcome.succeeded(report, side_effect_state=SIDE_EFFECT_NONE)
+
+    async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
+        return await self.plan(ctx, plan.args)
 
 
 class GraspInspect:
@@ -146,5 +193,5 @@ class GraspInspect:
         return await self.plan(ctx, plan.args)
 
 
-def skills() -> tuple[GraspVerify, InstallGraspEvidence, GraspInspect]:
-    return GraspVerify(), InstallGraspEvidence(), GraspInspect()
+def skills() -> tuple[GraspVerify, InstallGraspEvidence, GraspInspect, GraspEvidence]:
+    return GraspVerify(), InstallGraspEvidence(), GraspInspect(), GraspEvidence()

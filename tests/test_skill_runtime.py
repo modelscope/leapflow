@@ -141,10 +141,14 @@ async def test_list_marks_cartesian_skills_unavailable_until_calibrated(tmp_path
     by_id = {skill["skill_id"]: skill for skill in cell["skills"]}
     assert not by_id[SEQUENCE]["available"]
     assert "run calib.tcp" in by_id[SEQUENCE]["reason"]
-    assert "run calib.workspace" in by_id[SEQUENCE]["reason"]
+    assert "supply evidence/arguments for calib.workspace" in by_id[SEQUENCE]["reason"]
     # The listing names the declared providers in order: the tcp before the workspace.
-    steps = [step.split()[1] for step in by_id[SEQUENCE]["next"]]
-    assert steps.index("calib.tcp") < steps.index("calib.workspace")
+    steps = by_id[SEQUENCE]["readiness"]["next_steps"]
+    ids = [step["skill_id"] for step in steps]
+    assert ids.index("calib.tcp") < ids.index("calib.workspace")
+    workspace = steps[ids.index("calib.workspace")]
+    assert workspace["actionable"] is False
+    assert workspace["needs_args"] == ["x", "y", "z_max"]
     assert cell["calibration_status"]["tcp"]["status"] == "missing"
     assert by_id["motion.home"]["available"]
     assert by_id["arm.state"]["available"]

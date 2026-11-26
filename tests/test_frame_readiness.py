@@ -11,6 +11,7 @@ and that step must leave a record the frame graph then trusts.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -22,6 +23,7 @@ from leapflow.hardware.calibration_store import CalibrationRecord, CalibrationSt
 from leapflow.hardware.skill_results import frame_status_view, workcell_view
 from leapflow.hardware.skills.builtin.camera_calibration import skills as camera_skills
 from leapflow.hardware.skills.builtin.frame_lifecycle import skills as frame_lifecycle_skills
+from leapflow.hardware.skills.builtin.grasp_verify import InstallGraspEvidence
 from leapflow.hardware.skills.frame_status import Accuracy, FrameCandidate, FrameStatus
 from leapflow.hardware.skills.frames import FrameGraph, unmet_requirements
 from leapflow.hardware.skills.geometry import Pose, Transform
@@ -105,11 +107,14 @@ def _legacy_fixed(store: _Store, mount: Transform = FIXED_MOUNT) -> float:
 
 
 def _verified_wrist(store: _Store, achieved_mm: float = 2.5) -> float:
-    return store.put(
+    version = store.put(
         WRIST_PROC,
         {"target_mount": IDENTITY, "achieved_accuracy": {"translation_mm": achieved_mm}},
         WRIST_MOUNT.to_matrix(),
     )
+    store.put(f"{WRIST}.verify", {"training_disjoint": True, "p95_mm": achieved_mm,
+                                 "depends_on": {WRIST: version}})
+    return version
 
 
 def _candidate(dependency: Mapping[str, float], achieved_mm: float, digest: str = "a" * 64) -> FrameCandidate:
@@ -411,7 +416,7 @@ def test_attesting_an_unmoved_camera_restores_it_without_motion(store: _Store) -
     _verified_wrist(store, achieved_mm=2.5)
     ctx = _Ctx(spec, store)
     result = _attest(ctx, store)
-    assert result["p95_mm"] < 1e-3 and result["achieved"] == {"translation_mm": 2.5, "rotation_deg": 0.0}
+    assert result["p95_mm"] < 1e-3 and result["achieved"] == {"translation_mm": 2.5}
     ctx.refresh()
     diagnosis = ctx.frames.diagnosis(FIXED)
     assert diagnosis.ok and diagnosis.verified_by == f"{FIXED}.verify"
@@ -491,3 +496,105 @@ def test_promotion_with_no_admissible_candidate_is_refused(store: _Store) -> Non
     port = WorkcellFrameLifecycle(_Ctx(spec, store), _registry(store))
     with pytest.raises(SkillError, match="no admissible camera candidate"):
         asyncio.run(port.promotion_basis({"frame": FIXED}))
+
+
+@pytest.mark.parametrize("change", ["version", "drift", "invalid"])
+@pytest.mark.parametrize("own_evidence", [False, True])
+def test_cross_view_check_loses_changed_reference_but_preserves_own_geometry(
+    store: _Store, change: str, own_evidence: bool,
+) -> None:
+    subject = (_verified_wrist(store) if own_evidence else
+               store.put(WRIST_PROC, {"method": METHOD_MARKERLESS_SCREW}, WRIST_MOUNT.to_matrix()))
+    anchor = store.put(FIXED_PROC, {"target_mount": IDENTITY,
+                                   "achieved_accuracy": {"translation_mm": 2}}, FIXED_MOUNT.to_matrix())
+    store.put(f"{FIXED}.verify", {"training_disjoint": True, "p95_mm": 2,
+                                "depends_on": {FIXED: anchor}})
+    store.put(f"{WRIST}.verify", {"training_disjoint": True, "p95_mm": 3,
+                                "depends_on": {WRIST: subject, FIXED: anchor}})
+    assert FrameGraph.snapshot(_cell(), store.store).diagnosis(WRIST).verified_by
+    if change == "version":
+        store.put(FIXED_PROC, {"target_mount": IDENTITY}, FIXED_MOUNT.to_matrix())
+    elif change == "invalid":
+        store.put(FIXED_PROC, {}, FIXED_MOUNT.to_matrix())
+    else:
+        store.put(f"{FIXED}.attestation", {"passed": False, "depends_on": {FIXED: anchor}})
+    diagnosis = FrameGraph.snapshot(_cell(), store.store).diagnosis(WRIST)
+    assert not diagnosis.verified_by
+    assert diagnosis.ok is own_evidence
+
+
+def test_cross_view_proof_is_order_independent_and_cannot_bootstrap_a_cycle(store: _Store) -> None:
+    a = _legacy_fixed(store)
+    b = store.put(WRIST_PROC, {"method": METHOD_MARKERLESS_SCREW}, WRIST_MOUNT.to_matrix())
+    for subject, reference, version, ref_version in [(FIXED, WRIST, a, b), (WRIST, FIXED, b, a)]:
+        store.put(f"{subject}.verify", {"training_disjoint": True, "p95_mm": 2,
+                                     "depends_on": {subject: version, reference: ref_version}})
+    spec = _cell()
+    reverse = _cell(frames=dict(reversed(list(spec.to_dict()["frames"].items()))))
+    first, second = FrameGraph.snapshot(spec, store.store), FrameGraph.snapshot(reverse, store.store)
+    assert first.diagnoses == second.diagnoses
+    assert not first.versions
+    store.put(f"{WRIST}.verify", {"training_disjoint": True, "p95_mm": 2, "depends_on": {WRIST: b}})
+    assert all(d.ok for d in FrameGraph.snapshot(spec, store.store).diagnoses.values())
+
+
+def test_attestation_unknown_reference_accuracy_refuses_before_capture(store: _Store) -> None:
+    _legacy_fixed(store)
+    store.put(WRIST_PROC, {"target_mount": IDENTITY}, WRIST_MOUNT.to_matrix())
+    ctx = _Ctx(_cell(), store)
+    ctx._views.clear()  # capture would fail if the reference gate did not run first
+    with pytest.raises(SkillError, match="known positive accuracy"):
+        _attest(ctx, store)
+    assert store.store.latest(CELL_ID, f"{FIXED}.verify") is None
+
+
+def test_unknown_rotation_does_not_satisfy_a_rotational_bound() -> None:
+    assert not Accuracy(1).within(Accuracy(2, 1))
+    assert Accuracy(1, .2).plus(Accuracy(1)).rotation_deg is None
+    assert not Accuracy(float("nan")).within(Accuracy(2))
+
+
+def test_lost_reference_lineage_invalidates_record_tokens_even_with_valid_geometry(store: _Store) -> None:
+    subject = _verified_wrist(store)
+    anchor = store.put(FIXED_PROC, {"target_mount": IDENTITY}, FIXED_MOUNT.to_matrix())
+    store.put(f"{FIXED}.verify", {"training_disjoint": True, "p95_mm": 2, "depends_on": {FIXED: anchor}})
+    store.put(f"{WRIST}.verify", {"training_disjoint": True, "p95_mm": 3,
+                                 "depends_on": {WRIST: subject, FIXED: anchor}})
+    token = f"record:{WRIST}.verify"
+    assert not unmet_requirements((token,), _cell(), FrameGraph.snapshot(_cell(), store.store, (f"{WRIST}.verify",)))
+    store.put(f"{FIXED}.verify", {"training_disjoint": False, "depends_on": {FIXED: anchor}})
+    frames = FrameGraph.snapshot(_cell(), store.store, (f"{WRIST}.verify",))
+    assert frames.diagnosis(WRIST).ok and not frames.diagnosis(WRIST).verified_by
+    assert "independent dependency lineage" in unmet_requirements((token,), _cell(), frames)[0]
+
+
+def test_unknown_reference_rotation_cannot_support_a_rotational_cross_view_check(store: _Store) -> None:
+    wrist = _verified_wrist(store)
+    fixed = _legacy_fixed(store)
+    store.put(f"{FIXED}.verify", {"training_disjoint": True,
+                                "achieved_accuracy": {"translation_mm": 3, "rotation_deg": .5},
+                                "depends_on": {FIXED: fixed, WRIST: wrist}})
+    spec = _cell()
+    frames = spec.to_dict()["frames"]
+    frames[FIXED]["accuracy"]["rotation_deg"] = 1
+    spec = _cell(frames=frames)
+    assert not FrameGraph.snapshot(spec, store.store).diagnosis(FIXED).ok
+    ctx = _Ctx(spec, store)
+    ctx._views.clear()
+    with pytest.raises(SkillError, match="rotational accuracy"):
+        _attest(ctx, store)
+
+
+def test_readiness_marks_missing_evidence_and_ranks_complete_no_motion_options_first(store: _Store) -> None:
+    install = replace(InstallGraspEvidence.spec, requires=())
+    complete = SkillSpec(skill_id="evidence.restore", version="1", card="Restore a known artifact",
+                         effect=EFFECT_READ, provides=install.provides, args_schema={"type": "object"})
+    catalog = [SimpleNamespace(spec=install), SimpleNamespace(spec=complete)]
+    readiness = WorkcellReadiness(catalog, _cell(), FrameGraph.snapshot(_cell(), store.store))
+    options = readiness.options("record:grasp.qualification")
+    assert options[0].steps[0].skill_id == complete.skill_id
+    step = options[1].steps[0]
+    assert step.skill_id == install.skill_id and step.needs_args == ("qualification",)
+    assert not step.actionable and not step.motion and step.consent
+    assert step.to_dict()["actionable"] is False
+    assert step.describe().startswith("supply evidence/arguments")

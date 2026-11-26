@@ -159,6 +159,9 @@ def admit_package(data: Mapping, *, device_id: str, recorded_at: float,
         raise ValueError("all six separate calibration components are required")
     certificates, records = [], []
     for row in rows:
+        if (not isinstance(row, Mapping) or not isinstance(row.get("qualification"), Mapping)
+                or not isinstance(row.get("geometry"), Mapping)):
+            raise ValueError("each calibration component needs certificate and geometry objects")
         fields = dict(row["qualification"])
         fields["limits"] = QualificationLimits(**fields["limits"])
         for key in ("accepted_ids", "rejected_ids", "holdout_ids", "holdout_errors_mm"):

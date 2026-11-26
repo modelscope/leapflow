@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 import re
 from dataclasses import replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -132,13 +133,13 @@ class FrameGraph:
                 if record is not None:
                     records[name] = record
         superseded = _stale_records(records)
-        resolved = _Resolution(spec, store, candidates or {})
+        resolved = _Resolution(spec, store, candidates or {}, records, superseded)
         for name in (*spec.frames, WORKSPACE_FRAME):
             if name == WORKSPACE_FRAME and not spec.workspace_procedure:
                 continue
             resolved.add(name, records.get(name), superseded.get(name, ""))
         resolved.drop_orphaned_candidates()
-        installed, problems = _installed_records(spec, store, procedures, resolved.versions)
+        installed, problems = _installed_records(spec, store, procedures, resolved.versions, resolved.diagnoses)
         return cls(
             spec,
             resolved.transforms,
@@ -232,8 +233,11 @@ class _Resolution:
         spec: WorkcellSpec,
         store: Any | None,
         candidates: Mapping[str, Sequence[FrameCandidate]],
+        records: Mapping[str, Any],
+        superseded: Mapping[str, str],
     ) -> None:
         self.spec, self.store, self.candidates = spec, store, candidates
+        self.records, self.superseded = records, superseded
         self.transforms: dict[str, Transform] = {}
         self.versions: dict[str, float] = {}
         self.parameters: dict[str, Mapping[str, Any]] = {}
@@ -261,29 +265,7 @@ class _Resolution:
         if transform is None:
             self._note(name, FrameStatus.UNPROVEN, "the record is malformed", version, required, offered)
             return
-        verdict = judge(record, mounted=bool(self.spec.role(name)))
-        check, drift = self._independent_check(name, version)
-        achieved = _check_accuracy(check) if check is not None else verdict.achieved
-        status, reason = verdict.status, verdict.reason
-        if drift is not None:
-            status = FrameStatus.DRIFT_DETECTED
-            reason = str((drift.parameters or {}).get("reason") or "an independent check disagreed")
-        elif status is not FrameStatus.VALID and check is not None:
-            status, reason = FrameStatus.VALID, ""  # an independent check vouches for this version
-        if status is FrameStatus.VALID and achieved and required and not achieved.within(required):
-            status = FrameStatus.INSUFFICIENT_ACCURACY
-            reason = f"achieved {achieved.describe()}, required {required.describe()}"
-        diagnosis = FrameDiagnosis(
-            name,
-            status,
-            reason,
-            version,
-            verdict.method,
-            achieved,
-            required,
-            offered,
-            check.procedure_id if check is not None else "",
-        )
+        diagnosis = replace(self._diagnose(name, frozenset()), candidates=offered)
         self.diagnoses[name] = diagnosis
         if diagnosis.ok:
             self.transforms[name] = transform
@@ -295,12 +277,94 @@ class _Resolution:
         if workspace is None:
             self._note(WORKSPACE_FRAME, FrameStatus.UNPROVEN, "the record is malformed", version)
             return
+        diagnosis = self._diagnose(WORKSPACE_FRAME, frozenset())
+        if not diagnosis.ok:
+            self.diagnoses[WORKSPACE_FRAME] = diagnosis
+            return
         self.workspace, self.table = workspace, _record_table(record)
         self.versions[WORKSPACE_FRAME] = version
         self.parameters[WORKSPACE_FRAME] = dict(record.parameters or {})
         self._note(WORKSPACE_FRAME, FrameStatus.VALID, version=version)
 
-    def _independent_check(self, name: str, version: float) -> tuple[Any | None, Any | None]:
+    def _diagnose(self, name: str, path: frozenset[str]) -> FrameDiagnosis:
+        """Resolve proof from independent roots, never from declaration order or circular checks."""
+        record = self.records.get(name)
+        required = _required_accuracy(self.spec, name)
+        if record is None:
+            return FrameDiagnosis(name, FrameStatus.MISSING, required=required)
+        version = float(record.recorded_at)
+        if name in self.superseded:
+            return FrameDiagnosis(name, FrameStatus.DEPENDENCY_SUPERSEDED,
+                                  self.superseded[name], version, required=required)
+        if name == WORKSPACE_FRAME:
+            dependencies = record.parameters.get(DEPENDS_ON, {})
+            if dependencies and (name in path or not self._dependencies_hold(dependencies, name, path | {name})):
+                return FrameDiagnosis(name, FrameStatus.DEPENDENCY_SUPERSEDED,
+                                      "a workspace calibration dependency no longer holds", version)
+            status = FrameStatus.VALID if _record_box(record) else FrameStatus.UNPROVEN
+            return FrameDiagnosis(name, status, version=version)
+        if _record_transform(record) is None:
+            return FrameDiagnosis(name, FrameStatus.UNPROVEN, "the record is malformed", version)
+        verdict = judge(record, mounted=bool(self.spec.role(name)))
+        status, reason, achieved = verdict.status, verdict.reason, verdict.achieved
+        check = drift = None
+        if name not in path:
+            lineage = path | {name}
+            dependencies = (record.parameters or {}).get(DEPENDS_ON, {})
+            if not self._dependencies_hold(dependencies, name, lineage):
+                return FrameDiagnosis(name, FrameStatus.DEPENDENCY_SUPERSEDED,
+                                      "a calibration dependency no longer holds", version)
+            check, drift = self._independent_check(name, version, lineage)
+        elif self.store is not None:
+            # A cycle can end at genuine standalone evidence, but not at an
+            # unexamined contradiction or a record derived through the cycle.
+            failure = _bound(self.store.latest(self.spec.workcell_id, attestation_procedure(name)), name, version)
+            if (record.parameters or {}).get(DEPENDS_ON) or (
+                failure is not None and failure.parameters.get("passed") is False
+            ):
+                status, reason = FrameStatus.UNPROVEN, "circular verification has no independent root"
+        if drift is not None:
+            status = FrameStatus.DRIFT_DETECTED
+            reason = str(drift.parameters.get("reason") or "an independent check disagreed")
+        elif check is not None:
+            achieved = _check_accuracy(check)
+            status, reason = FrameStatus.VALID, ""
+        if status is FrameStatus.VALID and required is not None:
+            if (achieved is not None and not achieved.within(required)) or (
+                required.rotation_deg is not None and achieved is None
+            ):
+                status = FrameStatus.INSUFFICIENT_ACCURACY
+                reason = f"achieved {achieved.describe() if achieved else 'unknown accuracy'}, required {required.describe()}"
+        return FrameDiagnosis(name, status, reason, version, verdict.method, achieved, required,
+                              verified_by=check.procedure_id if check is not None else "")
+
+    def _dependencies_hold(self, dependencies: Any, subject: str, path: frozenset[str],
+                           *, reference_accuracy: bool = False) -> bool:
+        if not isinstance(dependencies, Mapping):
+            return False
+        for name, version in dependencies.items():
+            current = self.records.get(name)
+            if current is None or not _same_version(current.recorded_at, version):
+                return False
+            if name == subject:
+                continue  # a check's self-binding is a version assertion, not proof
+            diagnosis = self._diagnose(name, path)
+            if not diagnosis.ok:
+                return False
+            if reference_accuracy and (
+                diagnosis.achieved is None
+                or not math.isfinite(diagnosis.achieved.translation_mm)
+                or diagnosis.achieved.translation_mm <= 0
+                or not diagnosis.verified_by
+                or (_required_accuracy(self.spec, subject) is not None
+                    and _required_accuracy(self.spec, subject).rotation_deg is not None
+                    and diagnosis.achieved.rotation_deg is None)
+            ):
+                return False
+        return True
+
+    def _independent_check(self, name: str, version: float,
+                           path: frozenset[str]) -> tuple[Any | None, Any | None]:
         """The newest verdict on this exact version: a passing check, or a failed one."""
         if self.store is None:
             return None, None
@@ -314,6 +378,16 @@ class _Resolution:
             self.store.latest(self.spec.workcell_id, attestation_procedure(name)), name, version
         )
         if failed is not None and (failed.parameters or {}).get("passed") is not False:
+            failed = None
+        if passed is not None and (
+            _check_accuracy(passed) is None
+            or not self._dependencies_hold(passed.parameters.get(DEPENDS_ON), name, path,
+                                           reference_accuracy=True)
+        ):
+            passed = None
+        if failed is not None and not self._dependencies_hold(
+            failed.parameters.get(DEPENDS_ON), name, path, reference_accuracy=True
+        ):
             failed = None
         if failed is not None and passed is not None:
             if float(passed.recorded_at) >= float(failed.recorded_at):
@@ -334,14 +408,8 @@ class _Resolution:
                 self.diagnoses[name] = replace(diagnosis, candidates=kept)
 
     def _holds(self, dependency: Mapping[str, float]) -> bool:
-        for frame, version in dependency.items():
-            current = self.versions.get(str(frame))
-            try:
-                if current is None or abs(float(current) - float(version)) > _VERSION_TOLERANCE:
-                    return False
-            except (TypeError, ValueError):
-                return False
-        return True
+        return all(_same_version(self.versions.get(str(frame)), version)
+                   for frame, version in dependency.items())
 
     def _note(
         self,
@@ -357,6 +425,13 @@ class _Resolution:
         )
 
 
+def _same_version(left: Any, right: Any) -> bool:
+    try:
+        return abs(float(left) - float(right)) <= _VERSION_TOLERANCE
+    except (TypeError, ValueError):
+        return False
+
+
 def _bound(record: Any | None, name: str, version: float) -> Any | None:
     """*record* when its ``depends_on`` names exactly this version of *name*."""
     if record is None:
@@ -364,10 +439,7 @@ def _bound(record: Any | None, name: str, version: float) -> Any | None:
     depends = (record.parameters or {}).get(DEPENDS_ON)
     if not isinstance(depends, Mapping) or name not in depends:
         return None
-    try:
-        return record if abs(float(depends[name]) - version) <= _VERSION_TOLERANCE else None
-    except (TypeError, ValueError):
-        return None
+    return record if _same_version(depends[name], version) else None
 
 
 def _check_accuracy(record: Any) -> Accuracy | None:
@@ -376,7 +448,13 @@ def _check_accuracy(record: Any) -> Accuracy | None:
     stated = Accuracy.from_mapping(parameters.get(ACHIEVED_ACCURACY))
     if stated is not None:
         return stated
-    return Accuracy.from_mapping({"translation_mm": parameters.get("p95_mm")})
+    p95 = parameters.get("p95_mm")
+    errors = parameters.get("errors_mm")
+    if p95 is None and isinstance(errors, (list, tuple)) and errors and all(
+        type(e) in (int, float) and math.isfinite(e) and e >= 0 for e in errors
+    ):
+        p95 = sorted(errors)[max(0, math.ceil(len(errors) * 0.95) - 1)]
+    return Accuracy.from_mapping({"translation_mm": p95})
 
 
 def _required_accuracy(spec: WorkcellSpec, name: str) -> Accuracy | None:
@@ -390,7 +468,8 @@ def _required_accuracy(spec: WorkcellSpec, name: str) -> Accuracy | None:
 
 
 def _installed_records(
-    spec: WorkcellSpec, store: Any | None, procedures: Iterable[str], versions: Mapping[str, float]
+    spec: WorkcellSpec, store: Any | None, procedures: Iterable[str], versions: Mapping[str, float],
+    diagnoses: Mapping[str, FrameDiagnosis],
 ) -> tuple[dict[str, float], dict[str, str]]:
     """Latest version of each named record, and why any no longer matches the frames."""
     installed: dict[str, float] = {}
@@ -402,6 +481,10 @@ def _installed_records(
         if record is None:
             continue
         installed[procedure] = float(record.recorded_at)
+        subject = next((name for name in diagnoses if verify_procedure(name) == procedure), None)
+        if subject is not None and diagnoses[subject].verified_by != procedure:
+            problems[procedure] = "verification no longer has a current independent dependency lineage"
+            continue
         depends = (record.parameters or {}).get(DEPENDS_ON)
         if not isinstance(depends, Mapping):
             continue
@@ -410,11 +493,7 @@ def _installed_records(
             if current is None:
                 problems[procedure] = f"measured with a {frame} calibration that no longer holds"
                 break
-            try:
-                moved = abs(float(current) - float(version)) > _VERSION_TOLERANCE
-            except (TypeError, ValueError):
-                moved = True
-            if moved:
+            if not _same_version(current, version):
                 problems[procedure] = f"measured before {frame} was recalibrated"
                 break
     return installed, problems
@@ -451,11 +530,7 @@ def _dependency_problem(record: Any, records: Mapping[str, Any], stale: Mapping[
         current = records.get(str(frame))
         if current is None or str(frame) in stale:
             return f"measured with a {frame} calibration that no longer holds"
-        try:
-            superseded = abs(float(current.recorded_at) - float(version)) > _VERSION_TOLERANCE
-        except (TypeError, ValueError):
-            superseded = True
-        if superseded:
+        if not _same_version(current.recorded_at, version):
             return f"measured before {frame} was recalibrated"
     return ""
 
