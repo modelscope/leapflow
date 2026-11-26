@@ -454,6 +454,32 @@ async def test_a_joint_move_may_not_add_to_the_tilt_it_started_with(tmp_path: Pa
     assert registry.sim.batches == []
 
 
+async def test_a_translation_may_keep_a_tilt_the_cone_forbids(tmp_path: Path) -> None:
+    """A translation carries its attitude; it does not command a new one.
+
+    A calibration ring (or a halt) can leave the tool well off vertical.  Judging
+    every cartesian destination against the cone then stranded the arm: it could
+    not even be lifted away, because the lift kept the attitude already there.
+    """
+    registry = _joint_registry(tmp_path, _OFF_CONE_JOINTS)
+    run = await _run(_runtime(tmp_path, registry), SEQUENCE, _steps(_UP))
+
+    # Planning and execution have to agree: an approved lift of this kind may not
+    # be refused a second time once the arm is asked to move.
+    assert run.outcome is not None and run.outcome.ok, run.outcome
+    assert len(registry.sim.batches) == 1
+
+
+async def test_a_commanded_attitude_still_has_to_stay_inside_the_cone(tmp_path: Path) -> None:
+    registry = _joint_registry(tmp_path, _OFF_CONE_JOINTS)
+    program = _steps({"op": "move", "pose": {"rx": 180.0, "ry": 85.0}})
+    outcome = await _runtime(tmp_path, registry).plan(WORKCELL_ID, SEQUENCE, program)
+
+    assert isinstance(outcome, SkillOutcome) and not outcome.ok
+    assert outcome.failure_code == FAILURE_UNREACHABLE
+    assert outcome.result["limit"]["quantity"] == "tool_tilt"
+
+
 async def test_a_workspace_refusal_names_the_axis_its_bound_and_the_step(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     program = _steps(_UP, {"op": "move", "relative": {"dz": 300}})

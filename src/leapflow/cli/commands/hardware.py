@@ -766,6 +766,7 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
     if action == "validate":
         from leapflow.hardware.context import ContextSource
 
+        report = registry.report
         verified = read_verified(verified_path)
 
         results: list[dict[str, Any]] = []
@@ -804,12 +805,42 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
                 icon = _ok if status == "valid" else (_warn if status == "unbound" else _fail)
                 icon(f"{ctx.device_id}: {status}")
 
+        # A refused declaration never becomes a context, so walking the admitted set
+        # alone reports a file the operator just wrote as simply missing. The load
+        # report knows why: name the rule, the detail and the step that lifts it.
+        refused = [
+            note for note in report.notes
+            if note.outcome == "rejected" and (not device_id or note.device_id == device_id)
+        ]
+        for note in refused:
+            item = {
+                "device_id": note.device_id or "<unnamed>",
+                "status": "rejected",
+                "rule": note.rule,
+                "detail": note.detail,
+            }
+            if note.remedy:
+                item["remedy"] = note.remedy
+            if note.remedy_command:
+                item["remedy_command"] = note.remedy_command
+            results.append(item)
+            if not json_mode:
+                _fail(f"{item['device_id']}: rejected ({note.rule}) {note.detail}")
+                if note.remedy:
+                    _info(f"  fix: {note.remedy}")
+
         all_ok = all(r["status"] == "valid" for r in results)
         if skipped and not json_mode:
             _info(f"skipped {len(skipped)} discovered context(s) with no declaration to review")
+        rejected_ids = [note.device_id for note in refused]
         return _emit_result(
             "validate",
-            {"ok": all_ok, "devices": results, "skipped": skipped},
+            {
+                "ok": all_ok,
+                "devices": results,
+                "rejected": rejected_ids,
+                "skipped": skipped,
+            },
             json_mode,
         )
 
@@ -858,38 +889,52 @@ def _run_permit_key(args: argparse.Namespace, json_mode: bool) -> int:
 _DEVICE_TEMPLATE = """\
 # LeapFlow hardware device declaration (hc.v1)
 # Documentation: https://leapflow.dev/hardware/declarations
-schema: hc.v1
+#
+# The keys below are the ones admission reads; a declaration using other
+# spellings is refused with its rule id, not silently reinterpreted.
+hc_version: "hc.v1"
 
-device_id: "{device_id}"
+device_id: "{device_id}"   # non-empty, [a-z0-9_]+ (V2): no dots, spaces or dashes
 display_name: "{display_name}"
-device_class: sensor           # sensor | robot_arm | mobile_robot | actuator
+device_class: sensor           # sensor | camera | robot_arm | mobile_robot | actuator
+vendor: ""                     # optional
+model: ""                      # optional
 location: "lab bench"          # physical placement description
+# true only when the transport can stop this device in place; false demotes every
+# writable channel to read-only (V5).
+halt_supported: false
 
 transport:
-  type: serial                 # serial | realsense | lhp | simulated
-  # port: /dev/ttyUSB0
-  # baud_rate: 115200
+  # kind names a registered transport kind, never a product name (V4).
+  # Built in: mock | simulated | python | mcp | host | media | robot_arm | ros2 | lhp | model_service
+  kind: mock
+  # Transport-specific settings, e.g. a serial port for the robot_arm transport.
+  config: {{}}
 
 channels:
   - channel_id: sensor.temperature
+    direction: read
     quantity: temperature
     unit: degC
-    direction: read
     representation: scalar
-    # min_value: -40.0
-    # max_value: 125.0
 
+  # A writable channel needs an envelope (V3) and a stoppable device (V5);
+  # uncomment both this block and ``halt_supported: true`` above.
   # - channel_id: actuator.motor
-  #   quantity: position
+  #   direction: readwrite
+  #   quantity: angular_position
   #   unit: rad
-  #   direction: write
+  #   representation: scalar
   #   effect: actuate
-  #   min_value: -3.14
-  #   max_value: 3.14
-  #   max_rate: 1.0
-  #   tolerance: 0.01
-  #   settling_s: 0.5
-  #   reversible: true
+  #   verify_after_write: true
+  #   envelope:
+  #     declared: true
+  #     min_value: -3.14
+  #     max_value: 3.14
+  #     max_rate: 1.0
+  #     settling_time_s: 0.5
+  #     tolerance: 0.01
+  #     reversible: true
 
 # interlocks:
 #   - name: emergency_stop
@@ -912,12 +957,56 @@ async def _run_onboarding(action: str, args: argparse.Namespace, json_mode: bool
     return 1
 
 
+def _declaration_admission(devices_dir: Any, device_id: str) -> dict[str, Any]:
+    """What admission says about a declaration as it now sits on disk.
+
+    ``init`` is the first command a new device meets, so it must not hand back a
+    file the very next load refuses: an unusable template fails here, with its
+    rule id, instead of becoming a device that silently does not exist.
+    """
+    from leapflow.hardware.providers.yaml_provider import YamlContextProvider
+    from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
+
+    report = HardwareRegistry(
+        HardwareSettings(enabled=True),
+        providers=(YamlContextProvider({"devices_dir": str(devices_dir)}),),
+    ).load()
+    if device_id in report.admitted:
+        return {"admitted": True}
+    refusal = next(
+        (note for note in report.notes
+         if note.device_id == device_id and note.outcome == "rejected"),
+        None,
+    )
+    result: dict[str, Any] = {
+        "admitted": False,
+        "rule": "" if refusal is None else refusal.rule,
+        "detail": "" if refusal is None else refusal.detail,
+    }
+    if refusal is not None and refusal.remedy:
+        result["remedy"] = refusal.remedy
+    return result
+
+
 def _run_init(args: argparse.Namespace, json_mode: bool) -> int:
     """Generate an annotated hc.v1 device declaration template."""
     from pathlib import Path
 
     device_id = str(getattr(args, "device_id", "") or "my_device")
     display_name = device_id.replace("_", " ").replace(".", " ").title()
+
+    from leapflow.hardware.registry import DEVICE_ID_ALLOWED
+
+    if any(ch not in DEVICE_ID_ALLOWED for ch in device_id):
+        problem = (
+            f"device id {device_id!r} cannot be admitted: it must match [a-z0-9_]+ "
+            "(V2), because the id is a stable key and a file name"
+        )
+        if not json_mode:
+            _fail(problem)
+        return _emit_result(
+            "init", {"ok": False, "device_id": device_id, "error": problem}, json_mode
+        )
 
     template = _DEVICE_TEMPLATE.format(
         device_id=device_id,
@@ -941,10 +1030,26 @@ def _run_init(args: argparse.Namespace, json_mode: bool) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(template, encoding="utf-8")
 
+    admission = _declaration_admission(devices_dir, device_id)
+    if not admission["admitted"]:
+        problem = (
+            f"Generated template would be refused by admission "
+            f"({admission['rule'] or 'unknown rule'}): {admission['detail']}"
+        )
+        if not json_mode:
+            _fail(problem)
+        return _emit_result(
+            "init",
+            {"ok": False, "device_id": device_id, "path": str(out_path),
+             "error": problem, "admission": admission},
+            json_mode,
+        )
+
     result = {
         "ok": True,
         "device_id": device_id,
         "path": str(out_path),
+        "admission": admission,
         "hint": "Edit the template, then run `leap hw probe <device>` to verify connectivity.",
     }
     if not json_mode:

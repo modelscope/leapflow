@@ -44,6 +44,7 @@ from tests._harness.skill_stubs import (
     ARM_ID,
     SEQUENCE,
     WORKCELL_ID,
+    WORKCELL_YAML,
     SimArmTransport,
     SkillNodeRegistry,
     move_by,
@@ -59,14 +60,19 @@ class _Node:
     """A node server over a simulated, calibrated Piper workcell."""
 
     def __init__(
-        self, tmp_path: Path, *, write_mode: str = WRITE_MODE_TRUSTED_V1, **sim: Any
+        self,
+        tmp_path: Path,
+        *,
+        write_mode: str = WRITE_MODE_TRUSTED_V1,
+        workcell: Mapping[str, Any] | None = None,
+        **sim: Any,
     ) -> None:
         self.registry = SkillNodeRegistry(
             SimArmTransport(**sim), store_path=tmp_path / "instrument.duckdb"
         )
         self.registry.calibrate_cell()
         directory = tmp_path / "workcells"
-        write_workcell(directory)
+        write_workcell(directory, workcell)
         self.runtime = SkillRuntime(
             self.registry,
             settings=SkillRuntimeSettings(workcells_dir=directory),
@@ -148,6 +154,23 @@ async def test_list_returns_the_workcell_catalog(tmp_path: Path) -> None:
     (cell,) = (await node.call("skill.list"))["workcells"]
     assert cell["workcell"] == WORKCELL_ID
     assert {SEQUENCE, "motion.home"} <= {skill["skill_id"] for skill in cell["skills"]}
+
+
+async def test_a_cell_without_a_home_posture_never_offers_one(tmp_path: Path) -> None:
+    """The catalog and the plan agree: a skill that can only ever refuse is refused."""
+
+    bare = {key: value for key, value in WORKCELL_YAML.items() if key != "home"}
+    node = _Node(tmp_path, workcell=bare)
+    (cell,) = (await node.call("skill.list"))["workcells"]
+    home = next(skill for skill in cell["skills"] if skill["skill_id"] == "motion.home")
+    assert home["available"] is False
+    assert "declares no home" in home["reason"]
+    refused = await node.call(
+        "skill.plan", {"workcell": WORKCELL_ID, "skill": "motion.home", "args": {}}
+    )
+    assert refused["outcome"]["failure_code"] == FAILURE_SKILL_UNAVAILABLE
+    assert "declares no home" in refused["outcome"]["message"]
+    assert not node.sim.batches, "a refused plan never commandeers the arm"
 
 
 # ── Plan -> permit -> execute ────────────────────────────────────────────────

@@ -18,7 +18,11 @@ from leapflow.hardware.skills.protocol import (
 from leapflow.hardware.attestation import declaration_digest
 from leapflow.hardware.skills.workcell import ROLE_CAMERA
 from leapflow.hardware.skills.grasp_installation import (
-    GEOMETRY_FRAMES, PROCEDURE, inspect_evidence, installation_scope, prepare_installation,
+    GEOMETRY_FRAMES,
+    PROCEDURE,
+    inspect_evidence,
+    installation_scope,
+    prepare_installation,
 )
 
 
@@ -54,16 +58,34 @@ class WorkcellGraspVerification:
         from leapflow.hardware.skills.admission import generation_basis
 
         model = await generation_basis(self.registry, self.ctx.workcell)
-        return await asyncio.to_thread(prepare_installation, self.ctx, self.registry, args, model, self.admit)
+        return await asyncio.to_thread(
+            prepare_installation, self.ctx, self.registry, args, model, self.admit
+        )
 
-    async def evidence(self, *, include_package: bool = False, max_bytes: int = 65536) -> Mapping[str, Any]:
-        if type(include_package) is not bool or type(max_bytes) is not int or not 1 <= max_bytes <= 1024 * 1024:
+    async def evidence(
+        self, *, include_package: bool = False, max_bytes: int = 65536, history_limit: int = 20
+    ) -> Mapping[str, Any]:
+        if (
+            type(include_package) is not bool
+            or type(max_bytes) is not int
+            or not 1 <= max_bytes <= 1024 * 1024
+            or type(history_limit) is not int
+            or not 1 <= history_limit <= 100
+        ):
             raise ValueError("bounded evidence disclosure options required")
         from leapflow.hardware.skills.admission import generation_basis
 
         model = await generation_basis(self.registry, self.ctx.workcell)
-        return await asyncio.to_thread(inspect_evidence, self.ctx, self.registry, self.admit,
-                                       include_package=include_package, max_bytes=max_bytes, model_basis=model)
+        return await asyncio.to_thread(
+            inspect_evidence,
+            self.ctx,
+            self.registry,
+            self.admit,
+            include_package=include_package,
+            max_bytes=max_bytes,
+            model_basis=model,
+            history_limit=history_limit,
+        )
 
     def qualification(self, overview: str = ROLE_CAMERA) -> Mapping[str, Any]:
         """The installed qualification and *overview*'s held-out placement accuracy.
@@ -153,7 +175,9 @@ class WorkcellGraspVerification:
         qualification.package.require_geometry("table_plane", frames.parameters("workspace"))
         dependencies = qualification.data.get("depends_on")
         if not isinstance(dependencies, Mapping) or not set(GEOMETRY_FRAMES) <= set(dependencies):
-            raise ValueError("qualification must bind wrist camera, TCP and support-plane calibration versions")
+            raise ValueError(
+                "qualification must bind wrist camera, TCP and support-plane calibration versions"
+            )
         for frame, version in dependencies.items():
             if frames.versions.get(frame) != number(version):
                 raise ValueError(f"qualification dependency {frame} changed or no longer holds")
@@ -162,7 +186,9 @@ class WorkcellGraspVerification:
             if not isinstance(scope, Mapping) or scope != installation_scope(
                 self.ctx, self.registry, dependencies, scope.get("physical_model", {})
             ):
-                raise ValueError("qualification installation device/mount/profile/configuration scope changed")
+                raise ValueError(
+                    "qualification installation device/mount/profile/configuration scope changed"
+                )
         return qualification
 
     def _qualification(self) -> GraspQualification:

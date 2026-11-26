@@ -43,6 +43,7 @@ from leapflow.hardware.skills.geometry import Plane, Pose, Transform, WorkspaceB
 from leapflow.hardware.skills.protocol import (
     REQUIRE_CALIBRATION,
     REQUIRE_CANDIDATE,
+    REQUIRE_DECLARATION,
     REQUIRE_MODEL,
     REQUIRE_RECORD,
     REQUIRE_ROLE,
@@ -50,7 +51,12 @@ from leapflow.hardware.skills.protocol import (
     SHARE_FRAMES,
 )
 from leapflow.hardware.skills.provenance import ACHIEVED_ACCURACY, judge
-from leapflow.hardware.skills.workcell import DEPENDS_ON, WORKSPACE_FRAME, WorkcellSpec
+from leapflow.hardware.skills.workcell import (
+    DEPENDS_ON,
+    WORKSPACE_FRAME,
+    WorkcellSpec,
+    declaration_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -643,6 +649,10 @@ def unmet_requirements(
                 )
         elif token.startswith(REQUIRE_RECORD):
             reason = _record_refusal(token, spec, frames, hint)
+            if reason:
+                reasons.append(reason)
+        elif token.startswith(REQUIRE_DECLARATION):
+            reason = declaration_refusal(token, spec)
             if reason:
                 reasons.append(reason)
         else:

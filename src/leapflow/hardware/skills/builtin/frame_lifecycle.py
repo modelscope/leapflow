@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from leapflow.hardware.skills.frame_status import FrameStatus
+from leapflow.hardware.skills.frame_status import Accuracy, FrameStatus
 from leapflow.hardware.skills.ports import FrameLifecyclePort, SkillContext
 from leapflow.hardware.skills.protocol import (
     CONSENT_EACH_RUN,
@@ -135,13 +135,25 @@ class AttestFrame:
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
         basis = await _port(ctx).attestation_basis(args)
         preview = basis["preview"]
+        required = Accuracy.from_mapping(basis["required"]) if basis.get("required") else None
+        bound = Accuracy.from_mapping(preview["bound"])
+        verdict = ""
+        if required is not None:
+            verdict = f"; it must meet {required.describe()}"
+            if bound is not None and not bound.within(required):
+                # The executor refuses on exactly this bound, so say it now: an approval
+                # spent here can only record the frame as drifted, never restore it.
+                verdict += (
+                    f", which this bound cannot: the run can only record {basis['frame']} "
+                    "as drifted and change nothing"
+                )
         return SkillPlan(
             skill_id=self.spec.skill_id,
             args=args,
             summary=(
                 f"Compare {basis['frame']} with {basis['reference']} over {basis['samples']} "
                 f"simultaneous views of the board (a first look agrees to {preview['p95_mm']:.1f} mm, "
-                f"bound {float(preview['bound']['translation_mm']):.1f} mm); no motion"
+                f"bound {float(preview['bound']['translation_mm']):.1f} mm{verdict}); no motion"
             ),
             basis={"attestation": dict(basis)},
             limits={"max_duration_s": 60.0},

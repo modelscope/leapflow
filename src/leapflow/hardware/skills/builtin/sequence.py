@@ -91,6 +91,11 @@ def _fmt(pose: Pose) -> str:
     return f"({pose.x:.0f}, {pose.y:.0f}, {pose.z:.0f}) mm"
 
 
+# Two resolved targets whose attitudes agree this closely are the same attitude,
+# including whatever rounding the plan's JSON round trip applied.
+_SAME_ATTITUDE_DEG = 0.05
+
+
 # ── Execute ──────────────────────────────────────────────────────────────────
 
 
@@ -133,7 +138,8 @@ class _Run:
         if op in POSE_OPS:
             target = Pose.from_mapping(step["pose"])
             moved = await self._ctx.motion.move_tcp(
-                target, speed_pct=self._speed(step), path=step["path"]
+                target, speed_pct=self._speed(step), path=step["path"],
+                carried_from=self._carried_from(target),
             )
             self._observed(moved.state)
             self._target = target
@@ -150,6 +156,19 @@ class _Run:
             self._observed(await self._ctx.motion.state())
         self.log.append(self._entry(index, op))
         self._guard(index, step, before)
+
+    def _carried_from(self, target: Pose) -> Pose | None:
+        """The previous target when this step keeps its attitude instead of stating one.
+
+        Planning refuses a *commanded* attitude outside the cone but lets a step that
+        inherits the previous attitude leave a posture the cone would forbid, so the
+        same distinction has to hold here or the approved lift would be refused at
+        execution.  The comparison is between resolved targets, not the measured arm.
+        """
+        previous = self._target
+        if previous is None or target.rotation_to_deg(previous) > _SAME_ATTITUDE_DEG:
+            return None
+        return previous
 
     def _entry(self, index: int, op: str) -> dict[str, Any]:
         """One step as it ran: what it aimed at, where it ended, and how far apart."""

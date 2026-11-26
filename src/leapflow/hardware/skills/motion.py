@@ -445,6 +445,17 @@ class GovernedMotion:
         """
         self.geometry_snapshot().check_joint_target(pose, start=start)
 
+    def check_carried_target(self, pose: Pose, start: Pose) -> None:
+        """Check a cartesian target that keeps its attitude instead of commanding one.
+
+        A translation states where the tool goes, not where it points, so the cone
+        cannot be an admission test here either.  By the same argument as a
+        joint-space move, the target may hold or reduce the tilt it is carried from
+        and never add to it -- otherwise a posture the cell would never choose
+        could never be left through a cartesian move either.
+        """
+        self.geometry_snapshot().check_carried_target(pose, start)
+
     def joint_tilt_slack_deg(self) -> float:
         """How much tilt the declared joint tolerance alone can add.
 
@@ -507,9 +518,20 @@ class GovernedMotion:
         return () if channel is None else tuple(map(str, channel.envelope.allowed_values))
 
     async def move_tcp(
-        self, pose: Pose, *, speed_pct: float | None = None, path: str = PATH_DEFAULT
+        self, pose: Pose, *, speed_pct: float | None = None, path: str = PATH_DEFAULT,
+        carried_from: Pose | None = None,
     ) -> MotionResult:
-        self.check_target(pose)
+        """Move to *pose*; *carried_from* marks a step that keeps its attitude.
+
+        The caller that resolves a program knows whether the step states an attitude
+        or inherits the previous one.  An inherited attitude is judged by what it
+        keeps, not by the cone, so a posture the cell would never command can still
+        be left -- the same rule that governs a joint-space move.
+        """
+        if carried_from is None:
+            self.check_target(pose)
+        else:
+            self.check_carried_target(pose, carried_from)
         settings = self._path_command(path)
         flange = self.tcp_to_flange(pose)
         commands = tuple(zip(POSE_CHANNELS, flange.as_tuple()))

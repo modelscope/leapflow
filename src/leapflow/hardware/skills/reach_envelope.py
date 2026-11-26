@@ -92,6 +92,31 @@ class ReachEnvelope:
         }
 
 
+_TIMEOUT_RETRY_S = 30.0
+"""How long a timed-out slice is remembered before it is attempted again.
+
+A timed-out slice is never cached by :func:`build_envelope`, so without this
+memo a host too slow for its declared budget pays that whole budget on every
+catalog and ``arm.state`` read -- and still answers "unknown" every time. The
+entry expires so a transiently busy host (a concurrent calibration) recovers by
+itself instead of staying blind until the next reload. Advisory state only; the
+memo is written from worker threads and every operation on it is a single dict
+lookup or rebuild, so a race can at worst repeat one computation.
+"""
+
+_TIMEOUT_MEMO_MAX = 32
+_timed_out_until: dict[tuple[Any, ...], float] = {}
+
+
+def _remember_timeout(key: tuple[Any, ...]) -> None:
+    now = time.monotonic()
+    for stale in [item for item, deadline in _timed_out_until.items() if deadline <= now]:
+        del _timed_out_until[stale]
+    while len(_timed_out_until) >= _TIMEOUT_MEMO_MAX:
+        del _timed_out_until[next(iter(_timed_out_until))]
+    _timed_out_until[key] = now + _TIMEOUT_RETRY_S
+
+
 def envelope_view(arm: Any, spec: WorkcellSpec, frames: FrameGraph) -> dict[str, Any]:
     """The same declaration-derived guidance for the catalog and arm.state."""
     tcp, box = frames.transform("tcp"), frames.workspace
@@ -150,18 +175,21 @@ def envelope_for(
         for name, (lo, hi) in zip(names, bounds)
         for low, high in [(lo if lo is not None else -180.0, hi if hi is not None else 180.0)]
     )
-    return build_envelope(
-        chain,
-        bounds,
-        flange_tcp,
-        box,
-        ReachSettings.from_limits(limits),
-        float(limits["reach_envelope_step_mm"]),
-        seed,
-        int(limits["reach_envelope_yaw_samples"]),
-        float(limits["reach_envelope_timeout_s"]),
-        int(limits["reach_envelope_ik_iterations"]),
-    )
+    settings = ReachSettings.from_limits(limits)
+    step = float(limits["reach_envelope_step_mm"])
+    yaws = int(limits["reach_envelope_yaw_samples"])
+    budget = float(limits["reach_envelope_timeout_s"])
+    iterations = int(limits["reach_envelope_ik_iterations"])
+    key = (chain, bounds, flange_tcp, box, settings, step, seed, yaws, budget, iterations)
+    if _timed_out_until.get(key, 0.0) > time.monotonic():
+        raise SkillError(FAILURE_TIMEOUT, "the previous attempt at this slice ran out of its budget")
+    try:
+        return build_envelope(chain, bounds, flange_tcp, box, settings, step, seed, yaws,
+                              budget, iterations)
+    except SkillError as error:
+        if error.failure_code == FAILURE_TIMEOUT:
+            _remember_timeout(key)
+        raise
 
 
 @lru_cache(maxsize=32)

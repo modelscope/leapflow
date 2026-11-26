@@ -18,14 +18,20 @@ from leapflow.hardware.skills.kinematics import DhChain
 from leapflow.hardware.skills.protocol import (
     FAILURE_GRASP_INFEASIBLE,
     FAILURE_INVALID_ARGS,
+    FAILURE_TIMEOUT,
     FAILURE_UNREACHABLE,
     SIDE_EFFECT_NONE,
     SkillError,
     SkillOutcome,
 )
 from leapflow.hardware.skills.reach import LineFollower, ReachSettings, ReachTracker, joint_bounds
-from leapflow.hardware.skills.reach_envelope import ReachBand, ReachEnvelope, build_envelope
-from leapflow.hardware.skills.tuning import DEFAULT_LIMITS, tuned
+from leapflow.hardware.skills.reach_envelope import (
+    ReachBand,
+    ReachEnvelope,
+    build_envelope,
+    envelope_for,
+)
+from leapflow.hardware.skills.tuning import DEFAULT_LIMITS, REACH_ENVELOPE_MAX_TIMEOUT_S, tuned
 from tests._harness.skill_stubs import WORKCELL_ID, piper_context
 from tests.test_scene_sequence import CUP, _cell, _kinematic_cell, _read, _refusal, _sim
 
@@ -173,10 +179,53 @@ def test_advisory_iteration_budget_is_bounded_without_relaxing_path_checks(value
     assert LineFollower(SimpleNamespace(dof=1), ((-180, 180),), Transform(), ReachSettings(10, 10, 1))._ik_settings == IkSettings()
 
 
-@pytest.mark.parametrize("value", [0, -1, 5.1, math.inf, True])
+@pytest.mark.parametrize("value", [0, -1, 9.1, math.inf, True])
 def test_advisory_deadline_is_positive_finite_and_fits_transport(value: Any) -> None:
     with pytest.raises(ValueError):
         tuned({"reach_envelope_timeout_s": value}, "limits", DEFAULT_LIMITS)
+
+
+def test_a_slow_host_may_declare_a_longer_advisory_budget() -> None:
+    # 2026-11-26: the reference cell needs 5.1 s for its declared sweep while the
+    # default was 5.0, so reach answered "unknown" on about half the read-only
+    # calls, and a workcell that declared 6 s was refused admission outright.
+    # Patience is declarable up to the ceiling one request can carry; the slice's
+    # sampling and every motion check stay unchanged.
+    declared = tuned({"reach_envelope_timeout_s": REACH_ENVELOPE_MAX_TIMEOUT_S}, "limits",
+                     DEFAULT_LIMITS)
+    assert declared["reach_envelope_timeout_s"] == REACH_ENVELOPE_MAX_TIMEOUT_S
+    assert DEFAULT_LIMITS["reach_envelope_timeout_s"] >= 5.1
+    assert REACH_ENVELOPE_MAX_TIMEOUT_S < 10, "one LHP request ceiling"
+
+
+def test_a_timed_out_slice_is_remembered_instead_of_recomputed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import leapflow.hardware.skills.reach_envelope as module
+
+    arm = piper_context()
+    names = tuple(f"joint.j{i}.position" for i in range(1, 7))
+    bounds = joint_bounds(arm, names, 1)
+    box = WorkspaceBox(110, 420, -170, 220, 11.7, 330)
+    tcp = Transform.from_pose(Pose(0, 0, 126.5))
+    limits = {**DEFAULT_LIMITS, "reach_envelope_timeout_s": 0.001}
+    calls: list[Any] = []
+
+    def timed_out(*args: Any, **kwargs: Any) -> None:
+        calls.append(args)
+        raise SkillError(FAILURE_TIMEOUT, "budget")
+
+    module._timed_out_until.clear()
+    monkeypatch.setattr(module, "build_envelope", timed_out)
+    try:
+        for _ in range(3):
+            with pytest.raises(SkillError) as refusal:
+                envelope_for(arm, names, bounds, tcp, box, limits, {})
+            assert refusal.value.failure_code == FAILURE_TIMEOUT
+        # A repeat read must not pay the whole budget again to learn the same thing.
+        assert len(calls) == 1
+    finally:
+        module._timed_out_until.clear()
 
 
 async def test_cold_advisory_deadline_leaves_catalog_available_and_caches_no_partial_result(tmp_path: Path) -> None:

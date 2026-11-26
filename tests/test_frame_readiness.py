@@ -437,6 +437,55 @@ def test_attesting_a_moved_camera_marks_it_drifted(store: _Store) -> None:
     assert ctx.frames.diagnosis(FIXED).status is FrameStatus.DRIFT_DETECTED
 
 
+class _Basis:
+    """The port half ``calib.attest`` plans over, over a basis already measured."""
+
+    def __init__(self, basis: Mapping[str, Any]) -> None:
+        self._basis = basis
+
+    async def attestation_basis(self, args: Any) -> Mapping[str, Any]:
+        return self._basis
+
+    async def promotion_basis(self, args: Any) -> Mapping[str, Any]:
+        raise NotImplementedError("planning an attestation never promotes")
+
+    async def promote(self, plan: SkillPlan) -> Mapping[str, Any]:
+        raise NotImplementedError("planning an attestation never promotes")
+
+    async def attest(self, plan: SkillPlan) -> Mapping[str, Any]:
+        raise NotImplementedError("planning an attestation never attests")
+
+
+def _attestation_plan(p95_mm: float, bound_mm: float,
+                      required: Mapping[str, float] | None) -> Any:
+    ctx = SimpleNamespace(frame_lifecycle=_Basis({
+        "frame": FIXED, "reference": WRIST, "version": 1.0, "reference_version": 2.0,
+        "samples": 3, "flange": None, "required": required,
+        "preview": {"p95_mm": p95_mm, "rotation_p95_deg": 0.0,
+                    "bound": {"translation_mm": bound_mm}},
+    }))
+    skill = next(s for s in frame_lifecycle_skills() if s.spec.skill_id == "calib.attest")
+    return asyncio.run(skill.plan(ctx, {"frame": FIXED, "reference": WRIST, "samples": 3}))
+
+
+def test_an_attestation_plan_names_the_accuracy_it_must_meet() -> None:
+    """An approved plan has to say what the run will be judged against.
+
+    The preview used to report only its own bound, so a 148.3 mm disagreement
+    shown against a 151.0 mm bound read like a pass while the run required 5.0
+    mm -- the operator learned the real criterion only after spending the run.
+    """
+    plan = _attestation_plan(148.3, 151.0, {"translation_mm": 5.0})
+    assert "must meet 5.0 mm" in plan.summary
+    assert "can only record camera as drifted" in plan.summary
+
+
+def test_an_attestation_plan_with_room_left_promises_no_drift() -> None:
+    plan = _attestation_plan(0.4, 2.9, {"translation_mm": 5.0})
+    assert "must meet 5.0 mm" in plan.summary
+    assert "drifted" not in plan.summary
+
+
 def test_a_reference_too_coarse_to_vouch_writes_nothing(store: _Store) -> None:
     spec = _cell()
     _legacy_fixed(store)

@@ -31,11 +31,30 @@ DEFAULT_LIMITS: Mapping[str, float] = {
     "reach_refine_rounds": 6.0,
     "reach_envelope_step_mm": 20.0,
     "reach_envelope_yaw_samples": 8.0,
-    "reach_envelope_timeout_s": 5.0,  # advisory computation must fit ordinary LHP requests
+    # Measured on the reference cell (Jetson Orin NX): 0.2 s with an idle node and
+    # 5.1 s when the same sweep ran right after an aborted calibration, whose
+    # worker thread was still holding the CPU. A 5 s default therefore answered
+    # "reach remains unknown" for a slice the node can compute -- an advisory
+    # that never appears is worse than no advisory -- and the budget has to
+    # absorb a loaded host, not only an idle one.
+    "reach_envelope_timeout_s": 8.0,
     "reach_envelope_ik_iterations": 16.0,  # guidance only; missed samples remain unknown
     "max_steps": 16.0,  # steps one motion.sequence may carry
     "max_wait_s": 10.0,  # longest single ``wait`` step
 }
+
+REACH_ENVELOPE_MAX_TIMEOUT_S = 9.0
+"""Ceiling for the advisory compute budget a workcell may declare.
+
+The slice is computed inside an ordinary LHP request, whose client ceiling is
+10 s (``lhp.client.DEFAULT_REQUEST_TIMEOUT_S``). A larger budget would turn
+every catalog and ``arm.state`` read into a transport timeout -- the failure
+this ceiling prevents. It bounds *compute patience*, never motion: every move
+still passes workspace, orientation, path IK, approval and firmware checks.
+The default above is the patience a loaded host needs for the reference cell's
+sweep (5.1 s under load, 0.2 s idle); this ceiling is for a slower host, not a
+way to buy accuracy.
+"""
 
 DEFAULT_FRESHNESS: Mapping[str, float] = {
     "start_mm": 2.0,  # the TCP may sit this far from where the plan started
@@ -146,8 +165,11 @@ def tuned(raw: Any, name: str, defaults: Mapping[str, float]) -> dict[str, float
         if key in {"reach_continuity_rounds", "reach_refine_rounds", "reach_envelope_yaw_samples"}:
             if not values[str(key)].is_integer() or values[str(key)] > 16:
                 raise ValueError(f"{name}.{key} must be an integer from 1 to 16")
-        if key == "reach_envelope_timeout_s" and values[str(key)] > 5:
-            raise ValueError(f"{name}.{key} must be at most 5 seconds")
+        if key == "reach_envelope_timeout_s" and values[str(key)] > REACH_ENVELOPE_MAX_TIMEOUT_S:
+            raise ValueError(
+                f"{name}.{key} must be at most {REACH_ENVELOPE_MAX_TIMEOUT_S:g} seconds; "
+                "the advisory is computed inside one 10 s request"
+            )
         if key == "reach_envelope_ik_iterations":
             if not values[str(key)].is_integer() or values[str(key)] > 50:
                 raise ValueError(f"{name}.{key} must be an integer from 1 to 50")
@@ -194,6 +216,7 @@ __all__ = [
     "DEFAULT_MIN_HOLD_WIDTH_MM",
     "DEFAULT_VISION",
     "GRIPPER_SPEC_KEYS",
+    "REACH_ENVELOPE_MAX_TIMEOUT_S",
     "gripper_spec",
     "positive",
     "tuned",

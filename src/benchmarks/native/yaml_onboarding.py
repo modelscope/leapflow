@@ -89,6 +89,17 @@ class YAMLOnboardingAdapter:
         provider = YamlContextProvider({"devices_dir": str(self._examples_dir())})
         return provider.discover()
 
+    def _admitted_ids(self) -> list[str]:
+        """What the registry admits, which is the only set a user can reach."""
+        from leapflow.hardware.providers.yaml_provider import YamlContextProvider
+        from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
+
+        report = HardwareRegistry(
+            HardwareSettings(enabled=True),
+            providers=(YamlContextProvider({"devices_dir": str(self._examples_dir())}),),
+        ).load()
+        return sorted(report.admitted)
+
     def _exercise(
         self, scenario_id: str, contexts: tuple[Any, ...]
     ) -> tuple[dict[str, Any], bool]:
@@ -97,11 +108,19 @@ class YAMLOnboardingAdapter:
             # Every shipped example must load; a hard-coded count failed the moment a
             # new example was added, without anything being broken.
             shipped = [*self._examples_dir().glob("*.yaml"), *self._examples_dir().glob("*.yml")]
-            passed = len(contexts) == len(shipped) and "robot.so100_arm" in loaded_ids
-            return {"loaded_device_ids": loaded_ids}, passed
+            # Parsing is not onboarding: an example a user copies into a profile and
+            # the registry then refuses is a declaration that does not exist. Both
+            # halves have to hold for the shipped set to be usable at all.
+            admitted = self._admitted_ids()
+            passed = (
+                len(contexts) == len(shipped)
+                and "robot_so100_arm" in loaded_ids
+                and admitted == loaded_ids
+            )
+            return {"loaded_device_ids": loaded_ids, "admitted_device_ids": admitted}, passed
         if scenario_id != "control_binding_resolution":
             raise ValueError(f"unknown scenario {scenario_id!r}")
-        arm = next(context for context in contexts if context.device_id == "robot.so100_arm")
+        arm = next(context for context in contexts if context.device_id == "robot_so100_arm")
         return self._resolve_binding(arm, loaded_ids)
 
     @staticmethod

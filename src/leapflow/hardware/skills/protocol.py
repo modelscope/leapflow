@@ -97,6 +97,12 @@ REQUIRE_RECORD = "record:"
 # A measured-but-uninstalled estimate of a frame (``candidate:camera``): holds once
 # some calibration produced one that is still admissible, so promoting it is listed.
 REQUIRE_CANDIDATE = "candidate:"
+# A workcell (or device) declaration a skill cannot plan without, beyond geometry:
+# ``declare:home`` holds once the workcell or the arm's kinematics names a home
+# posture, so a listing refuses the skill instead of advertising one that can only
+# ever refuse. ``mode`` takes the declaration's name.
+REQUIRE_DECLARATION = "declare:"
+DECLARE_HOME = "home"
 REQUIRE_PREFIXES = (
     REQUIRE_ROLE,
     REQUIRE_CALIBRATION,
@@ -104,6 +110,7 @@ REQUIRE_PREFIXES = (
     REQUIRE_SHARE,
     REQUIRE_RECORD,
     REQUIRE_CANDIDATE,
+    REQUIRE_DECLARATION,
 )
 
 # How a camera mount was measured. A calibration record names its method, and the
@@ -774,6 +781,7 @@ __all__ = [
     "COORDS_PER_MILLE",
     "COORDS_PIXEL",
     "COORDS_UNIT",
+    "DECLARE_HOME",
     "EFFECT_ACTUATE",
     "EFFECT_READ",
     "FAILURE_ARM_NOT_READY",
@@ -802,6 +810,7 @@ __all__ = [
     "FAILURE_UNREACHABLE",
     "FAILURE_WRITE_REFUSED",
     "REQUIRE_CALIBRATION",
+    "REQUIRE_DECLARATION",
     "REQUIRE_MODEL",
     "REQUIRE_RECORD",
     "REQUIRE_ROLE",

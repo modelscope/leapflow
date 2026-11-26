@@ -76,6 +76,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from leapflow.hardware.skills.geometry import WorkspaceBox
+from leapflow.hardware.skills.protocol import DECLARE_HOME, REQUIRE_DECLARATION
 from leapflow.hardware.skills.tuning import (
     DEFAULT_CALIBRATION,
     DEFAULT_FRESHNESS,
@@ -671,6 +672,26 @@ def _resolved_home(spec: WorkcellSpec, arm: Any) -> Mapping[str, float]:
 
 def _with_home(spec: WorkcellSpec, home: Mapping[str, float]) -> WorkcellSpec:
     return spec if home == spec.home else replace(spec, home=dict(home))
+
+
+# Declaration kinds a ``declare:`` requirement can name, and where each is declared.
+# The field is read off the resolved spec, so a value filled in from the device
+# declaration (the arm's ``kinematics.home_joint_targets``) counts as declared.
+_DECLARATIONS: Mapping[str, tuple[str, str]] = {
+    DECLARE_HOME: ("home", "declare 'home' on the workcell or kinematics.home_joint_targets on the arm"),
+}
+
+
+def declaration_refusal(token: str, spec: WorkcellSpec) -> str:
+    """Why a ``declare:`` requirement does not hold, and where that declaration lives."""
+    kind = token[len(REQUIRE_DECLARATION) :]
+    entry = _DECLARATIONS.get(kind)
+    if entry is None:
+        return f"unknown requirement {token!r}"
+    name, where = entry
+    if getattr(spec, name, None):
+        return ""
+    return f"workcell {spec.workcell_id!r} declares no {kind} ({where})"
 
 
 def _writable(context: Any, channel_id: str) -> bool:

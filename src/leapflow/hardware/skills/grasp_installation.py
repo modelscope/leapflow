@@ -235,7 +235,10 @@ def prepare_installation(
         except (KeyError, TypeError, ValueError):
             pass  # invalid evidence is never a successful no-op
         else:
-            if accepted is not None and current.parameters.get("installation_scope", scope) == scope:
+            if (
+                accepted is not None
+                and current.parameters.get("installation_scope", scope) == scope
+            ):
                 no_op, proposed = current.recorded_at, accepted
     return {
         **proposed,
@@ -357,6 +360,24 @@ def _export_package(data: Mapping[str, Any], report: dict[str, Any], max_bytes: 
         )
 
 
+def _stored_versions(store: Any, workcell_id: str, limit: int) -> Mapping[str, Any]:
+    """Discover exact reuse identities without exporting historical measurement payloads."""
+    records = store.history(workcell_id, PROCEDURE, limit=limit + 1) if store else ()
+    versions = []
+    for record in records[:limit]:
+        row: dict[str, Any] = {"recorded_at": record.recorded_at, "admissibility": "not_assessed"}
+        try:
+            row["qualification_digest"] = digest(snapshot(record.parameters))
+        except (TypeError, ValueError, RecursionError):
+            row["admissibility"] = "malformed"
+        versions.append(row)
+    return {
+        "stored_versions": versions,
+        "history_truncated": len(records) > limit,
+        "history_limit": limit,
+    }
+
+
 def inspect_evidence(
     ctx: Any,
     registry: Any,
@@ -365,6 +386,7 @@ def inspect_evidence(
     include_package: bool,
     max_bytes: int,
     model_basis: Mapping[str, Any],
+    history_limit: int = 20,
 ) -> Mapping[str, Any]:
     """Read stored metadata while calibration is blocked; success proves no physical outcome."""
     store = registry.calibration_store
@@ -374,6 +396,7 @@ def inspect_evidence(
         "execution_ready": False,
         "measured_task_outcome": "unverified",
         "installed_version": record.recorded_at if record else None,
+        **_stored_versions(store, ctx.workcell.workcell_id, history_limit),
         "components": {component: {"status": "missing"} for component in sorted(COMPONENTS)},
         "force": {"status": "missing"},
         "problems": [],

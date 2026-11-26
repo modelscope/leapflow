@@ -158,11 +158,21 @@ class MotionGeometry:
         return sum(float(envelope.tolerance or 0) for _, envelope in self.joint_envelopes)
 
     def check_joint_target(self, pose: Pose, *, start: Pose | None) -> None:
+        if start is None:
+            self.check_target(pose)
+        else:
+            self.check_carried_target(pose, start)
+
+    def check_carried_target(self, pose: Pose, start: Pose) -> None:
+        """Reach in full; attitude only as far as the posture it is carried from.
+
+        A command that keeps its attitude does not state where the tool points, so
+        the cone is a no-further-tilt ceiling here rather than an admission test.
+        Otherwise a posture the cell would never choose -- one a calibration ring
+        or a halt left behind -- could not be left at all.
+        """
         self.check_reach(pose)
-        ceiling = self.cone_deg
-        if start is not None:
-            ceiling = max(ceiling, tool_cone_deg(start) + self.joint_tilt_slack_deg())
-        self.require_cone(pose, ceiling)
+        self.require_cone(pose, max(self.cone_deg, tool_cone_deg(start) + self.joint_tilt_slack_deg()))
 
     def reach_tracker(self, state: ArmState) -> ReachTracker:
         self.check_state(state)

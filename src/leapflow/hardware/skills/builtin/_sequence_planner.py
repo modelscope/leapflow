@@ -196,7 +196,12 @@ class _Planner:
             target, entry["object"], entry["grasp"] = self._referenced(index, step)
             text = f"to {step['ref']} at {_fmt(target)}"
         try:
-            self._ctx.motion.check_target(target)
+            if self._commands_attitude(step) or self._previous is None:
+                self._ctx.motion.check_target(target)
+            else:
+                # The attitude is carried over, not commanded: the cone may not be
+                # used to forbid leaving a posture the program never chose.
+                self._ctx.motion.check_carried_target(target, self._previous)
             self.reach.move(target, linear=self._linear(path), label=f"step {index}")
         except SkillError as error:
             if error.failure_code not in {FAILURE_UNREACHABLE, FAILURE_OUT_OF_WORKSPACE}:
@@ -207,6 +212,15 @@ class _Planner:
         self.targets.append(target)
         verb = "move" if path == PATH_DEFAULT else f"move {path}"
         return {**entry, "pose": target.to_dict(), "text": f"{verb} {text}"}
+
+    @staticmethod
+    def _commands_attitude(step: Mapping[str, Any]) -> bool:
+        """Whether the step states where the tool points, rather than keeping it."""
+        if "relative" in step:
+            return False
+        if "ref" in step:
+            return str(step["ref"]).partition(":")[0] == "grasp"
+        return any(axis in (step.get("pose") or {}) for axis in ("rx", "ry", "rz"))
 
     def collect_problem(self, index: int, error: SkillError) -> None:
         message = error.message

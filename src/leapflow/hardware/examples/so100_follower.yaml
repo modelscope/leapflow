@@ -4,7 +4,7 @@
 # kinematics, capabilities, safety, trust_config, degradation.
 
 hc_version: "hc.v1"
-device_id: "robot.so100_arm"
+device_id: "robot_so100_arm"
 display_name: "SO-100 Follower Arm"
 device_class: "robot_arm"
 vendor: "Feetech"

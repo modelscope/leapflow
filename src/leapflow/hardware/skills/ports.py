@@ -183,6 +183,10 @@ class MotionFacade(Protocol):
         """Check a joint endpoint and path with FK; return its predicted TCP."""
         ...
 
+    def check_carried_target(self, pose: Pose, start: Pose) -> None:
+        """Refuse a target that tilts further than the attitude it is carried from."""
+        ...
+
     def check_cartesian_path(
         self, state: ArmState, targets: Sequence[Pose]
     ) -> tuple[Mapping[str, Any], ...]:
@@ -207,8 +211,11 @@ class MotionFacade(Protocol):
         ...
 
     async def move_tcp(
-        self, pose: Pose, *, speed_pct: float | None = None, path: str = PATH_DEFAULT
-    ) -> MotionResult: ...
+        self, pose: Pose, *, speed_pct: float | None = None, path: str = PATH_DEFAULT,
+        carried_from: Pose | None = None,
+    ) -> MotionResult:
+        """Move to *pose*; ``carried_from`` marks a step that keeps its attitude."""
+        ...
 
     async def move_joints(
         self, targets: Mapping[str, float], *, speed_pct: float | None = None,

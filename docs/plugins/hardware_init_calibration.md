@@ -214,8 +214,13 @@ readiness before committing an irreversible physical effect.
 
 Device declarations are YAML files whose structure mirrors
 `HardwareContext.to_dict()` / `from_mapping`. `hc_version` must be `hc.v0`.
-`Interlock.operator` is one of `eq` / `ne` / `lt` / `le` / `gt` / `ge`
-(default `eq`); `value` defaults to `true`.
+`transport.kind` must name a **registered** transport kind (rule V4) -- the
+built-ins are `mock`, `simulated`, `python`, `mcp`, `host`, `media`,
+`robot_arm`, `ros2`, `lhp`, `model_service`, plus any kind installed through an
+entry point. The examples below use the in-tree `python` escape hatch, which
+names an external driver module instead of inventing a kind that admission
+would refuse. `Interlock.operator` is one of `eq` / `ne` / `lt` / `le` / `gt` /
+`ge` (default `eq`); `value` defaults to `true`.
 
 ### 5.1 Robot arm homing
 
@@ -236,12 +241,14 @@ notes: >-
   the absolute joint origin the motion channels are expressed against.
 
 transport:
-  kind: cli
-  # Homing sequence, DH parameters, and the homing routine itself live here in the
-  # transport/app-pack layer -- never in the HCP core declaration. See section 6.
+  kind: python
+  # Homing sequence, DH parameters, and the homing routine itself live in the
+  # driver module named below (or in an out-of-tree transport) -- never in the
+  # HCP core declaration. See section 6.
   config:
-    endpoint: "robotctl"
-    home_command: "home --all"
+    module: my_cell_drivers.robotctl   # any importable module on PYTHONPATH
+    factory: build_transport           # defaults to build_transport
+    options: {endpoint: "robotctl", home_command: "home --all"}
 
 channels:
   # Readiness channel: readable boolean the interlock points at.
@@ -303,12 +310,14 @@ notes: >-
   verifier is recorded out of band.
 
 transport:
-  kind: cli
+  kind: python
   # Intrinsic/extrinsic/hand-eye calibration algorithms, the camera-matrix format,
-  # and convergence criteria all live here -- not in the HCP core. See section 6.
+  # and convergence criteria all live in the driver module -- not in the HCP
+  # core. See section 6.
   config:
-    endpoint: "depthcamctl"
-    calibrate_command: "calibrate --hand-eye"
+    module: my_cell_drivers.depthcamctl
+    factory: build_transport
+    options: {endpoint: "depthcamctl", calibrate_command: "calibrate --hand-eye"}
 
 provenance:
   source: declared
@@ -382,14 +391,14 @@ notes: >-
   Peltier-based temperature controller with first-order thermal response. The
   heatsink sensor has 0.5 °C absolute precision (tolerance), and the PID loop
   settles exponentially with τ ≈ 2 s to the setpoint. Declaration via the
-  leapflow_host macOS driver.
+  external my_cell_drivers.ptc200 driver.
 
 transport:
-  kind: leapflow_host
+  kind: python
   config:
-    endpoint: "localhost:9710"
-    bus: i2c
-    device_address: 0x48
+    module: my_cell_drivers.ptc200
+    factory: build_transport
+    options: {endpoint: "localhost:9710", bus: i2c, device_address: 0x48}
 
 provenance:
   source: declared

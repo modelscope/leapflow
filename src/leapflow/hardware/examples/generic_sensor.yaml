@@ -3,18 +3,34 @@
 # Demonstrates backward compatibility: just device_id, transport, and one
 # read channel.  No hc.v1 sections are present; the provider must load
 # this without error and leave all v1 fields as None.
+#
+# ``transport.kind`` must name a *registered* transport kind (V4).  ``mock`` is
+# built in, so this file is admissible on a stock install and can be read
+# immediately:
+#
+#     leap hw read sensor_generic_temp --channel temperature
+#
+# Swap ``kind`` for the driver you actually use once it is installed; each
+# driver reads its own keys under ``config``, for example a serial Modbus
+# adapter shipped as an out-of-tree transport package:
+#
+#     transport:
+#       kind: "modbus"          # after: pip install leapflow-modbus
+#       config:
+#         address: 1
+#         port: "/dev/ttyUSB1"
+#         baudrate: 9600
 
 hc_version: "hc.v0"
-device_id: "sensor.generic_temp"
+device_id: "sensor_generic_temp"
 display_name: "Generic Temperature Sensor"
 device_class: "sensor"
 
 transport:
-  kind: "modbus"
+  kind: "mock"
   config:
-    address: 1
-    port: "/dev/ttyUSB1"
-    baudrate: 9600
+    values:
+      temperature: 21.5
 
 channels:
   - channel_id: "temperature"

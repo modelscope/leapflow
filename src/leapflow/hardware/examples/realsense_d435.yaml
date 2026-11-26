@@ -5,7 +5,7 @@
 # section declares what the sensor can observe, not what it can do.
 
 hc_version: "hc.v1"
-device_id: "sensor.realsense_d435"
+device_id: "sensor_realsense_d435"
 display_name: "RealSense D435 Depth Camera"
 device_class: "camera"
 vendor: "Intel"

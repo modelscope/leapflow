@@ -44,7 +44,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEVICE_ID_ALLOWED = set("abcdefghijklmnopqrstuvwxyz0123456789_")
+DEVICE_ID_ALLOWED = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
+"""Characters a device id may use (V2): a stable key and a safe file name.
+
+Exported so the commands that *write* declarations can refuse a name admission
+would reject, instead of producing a file that silently never loads.
+"""
 
 
 class UnverifiedContextPolicy:
@@ -858,7 +863,7 @@ class HardwareRegistry:
         device_id = context.device_id
 
         # V2 -- identity must be usable as a stable key and safe in a path.
-        if not device_id or any(ch not in _DEVICE_ID_ALLOWED for ch in device_id):
+        if not device_id or any(ch not in DEVICE_ID_ALLOWED for ch in device_id):
             notes.append(
                 AdmissionNote(
                     device_id=device_id or "<unnamed>",

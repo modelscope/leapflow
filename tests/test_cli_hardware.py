@@ -724,3 +724,141 @@ async def test_client_wrappers_pass_device_param() -> None:
         ("hardware.pause", {"device": "rig"}),
         ("hardware.resume", {"device": "rig"}),
     ]
+
+
+# ════════════════════════════════════════════════════════════════
+# Onboarding: the first command must produce a declaration admission keeps
+# ════════════════════════════════════════════════════════════════
+
+
+def _admit_devices_dir(devices_dir: Any) -> Any:
+    """Load declarations from *devices_dir* through production admission."""
+    from leapflow.hardware.providers.yaml_provider import YamlContextProvider
+
+    registry = HardwareRegistry(
+        HardwareSettings(enabled=True),
+        providers=(YamlContextProvider({"devices_dir": str(devices_dir)}),),
+    )
+    registry.load()
+    return registry
+
+
+def test_hw_init_writes_a_declaration_admission_accepts(monkeypatch, tmp_path, capsys) -> None:
+    """`leap hw init` is the first command a new device meets.
+
+    It used to emit `schema:` and `transport.type`, neither of which admission
+    reads, so the file it handed back was rejected by V1 (and would then fail V4)
+    and the device simply never appeared. The template is only useful if the very
+    next load keeps it.
+    """
+    import leapflow.cli.commands.hardware as hardware_module
+    from leapflow.cli.commands.hardware import cmd_hardware
+
+    monkeypatch.setattr(hardware_module, "load_config", lambda: make_settings(str(tmp_path)))
+
+    assert cmd_hardware(_ns("init", device_id="bench_sensor")) == 0
+    payload = _json_out(capsys)
+    assert payload["ok"] is True
+    assert payload["admission"] == {"admitted": True}
+
+    settings = make_settings(str(tmp_path))
+    registry = _admit_devices_dir(settings.profile_layout.hardware.devices_dir)
+    assert registry.report.admitted == ("bench_sensor",)
+    assert not registry.report.rejected
+    (channel,) = registry.context("bench_sensor").channels
+    assert channel.channel_id == "sensor.temperature"
+    assert channel.is_readable
+
+
+def test_hw_init_refuses_a_name_admission_would_reject(monkeypatch, tmp_path, capsys) -> None:
+    """A dotted id cannot be admitted, so it must not become a file either."""
+    import leapflow.cli.commands.hardware as hardware_module
+    from leapflow.cli.commands.hardware import cmd_hardware
+
+    settings = make_settings(str(tmp_path))
+    monkeypatch.setattr(hardware_module, "load_config", lambda: settings)
+
+    assert cmd_hardware(_ns("init", device_id="sensor.bench_temp")) == 1
+    payload = _json_out(capsys)
+    assert payload["ok"] is False
+    assert "[a-z0-9_]" in payload["error"]
+    assert not list(settings.profile_layout.hardware.devices_dir.glob("*.yaml"))
+
+
+def test_validate_names_the_rule_that_refused_a_declaration(monkeypatch, tmp_path, capsys) -> None:
+    """A refused declaration must not read as "no such device".
+
+    Only admitted contexts reach `registry.contexts()`, so a file failing V1/V2/V4
+    used to be invisible to `leap hw validate` -- the operator was told nothing
+    about the declaration they had just written.
+    """
+    from leapflow.cli.commands.hardware import cmd_hardware
+
+    settings = make_settings(str(tmp_path))
+    devices_dir = settings.profile_layout.hardware.devices_dir
+    devices_dir.mkdir(parents=True, exist_ok=True)
+    (devices_dir / "bench_sensor.yaml").write_text(
+        'hc_version: "hc.v1"\ndevice_id: "sensor.bench"\ntransport: {kind: mock}\n'
+        "channels:\n  - {channel_id: temp, direction: read, quantity: temperature}\n",
+        encoding="utf-8",
+    )
+    _install_local_registry(monkeypatch, tmp_path, _admit_devices_dir(devices_dir))
+
+    assert cmd_hardware(_ns("validate")) == 1
+    payload = _json_out(capsys)
+    assert payload["ok"] is False
+    assert payload["rejected"] == ["sensor.bench"]
+    (refused,) = [item for item in payload["devices"] if item["status"] == "rejected"]
+    assert refused["rule"] == "V2"
+    assert "[a-z0-9_]" in refused["detail"]
+
+
+def test_every_shipped_example_survives_admission() -> None:
+    """Copying an example into a profile is the documented onboarding path.
+
+    Parsing is not onboarding: three shipped examples used dotted device ids that
+    V2 refuses, so copying them produced a device that silently did not exist. The
+    shipped set has to be admitted in full, and the benchmark that checks it now
+    asks admission rather than only the parser.
+    """
+    from pathlib import Path
+
+    from leapflow.hardware.providers.yaml_provider import YamlContextProvider
+
+    examples = Path(__file__).resolve().parents[1] / "src" / "leapflow" / "hardware" / "examples"
+    parsed = sorted(
+        context.device_id
+        for context in YamlContextProvider({"devices_dir": str(examples)}).discover()
+    )
+    registry = _admit_devices_dir(examples)
+    assert not registry.report.rejected, registry.report.to_dict()
+    assert sorted(registry.report.admitted) == parsed
+
+
+def test_every_documented_declaration_survives_admission(tmp_path) -> None:
+    """Documentation is onboarding too, and it rots the same way examples do.
+
+    The three declarations in `docs/plugins/hardware_init_calibration.md` named
+    transport kinds that do not exist (`cli`, `leapflow_host`), so an operator who
+    copied one was refused by V4 and told nothing about a typo in the docs. Every
+    fenced `yaml` block carrying a `device_id` is a promise that the file works.
+    """
+    import re
+    from pathlib import Path
+
+    doc = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "plugins"
+        / "hardware_init_calibration.md"
+    ).read_text(encoding="utf-8")
+    declarations = [
+        block for block in re.findall(r"```yaml\n(.*?)```", doc, re.S) if "device_id:" in block
+    ]
+    assert declarations, "the doc's device declarations moved or lost their fences"
+    for index, block in enumerate(declarations):
+        (tmp_path / f"doc_{index}.yaml").write_text(block, encoding="utf-8")
+
+    report = _admit_devices_dir(tmp_path).report
+    assert not report.rejected, report.to_dict()
+    assert len(report.admitted) == len(declarations)

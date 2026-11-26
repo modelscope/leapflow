@@ -126,14 +126,20 @@ class InstallGraspEvidence:
             raise SkillError(FAILURE_PLAN_STALE, "qualified geometry changed before installation")
         if admitted.get("no_op") is not None:
             return SkillOutcome.succeeded(
-                {"no_op": True, "recorded_at": admitted["no_op"],
-                 "qualification_digest": admitted["qualification_digest"]},
+                {
+                    "no_op": True,
+                    "recorded_at": admitted["no_op"],
+                    "qualification_digest": admitted["qualification_digest"],
+                },
                 side_effect_state=SIDE_EFFECT_NONE,
                 message="Identical valid qualification already installed; no record changed",
             )
         recorded_at = ctx.record_calibration(
-            "grasp.qualification", parameters=admitted["parameters"],
-            notes=f"reused stored qualification {admitted['source']['recorded_at']}" if admitted.get("source") else "",
+            "grasp.qualification",
+            parameters=admitted["parameters"],
+            notes=f"reused stored qualification {admitted['source']['recorded_at']}"
+            if admitted.get("source")
+            else "",
         )
         return SkillOutcome.succeeded(
             {"recorded_at": recorded_at, "qualification_digest": admitted["qualification_digest"]}
@@ -149,22 +155,36 @@ class GraspEvidence:
         effect=EFFECT_READ,
         motion_allowed=False,
         card="Inspect stored grasp certificates, force evidence, dependencies and task/profile scope. "
+        "stored_versions lists bounded exact reuse identities, not admission or physical success. "
         "No calibration prerequisites, sensor capture, motion or installation. Metadata success "
         "does not establish execution readiness. include_package discloses bounded redacted JSON; "
         "reuse_from on calib.grasp_evidence previews a stored version under ordinary approval.",
-        args_schema={"type": "object", "properties": {
-            "include_package": {"type": "boolean", "default": False},
-            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536},
-        }},
+        args_schema={
+            "type": "object",
+            "properties": {
+                "include_package": {"type": "boolean", "default": False},
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1048576,
+                    "default": 65536,
+                },
+                "history_limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            },
+        },
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillOutcome:
         try:
             report = await ctx.grasp_verification.evidence(
-                include_package=args.get("include_package", False), max_bytes=args.get("max_bytes", 65536)
+                include_package=args.get("include_package", False),
+                max_bytes=args.get("max_bytes", 65536),
+                history_limit=args.get("history_limit", 20),
             )
         except (KeyError, TypeError, ValueError) as error:
-            raise SkillError(FAILURE_GUARD_FAILED, f"stored evidence inspection refused: {error}") from error
+            raise SkillError(
+                FAILURE_GUARD_FAILED, f"stored evidence inspection refused: {error}"
+            ) from error
         return SkillOutcome.succeeded(report, side_effect_state=SIDE_EFFECT_NONE)
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:

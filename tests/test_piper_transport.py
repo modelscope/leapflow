@@ -24,7 +24,7 @@ from leapflow.hardware.drivers._piper_motion import (
     SPACE_JOINT, PiperMotion, firmware_version, joints_to_sdk, pose_to_sdk,
 )
 from leapflow.hardware.drivers.piper import PiperArmTransport
-from leapflow.hardware.registry import _DEVICE_ID_ALLOWED
+from leapflow.hardware.registry import DEVICE_ID_ALLOWED
 from leapflow.hardware.drivers._piper_halt import HoldSpec, TorqueReleasePolicy
 from leapflow.hardware.transport import (
     SIDE_EFFECT_COMMITTED, SIDE_EFFECT_NONE, SIDE_EFFECT_UNKNOWN, STOP_EFFECT_DEVICE_LATCHED,
@@ -321,7 +321,7 @@ def _write(transport: PiperArmTransport, channel: str, value: Any) -> Any:
 def test_example_yaml_pins_model_limits_units_and_dh() -> None:
     context = _context()
     assert context.device_id == "robot_piper_arm"
-    assert all(c in _DEVICE_ID_ALLOWED for c in context.device_id)
+    assert all(c in DEVICE_ID_ALLOWED for c in context.device_id)
     assert context.transport.kind == "piper" and context.halt_supported
     assert context.transport.config["robot"] == "piper_x"
     assert context.transport.config["firmware_profile"] == "v189"

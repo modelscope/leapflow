@@ -14,9 +14,11 @@ from typing import Any, Mapping
 from leapflow.hardware.skills.geometry import Pose
 from leapflow.hardware.skills.ports import SkillContext
 from leapflow.hardware.skills.protocol import (
+    DECLARE_HOME,
     EFFECT_ACTUATE,
     EFFECT_READ,
     FAILURE_SKILL_UNAVAILABLE,
+    REQUIRE_DECLARATION,
     REQUIRE_ROLE,
     SIDE_EFFECT_NONE,
     SkillError,
@@ -90,7 +92,9 @@ class Home:
         ),
         args_schema={"type": "object", "properties": {"speed_pct": _SPEED_ARG}},
         effect=EFFECT_ACTUATE,
-        requires=(f"{REQUIRE_ROLE}arm",),
+        # The posture is a declaration, not a measurement: a cell that names none can
+        # never plan this skill, so the listing says so instead of advertising it.
+        requires=(f"{REQUIRE_ROLE}arm", f"{REQUIRE_DECLARATION}{DECLARE_HOME}"),
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
