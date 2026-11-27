@@ -48,6 +48,22 @@ _SESSION_SALIENCE_SYSTEM = (
 )
 
 
+def _redact_execution_value(value: Any) -> Any:
+    """Redact structured secrets before serialization, preserving valid JSON."""
+    from leapflow.security.redact import redact_sensitive_text
+
+    if isinstance(value, dict):
+        return {key: "<redacted>" if str(key).lower() in {
+            "token", "password", "secret", "api_key", "credential", "access_token",
+            "authorization", "app_secret", "app_key", "bot_token", "webhook_secret",
+        } else _redact_execution_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_redact_execution_value(item) for item in value]
+    if isinstance(value, str):
+        return redact_sensitive_text(value, force=True)
+    return value
+
+
 class SessionCoordinator:
     """Manages session lifecycle: create, resume, history, analysis, artifacts."""
 
@@ -187,6 +203,46 @@ class SessionCoordinator:
             "messages": normalized,
             "artifacts": artifacts,
         }
+
+    async def get_execution_detail(
+        self, ctx: Any, settings: Any, session_id: str, idempotency_key: str,
+        *, workspace_root: str = "",
+    ) -> dict[str, Any]:
+        """Read one durable execution without replay or a live-engine fallback."""
+        from dataclasses import asdict
+
+        from leapflow.daemon._transport import RPC_STREAM_LIMIT
+
+        if not isinstance(session_id, str) or not session_id.strip():
+            return {"ok": False, "code": "missing_session_id"}
+        if not isinstance(idempotency_key, str) or not re.fullmatch(r"[0-9a-f]{64}", idempotency_key):
+            return {"ok": False, "code": "invalid_execution_key"}
+        store = getattr(ctx, "_conversation_store", None) if ctx is not None else None
+        if store is None or not hasattr(store, "get_tool_execution_by_key"):
+            return {"ok": False, "code": "store_unavailable"}
+        try:
+            session = store.get_session(session_id)
+            if session is None:
+                return {"ok": False, "code": "not_found"}
+            # Unlike old unbound history, full execution data requires a known workspace.
+            if not getattr(session, "cwd", ""):
+                return {"ok": False, "code": "workspace_unbound"}
+            workspace = self._workspace_root(ctx, settings, workspace_root=workspace_root)
+            if self._session_workspace_mismatch(session, workspace):
+                return {"ok": False, "code": "workspace_mismatch"}
+            record = store.get_tool_execution_by_key(session_id, idempotency_key)
+            if record is None:
+                return {"ok": False, "code": "not_found"}
+            if record.session_id != session_id or record.idempotency_key != idempotency_key:
+                return {"ok": False, "code": "execution_scope_mismatch"}
+            payload = {"ok": True, "execution": _redact_execution_value(asdict(record))}
+            # Refuse atomically; a chopped structured result cannot be evidence.
+            if len(json.dumps(payload, ensure_ascii=True).encode()) > RPC_STREAM_LIMIT // 2:
+                return {"ok": False, "code": "execution_too_large"}
+            return payload
+        except Exception:  # noqa: BLE001 - diagnostic RPC must fail closed
+            logger.warning("session execution evidence unavailable", exc_info=True)
+            return {"ok": False, "code": "store_error"}
 
     async def get_detail(
         self,

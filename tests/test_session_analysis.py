@@ -7,7 +7,12 @@ the manager path, the session.history RPC, and the session template render.
 
 from __future__ import annotations
 
+import asyncio
+import json
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 from types import SimpleNamespace
 
 from leapflow.dashboard import TemplateLibrary
@@ -267,6 +272,125 @@ def test_session_detail_rpc_method_is_registered() -> None:
     from leapflow.daemon.protocol import METHOD_REGISTRY
 
     assert METHOD_REGISTRY["session.detail"] == "session_detail"
+    assert METHOD_REGISTRY["session.execution_detail"] == "session_execution_detail"
+
+
+def _execution_service(tmp_path: Path):
+    from leapflow.engine.tools.tool_execution import ToolExecutionRecord
+    from leapflow.storage.conversation_store import DuckDBConversationStore
+
+    store = DuckDBConversationStore(tmp_path / "execution.duckdb")
+    work_a, work_b = tmp_path / "a", tmp_path / "b"
+    for sid, work in (("a", work_a), ("b", work_b)):
+        store.create_session(sid, cwd=str(work))
+        record = ToolExecutionRecord.create(
+            session_id=sid, turn_id="turn-1", command_id="", tool_call_id="call-1",
+            tool_name="example", idempotency_key="a" * 64, arguments={}, policy="read_only",
+        )
+        store.reserve_tool_execution(record)
+        store.complete_tool_execution(record.mark_completed({"body": sid * 16000}))
+    settings = SimpleNamespace(workspace_root=str(work_a))
+    service = RuntimeLeapService(settings)
+    service._ctx = SimpleNamespace(_conversation_store=store, settings=settings)
+    return service, store, work_a, work_b
+
+
+async def test_session_execution_full_result_and_concurrent_workspace_isolation(tmp_path: Path) -> None:
+    service, store, work_a, work_b = _execution_service(tmp_path)
+    try:
+        a, b, cross = await asyncio.gather(
+            service.session_execution_detail("a", "a" * 64, workspace_root=str(work_a)),
+            service.session_execution_detail("b", "a" * 64, workspace_root=str(work_b)),
+            service.session_execution_detail("a", "a" * 64, workspace_root=str(work_b)),
+        )
+        assert a["execution"]["result"]["body"] == "a" * 16000
+        assert b["execution"]["result"]["body"] == "b" * 16000
+        assert cross == {"ok": False, "code": "workspace_mismatch"}
+        assert store.get_tool_execution_by_key("a", "a" * 64).status == "completed"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("sid,key,code", [
+    ("", "a" * 64, "missing_session_id"),
+    ("a", "invalid", "invalid_execution_key"),
+    ("missing", "a" * 64, "not_found"),
+    ("a", "b" * 64, "not_found"),
+])
+async def test_session_execution_missing_identity_has_no_fallback(tmp_path: Path, sid, key, code) -> None:
+    service, store, _, _ = _execution_service(tmp_path)
+    try:
+        assert await service.session_execution_detail(sid, key) == {"ok": False, "code": code}
+    finally:
+        store.close()
+
+
+async def test_session_execution_atomic_bound_and_structured_redaction(tmp_path: Path, monkeypatch) -> None:
+    from leapflow.daemon import _transport
+
+    service, store, _, _ = _execution_service(tmp_path)
+    try:
+        record = store.get_tool_execution_by_key("a", "a" * 64)
+        secret = "sk-" + "z" * 40
+        result = {"password": "short", "nested": [{"api_key": secret}], "text": secret}
+        store.complete_tool_execution(record.mark_completed(result))
+        value = await service.session_execution_detail("a", "a" * 64)
+        assert secret not in json.dumps(value)
+        assert value["execution"]["result"]["password"] == "<redacted>"
+        assert value["execution"]["result"]["nested"][0]["api_key"] == "<redacted>"
+        assert store.get_tool_execution_by_key("a", "a" * 64).result == result
+        monkeypatch.setattr(_transport, "RPC_STREAM_LIMIT", 100)
+        assert await service.session_execution_detail("a", "a" * 64) == {
+            "ok": False, "code": "execution_too_large"}
+    finally:
+        store.close()
+
+
+async def test_session_execution_foreign_record_and_unbound_workspace_fail_closed(tmp_path: Path, monkeypatch) -> None:
+    service, store, _, _ = _execution_service(tmp_path)
+    try:
+        record = store.get_tool_execution_by_key("a", "a" * 64)
+        monkeypatch.setattr(store, "get_tool_execution_by_key", lambda *args: replace(record, session_id="b"))
+        assert await service.session_execution_detail("a", "a" * 64) == {
+            "ok": False, "code": "execution_scope_mismatch"}
+        monkeypatch.setattr(store, "get_session", lambda sid: ConversationSession(session_id=sid, cwd=""))
+        assert await service.session_execution_detail("a", "a" * 64) == {
+            "ok": False, "code": "workspace_unbound"}
+    finally:
+        store.close()
+
+
+async def test_session_execution_store_failure_contains_no_exception_text(tmp_path: Path, monkeypatch) -> None:
+    service, store, _, _ = _execution_service(tmp_path)
+    try:
+        def fail(*args):
+            raise RuntimeError("credential details must stay in redacted logs")
+        monkeypatch.setattr(store, "get_tool_execution_by_key", fail)
+        assert await service.session_execution_detail("a", "a" * 64) == {
+            "ok": False, "code": "store_error"}
+    finally:
+        store.close()
+
+
+async def test_session_execution_client_rpc_roundtrip(tmp_path: Path) -> None:
+    import tempfile
+
+    from leapflow.daemon._transport import get_transport
+    from leapflow.daemon.client import DaemonClient
+    from test_daemon_rpc import _short_tempdir, _start_server
+
+    service, store, work_a, _ = _execution_service(tmp_path)
+    with tempfile.TemporaryDirectory(prefix="lf-exec-", dir=_short_tempdir()) as root:
+        server, task, runtime = await _start_server(Path(root), service)
+        try:
+            client = DaemonClient(get_transport().readiness_path(runtime))
+            value = await client.session_execution_detail("a", "a" * 64, workspace_root=str(work_a))
+            assert value["execution"]["result"]["body"] == "a" * 16000
+        finally:
+            task.cancel()
+            await server.stop()
+            await asyncio.gather(task, return_exceptions=True)
+            store.close()
 
 
 def test_session_tool_workspace_prefers_current_tool_context(tmp_path: Path) -> None:

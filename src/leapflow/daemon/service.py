@@ -1061,6 +1061,14 @@ class RuntimeLeapService:
             self._ctx, self._settings, limit=limit, session_id=session_id,
         )
 
+    async def session_execution_detail(
+        self, session_id: str, idempotency_key: str, *, workspace_root: str = "",
+    ) -> dict[str, Any]:
+        return await self._session_coordinator.get_execution_detail(
+            self._ctx, self._settings, session_id, idempotency_key,
+            workspace_root=workspace_root,
+        )
+
     async def session_detail(
         self,
         session_id: str,

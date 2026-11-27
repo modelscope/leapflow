@@ -605,6 +605,15 @@ class DaemonClient:
             "session.history", {"limit": limit, "session_id": session_id},
         ) or {})
 
+    async def session_execution_detail(
+        self, session_id: str, idempotency_key: str, *, workspace_root: str = "",
+    ) -> dict[str, Any]:
+        """Read one durable execution; never ask the engine to run it again."""
+        return dict(await self.request("session.execution_detail", {
+            "session_id": session_id, "idempotency_key": idempotency_key,
+            "workspace_root": workspace_root,
+        }) or {})
+
     async def session_detail(
         self,
         session_id: str,
