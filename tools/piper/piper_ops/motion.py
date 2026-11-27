@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from leapflow.engine.recovery.failure_envelope import SideEffectState
 from leapflow.hardware.arm_status import TARGET_REFUSALS, is_arm_fault, status_name
 from leapflow.hardware.context import HardwareContext
+from leapflow.hardware.drivers._piper_motion import CTRL_MODE_CAN, ctrl_mode_name
 from leapflow.hardware.skills.adapt.ik import solve_ik
 from leapflow.hardware.skills.adapt.spec import IkSettings
 from leapflow.hardware.skills.geometry import Pose, Transform, WorkspaceBox

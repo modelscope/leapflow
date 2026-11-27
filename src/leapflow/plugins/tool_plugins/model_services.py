@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from leapflow.plugins.protocol import ToolMetadata
-from leapflow.tools.model_tools import ModelTools
+from leapflow.tools.model_tools import BATCH_REQUESTS_SCHEMA, ModelTools
 
 
 class ModelServicesPlugin:
@@ -69,6 +69,21 @@ class ModelServicesPlugin:
                 }, "required": ["service_id", "input"], "additionalProperties": False},
                 handler=self._behavior.query, x_leapflow={**metadata, "summary": "query an advisory specialist"},
                 provides_capabilities=("model.query",),
+            ),
+            ToolMetadata(
+                name="model_query_batch",
+                description=("Query 1–8 independently labeled specialist inputs in order using one pinned "
+                             "service connection. Use this for independent choices on a single-inflight service "
+                             "instead of concurrent model_query calls. Each item has ordinary consent, evidence "
+                             "checks and its own consultation ID; results are keyed by request ID. Stops at "
+                             "first refusal; never retries the batch or executes generated actions. "
+                             "Inputs cannot depend on earlier results. Advice and scores carry no physical authority."),
+                parameters_schema={"type": "object", "properties": {
+                    "service_id": {"type": "string"}, "requests": BATCH_REQUESTS_SCHEMA,
+                }, "required": ["service_id", "requests"], "additionalProperties": False},
+                handler=self._behavior.query_batch,
+                x_leapflow={**metadata, "summary": "query independent specialist advice serially"},
+                provides_capabilities=("model.query_batch",),
             ),
         ]
 

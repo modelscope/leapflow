@@ -57,7 +57,7 @@
     {
       "status": 200,
       "content_type": "application/json",
-      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"cassette-model\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"plugin_install\", \"arguments\": \"{\\\"plugin_id\\\": \\\"r6_dsh_echo\\\", \\\"source_path\\\": \\\"/tmp/lfj-r6_lifecycle/workspaces/life/dsh-echo\\\", \\\"version_label\\\": \\\"r6\\\"}\"}}]}, \"finish_reason\": \"tool_calls\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
+      "body": "{\"id\": \"chatcmpl-cassette\", \"object\": \"chat.completion\", \"model\": \"cassette-model\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"plugin_install\", \"arguments\": \"{\\\"plugin_id\\\": \\\"r6_dsh_echo\\\", \\\"source_path\\\": \\\"/private/tmp/lfj-r6_lifecycle/workspaces/life/dsh-echo\\\", \\\"version_label\\\": \\\"r6\\\"}\"}}]}, \"finish_reason\": \"tool_calls\"}], \"usage\": {\"prompt_tokens\": 64, \"completion_tokens\": 16, \"total_tokens\": 80}}"
     }
   ]
 }

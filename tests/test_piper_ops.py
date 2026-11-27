@@ -658,6 +658,18 @@ async def test_arrival_accepts_pose_converged_servo_residual(settings, tmp_path)
     assert result.receipts[0] == 4
 
 
+@pytest.mark.parametrize("mode,expected", [(CTRL_MODE_CAN, None), (CTRL_MODE_TEACH, "teach"), (None, "None")])
+def test_motion_preview_requires_can_control_before_planning(settings, mode, expected):
+    """Both admitted and refused previews resolve the real driver control-mode symbols."""
+    start = snapshot()
+    start = replace(start, status={**start.status, "ctrl_mode": mode})
+    if expected is None:
+        assert motion.preview(context(), start, settings, operation="grasp", width=40., force=2.5)["steps"]
+    else:
+        with pytest.raises(Refusal, match=f"movement needs CAN control, not {expected}"):
+            motion.preview(context(), start, settings, operation="grasp", width=40., force=2.5)
+
+
 def test_return_check_uses_pose_and_envelope(settings):
     """The return is judged by the flange pose, with the envelope bounding branch departure."""
     origin = snapshot()

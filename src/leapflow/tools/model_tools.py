@@ -14,7 +14,9 @@ from functools import partial
 from typing import Any, Callable, Mapping
 
 from leapflow.llm.services.codec import media_kind, validate_schema
-from leapflow.llm.services.protocol import ActiveCallBudget, ServiceError, ServiceSpec, StructuredModelClient, canonical
+from leapflow.llm.services.protocol import (
+    ActiveCallBudget, ServiceError, ServiceHandle, ServiceSpec, StructuredModelClient, canonical,
+)
 from leapflow.llm.services.telemetry import (
     ConsultationRecord, InferenceCapture, capture_inference, current_capture, measure_phase,
 )
@@ -25,6 +27,16 @@ from leapflow.tools.execution_context import current_tool_context
 from leapflow.hardware.service_contracts import GEOMETRY_INPUTS
 
 logger = logging.getLogger(__name__)
+
+BATCH_REQUESTS_SCHEMA = {
+    "type": "array", "minItems": 1, "maxItems": 8,
+    "items": {"type": "object", "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "input": {"type": "object"},
+        "artifacts": {"type": "object", "additionalProperties": {"type": "string"}},
+    }, "required": ["id", "input"], "additionalProperties": False},
+}
+
 
 async def authorize(action: ActionDescriptor, gate: Any = None) -> None:
     """Use the active turn's orchestrator; no check-only fallback or shared session."""
@@ -168,6 +180,76 @@ class ModelTools:
 
     async def query(self, service_id: str, input: dict[str, Any],
                     artifacts: dict[str, str] | None = None, **_: Any) -> dict[str, Any]:
+        return await self._consultation(service_id, input, artifacts or {})
+
+    async def query_batch(self, service_id: str, requests: list[dict[str, Any]], **_: Any) -> dict[str, Any]:
+        """Independent advice in order, one owned handle, no actuation or implicit fallback."""
+        task = asyncio.current_task()
+        if task is not None:
+            self._calls.add(task)
+        started = time.monotonic()
+        try:
+            return await self._query_batch(service_id, requests, started)
+        except ServiceError as exc:
+            return failure_payload(exc)
+        except asyncio.TimeoutError:
+            return failure_payload(ServiceError("Batch assembly deadline exhausted", service_id=service_id,
+                                                code="model_timeout", recoverable=True))
+        except (ValueError, OSError) as exc:
+            return failure_payload(ServiceError(str(exc), service_id=service_id,
+                                                code="model_invalid_request", category="validation"))
+        finally:
+            if task is not None:
+                self._calls.discard(task)
+
+    async def _query_batch(self, service_id: str, requests: list[dict[str, Any]],
+                           started: float) -> dict[str, Any]:
+        context = current_tool_context()
+        if self.client is None or context is None or not context.session_id:
+            raise ServiceError("Model batch requires a bound service and active session", code="model_unavailable")
+        validate_schema(requests, BATCH_REQUESTS_SCHEMA)
+        identities = [entry["id"] for entry in requests]
+        if len(set(identities)) != len(identities):
+            raise ValueError("batch request IDs must be unique")
+        with measure_phase("acquisition_ms"):
+            handle = await self.client.acquire(service_id)
+        results: list[dict[str, Any]] = []
+        failure: dict[str, Any] | None = None
+        try:
+            # Detach the complete selection before consent. Each item still receives
+            # its ordinary work budget, artifact checks and endpoint authorization.
+            budget = ActiveCallBudget(handle.spec.limits.deadline_s)
+            snapshot = await budget.run(asyncio.to_thread(canonical, requests))
+            if len(snapshot.encode()) > handle.spec.limits.max_request_bytes:
+                raise ValueError("aggregate batch exceeds the service request byte budget")
+            detached = json.loads(snapshot)
+            for entry in detached:
+                handle.check_admission()
+                item = await self._consultation(service_id, entry["input"], entry.get("artifacts", {}), handle)
+                if item.get("ok") is not True:
+                    failure = {**item, "failed_id": entry["id"]}
+                    break
+                results.append({"id": entry["id"], **item})
+        finally:
+            with measure_phase("cleanup_ms"):
+                await handle.aclose()
+        # Closing can yield to disable/removal. No successful advice is delivered
+        # from a batch whose admission was revoked, even after a later re-enable.
+        handle.check_result_eligibility()
+        if failure is not None:
+            return {**failure, "completed": len(results),
+                    "consultations": [item.get("consultation", {}) for item in results]}
+        return {"ok": True, "service_id": service_id,
+                "results": {item["id"]: {key: value for key, value in item.items()
+                    if key not in {"id", "_context_fields"}} for item in results},
+                "elapsed_ms": (time.monotonic() - started) * 1000,
+                "advisory": True, "physical_authority": False,
+                "_context_fields": {"ok": True, "service_id": True, "advisory": True,
+                    "physical_authority": True, "results": {
+                        item["id"]: item.get("_context_fields", {}) for item in results}}}
+
+    async def _consultation(self, service_id: str, input: dict[str, Any], artifacts: dict[str, str],
+                            handle: ServiceHandle | None = None) -> dict[str, Any]:
         from leapflow.layout import workspace_id_for_path
 
         context = current_tool_context()
@@ -180,7 +262,7 @@ class ModelTools:
         status = "failed"
         with capture_inference(scope=scope, task_id=context.task_id if context else "") as capture:
             try:
-                payload = await self._query_safe(service_id, input, artifacts or {})
+                payload = await self._query_safe(service_id, input, artifacts, handle)
                 status = "eligible" if payload.get("ok") else "refused"
             except asyncio.CancelledError:
                 status = "cancelled"
@@ -217,12 +299,14 @@ class ModelTools:
         except Exception:  # noqa: BLE001 - bookkeeping must never change a tool result
             logger.warning("Consultation provenance recording failed", exc_info=True)
 
-    async def _query_safe(self, service_id: str, data: dict[str, Any], artifacts: dict[str, str]) -> dict[str, Any]:
+    async def _query_safe(self, service_id: str, data: dict[str, Any], artifacts: dict[str, str],
+                          handle: ServiceHandle | None = None) -> dict[str, Any]:
         task = asyncio.current_task()
-        if task is not None:
+        owns_task = task is not None and task not in self._calls
+        if owns_task:
             self._calls.add(task)
         try:
-            return await self._query(service_id, data, artifacts)
+            return await self._query(service_id, data, artifacts, handle)
         except ServiceError as exc:
             return failure_payload(exc)
         except asyncio.TimeoutError:
@@ -232,17 +316,18 @@ class ModelTools:
             return failure_payload(ServiceError(str(exc), service_id=service_id, code="model_invalid_request",
                                                 category="validation"))
         finally:
-            if task is not None:
+            if owns_task:
                 self._calls.discard(task)
 
-    async def _query(self, service_id: str, data: dict[str, Any], artifacts: dict[str, str]) -> dict[str, Any]:
+    async def _query(self, service_id: str, data: dict[str, Any], artifacts: dict[str, str],
+                     handle: ServiceHandle | None = None) -> dict[str, Any]:
         context = current_tool_context()
         if self.client is None or context is None or not context.session_id:
             raise ServiceError("Model query requires a bound service and active session", code="model_unavailable")
         catalog = self.client.describe(service_id)["services"]
         if not catalog:
             raise ServiceError("Unknown service; use model_describe", service_id=service_id)
-        task = catalog[0]["task"]
+        task = handle.spec.task if handle is not None else catalog[0]["task"]
         validate_schema(artifacts, {"type": "object", "properties": {}, "additionalProperties": True})
         if len(artifacts) > 16 or any(not isinstance(k, str) or not isinstance(v, str) for k, v in artifacts.items()):
             raise ValueError("artifacts must map at most 16 labels to session artifact IDs")
@@ -250,8 +335,10 @@ class ModelTools:
             raise ValueError("grounding requires exactly one image artifact")
         if task == "grasp_proposal" and set(artifacts) != {"image", "depth"}:
             raise ValueError("grasp_proposal requires image and depth artifacts")
-        with measure_phase("acquisition_ms"):
-            handle = await self.client.acquire(service_id)
+        owned = handle is None
+        if owned:
+            with measure_phase("acquisition_ms"):
+                handle = await self.client.acquire(service_id)
         budget = ActiveCallBudget(handle.spec.limits.deadline_s)
         try:
             handle.check_admission()
@@ -329,8 +416,9 @@ class ModelTools:
                     "elapsed_ms": result.elapsed_ms, "usage": json.loads(result.usage_json),
                     "timing": json.loads(result.timing_json)}
         finally:
-            with measure_phase("cleanup_ms"):
-                await handle.aclose()
+            if owned:
+                with measure_phase("cleanup_ms"):
+                    await handle.aclose()
         handle.check_result_eligibility()
         return payload
 

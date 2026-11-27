@@ -877,7 +877,10 @@ async def test_unified_skill_delegate_optional_consultation(tmp_path, monkeypatc
             assert engine._current_session_id == "own" and engine._usage_tracker is parent_usage
         assert output and llm.scopes and all(scope.session_id == sid for scope in llm.scopes)
         assert all(scope.workspace_id == workspace_id_for_path(tmp_path) for scope in llm.scopes)
-        assert all({tool["function"]["name"] for tool in tools} == {"model_query", "model_describe"}
+        expected_tools = {"model_query", "model_describe"}
+        if route == "skill":
+            expected_tools.add("model_query_batch")
+        assert all({tool["function"]["name"] for tool in tools} == expected_tools
                    for tools in llm.catalogs)
         rows = store.get_messages(sid)
         queries = [json.loads(row.content) for row in rows if row.tool_name == "model_query"]
