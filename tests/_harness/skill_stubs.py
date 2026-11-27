@@ -362,7 +362,7 @@ class SkillNodeRegistry:
         if table_z is not None:
             box["floor"] = {"method": "table_z", "table_z": table_z}
         self.calibrate("workspace.safe_box", parameters=box)
-        self.calibrate(
+        version = self.calibrate(
             "camera.handeye",
             pose=camera_pose,
             parameters={
@@ -370,6 +370,9 @@ class SkillNodeRegistry:
                 **({"intrinsics": intrinsics.to_dict()} if intrinsics is not None else {}),
             },
         )
+        self.calibrate("camera.verify", parameters={
+            "training_disjoint": True, "p95_mm": 0.5, "depends_on": {"camera": version},
+        })
 
 
 WORKCELL_YAML: dict[str, Any] = {

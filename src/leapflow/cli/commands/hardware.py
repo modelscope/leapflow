@@ -130,6 +130,10 @@ def cmd_hardware(args: argparse.Namespace) -> int:
 
 async def _dispatch(args: argparse.Namespace, action: str) -> int:
     json_mode = bool(getattr(args, "json", False))
+    if action == "board":
+        from leapflow.cli.commands.hardware_board import run_board
+
+        return run_board(args, load_config(), json_mode)
     if action in _LOCAL_ACTIONS:
         return await _run_local(action, args, json_mode)
     if action in _SAMPLING_ACTIONS:

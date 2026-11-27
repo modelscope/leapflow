@@ -94,7 +94,10 @@ async def test_missing_depth_nearer_surface_and_truncation_do_not_certify(tmp_pa
 async def test_relocate_uses_alternative_without_grounding_or_replacing_identity(tmp_path):
     registry = _calibrated(tmp_path, CUP)
     registry.devices['second'] = SimRgbdCamera((CUP,))
-    registry.calibrate('other.handeye', pose=CAMERA_POSE, parameters={'target_mount': IDENTITY_MATRIX})
+    version = registry.calibrate('other.handeye', pose=CAMERA_POSE, parameters={'target_mount': IDENTITY_MATRIX})
+    registry.calibrate('camera.other.verify', parameters={
+        'training_disjoint': True, 'p95_mm': .5, 'depends_on': {'camera.other': version},
+    })
     spec = _spec(roles={**PERCEPTION_WORKCELL_YAML['roles'], 'camera.other': 'second'},
                  frames={**PERCEPTION_WORKCELL_YAML['frames'],
                          'camera.other': {'parent': 'base', 'procedure': 'other.handeye'}})
@@ -258,7 +261,10 @@ def test_ring_settings_never_coerce_malformed_budgets(config):
 async def test_auto_locate_fuses_unique_geometry_but_not_ambiguous_instances(tmp_path, monkeypatch):
     registry = _calibrated(tmp_path, CUP)
     registry.devices['second'] = SimRgbdCamera((CUP,))
-    registry.calibrate('other.handeye', pose=CAMERA_POSE, parameters={'target_mount': IDENTITY_MATRIX})
+    version = registry.calibrate('other.handeye', pose=CAMERA_POSE, parameters={'target_mount': IDENTITY_MATRIX})
+    registry.calibrate('camera.other.verify', parameters={
+        'training_disjoint': True, 'p95_mm': .5, 'depends_on': {'camera.other': version},
+    })
     spec = _spec(roles={**PERCEPTION_WORKCELL_YAML['roles'], 'camera.other': 'second'},
                  frames={**PERCEPTION_WORKCELL_YAML['frames'],
                          'camera.other': {'parent': 'base', 'procedure': 'other.handeye'}})

@@ -64,7 +64,7 @@ WRIST_ONLY: dict[str, Any] = {
     "frames": {
         **TWO_CAMERAS["frames"],
         "camera": {"parent": "base", "procedure": "global.handeye"},
-        "camera.wrist": {"parent": "base", "procedure": "camera.handeye"},
+        "camera.wrist": {"parent": "base", "procedure": "wrist.handeye"},
     },
 }
 IR_CHANNEL = "cam.ir_left.preview"
@@ -106,11 +106,14 @@ def _registry(tmp_path: Path, cls: type = SkillNodeRegistry, *boxes: SimBox) -> 
     registry = base if cls is SkillNodeRegistry else _rebuild(base, cls, tmp_path)
     registry.devices[WRIST_ID] = SimRgbdCamera(list(boxes or (CUP,)))
     registry.calibrate_perception()
-    registry.calibrate(
+    version = registry.calibrate(
         "wrist.handeye",
         pose=CAMERA_POSE,
         parameters={"target_mount": IDENTITY_MATRIX, "intrinsics": SIM_INTRINSICS.to_dict()},
     )
+    registry.calibrate("camera.wrist.verify", parameters={
+        "training_disjoint": True, "p95_mm": .5, "depends_on": {"camera.wrist": version},
+    })
     return registry
 
 

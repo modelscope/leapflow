@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import Counter
-from os import terminal_size
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -423,16 +422,14 @@ def test_guard_does_not_skip_exit_resize_or_initial_render(is_done, previous_wid
     ids=["idle-empty", "idle-draft", "running-draft", "running-empty"],
 )
 async def test_real_tui_is_quiet_without_events_and_keeps_input_responsive(
-    tmp_path, monkeypatch, guarded_renderer, columns: int, running: bool, draft: str,
+    tmp_path, guarded_renderer, columns: int, running: bool, draft: str,
 ) -> None:
-    from leapflow.cli.tui_app import app as app_module
     from leapflow.cli.tui_app.app import LeapApp
     from leapflow.cli.tui_app.status import StatusBar
     from leapflow.cli.tui_app.theme import _LIGHT, resolve_theme
     from tests.test_tui_command_queue import _FakeConsole, _wait_for
 
     size = Size(rows=48, columns=columns)
-    monkeypatch.setattr(app_module.shutil, "get_terminal_size", lambda fallback=(80, 24): terminal_size((size.columns, size.rows)))
     sink = _Sink()
     output = Vt100_Output(sink, lambda: size, term="xterm-256color", enable_cpr=False)
     with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
@@ -461,6 +458,8 @@ async def test_real_tui_is_quiet_without_events_and_keeps_input_responsive(
                 for _ in range(5):
                     app._app._redraw()  # Redundant notifications must emit zero bytes.
                 assert "".join(sink.chunks) == baseline
+            # With an empty running draft, an explicit redraw can still update
+            # elapsed status/spinner text off the input row. There is no timer.
             status.update(context_used=123, context_max=1000)
             app.invalidate()
             await _wait_for(lambda: "".join(sink.chunks) != baseline)
@@ -485,6 +484,128 @@ async def test_real_tui_is_quiet_without_events_and_keeps_input_responsive(
             assert app._app.renderer._last_size == size
             assert app._input_area.buffer.text == draft + "a"
             assert app._input_area.buffer.cursor_position == len(draft)
+        finally:
+            if app._app.is_running:
+                app._app.exit()
+            await task
+
+
+async def test_wrapped_cjk_overflow_keeps_cursor_in_input(monkeypatch) -> None:
+    from tests.test_tui_command_queue import _make_app, _wait_for
+
+    monkeypatch.setenv("TERM_PROGRAM", "xterm")
+    size = Size(rows=24, columns=19)
+    output = Vt100_Output(_Sink(), lambda: size, term="xterm-256color", enable_cpr=False)
+    with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
+        app, _, _ = _make_app()
+        app.agent_running = True
+        task = asyncio.create_task(app._app.run_async())
+        try:
+            await _wait_for(lambda: app._app.renderer._last_screen is not None)
+            # Each full CJK row leaves a cell unused at this odd width. Counting
+            # the total cells / width understates the actual wrapped height.
+            draft = "a" + "中" * 36
+            for phrase in (draft[:17], draft[17:]):
+                app._reset_paste_fragment_window()
+                pipe.send_text(phrase)
+                await _wait_for(lambda: app._input_area.buffer.text.endswith(phrase))
+            app._app._redraw()
+            assert app._input_area.buffer.text == draft
+            screen = app._app.renderer._last_screen
+            window = app._input_area.window
+            region = screen.visible_windows_to_write_positions[window]
+            cursor = screen.get_cursor_position(window)
+            assert region.ypos <= cursor.y < region.ypos + region.height
+            assert cursor.x == 2  # One final CJK glyph on the newly visible row.
+        finally:
+            if app._app.is_running:
+                app._app.exit()
+            await task
+
+
+@pytest.mark.parametrize("apple_terminal", [False, True], ids=["hazard-control", "apple-terminal"])
+async def test_native_only_wide_cell_is_erased_before_rewriting_cursor_row(
+    monkeypatch, guarded_renderer, apple_terminal: bool,
+) -> None:
+    from tests.test_tui_command_queue import _wait_for
+
+    monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal" if apple_terminal else "xterm")
+    sink = _Sink()
+    output = Vt100_Output(sink, lambda: Size(rows=24, columns=40), term="xterm-256color", enable_cpr=False)
+    with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
+        area = TextArea(text="a", multiline=True)
+        area.buffer.cursor_position = 1
+        app = Application(layout=Layout(area))
+        task = asyncio.create_task(app.run_async())
+        try:
+            await _wait_for(lambda: app.renderer._last_screen is not None)
+            terminal = _TerminalModel(40)
+            terminal.feed("".join(sink.chunks))
+            assert terminal.text(0) == "a" and (terminal.x, terminal.y) == (1, 0)
+            # Model a wide native marked glyph absent from the old Screen.
+            terminal.feed("中\b\b")
+            start = len(sink.chunks)
+            pipe.send_text("b")
+            await _wait_for(lambda: area.buffer.text == "ab")
+            app._redraw()
+            terminal.feed("".join(sink.chunks[start:]))
+            if apple_terminal:
+                assert terminal.stats["split"] == 0
+                assert terminal.text(0) == "ab"
+            else:
+                assert terminal.stats["split"] > 0
+        finally:
+            if app.is_running:
+                app.exit()
+            await task
+
+
+@pytest.mark.parametrize("running", [False, True], ids=["idle", "streaming"])
+async def test_apple_terminal_overflow_keeps_cursor_clear_and_submits_full_draft(monkeypatch, running: bool) -> None:
+    from tests.test_tui_command_queue import _make_app, _wait_for
+
+    monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+    sink = _Sink()
+    size = Size(rows=16, columns=37)
+    output = Vt100_Output(sink, lambda: size, term="xterm-256color", enable_cpr=False)
+    with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
+        app, _, _ = _make_app()
+        app.agent_running = running
+        task = asyncio.create_task(app._app.run_async())
+        try:
+            await _wait_for(lambda: app._app.renderer._last_screen is not None)
+            window = app._input_area.window
+            app._reset_paste_fragment_window()
+            parts = ["a中b文"] * 40
+            draft = ""
+            full_region = None
+            for part in parts:
+                draft += part
+                pipe.send_text(part)
+                await _wait_for(lambda: window.content.buffer.text == draft)
+                app._app._redraw()
+                screen = app._app.renderer._last_screen
+                region = screen.visible_windows_to_write_positions[window]
+                cursor = screen.get_cursor_position(window)
+                assert region.ypos <= cursor.y < region.ypos + region.height
+                assert 0 <= cursor.x < region.width == 28  # Nine cells of IME headroom.
+                if region.height == app._effective_input_cap(size.rows):
+                    if full_region is None:
+                        assert app._input_hidden_rows() == 0
+                        full_region = region
+                    assert (region.ypos, region.height) == (full_region.ypos, full_region.height)
+            assert full_region is not None and app._input_hidden_rows() > 0
+            assert not app._paste_store.has_blocks
+            model = _TerminalModel(size.columns)
+            model.feed("".join(sink.chunks))
+            assert model.stats["split"] == model.stats["overflow"] == 0
+            assert Point(model.x, model.y) == cursor
+            pipe.send_text("\x1b[D\x7f中")
+            edited = draft[:-2] + "中文"
+            await _wait_for(lambda: window.content.buffer.text == edited)
+            pipe.send_text("\r")
+            await _wait_for(lambda: len(app.queued_commands()) == 1)
+            assert app.queued_commands()[0].text == edited
         finally:
             if app._app.is_running:
                 app._app.exit()

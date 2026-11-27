@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from contextlib import suppress
-from os import terminal_size
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +13,7 @@ import leapflow.cli.tui_app.app as app_module
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest
 from prompt_toolkit.auto_suggest import Suggestion
 from prompt_toolkit.completion import Completion
+from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import to_plain_text
 from leapflow.cli.tui_app.app import (
@@ -39,21 +39,17 @@ def test_compute_input_cap_scales_with_terminal_and_floors_at_four() -> None:
 
 
 def test_estimate_input_rows_uses_display_cells_and_prompt_prefix() -> None:
-    assert _estimate_input_rows("", 80, prompt_width=2) == 1
-    assert _estimate_input_rows("abcd", 6, prompt_width=2) == 1
-    assert _estimate_input_rows("abcde", 6, prompt_width=2) == 2
-    # CJK wide characters take two display cells; first row also loses prompt width.
-    assert _estimate_input_rows("测" * 5, 10, prompt_width=2) == 2
-    assert _estimate_input_rows("hello\n" + "测" * 5, 10, prompt_width=2) == 2
+    assert _estimate_input_rows("", 80, prompt="> ") == 1
+    assert _estimate_input_rows("abc", 6, prompt="> ") == 1
+    assert _estimate_input_rows("abcd", 6, prompt="> ") == 2  # Cursor cell wraps.
+    assert _estimate_input_rows("测" * 5, 10, prompt="> ") == 2
+    assert _estimate_input_rows("hello\n" + "测" * 5, 11, prompt="> ") == 2
+    assert _estimate_input_rows("a" + "中" * 36, 19, prompt="> ") == 5
 
 
 def test_input_height_preferred_tracks_wrapped_content(monkeypatch) -> None:
     app, _console, _status = _make_app()
-    monkeypatch.setattr(
-        app_module.shutil,
-        "get_terminal_size",
-        lambda _fallback=(80, 24): terminal_size((20, 24)),
-    )
+    monkeypatch.setattr(app._app.output, "get_size", lambda: Size(rows=24, columns=20))
     app._input_area.buffer.text = "测" * 20
 
     height = app._input_area.window.height
@@ -66,11 +62,7 @@ def test_input_height_preferred_tracks_wrapped_content(monkeypatch) -> None:
 
 def test_input_overflow_hint_reports_hidden_rows(monkeypatch) -> None:
     app, _console, _status = _make_app()
-    monkeypatch.setattr(
-        app_module.shutil,
-        "get_terminal_size",
-        lambda _fallback=(80, 24): terminal_size((10, 10)),
-    )
+    monkeypatch.setattr(app._app.output, "get_size", lambda: Size(rows=10, columns=10))
     app._input_area.buffer.text = "测" * 30
 
     hint = to_plain_text(app._input_overflow_hint())
@@ -89,11 +81,7 @@ def test_input_height_keeps_wrapped_rows_while_agent_running(monkeypatch) -> Non
     submitting still worked.
     """
     app, _console, _status = _make_app()
-    monkeypatch.setattr(
-        app_module.shutil,
-        "get_terminal_size",
-        lambda _fallback=(80, 24): terminal_size((20, 24)),
-    )
+    monkeypatch.setattr(app._app.output, "get_size", lambda: Size(rows=24, columns=20))
     app.agent_running = True  # streaming -> bounded but still content-sized
 
     app._input_area.buffer.text = "测" * 40  # wraps to five rows at 20 columns
@@ -112,11 +100,7 @@ def test_input_height_keeps_wrapped_rows_while_agent_running(monkeypatch) -> Non
 
 def test_input_overflow_hint_omits_editor_while_running(monkeypatch) -> None:
     app, _console, _status = _make_app()
-    monkeypatch.setattr(
-        app_module.shutil,
-        "get_terminal_size",
-        lambda _fallback=(80, 24): terminal_size((10, 10)),
-    )
+    monkeypatch.setattr(app._app.output, "get_size", lambda: Size(rows=10, columns=10))
     app._input_area.buffer.text = "测" * 30
     app.agent_running = True
 
@@ -1205,6 +1189,14 @@ def test_placeholder_processor_indents_hint_after_prompt_space() -> None:
     assert sum(text.count("❯") for _style, text in transformed.fragments) == 1
     assert transformed.source_to_display(0) == len("❯ ")
     assert transformed.display_to_source(len("❯   Queue paused · /resume continue")) == 0
+
+
+def test_running_placeholder_is_stable_before_first_ime_commit() -> None:
+    app, _, _ = _make_app()
+    app._active_command = TuiCommand.create(command_id=1, text="Example task").mark_running()
+    app.agent_running = True
+    # No elapsed metric between the task label and queue guidance.
+    assert app._placeholder_text().startswith("Running #1 · type to queue next · ")
 
 
 def test_prompt_prefix_is_preserved_with_placeholder_hint() -> None:

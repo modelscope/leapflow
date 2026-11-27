@@ -39,32 +39,31 @@ from typing import (
 
 from prompt_toolkit import Application
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.filters import Condition
-from prompt_toolkit.formatted_text.utils import fragment_list_len, fragment_list_width
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.filters import Condition, has_focus, is_done
+from prompt_toolkit.formatted_text.utils import fragment_list_len, fragment_list_to_text
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.containers import ConditionalContainer, Float, FloatContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
-from prompt_toolkit.layout.processors import Processor, Transformation
+from prompt_toolkit.layout.processors import AppendAutoSuggestion, ConditionalProcessor, Processor, Transformation
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style as PTStyle
-from prompt_toolkit.utils import get_cwidth
-from prompt_toolkit.widgets import TextArea
 
 from leapflow.cli.tui_app.approval_modal import ApprovalModal
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus, command_key
 from leapflow.cli.tui_app.display_clock import DisplayClock
 from leapflow.cli.tui_app.history import SecretAwareFileHistory
-from leapflow.cli.tui_app.input import build_completer
+from leapflow.cli.tui_app.input import DraftBufferControl, DraftInput, build_completer, wrapped_display_rows
 from leapflow.cli.tui_app.paste import (
     PASTE_FRAGMENT_WINDOW_S,
     PasteHeuristics,
     PasteStore,
 )
-from leapflow.cli.tui_app.render_guard import install_render_guard
+from leapflow.cli.tui_app.render_guard import install_render_guard, uses_apple_terminal
 from leapflow.cli.tui_app.status import StatusBar
 from leapflow.cli.tui_app.theme import Theme
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest
@@ -81,59 +80,20 @@ InputHandler = Callable[[str], Union[Awaitable[None], None]]
 ControlHandler = Callable[[str], bool]
 
 
-def _format_inline_duration(seconds: float) -> str:
-    """Format short elapsed text for inline TUI guidance."""
-    if seconds < 1.0:
-        return f"{seconds * 1000:.0f}ms"
-    if seconds < 60.0:
-        return f"{seconds:.1f}s"
-    minutes = int(seconds // 60)
-    return f"{minutes}m{seconds - minutes * 60:.0f}s"
-
-
 def _compute_input_cap(rows: int) -> int:
     """Max visible input rows: grow with content up to ~45% of the terminal,
     leaving room for the status chrome and some transcript; never below 4."""
     return max(4, min(int(rows * 0.45), rows - 6))
 
 
-def _wrapped_display_rows(line: str, width: int) -> int:
-    """Return display rows needed for one logical line at a given cell width."""
-    width = max(1, int(width))
-    if not line:
-        return 1
-    rows = 1
-    used = 0
-    for char in line:
-        char_width = max(0, get_cwidth(char))
-        if char_width == 0:
-            continue
-        if used and used + char_width > width:
-            rows += 1
-            used = 0
-        if char_width > width:
-            rows += 1 if used else 0
-            used = 0
-            continue
-        used += char_width
-    return rows
-
-
-def _estimate_input_rows(text: str, columns: int, *, prompt_width: int = 0) -> int:
-    """Estimate wrapped display rows for the input buffer.
-
-    The first logical line loses cells to the rendered prompt prefix. Later
-    logical lines use the full input width. Width is display-cell based, so CJK
-    wide characters count as two cells.
-    """
-    columns = max(1, int(columns))
+def _estimate_input_rows(text: str, columns: int, *, prompt: str = "") -> int:
+    """Measure committed text, the prompt, and BufferControl's end-of-line cell."""
     if not text:
-        return 1
-    total = 0
-    for index, line in enumerate(str(text).split("\n")):
-        line_width = columns if index else max(1, columns - max(0, prompt_width))
-        total += _wrapped_display_rows(line, line_width)
-    return max(1, total)
+        return 1  # Empty-input guidance does not grow the draft viewport.
+    return sum(
+        wrapped_display_rows((prompt if index == 0 else "") + line + " ", columns)
+        for index, line in enumerate(text.split("\n"))
+    )
 
 
 class _DynamicPlaceholderProcessor(Processor):
@@ -272,6 +232,7 @@ class LeapApp:
             raise ValueError("LeapApp requires an explicit layout-derived history_path")
         history_path.parent.mkdir(parents=True, exist_ok=True)
         self._history_path = history_path
+        self._leave_ime_space = uses_apple_terminal()
 
         self._input_area = self._build_input_area(commands, config_fields, board_templates)
         self._display_clock = DisplayClock(
@@ -870,33 +831,29 @@ class LeapApp:
         buffer = getattr(input_area, "buffer", None)
         return str(getattr(buffer, "text", "") or "")
 
+    def _ime_gutter_width(self, columns: int) -> int:
+        if not self._leave_ime_space:
+            return 0
+        # Leave native marked text room before Terminal.app's right margin,
+        # without sacrificing most of the editor on a narrow window.
+        return min(16, columns // 4)
+
     def _input_visual_rows(self, columns: int) -> int:
-        prompt_width = fragment_list_width(self._prompt_fragments())
         return _estimate_input_rows(
             self._current_input_text(),
-            columns,
-            prompt_width=prompt_width,
+            columns - self._ime_gutter_width(columns),
+            prompt=fragment_list_to_text(self._prompt_fragments()),
         )
 
     def _effective_input_cap(self, lines: int) -> int:
-        """Max visible input rows for the current run-state.
-
-        While a task streams output the reserved region stays bounded: an
-        unbounded region reshapes the scroll region under ``patch_stdout`` and
-        can crash the terminal (macOS Terminal in particular). That bound is a
-        cap, not a fixed height -- the draft still sizes the region up to it, so
-        a long draft never silently scrolls out of its own box while a task
-        runs, and the ``up N more input rows hidden`` hint tells the user when
-        the draft outgrows the cap. Adaptive sizing resumes once the task
-        finishes (idle), when the input area is the sole owner of the TTY.
-        """
+        """Bound the viewport footprint, without imposing a draft length limit."""
         if self._agent_running:
             return _STREAMING_INPUT_CAP
         return _compute_input_cap(lines)
 
     def _input_hidden_rows(self) -> int:
-        terminal = shutil.get_terminal_size((80, 24))
-        cap = self._effective_input_cap(terminal.lines)
+        terminal = self._app.output.get_size()
+        cap = self._effective_input_cap(terminal.rows)
         return max(0, self._input_visual_rows(terminal.columns) - cap)
 
     def _input_overflow_hint(self) -> list[tuple[str, str]]:
@@ -906,26 +863,17 @@ class LeapApp:
         suffix = "row" if hidden_rows == 1 else "rows"
         # The external editor is disabled while a task streams (single TTY owner),
         # so don't advertise it then.
-        action = "full view resumes when idle" if self._agent_running else "Ctrl+X Ctrl+E edit full draft"
+        action = "editor available when idle" if self._agent_running else "Ctrl+X Ctrl+E edit full draft"
         return [(
             "class:hint",
             f"↑ {hidden_rows} more input {suffix} hidden · {action}",
         )]
 
     def _input_height(self) -> Dimension:
-        """Content-sized input height, bounded by the current run-state cap.
-
-        The reserved rows always track the wrapped draft up to the effective
-        cap, so what the user typed stays visible in both modes -- a one-line
-        draft renders as a single row, a draft that wraps keeps its rows. A
-        run-state that pinned the region to a single row instead made every
-        wrapped draft scroll inside that box: the prompt and all earlier rows
-        disappeared, the cursor could not follow the text, and the overflow
-        hint stayed silent because it measured against the cap.
-        """
-        terminal = shutil.get_terminal_size((80, 24))
-        cap = self._effective_input_cap(terminal.lines)
-        preferred = min(cap, max(1, self._input_visual_rows(terminal.columns)))
+        """Size the viewport to wrapped rows up to the current run-state cap."""
+        terminal = self._app.output.get_size()
+        cap = self._effective_input_cap(terminal.rows)
+        preferred = min(cap, self._input_visual_rows(terminal.columns))
         return Dimension(min=1, max=cap, preferred=preferred)
 
     def _build_input_area(
@@ -933,31 +881,30 @@ class LeapApp:
         commands: Sequence[tuple[str, str]],
         config_fields: Sequence[object],
         board_templates: Sequence[str] = (),
-    ) -> TextArea:
-        completer = build_completer(
-            commands, config_fields=config_fields, board_templates=board_templates
-        )
-        ref = self
-
-        area = TextArea(
-            height=self._input_height,
-            prompt="",
-            style="class:input-area",
+    ) -> DraftInput:
+        buffer = Buffer(
             multiline=True,
-            wrap_lines=True,
-            dont_extend_height=True,
             history=SecretAwareFileHistory(str(self._history_path)),
-            completer=completer,
+            completer=build_completer(commands, config_fields=config_fields, board_templates=board_templates),
             complete_while_typing=True,
             auto_suggest=AutoSuggestFromHistory(),
-            input_processors=[_DynamicPlaceholderProcessor(
-                ref._placeholder_text,
-                ref._prompt_fragments,
-            )],
+            tempfile_suffix=".md",
         )
-        area.buffer.tempfile_suffix = ".md"
-        self._install_paste_compactor(area.buffer)
-        return area
+        control = DraftBufferControl(
+            buffer=buffer,
+            input_processors=[
+                ConditionalProcessor(AppendAutoSuggestion(), has_focus(buffer) & ~is_done),
+                _DynamicPlaceholderProcessor(self._placeholder_text, self._prompt_fragments),
+            ],
+        )
+        self._install_paste_compactor(buffer)
+        return DraftInput(buffer, Window(
+            content=control,
+            height=self._input_height,
+            style="class:text-area class:input-area",
+            wrap_lines=True,
+            dont_extend_height=True,
+        ))
 
     def _build_application(self) -> Application[Any]:
         no_approval = Condition(lambda: self._approval_modal is None)
@@ -968,9 +915,12 @@ class LeapApp:
             height=self._spinner_height,
             wrap_lines=True,
         )
+        # Reuse the reserved gap so crossing the cap cannot insert another
+        # physical row and move the whole input pane under the native cursor.
         status_gap = Window(
-            content=FormattedTextControl(lambda: []),
+            content=FormattedTextControl(self._input_overflow_hint),
             height=1,
+            wrap_lines=False,
             style="class:status-gap",
         )
         status_bar = Window(
@@ -989,20 +939,18 @@ class LeapApp:
             ),
             filter=has_approval,
         )
-        input_overflows = Condition(lambda: self._input_hidden_rows() > 0)
-
-        input_hint = Window(
-            content=FormattedTextControl(self._input_overflow_hint),
-            height=1,
-            style="class:hint",
-        )
+        input_pane: Window | VSplit = self._input_area.window
+        if self._leave_ime_space:
+            input_pane = VSplit([
+                input_pane,
+                Window(width=lambda: self._ime_gutter_width(self._app.output.get_size().columns)),
+            ])
         root = HSplit([
             ConditionalContainer(spinner, filter=no_approval),
             approval_panel,
             ConditionalContainer(status_gap, filter=no_approval),
             status_bar,
-            ConditionalContainer(input_hint, filter=no_approval & input_overflows),
-            ConditionalContainer(self._input_area, filter=no_approval),
+            ConditionalContainer(input_pane, filter=no_approval),
         ])
         layout = Layout(
             FloatContainer(
@@ -1250,9 +1198,8 @@ class LeapApp:
             return "Queue paused · /resume continue · /drop <id> remove · /queue view"
         if self._active_command is not None:
             command = self._active_command
-            elapsed = _format_inline_duration(command.elapsed_s)
             return (
-                f"Running {command.label} {elapsed} · type to queue next · "
+                f"Running {command.label} · type to queue next · "
                 "/cancel stop · /skip next · /queue view"
             )
         if self._pending_input.qsize() > 0:

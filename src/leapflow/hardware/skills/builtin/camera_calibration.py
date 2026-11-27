@@ -10,7 +10,8 @@ frame, so a camera is usable only once that frame is measured:
    flange; a wrist camera (parent ``flange``, eye-in-hand) looks at a board
    lying still in the cell. The record carries the live intrinsics (perception
    refuses a stream that no longer matches them) and the board's mount, which
-   ``calib.verify`` uses as ground truth.
+   its held-out grid and later ``calib.verify`` checks use as ground truth.
+   The fit and depth check must both pass before a new record is installed.
 2. ``calib.screws`` -- the same mount with no board at all: the arm moves one
    joint at a time, and the surfaces that joint carries must land where the
    firmware's own rotation says they went. See ``screw`` for why that is enough.
@@ -207,10 +208,10 @@ async def _observe(ctx: SkillContext, role: str) -> TargetObservation | None:
         raise
 
 
-async def _sweep(ctx: SkillContext, plan: SkillPlan) -> tuple[list[Sample], int]:
+async def _sweep(ctx: SkillContext, plan: SkillPlan) -> tuple[list[tuple[int, Sample]], int]:
     """Visit every target; observe the board at the first ``basis.samples`` of them."""
     count, settle = int(plan.basis["samples"]), float(plan.basis["settle_s"])
-    seen: list[Sample] = []
+    seen: list[tuple[int, Sample]] = []
     skipped = 0
     for index, target in enumerate(plan.targets):
         await ctx.motion.move_tcp(target, speed_pct=plan.limits.get("speed_pct"))
@@ -228,8 +229,57 @@ async def _sweep(ctx: SkillContext, plan: SkillPlan) -> tuple[list[Sample], int]
         if observation is None:
             skipped += 1
             continue
-        seen.append((after, observation))
+        seen.append((index, (after, observation)))
     return seen, skipped
+
+
+def _target_scale(ctx: SkillContext, seen: TargetObservation) -> float | None:
+    """Screen gross depth/PnP disagreement without claiming a metrological result."""
+    scale = seen.depth_scale
+    if scale is not None and abs(scale - 1.0) > ctx.workcell.calibration["max_target_scale_error"]:
+        target = ctx.workcell.calibration_target
+        square, marker = float(target["square_mm"]), float(target["marker_mm"])
+        raise SkillError(
+            FAILURE_CHECK_FAILED,
+            f"depth and the declared board disagree by a scale of {scale:.2f}x "
+            f"(square_mm={square:g}, marker_mm={marker:g}); measure the physical board "
+            f"with a ruler. If printing caused the mismatch, its estimated dimensions "
+            f"are {square * scale:.1f}/{marker * scale:.1f} mm. Reprint at actual size or "
+            "correct the declaration and reload; also check depth alignment and intrinsics",
+        )
+    return scale
+
+
+def _planning_scales(ctx: SkillContext) -> tuple[float, ...]:
+    accept = ctx.workcell.calibration
+    count, floor = int(accept["ring_attempts"]), float(accept["min_ring_scale"])
+    return tuple(1.0 - (1.0 - floor) * i / max(1, count - 1) for i in range(count))
+
+
+def _ring_targets(
+    ctx: SkillContext, start: Pose, pivot: Vec3, args: Mapping[str, Any],
+) -> tuple[list[Pose], dict[str, Any], float, int]:
+    accept = ctx.workcell.calibration
+    tilt = min(float(args["tilt_deg"]), ctx.workcell.tool_cone_deg - tool_cone_deg(start))
+    if tilt < accept["min_tilt_deg"]:
+        raise SkillError(
+            FAILURE_UNREACHABLE,
+            f"the tool may tilt only {max(tilt, 0.0):.1f} deg more here (tool_cone_deg "
+            f"{ctx.workcell.tool_cone_deg:.0f}); start with the tool closer to straight down",
+        )
+    count = int(args["poses"])
+    required = max(int(accept["min_hand_eye_poses"]), count // 2)
+    for scale in _planning_scales(ctx):
+        effective = {**args, **{key: float(args[key]) * scale for key in ("yaw_deg", "spread_mm", "lift_mm")},
+                     "tilt_deg": max(float(accept["min_tilt_deg"]), tilt * scale)}
+        targets, reason = _reachable(ctx, _ring(start, pivot, count, tilt=effective["tilt_deg"], args=effective))
+        if len(targets) >= required:
+            return targets, effective, scale, required
+    raise SkillError(
+        FAILURE_OUT_OF_WORKSPACE,
+        f"only {len(targets)} of {count} calibration poses are reachable (need {required}): "
+        f"{reason}. Start nearer the middle of the bootstrap box, or lower spread_mm / tilt_deg",
+    )
 
 
 # ── calib.handeye ────────────────────────────────────────────────────────────
@@ -240,14 +290,15 @@ class HandEye:
 
     spec = SkillSpec(
         skill_id="calib.handeye",
-        version="1.2.0",
+        version="1.3.0",
         card=(
-            "Calibrate where the camera sits (hand-eye). The workcell's calibration board "
+            "Calibrate and verify where the camera sits (hand-eye). The workcell's calibration board "
             "must be in view: held in the gripper or fixed to the flange for a fixed camera, "
             "lying still in the cell for a wrist camera. The arm visits `poses` poses "
             "around the current one -- tilted up to tilt_deg, yawed up to yaw_deg, shifted "
             "up to spread_mm -- slowly, observing the board at each, then returns. Start "
-            "with the board centred in the image. Run calib.verify afterwards."
+            "with the board centred in the image. A separate grid measures depth accuracy "
+            "before the calibration is installed; keep the board in the same mount."
         ),
         args_schema={
             "type": "object",
@@ -256,6 +307,7 @@ class HandEye:
                 "tilt_deg": _number(5, 30, 15.0),
                 "yaw_deg": _number(0, 60, 30.0),
                 "spread_mm": _number(0, 80, 30.0),
+                "verify_spacing_mm": _number(10, 80, 40.0),
                 "lift_mm": _number(0, 50, 15.0),
                 "camera": {"type": "string", "pattern": "^camera(\\.[a-z0-9_]+)*$", "default": CAMERA_FRAME},
                 "settle_s": _number(0, 5, 0.5),
@@ -266,7 +318,7 @@ class HandEye:
         requires=(f"{REQUIRE_ROLE}arm",),
         consent=CONSENT_EACH_RUN,
         region=REGION_BOOTSTRAP_UNTIL_MEASURED,
-        provides=(f"{REQUIRE_CALIBRATION}{{camera}}",),
+        provides=(f"{REQUIRE_CALIBRATION}{{camera}}", f"{REQUIRE_RECORD}{{camera}}.verify"),
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
@@ -275,42 +327,30 @@ class HandEye:
         mounting = _mounting(ctx, role)
         state = await _ready_state(ctx)
         seen = await _vision(ctx, role).observe_target()
+        target_scale = _target_scale(ctx, seen)
         start = state.tcp
         if mounting == EYE_TO_HAND:
             pivot = start.position
         else:
             reach = norm(seen.center_in_camera)
             pivot = add(state.flange.position, [v * reach for v in state.flange.tool_axis])
-        tilt = min(float(args["tilt_deg"]), ctx.workcell.tool_cone_deg - tool_cone_deg(start))
-        if tilt < ctx.workcell.calibration["min_tilt_deg"]:
-            raise SkillError(
-                FAILURE_UNREACHABLE,
-                f"the tool may tilt only {max(tilt, 0.0):.1f} deg more here (tool_cone_deg "
-                f"{ctx.workcell.tool_cone_deg:.0f}); start with the tool closer to straight down",
-            )
-        count = int(args["poses"])
-        ring = _ring(start, pivot, count, tilt=tilt, args=args)
-        targets, reason = _reachable(ctx, ring)
+        targets, effective, ring_scale, required = _ring_targets(ctx, start, pivot, args)
         calibration = ctx.workcell.calibration
-        required = max(int(calibration["min_hand_eye_poses"]), count // 2)
-        if len(targets) < required:
-            raise SkillError(
-                FAILURE_OUT_OF_WORKSPACE,
-                f"only {len(targets)} of {count} calibration poses are reachable (need "
-                f"{required}): {reason}. Start nearer the middle of the bootstrap box, or "
-                "lower spread_mm / tilt_deg",
-            )
+        training = [_flange_at(state, pose).to_dict() for pose in targets]
+        grid, spacing = _heldout_grid(ctx, state, float(args["verify_spacing_mm"]), training)
         return SkillPlan(
             skill_id=self.spec.skill_id,
             args=args,
             summary=(
                 f"Hand-eye calibrate the {mounting.replace('_', '-')} camera: visit "
-                f"{len(targets)} poses (tilt up to {tilt:.0f} deg, yaw up to "
-                f"{float(args['yaw_deg']):.0f} deg) around {_fmt(pivot)} mm at "
+                f"{len(targets)} poses (tilt up to {effective['tilt_deg']:.0f} deg, yaw up to "
+                f"{effective['yaw_deg']:.0f} deg, ring scale {ring_scale:.0%}) around {_fmt(pivot)} mm at "
                 f"{float(args['speed_pct']):.0f}% speed, observing the board at each, then "
-                "return -- keep the area clear and the board still"
+                f"verify at {len(grid)} held-out points ({spacing:g} mm spacing), then return -- "
+                "keep the area clear and the board still"
+                + ("; board scale unchecked (no usable depth)" if target_scale is None else "")
             ),
-            targets=_with_return(ctx, targets, start),
+            targets=_with_return(ctx, targets + grid, start),
             limits={"speed_pct": float(args["speed_pct"])},
             basis={
                 "procedure": procedure,
@@ -319,8 +359,15 @@ class HandEye:
                 "mounting": mounting,
                 "start": start.to_dict(),
                 "settle_s": float(args["settle_s"]),
-                "samples": len(targets),
+                "samples": len(targets) + len(grid),
+                "training_samples": len(targets),
+                "ring_scale": ring_scale,
+                "effective_args": effective,
+                "verify_spacing_mm": spacing,
+                "target_scale": target_scale,
                 "required": required,
+                "max_p95_mm": calibration["max_verify_p95_mm"],
+                "max_rms_mm": calibration["max_verify_rms_mm"],
                 "max_translation_rms_mm": calibration["max_hand_eye_translation_rms_mm"],
                 "max_rotation_rms_deg": calibration["max_hand_eye_rotation_rms_deg"],
                 "seen": seen.to_dict(),
@@ -329,17 +376,21 @@ class HandEye:
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
         await _check_start(ctx, Pose.from_mapping(plan.basis["start"]))
-        seen, skipped = await _sweep(ctx, plan)
+        indexed, _ = await _sweep(ctx, plan)
+        training_count = int(plan.basis["training_samples"])
+        seen = [sample for index, sample in indexed if index < training_count]
+        heldout = [sample for index, sample in indexed if index >= training_count]
+        skipped = training_count - len(seen)
         required = int(plan.basis["required"])
         if len(seen) < required:
             raise _check_failed(
-                f"the board was seen in only {len(seen)} of {plan.basis['samples']} poses "
+                f"the board was seen in only {len(seen)} of {training_count} training poses "
                 f"(need {required}); keep it in view and lit evenly, or reduce tilt_deg",
                 problems=["board not seen often enough"],
                 skipped=skipped,
             )
         intrinsics = seen[0][1].intrinsics
-        if any(observation.intrinsics != intrinsics for _, observation in seen):
+        if any(observation.intrinsics != intrinsics for _, observation in seen + heldout):
             raise _check_failed(
                 "the camera stream changed during calibration; run it again",
                 problems=["intrinsics changed"],
@@ -353,10 +404,17 @@ class HandEye:
                 f"the observations disagree by {fit.translation_rms_mm:.2f} mm / "
                 f"{fit.rotation_rms_deg:.3f} deg rms (limits {limit_mm} mm / {limit_deg} deg); "
                 "check the board is rigid and did not slip, and its dimensions match "
-                "calibration_target",
+                f"calibration_target. {_fit_advice(plan)}",
                 problems=["fit residual above limit"],
                 fit=fit.to_dict(),
             )
+        training = [flange.to_dict() for flange, _ in seen]
+        if any(_overlaps_training(flange, training) for flange, _ in heldout):
+            raise _check_failed("verification repeated a training pose", problems=["not held-out"])
+        stats = _verification_stats(
+            ctx, plan, mount, target_mount, heldout,
+            int(plan.basis["samples"]) - training_count - len(heldout),
+        )
         reprojection = max(observation.reprojection_px for _, observation in seen)
         recorded_at = ctx.record_calibration(
             plan.basis["procedure"],
@@ -376,6 +434,9 @@ class HandEye:
                 "reprojection_px_max": round(reprojection, 3),
             },
         )
+        verified_at = _record_verification(
+            ctx, str(plan.basis["camera_role"]), recorded_at, plan, stats, heldout
+        )
         camera = mount.to_pose()
         return SkillOutcome.succeeded(
             {
@@ -385,14 +446,26 @@ class HandEye:
                 "samples": len(seen),
                 "skipped": skipped,
                 "recorded_at": recorded_at,
+                "verification": {**stats, "recorded_at": verified_at},
             },
             message=(
                 f"The camera sits at {_fmt(camera.position)} mm in the "
                 f"{'base' if mounting == EYE_TO_HAND else 'flange'} frame "
                 f"({fit.translation_rms_mm:.2f} mm / {fit.rotation_rms_deg:.3f} deg rms over "
-                f"{len(seen)} poses). Run calib.verify to measure perception accuracy."
+                f"{len(seen)} poses); held-out depth accuracy is {stats['p95_mm']:.1f} mm "
+                "at p95. calib.verify can recheck this version later."
             ),
         )
+
+
+def _fit_advice(plan: SkillPlan) -> str:
+    schema = HandEye.spec.args_schema["properties"]
+    effective = plan.basis["effective_args"]
+    poses = min(schema["poses"]["maximum"], int(plan.args["poses"]) + schema["poses"]["minimum"] // 2)
+    settle = min(schema["settle_s"]["maximum"], max(schema["settle_s"]["default"], float(plan.args["settle_s"])) * 2)
+    return (f"After checking the setup, consider poses={poses}, settle_s={settle:g}, "
+            f"tilt_deg={effective['tilt_deg']:g}, yaw_deg={effective['yaw_deg']:g}; "
+            "no automatic retry is attempted")
 
 
 def _rotation_about(axis_deg: float, tilt_deg: float) -> Mat3:
@@ -900,7 +973,9 @@ class Screws:
             message=(
                 f"The camera sits at {_fmt(camera.position)} mm in the base frame, measured "
                 f"without a board from {len(fit.joints)} joints; the worst of them "
-                f"({worst.label}) leaves {worst.shift_gap_mm:.1f} mm unexplained"
+                f"({worst.label}) leaves {worst.shift_gap_mm:.1f} mm unexplained. "
+                "Accuracy is not yet verified; calib.attest can check this frame against "
+                "an independently verified reference."
             ),
         )
 
@@ -1370,6 +1445,78 @@ def _spread_marks(count: int, marked: int) -> list[bool]:
     return flags
 
 
+def _flange_at(state: ArmState, pose: Pose) -> Pose:
+    tcp_to_flange = Transform.from_pose(state.tcp).inverse().compose(Transform.from_pose(state.flange))
+    return Transform.from_pose(pose).compose(tcp_to_flange).to_pose()
+
+
+def _heldout_grid(
+    ctx: SkillContext, state: ArmState, spacing: float,
+    training: Sequence[Mapping[str, Any]], count: int = 9,
+) -> tuple[list[Pose], float]:
+    needed = int(ctx.workcell.calibration["min_verify_points"])
+    minimum = VerifyCamera.spec.args_schema["properties"]["spacing_mm"]["minimum"]
+    for scale in _planning_scales(ctx):
+        actual = max(minimum, spacing * scale)
+        grid = [
+            state.tcp.translated(dx * actual * (1 if row % 2 == 0 else -1), dy * actual)
+            for row, dy in enumerate((-1, 0, 1)) for dx in (-1, 0, 1)
+        ]
+        heldout = [pose for pose in grid[:count] if not _overlaps_training(_flange_at(state, pose), training)]
+        targets, reason = _reachable(ctx, heldout)
+        if len(targets) >= needed:
+            return targets, actual
+    raise SkillError(
+        FAILURE_OUT_OF_WORKSPACE,
+        f"only {len(targets)} of {len(grid)} held-out grid points are reachable (need "
+        f"{needed}): {reason}. Start nearer the middle, or lower spacing_mm",
+    )
+
+
+def _verification_stats(
+    ctx: SkillContext, plan: SkillPlan, mount: Transform, target_mount: Transform,
+    seen: Sequence[Sample], skipped: int,
+) -> dict[str, Any]:
+    depth, pnp = _errors(plan.basis["mounting"], mount, target_mount, seen)
+    stats = {
+        **_stats(depth, prefix=""), **_stats(pnp, prefix="pnp_"),
+        "points": len(depth), "skipped": skipped, "no_depth": len(seen) - len(depth),
+        "errors_mm": depth,
+    }
+    needed = int(ctx.workcell.calibration["min_verify_points"])
+    if len(depth) < needed:
+        raise _check_failed(
+            f"the board centre was measured at only {len(depth)} points (need {needed}); "
+            "keep the board in view and check the depth stream",
+            problems=["too few measurements"], **stats,
+        )
+    limit, rms_limit = float(plan.basis["max_p95_mm"]), float(plan.basis["max_rms_mm"])
+    if stats["p95_mm"] > limit or stats["rms_mm"] > rms_limit:
+        raise _check_failed(
+            f"the camera is off by {stats['p95_mm']:.1f} mm at p95 / "
+            f"{stats['rms_mm']:.1f} mm RMS (limits {limit} / {rms_limit} mm, "
+            f"PnP-only {stats['pnp_p95_mm']:.1f} mm); check board dimensions and mounting "
+            "before running calib.handeye again",
+            problems=["accuracy above limit"], **stats,
+        )
+    return stats
+
+
+def _record_verification(
+    ctx: SkillContext, role: str, version: float, plan: SkillPlan,
+    stats: Mapping[str, Any], seen: Sequence[Sample],
+) -> float:
+    return ctx.record_calibration(
+        f"{role}.verify",
+        parameters={
+            **stats, "camera_role": role, "max_p95_mm": plan.basis["max_p95_mm"],
+            "max_rms_mm": plan.basis["max_rms_mm"], "depends_on": {role: version},
+            "heldout_poses": [flange.to_dict() for flange, _ in seen],
+            "training_disjoint": True,
+        },
+    )
+
+
 # ── calib.verify ─────────────────────────────────────────────────────────────
 
 
@@ -1380,7 +1527,7 @@ class VerifyCamera:
         skill_id="calib.verify",
         version="1.2.0",
         card=(
-            "Measure camera accuracy after calib.handeye, with the calibration board "
+            "Recheck an already verified camera calibration, with the calibration board "
             "mounted exactly as it was then. The arm moves over a 3 x 3 grid spacing_mm "
             "apart around the current pose; at each stop the arm predicts the board "
             "centre and the camera measures it through depth -- the chain perceive.locate "
@@ -1414,29 +1561,10 @@ class VerifyCamera:
             )
         state = await _ready_state(ctx)
         seen = await _vision(ctx, role).observe_target()
+        target_scale = _target_scale(ctx, seen)
         start, spacing = state.tcp, float(args["spacing_mm"])
-        grid = [
-            start.translated(dx * spacing * (1 if row % 2 == 0 else -1), dy * spacing)
-            for row, dy in enumerate((-1, 0, 1))
-            for dx in (-1, 0, 1)
-        ]
         training = ctx.frames.parameters(role).get("training_poses", [])
-        tcp_to_flange = Transform.from_pose(state.tcp).inverse().compose(
-            Transform.from_pose(state.flange)
-        )
-        heldout = []
-        for pose in grid[:int(args.get("poses", 9))]:
-            flange = Transform.from_pose(pose).compose(tcp_to_flange).to_pose()
-            if not _overlaps_training(flange, training):
-                heldout.append(pose)
-        targets, reason = _reachable(ctx, heldout)
-        needed = int(ctx.workcell.calibration["min_verify_points"])
-        if len(targets) < needed:
-            raise SkillError(
-                FAILURE_OUT_OF_WORKSPACE,
-                f"only {len(targets)} of {len(grid)} grid points are reachable (need "
-                f"{needed}): {reason}. Start nearer the middle, or lower spacing_mm",
-            )
+        targets, spacing = _heldout_grid(ctx, state, spacing, training, int(args["poses"]))
         return SkillPlan(
             skill_id=self.spec.skill_id,
             args=args,
@@ -1444,6 +1572,7 @@ class VerifyCamera:
                 f"Verify the camera: visit {len(targets)} points {spacing:.0f} mm apart around "
                 f"{_fmt(start.position)} mm at {float(args['speed_pct']):.0f}% speed, comparing "
                 "the board centre the arm predicts with the one the camera measures"
+                + ("; board scale unchecked (no usable depth)" if target_scale is None else "")
             ),
             targets=_with_return(ctx, targets, start),
             limits={"speed_pct": float(args["speed_pct"])},
@@ -1457,6 +1586,8 @@ class VerifyCamera:
                 "max_rms_mm": ctx.workcell.calibration["max_verify_rms_mm"],
                 "seen": seen.to_dict(),
                 "depends_on": {role: ctx.frames.versions[role]},
+                "target_scale": target_scale,
+                "spacing_mm": spacing,
             },
         )
 
@@ -1467,50 +1598,20 @@ class VerifyCamera:
         target_mount = ctx.frames.parameters(role).get("target_mount")
         if mount is None or target_mount is None:
             raise SkillError(FAILURE_PLAN_STALE, "the camera calibration changed; plan again")
-        seen, skipped = await _sweep(ctx, plan)
+        indexed, skipped = await _sweep(ctx, plan)
+        seen = [sample for _, sample in indexed]
         training = ctx.frames.parameters(role).get("training_poses", [])
         if any(_overlaps_training(flange, training) for flange, _ in seen):
             raise _check_failed("verification repeated a training pose", problems=["not held-out"])
-        depth, pnp = _errors(
-            plan.basis["mounting"], mount, Transform.from_matrix(target_mount), seen
-        )
-        stats = {
-            **_stats(depth, prefix=""),
-            **_stats(pnp, prefix="pnp_"),
-            "points": len(depth),
-            "skipped": skipped,
-            "no_depth": len(seen) - len(depth),
-        }
-        needed = int(ctx.workcell.calibration["min_verify_points"])
-        if len(depth) < needed:
-            raise _check_failed(
-                f"the board centre was measured at only {len(depth)} points (need "
-                f"{needed}); keep the board in view and check the depth stream",
-                problems=["too few measurements"],
-                **stats,
-            )
-        limit = float(plan.basis["max_p95_mm"])
-        rms_limit = float(plan.basis["max_rms_mm"])
-        if stats["p95_mm"] > limit or stats["rms_mm"] > rms_limit:
-            raise _check_failed(
-                f"the camera is off by {stats['p95_mm']:.1f} mm at p95 / "
-                f"{stats['rms_mm']:.1f} mm RMS (limits {limit} / {rms_limit} mm, "
-                f"PnP-only {stats['pnp_p95_mm']:.1f} mm); run calib.handeye again",
-                problems=["accuracy above limit"],
-                **stats,
-            )
-        recorded_at = ctx.record_calibration(
-            f"{role}.verify",
-            parameters={**stats, "camera_role": role, "max_p95_mm": limit,
-                        "max_rms_mm": plan.basis["max_rms_mm"], "depends_on": plan.basis["depends_on"],
-                        "heldout_poses": [flange.to_dict() for flange, _ in seen],
-                        "errors_mm": depth, "training_disjoint": True},
+        stats = _verification_stats(ctx, plan, mount, Transform.from_matrix(target_mount), seen, skipped)
+        recorded_at = _record_verification(
+            ctx, role, float(plan.basis["depends_on"][role]), plan, stats, seen
         )
         return SkillOutcome.succeeded(
             {**stats, "recorded_at": recorded_at},
             message=(
                 f"The camera measures within {stats['p95_mm']:.1f} mm at p95 "
-                f"(max {stats['max_mm']:.1f} mm over {len(depth)} points)"
+                f"(max {stats['max_mm']:.1f} mm over {stats['points']} points)"
             ),
         )
 
@@ -1518,7 +1619,11 @@ class VerifyCamera:
 def _overlaps_training(flange: Pose, training: Sequence[Mapping[str, Any]]) -> bool:
     for value in training:
         pose = Pose.from_mapping(value)
-        if flange.distance_mm(pose) < 1e-6 and flange.rotation_to_deg(pose) < 1e-6:
+        # Stored poses use Pose.to_dict precision; an identical capture must
+        # still match after that serialization, not fall through its rounding gap.
+        if flange.to_dict() == pose.to_dict() or (
+            flange.distance_mm(pose) < 1e-6 and flange.rotation_to_deg(pose) < 1e-6
+        ):
             return True
     return False
 

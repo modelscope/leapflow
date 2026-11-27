@@ -291,6 +291,7 @@ def test_an_installed_candidate_is_no_longer_on_offer(store: _Store) -> None:
     wrist = _verified_wrist(store)
     candidate = _candidate({WRIST: wrist}, 3.0)
     store.put(FIXED_PROC, {"method": METHOD_CANDIDATE_PROMOTION, "depends_on": {WRIST: wrist},
+                           "achieved_accuracy": candidate.achieved.to_dict(),
                            "promotion": {"candidate_digest": candidate.digest,
                                          "matrix": [list(r) for r in candidate.matrix]}},
               candidate.matrix)
@@ -312,6 +313,34 @@ def test_a_malformed_frame_accuracy_is_refused_at_admission(accuracy: Any) -> No
 def test_an_undeclared_accuracy_keeps_the_declaration_digest_stable() -> None:
     frames = {FIXED: {"parent": "base", "procedure": FIXED_PROC}}
     assert "accuracy" not in _cell(frames=frames).to_dict()["frames"][FIXED]
+
+
+@pytest.mark.parametrize("mounted", [False, True])
+def test_unknown_accuracy_only_blocks_device_frames(store: _Store, mounted: bool) -> None:
+    name = FIXED if mounted else "tcp"
+    spec = _cell(roles={"arm": "arm0", **({FIXED: "cam_fixed"} if mounted else {})},
+                 frames={name: {"parent": "base", "procedure": "mount"}})
+    version = store.put("mount", {"target_mount": IDENTITY} if mounted else {}, IDENTITY)
+    frames = FrameGraph.snapshot(spec, store.store)
+    assert frames.diagnosis(name).status is (FrameStatus.INSUFFICIENT_ACCURACY if mounted else FrameStatus.VALID)
+    if mounted:
+        assert frames.transform(name) is None
+        assert frames.measured(name) is not None
+        assert "checked independently" in unmet_requirements((f"calib:{name}",), spec, frames)[0]
+        store.put(f"{name}.verify", {"p95_mm": 2, "training_disjoint": True, "depends_on": {name: version}})
+        checked = FrameGraph.snapshot(spec, store.store)
+        assert checked.diagnosis(name).ok and checked.diagnosis(name).achieved == Accuracy(2)
+
+
+def test_unknown_accuracy_has_a_safe_readiness_remedy(store: _Store) -> None:
+    store.put(FIXED_PROC, {"target_mount": IDENTITY}, FIXED_MOUNT.to_matrix())
+    _verified_wrist(store)
+    spec = _cell()
+    frames = FrameGraph.snapshot(spec, store.store)
+    readiness = WorkcellReadiness(_catalog(), spec, frames)
+    explained = readiness.explain(_requester(f"calib:{FIXED}"))
+    assert not explained.ready and explained.blockers[0].status == "insufficient_accuracy"
+    assert explained.next_steps[0].skill_id == "calib.attest"
 
 
 # ── Readiness ────────────────────────────────────────────────────────────────
@@ -623,7 +652,7 @@ def test_attestation_unknown_reference_accuracy_refuses_before_capture(store: _S
     store.put(WRIST_PROC, {"target_mount": IDENTITY}, WRIST_MOUNT.to_matrix())
     ctx = _Ctx(_cell(), store)
     ctx._views.clear()  # capture would fail if the reference gate did not run first
-    with pytest.raises(SkillError, match="known positive accuracy"):
+    with pytest.raises(SkillError, match="reference camera.wrist does not hold"):
         _attest(ctx, store)
     assert store.store.latest(CELL_ID, f"{FIXED}.verify") is None
 

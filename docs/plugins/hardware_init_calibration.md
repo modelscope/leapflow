@@ -8,9 +8,9 @@
 > `src/leapflow/security/permission_failures.py` (`build_readiness_failure`).
 > **Scope**: This document covers **one** pattern — declaring that a device must
 > reach a ready state (homed / initialized / calibrated) before a channel can be
-> commanded, and how that declaration is enforced fail-closed. It does **not**
-> describe a device state machine, calibration procedures, or persisted
-> calibration data; those are deliberately out of scope (see §6).
+> commanded, and how that declaration is enforced fail-closed. Section 8 adds an
+> operator quickstart for the governed calibration skills; those skills and their
+> versioned records remain separate from HCP interlocks (see §6).
 
 ---
 
@@ -512,17 +512,62 @@ boundary above.
 
 ---
 
-## 7. Out of scope (subsequent evolution)
+## 7. Boundary of the readiness-gating pattern
 
-This document covers **only** the readiness-gating pattern that ships today.
+HCP interlocks do not themselves implement a device state machine or procedure runner.
+The skill layer independently provides measured frames and governed calibration:
 
 | Capability | Status |
 |---|---|
 | Persisted calibration data (parameters, matrices, poses) | **Implemented — IC-7** (`CalibrationStore` in `instrument.duckdb`, versioned; `hw_describe` outputs `last_calibrated_at`) |
 | A full device state machine (`DevicePhase` / `CalibrationState`) | Not implemented — future (IC-5) |
 | Multi-step `Procedure` orchestration for init/homing/calibration | Not implemented — future (IC-8) |
-| Reference frames / pose representation | Not implemented — future (IC-10) |
+| Reference frames / pose representation | Implemented in `hardware/skills/frames.py` and `geometry.py`, outside HCP interlocks |
 
 Today, "readiness" is exactly a readable channel plus an interlock, backed by
 versioned calibration storage. There is no state-machine type and no procedure
 runner behind these primitives yet.
+
+## 8. Calibration quickstart (operator)
+
+1. Declare the workcell's camera roles, frame parents, `calibration_target`, and
+   conservative `bootstrap_box`. Use the owning node's workcell YAML for remote devices.
+   Export without opening hardware:
+   ```sh
+   leap hw board --workcell /path/to/workcell.yaml --out calibration-board.svg
+   ```
+   An id selects a workcell from this profile; omit it only when exactly one exists.
+   Export needs the existing OpenCV vision dependency; it never overwrites a file.
+2. Print at **100% / actual size**, not fit-to-page. Choose paper large enough for
+   the board, ruler, and margins. Measure the 100 mm ruler and a square with a real
+   ruler; mount the sheet flat on rigid backing. The SVG preserves the board's
+   declared size; its page includes a 10 mm quiet margin and labels.
+3. In the TUI, request `calib.bringup` → `calib.tcp` → `calib.workspace` using measured
+   tool/table dimensions. Every physical run retains its own preview and approval.
+4. Request `calib.handeye camera=<role>`. For a wrist camera, keep the board still
+   in the cell; for a fixed camera, mount it rigidly to the flange/gripper. Center
+   it in the image and clear the approved motion area. The preview includes the
+   fit ring, separate verification grid, speed, and return. Both fit and depth
+   checks must pass before new records are written. `calib.verify` later rechecks
+   a valid version with the same board mounting.
+5. A board-free `calib.screws` estimate does not prove accuracy. `calib.attest` can
+   check it against an independently verified camera; alternatively use hand-eye.
+   `calib.bridge` creates a shadow candidate, not a live frame. Promotion remains
+   explicitly governed; neither promotion nor approval bypasses accuracy requirements.
+
+| Refusal | Next step |
+|---|---|
+| Board scale disagreement | Measure the board; reprint or correct dimensions and govern a reload. Check depth alignment/intrinsics too. |
+| Board scale unchecked | No usable depth was available during preview; depth verification must still pass before installation. |
+| Too few reachable poses | Planning tries bounded smaller rings/grids; if still refused, reposition nearer the safe region center. No exploratory motion occurs. |
+| `insufficient_accuracy` / accuracy never checked | Re-run combined hand-eye or attest against a verified reference. Old records without a bound/check no longer enable metric perception. |
+| Stale dependency or changed intrinsics | Re-measure the changed component, then restore dependent calibration. A missing result is not replaced by nominal geometry. |
+
+Workcell `calibration` controls `max_target_scale_error` (default 0.05),
+`min_ring_scale` (0.5), and `ring_attempts` (3); attempts are bounded and do not
+relax fit/verification gates. No blind physical retries are added.
+Observed wrist depth p95 has been roughly 2–3 mm in a particular setup, not a
+universal guarantee or an absolute accuracy certificate. Fixed-camera bridge
+uncertainty can be tens of millimeters when reference rotation errors are
+amplified by a long lever arm, even with small hold-out residuals. Report the
+measured result and required limit; do not widen limits merely to accept a run.

@@ -22,9 +22,11 @@ with the arm's prediction so the accuracy it reports is the one ``locate`` gets.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import math
 from dataclasses import dataclass
+from html import escape
 from typing import Any, Mapping
 
 from leapflow.hardware.rgbd import FrameSource, RgbdFrame
@@ -178,6 +180,66 @@ class BoardDetection:
                       "marker_points": tuple(tuple(tuple(p) for p in row) for row in data["marker_points"])})
 
 
+def _charuco_board(target: CharucoTarget) -> Any:
+    """One geometry definition for printing and detection; OpenCV stays lazy."""
+    import cv2
+
+    aruco = getattr(cv2, "aruco", None)
+    if aruco is None or not hasattr(aruco, "CharucoBoard"):
+        raise ImportError("this OpenCV build has no cv2.aruco.CharucoBoard")
+    code = getattr(aruco, target.dictionary, None)
+    if not isinstance(code, int):
+        raise ValueError(f"OpenCV knows no ArUco dictionary {target.dictionary!r}")
+    board = aruco.CharucoBoard(
+        (target.squares_x, target.squares_y), target.square_mm, target.marker_mm,
+        aruco.getPredefinedDictionary(code),
+    )
+    board.setLegacyPattern(target.legacy)
+    return board
+
+
+def charuco_svg(target: CharucoTarget, px_per_mm: float = 10) -> str:
+    """Printable millimeter-sized board with a quiet margin and a 100 mm ruler.
+
+    Page dimensions include the margin and labels; the embedded board retains
+    exactly the declared physical size. Print at 100%, never fit to page.
+    """
+    import cv2
+
+    if not math.isfinite(px_per_mm) or px_per_mm <= 0:
+        raise ValueError("px_per_mm must be positive and finite")
+    width, height = target.squares_x * target.square_mm, target.squares_y * target.square_mm
+    size = (round(width * px_per_mm), round(height * px_per_mm))
+    if min(size) < 1 or size[0] * size[1] > 16_000_000:
+        raise ValueError("board raster must contain 1 to 16000000 pixels; reduce px_per_mm")
+    try:
+        image = _charuco_board(target).generateImage(size, marginSize=0)
+        ok, encoded = cv2.imencode(".png", image)
+    except cv2.error as exc:
+        raise ValueError(f"cannot render this ChArUco board: {exc}") from exc
+    if not ok:
+        raise ValueError("OpenCV could not encode the board PNG")
+    data = base64.b64encode(encoded.tobytes()).decode("ascii")
+    page_width, page_height = max(width, 100) + 20, height + 45
+    ruler_y = height + 20
+    labels = (
+        "Print at 100% / actual size. Measure the 100 mm ruler.",
+        f"Square {target.square_mm:g} mm; marker {target.marker_mm:g} mm",
+        f"{target.dictionary}; legacy={str(target.legacy).lower()}",
+    )
+    text = "".join(f'<text x="10" y="{height + 29 + i * 5:g}" font-size="3">{escape(label)}</text>'
+                   for i, label in enumerate(labels))
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{page_width:g}mm" height="{page_height:g}mm" '
+        f'viewBox="0 0 {page_width:g} {page_height:g}">'
+        f'<rect width="100%" height="100%" fill="white"/>'
+        f'<image x="10" y="10" width="{width:g}" height="{height:g}" '
+        f'preserveAspectRatio="none" href="data:image/png;base64,{data}"/>'
+        f'<path d="M10 {ruler_y - 2:g}v4m0 -2h100m0 -2v4" fill="none" stroke="black" stroke-width="0.3"/>'
+        f'{text}</svg>\n'
+    )
+
+
 def detect_board(frame: RgbdFrame, target: CharucoTarget) -> BoardDetection | None:
     """Find *target* in *frame*; None when too few corners (or only one row) are seen.
 
@@ -190,17 +252,7 @@ def detect_board(frame: RgbdFrame, target: CharucoTarget) -> BoardDetection | No
     aruco = getattr(cv2, "aruco", None)
     if aruco is None or not hasattr(aruco, "CharucoDetector"):
         raise ImportError("this OpenCV build has no cv2.aruco.CharucoDetector")
-    code = getattr(aruco, target.dictionary, None)
-    if not isinstance(code, int):
-        raise ValueError(f"OpenCV knows no ArUco dictionary {target.dictionary!r}")
-    board = aruco.CharucoBoard(
-        (target.squares_x, target.squares_y),
-        target.square_mm,
-        target.marker_mm,
-        aruco.getPredefinedDictionary(code),
-    )
-    if target.legacy:
-        board.setLegacyPattern(True)
+    board = _charuco_board(target)
     image = np.frombuffer(frame.color, dtype=np.uint8).reshape(frame.height, frame.width, 3)
     try:
         corners, ids, marker_corners, marker_ids = aruco.CharucoDetector(board).detectBoard(
@@ -507,6 +559,7 @@ __all__ = [
     "BoardDetection",
     "CharucoTarget",
     "WorkcellVision",
+    "charuco_svg",
     "cloud_points",
     "depth_point",
     "detect_board",

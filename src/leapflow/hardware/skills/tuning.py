@@ -89,6 +89,10 @@ DEFAULT_CALIBRATION: Mapping[str, float] = {
     "start_drift_deg": 2.0,
     "min_hand_eye_poses": 6.0,
     "min_tilt_deg": 5.0,
+    # Coarse print-scale screening and bounded, planning-only feasibility search.
+    "max_target_scale_error": 0.05,
+    "min_ring_scale": 0.5,
+    "ring_attempts": 3.0,
     "max_hand_eye_translation_rms_mm": 3.0,
     "max_hand_eye_rotation_rms_deg": 0.5,
     "min_verify_points": 5.0,
@@ -200,6 +204,10 @@ def tuned(raw: Any, name: str, defaults: Mapping[str, float]) -> dict[str, float
         if key in {"reach_continuity_rounds", "reach_refine_rounds", "reach_envelope_yaw_samples"}:
             if not values[str(key)].is_integer() or values[str(key)] > 16:
                 raise ValueError(f"{name}.{key} must be an integer from 1 to 16")
+        if key in {"max_target_scale_error", "min_ring_scale"} and values[str(key)] > 1:
+            raise ValueError(f"{name}.{key} must be at most 1")
+        if key == "ring_attempts" and (not values[str(key)].is_integer() or values[str(key)] > 16):
+            raise ValueError(f"{name}.{key} must be an integer from 1 to 16")
         if key == "reach_envelope_timeout_s" and values[str(key)] > REACH_ENVELOPE_MAX_TIMEOUT_S:
             raise ValueError(
                 f"{name}.{key} must be at most {REACH_ENVELOPE_MAX_TIMEOUT_S:g} seconds; "

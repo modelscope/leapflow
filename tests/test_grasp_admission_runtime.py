@@ -126,16 +126,21 @@ async def admission_rig(tmp_path: Path, rigs: Any, monkeypatch: Any) -> Any:
     monkeypatch.setattr(
         registry, "context", lambda device: declarations.get(device) or original_context(device)
     )
+    # A standalone bound keeps overview geometry available while the separate
+    # overview holdout record is deliberately absent in inspection tests.
     registry.calibrate(
         "camera.handeye",
         pose=Pose(0, 0, 0).to_dict(),
-        parameters={"target_mount": IDENTITY_MATRIX},
+        parameters={"target_mount": IDENTITY_MATRIX, "achieved_accuracy": {"translation_mm": .5}},
     )
-    registry.calibrate(
+    wrist_version = registry.calibrate(
         "wrist.handeye",
         pose=Pose(0, 0, 120).to_dict(),
         parameters={"target_mount": IDENTITY_MATRIX},
     )
+    registry.calibrate("camera.wrist.verify", parameters={
+        "training_disjoint": True, "p95_mm": .5, "depends_on": {"camera.wrist": wrist_version},
+    })
     registry.calibrate(
         "workspace.safe_box",
         parameters={**SAFE_BOX, "floor": {"method": "table_z", "table_z": 140}},

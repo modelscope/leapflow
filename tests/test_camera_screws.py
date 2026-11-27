@@ -39,6 +39,7 @@ from leapflow.hardware.skills.builtin.camera_calibration import (
     Screws,
     skills as camera_skills,
 )
+from leapflow.hardware.skills.frame_status import FrameStatus
 from leapflow.hardware.skills.frames import FrameGraph
 from leapflow.hardware.skills.geometry import (
     Pose,
@@ -532,8 +533,12 @@ async def test_screws_measures_the_mount_it_is_shown(
     # The arm went back to where it started between swings and at the end.
     assert sim.arm.flange.distance_mm(flange) < 0.01
 
-    measured = _frames(runtime).transform("camera")
-    assert measured is not None, "the gate refused a record the skill just wrote"
+    frames = _frames(runtime)
+    assert frames.transform("camera") is None
+    assert frames.diagnosis("camera").status is FrameStatus.INSUFFICIENT_ACCURACY
+    assert "calib.attest" in outcome.message
+    measured = frames.measured("camera")
+    assert measured is not None, "the solver result remains available for verification"
     assert norm(sub(measured.translation, true_mount().translation)) < 5.0
     assert rotation_distance_deg(measured.rotation, true_mount().rotation) < 1.0
 
@@ -637,7 +642,8 @@ async def test_screws_accepts_a_mount_it_is_given(
     runtime, sim = _cell(tmp_path, monkeypatch, sim=SimCell(mount=other))
     outcome = await _run(runtime, FAST)
     assert outcome.ok, outcome
-    measured = _frames(runtime).transform("camera")
+    assert _frames(runtime).transform("camera") is None
+    measured = _frames(runtime).measured("camera")
     assert measured is not None and sim.captures == 7
     assert norm(sub(measured.translation, other.translation)) < 5.0
     assert rotation_distance_deg(measured.rotation, other.rotation) < 1.0

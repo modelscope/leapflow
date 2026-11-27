@@ -55,6 +55,7 @@ from leapflow.hardware.skills.workcell import WorkcellError, WorkcellSpec
 from tests._harness.skill_stubs import (
     CAMERA_ID,
     CAMERA_POSE,
+    IDENTITY_MATRIX,
     LOCATOR_ID,
     PERCEPTION_WORKCELL_YAML,
     SIM_INTRINSICS,
@@ -655,7 +656,7 @@ WRIST_YAML: dict[str, Any] = {
     "frames": {
         **SHARED_YAML["frames"],
         "camera": {"parent": "base", "procedure": "global.handeye"},
-        "camera.wrist": {"parent": "base", "procedure": "camera.handeye"},
+        "camera.wrist": {"parent": "base", "procedure": "wrist.handeye"},
     },
 }
 
@@ -663,6 +664,12 @@ WRIST_YAML: dict[str, Any] = {
 def _wrist_cell(tmp_path: Path) -> SkillNodeRegistry:
     registry = _calibrated(tmp_path, CUP)
     registry.devices[WRIST_ID] = SimRgbdCamera([CUP])
+    version = registry.calibrate("wrist.handeye", pose=CAMERA_POSE, parameters={
+        "target_mount": IDENTITY_MATRIX, "intrinsics": SIM_INTRINSICS.to_dict(),
+    })
+    registry.calibrate("camera.wrist.verify", parameters={
+        "training_disjoint": True, "p95_mm": .5, "depends_on": {"camera.wrist": version},
+    })
     return registry
 
 

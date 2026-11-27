@@ -175,7 +175,10 @@ def test_a_record_naming_a_method_without_its_evidence_is_not_a_calibration(
         frames = FrameGraph.snapshot(spec, registry.calibration_store)
         stale = frames.stale.get("camera", "")
         assert reason in stale, (evidence, stale)
-        assert (frames.transform("camera") is not None) is (reason == "")
+        assert frames.transform("camera") is None
+        if not reason:
+            assert frames.diagnosis("camera").status is FrameStatus.INSUFFICIENT_ACCURACY
+            assert frames.measured("camera") is not None
         assert record
 
 
@@ -207,6 +210,9 @@ def test_frames_resolve_from_the_latest_calibration_preferring_a_matrix(tmp_path
             parameters={"target_mount": IDENTITY_MATRIX},
         )
     )
+    registry.calibrate("camera.verify", parameters={
+        "training_disjoint": True, "p95_mm": .5, "depends_on": {"camera": 3.0},
+    })
     frames = FrameGraph.snapshot(spec, store)
     tcp, camera = frames.transform("tcp"), frames.transform("camera")
     assert tcp is not None and tcp.to_pose().z == pytest.approx(120)
@@ -310,12 +316,22 @@ def test_camera_frames_resolve_independent_mount_versions(tmp_path: Path) -> Non
                        pose={"x": 500., "y": 0., "z": 0.}, recorded_at=1.)
     registry.calibrate("handeye.eye_in_hand", parameters=mount,
                        pose={"x": 60., "y": 0., "z": 0.}, recorded_at=2.)
+    for role, version in (("camera", 1.), ("camera.wrist", 2.)):
+        registry.calibrate(f"{role}.verify", parameters={
+            "training_disjoint": True, "p95_mm": .5, "depends_on": {role: version},
+        })
     frames = FrameGraph.snapshot(spec, registry.calibration_store)
     assert frames.transform("camera").translation == (500., 0., 0.)
     assert frames.transform("camera.wrist").translation == (60., 0., 0.)
     assert frames.versions == {"camera": 1., "camera.wrist": 2.}
     registry.calibrate("handeye.eye_in_hand", parameters=mount,
                        pose={"x": 61., "y": 0., "z": 0.}, recorded_at=3.)
+    unchecked = FrameGraph.snapshot(spec, registry.calibration_store)
+    assert unchecked.transform("camera.wrist") is None
+    assert unchecked.diagnosis("camera.wrist").status is FrameStatus.INSUFFICIENT_ACCURACY
+    registry.calibrate("camera.wrist.verify", parameters={
+        "training_disjoint": True, "p95_mm": .5, "depends_on": {"camera.wrist": 3.},
+    })
     assert FrameGraph.snapshot(spec, registry.calibration_store).versions == {
         "camera": 1., "camera.wrist": 3.,
     }

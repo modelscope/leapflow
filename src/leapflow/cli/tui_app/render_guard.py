@@ -33,9 +33,9 @@ The terminal must then *split* each such glyph (replace it with two blanks
 before writing). macOS Terminal.app's split routine miscomputes the tail
 length in its UTF-8 line storage and ``memmove``s a negative length off the
 heap, killing every Terminal window (SIGBUS in ``_platform_memmove`` called
-from its tty output handler). Typing or pasting at the end of a draft never
-splits a glyph; editing, history recall, and auto-suggest updates do so
-hundreds of times per second.
+from its tty output handler). Appending is not inherently safe: overflow
+scrolls existing rows, and Terminal's uncommitted IME text can extend beyond
+what the previous Screen knows about.
 
 The guard removes the operation altogether. Before prompt_toolkit's own
 diff runs, every row whose previous content holds a double-width glyph at or
@@ -46,12 +46,19 @@ cells, so no write ever lands on part of an existing wide glyph. It also
 blanks any wide glyph whose right half cannot be drawn (last column, or
 covered by a float), which would otherwise leave the terminal and the
 renderer disagreeing about the row.
+
+On Apple Terminal, clear a changed previous cursor row from column zero,
+including when the old Screen has no wide cells. Erasing from an interior
+column assumes that column is also a glyph boundary in Terminal's untracked
+marked text. The input viewport also leaves right-margin composition space
+on that terminal. Neither mitigation can observe native IME state.
 """
 
 from __future__ import annotations
 
 import inspect
 import logging
+import os
 from typing import Any, Callable
 
 from prompt_toolkit.data_structures import Point, Size
@@ -76,6 +83,11 @@ _EXPECTED_PARAMS = (
     "size",
     "previous_width",
 )
+
+
+def uses_apple_terminal() -> bool:
+    """Whether the host terminal advertises Apple's Terminal.app."""
+    return os.environ.get("TERM_PROGRAM") == "Apple_Terminal"
 
 
 def blank_undrawable_wide_glyphs(screen: Screen, size: Size) -> int:
@@ -189,25 +201,31 @@ def erase_misaligned_wide_tails(
     previous_screen: Screen,
     current_pos: Point,
     size: Size,
+    *,
+    protect_marked_text: bool = False,
 ) -> tuple[Point, int]:
-    """Erase changed row tails that still hold wide glyphs on the terminal.
+    """Erase changed wide tails and, when requested, the changed IME row.
 
     Mutates ``previous_screen`` so prompt_toolkit's diff sees those cells as
     blank and repaints them by appending. Returns the cursor position and the
     number of rows erased.
     """
     blank = _CHAR_CACHE[" ", ""]
+    ime_row = current_pos.y if protect_marked_text and previous_screen.show_cursor else None
     erased = 0
     for y in range(min(previous_screen.height, size.rows)):
-        old_row = previous_screen.data_buffer.get(y)
-        if not old_row or not any(char.width > 1 for char in old_row.values()):
-            continue
-        new_row = screen.data_buffer.get(y) or {}
-        first = _first_changed_column(old_row, new_row, blank)
-        if first is None or first >= size.columns:
-            continue
-        if not any(x >= first and char.width > 1 for x, char in old_row.items()):
-            continue
+        old_row = previous_screen.data_buffer.get(y, {})
+        if y == ime_row and not _rows_equal(screen, previous_screen, y, size.columns):
+            first = 0
+        else:
+            if not any(char.width > 1 for char in old_row.values()):
+                continue
+            new_row = screen.data_buffer.get(y) or {}
+            first = _first_changed_column(old_row, new_row, blank)
+            if first is None or first >= size.columns:
+                continue
+            if not any(x >= first and char.width > 1 for x, char in old_row.items()):
+                continue
         if erased == 0:
             output.hide_cursor()
             output.reset_attributes()
@@ -241,7 +259,8 @@ def _wrap(original: Callable[..., tuple[Point, str | None]]) -> Callable[..., tu
             if frame_unchanged(screen, previous_screen, cursor_target, current_pos, size):
                 return current_pos, last_style
             current_pos, erased = erase_misaligned_wide_tails(
-                output, screen, previous_screen, current_pos, size
+                output, screen, previous_screen, current_pos, size,
+                protect_marked_text=uses_apple_terminal(),
             )
             if erased:
                 last_style = None

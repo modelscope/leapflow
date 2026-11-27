@@ -153,7 +153,8 @@ def test_leap_app_style_builder_accepts_resolved_theme(tmp_path) -> None:
     assert grown.preferred >= resolved.preferred
 
 
-def test_leap_app_layout_keeps_status_breathing_gap(tmp_path) -> None:
+def test_leap_app_layout_reuses_reserved_status_gap_for_overflow(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TERM_PROGRAM", "xterm")
     theme = resolve_theme(_DARK, terminal_bg="#102A2E")
     app = LeapApp(
         console=None,
@@ -166,17 +167,16 @@ def test_leap_app_layout_keeps_status_breathing_gap(tmp_path) -> None:
     root = app._app.layout.container.content
     children = root.children
 
-    assert len(children) == 6
+    assert len(children) == 5
     status_gap = children[2].content
     status_bar = children[3]
-    input_hint = children[4].content
-    input_area = children[5].content
+    input_area = children[4].content
     assert status_gap.style == "class:status-gap"
     assert status_gap.height == 1
     assert app._build_style().get_attrs_for_style_str("class:status-gap").bgcolor == ""
     assert status_bar.style == "class:status-bar"
-    assert input_hint.style == "class:hint"
-    assert input_hint.height == 1
+    assert not status_gap.wrap_lines()
+    assert status_gap.content.text == app._input_overflow_hint
     assert input_area is app._input_area.window
 
 

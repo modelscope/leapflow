@@ -334,7 +334,8 @@ class _Resolution:
             return FrameDiagnosis(name, status, version=version)
         if _record_transform(record) is None:
             return FrameDiagnosis(name, FrameStatus.UNPROVEN, "the record is malformed", version)
-        verdict = judge(record, mounted=bool(self.spec.role(name)))
+        mounted = bool(self.spec.role(name))
+        verdict = judge(record, mounted=mounted)
         status, reason, achieved = verdict.status, verdict.reason, verdict.achieved
         check = drift = None
         if name not in path:
@@ -358,12 +359,19 @@ class _Resolution:
         elif check is not None:
             achieved = _check_accuracy(check)
             status, reason = FrameStatus.VALID, ""
+        # A device frame acts on the world through its geometry, so a fit that was
+        # never checked against held-out evidence proves nothing about how well it
+        # does: unknown accuracy is not sufficient accuracy.
         if status is FrameStatus.VALID and required is not None:
             if (achieved is not None and not achieved.within(required)) or (
-                required.rotation_deg is not None and achieved is None
+                achieved is None and (mounted or required.rotation_deg is not None)
             ):
                 status = FrameStatus.INSUFFICIENT_ACCURACY
-                reason = f"achieved {achieved.describe() if achieved else 'unknown accuracy'}, required {required.describe()}"
+                reason = (
+                    f"achieved {achieved.describe()}, required {required.describe()}"
+                    if achieved is not None
+                    else f"its accuracy was never checked independently (required {required.describe()})"
+                )
         return FrameDiagnosis(name, status, reason, version, verdict.method, achieved, required,
                               verified_by=check.procedure_id if check is not None else "")
 
@@ -483,7 +491,11 @@ def _check_accuracy(record: Any) -> Accuracy | None:
         type(e) in (int, float) and math.isfinite(e) and e >= 0 for e in errors
     ):
         p95 = sorted(errors)[max(0, math.ceil(len(errors) * 0.95) - 1)]
-    return Accuracy.from_mapping({"translation_mm": p95})
+    # An observed zero residual is still a measurement (e.g. an exact replay),
+    # not missing evidence. Required bounds remain strictly positive at admission.
+    if type(p95) in (int, float) and math.isfinite(p95) and p95 >= 0:
+        return Accuracy(float(p95))
+    return None
 
 
 def _required_accuracy(spec: WorkcellSpec, name: str) -> Accuracy | None:

@@ -20,6 +20,7 @@ import pytest
 
 from leapflow.hardware.rgbd import CameraIntrinsics, RgbdFrame
 from leapflow.hardware.skills import vision as vision_module
+from leapflow.hardware.skills.builtin import camera_calibration as calibration_module
 from leapflow.hardware.skills.builtin.camera_calibration import (
     EYE_IN_HAND,
     EYE_TO_HAND,
@@ -306,7 +307,12 @@ async def test_handeye_measures_the_camera_and_verify_confirms_it(
 
     frames = _frames(runtime)
     measured = frames.transform("camera")
-    assert measured is not None
+    assert measured is not None, frames.diagnosis("camera")
+    assert frames.diagnosis("camera").verified_by == VERIFY_PROCEDURE
+    assert outcome.result["verification"]["points"] == 9
+    record = _registry(runtime).calibration_store.latest(WORKCELL_ID, VERIFY_PROCEDURE)
+    assert record.parameters["training_disjoint"] is True
+    assert record.parameters["depends_on"] == {"camera": frames.versions["camera"]}
     _assert_close(measured, expected, mm=0.05, deg=0.01)
     parameters = frames.parameters("camera")
     assert parameters["intrinsics"] == SIM_INTRINSICS.to_dict()
@@ -330,10 +336,11 @@ async def test_handeye_plan_moves_nothing_and_turns_about_several_axes(
     plan = await _plan(runtime, "calib.handeye", {"poses": 12, "tilt_deg": 20})
     assert runtime._skills["calib.handeye"].spec.consent == CONSENT_EACH_RUN  # type: ignore[attr-defined]
     assert camera.arm.batches == [] and camera.captures == 1
-    assert plan.basis["samples"] == 12 and len(plan.targets) == 13
+    assert plan.basis["training_samples"] == 12
+    assert plan.basis["samples"] == 21 and len(plan.targets) == 22
     start = Pose.from_mapping(plan.basis["start"])
     assert plan.targets[-1].distance_mm(start) < 1e-9
-    samples = plan.targets[:-1]
+    samples = plan.targets[:plan.basis["training_samples"]]
     assert max(tool_cone_deg(pose) for pose in samples) == pytest.approx(20.0, abs=0.01)
     assert min(tool_cone_deg(pose) for pose in samples) == pytest.approx(10.0, abs=0.01)
     # Each pose's turn from the start: tilts about many horizontal axes plus a yaw.
@@ -371,11 +378,15 @@ async def test_handeye_fails_committed_when_the_board_slips(
     assert outcome.failure_code == FAILURE_CHECK_FAILED
     assert outcome.side_effect_state == SIDE_EFFECT_COMMITTED
     assert outcome.result["fit"]["translation_rms_mm"] > 3.0
+    assert "poses=16, settle_s=1" in outcome.message
+    assert "tilt_deg=15, yaw_deg=30" in outcome.message
     assert _frames(runtime).transform("camera") is None
 
     calibration = {
         "max_hand_eye_translation_rms_mm": 100.0,
         "max_hand_eye_rotation_rms_deg": 100.0,
+        "max_verify_p95_mm": 100.0,
+        "max_verify_rms_mm": 100.0,
     }
     tolerant, camera = _cell(
         tmp_path / "tolerant",
@@ -410,12 +421,13 @@ async def test_verify_needs_a_handeye_measurement(tmp_path: Path, analytic_detec
 async def test_verify_catches_a_bumped_camera(tmp_path: Path, analytic_detector: None) -> None:
     runtime, camera = _cell(tmp_path)
     assert (await _run(runtime, "calib.handeye", FAST)).ok
+    original = _registry(runtime).calibration_store.latest(WORKCELL_ID, VERIFY_PROCEDURE)
     camera.camera = BASE_CAMERA.compose(Transform.from_pose(Pose(8.0, 6.0, 0.0)))
     outcome = await _run(runtime, "calib.verify", FAST)
     assert outcome.failure_code == FAILURE_CHECK_FAILED
     assert outcome.side_effect_state == SIDE_EFFECT_COMMITTED
     assert outcome.result["p95_mm"] == pytest.approx(10.0, abs=0.5)
-    assert _registry(runtime).calibration_store.latest(WORKCELL_ID, VERIFY_PROCEDURE) is None
+    assert _registry(runtime).calibration_store.latest(WORKCELL_ID, VERIFY_PROCEDURE).recorded_at == original.recorded_at
 
     tolerant, camera = _cell(
         tmp_path / "tolerant",
@@ -581,6 +593,119 @@ def test_admission_rejects_a_workcell_with_a_bad_board(tmp_path: Path) -> None:
     runtime, _ = _cell(tmp_path, workcell=data)
     (note,) = runtime.load_report.rejected
     assert "calibration_target" in note.detail and WORKCELL_ID not in runtime._workcells  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("existing", [False, True])
+async def test_failed_heldout_validation_never_replaces_calibration(
+    tmp_path: Path, analytic_detector: None, existing: bool,
+) -> None:
+    runtime, camera = _cell(tmp_path)
+    if existing:
+        assert (await _run(runtime, "calib.handeye", FAST)).ok
+    store = _registry(runtime).calibration_store
+    old_mount = store.latest(WORKCELL_ID, "camera.handeye")
+    old_check = store.latest(WORKCELL_ID, VERIFY_PROCEDURE)
+    camera.shift_after = (camera.captures + 13, FLANGE_BOARD.compose(Transform.from_pose(Pose(12, 0, 0))))
+    outcome = await _run(runtime, "calib.handeye", FAST)
+    assert not outcome.ok and outcome.side_effect_state == SIDE_EFFECT_COMMITTED
+    assert outcome.result["p95_mm"] > 5
+    assert store.latest(WORKCELL_ID, "camera.handeye") == old_mount
+    assert store.latest(WORKCELL_ID, VERIFY_PROCEDURE) == old_check
+
+
+@pytest.mark.parametrize("skill", ["calib.handeye", "calib.verify"])
+async def test_board_scale_mismatch_refuses_before_motion(
+    tmp_path: Path, analytic_detector: None, monkeypatch: pytest.MonkeyPatch, skill: str,
+) -> None:
+    runtime, camera = _cell(tmp_path)
+    if skill == "calib.verify":
+        assert (await _run(runtime, "calib.handeye", FAST)).ok
+    camera.arm.batches.clear()
+    original = vision_module.depth_point
+    monkeypatch.setattr(vision_module, "depth_point", lambda *a, **kw: tuple(v * 1.322 for v in original(*a, **kw)))
+    refused = await _refusal(runtime, skill, FAST)
+    assert refused.failure_code == FAILURE_CHECK_FAILED
+    assert "1.32x" in refused.message and "26.4/19.8" in refused.message
+    assert "ruler" in refused.message and camera.arm.batches == []
+
+
+@pytest.mark.parametrize("skill", ["calib.handeye", "calib.verify"])
+async def test_missing_depth_is_disclosed_in_preview(
+    tmp_path: Path, analytic_detector: None, monkeypatch: pytest.MonkeyPatch, skill: str,
+) -> None:
+    runtime, camera = _cell(tmp_path)
+    if skill == "calib.verify":
+        assert (await _run(runtime, "calib.handeye", FAST)).ok
+    camera.arm.batches.clear()
+    monkeypatch.setattr(vision_module, "depth_point", lambda *a, **kw: None)
+    plan = await _plan(runtime, skill, FAST)
+    assert plan.basis["target_scale"] is None
+    assert "scale unchecked" in plan.summary and camera.arm.batches == []
+    run = await runtime.execute(plan.digest)
+    outcome = (await runtime.wait(run.run_id, timeout_s=20)).outcome
+    assert not outcome.ok and outcome.result["no_depth"] == 9
+
+
+async def test_ring_and_grid_shrink_only_during_planning(tmp_path: Path, analytic_detector: None) -> None:
+    workspace = {**WORKCELL_YAML["workspace"], "bootstrap_box": {"x": [225, 275], "y": [-25, 25], "z": [120, 400]}}
+    runtime, camera = _cell(tmp_path, workcell=_workcell(EYE_TO_HAND, workspace=workspace))
+    plan = await _plan(runtime, "calib.handeye", FAST)
+    assert plan.basis["ring_scale"] == .75
+    assert plan.basis["verify_spacing_mm"] == 20
+    assert plan.basis["effective_args"]["spread_mm"] == 22.5
+    assert plan.basis["effective_args"]["yaw_deg"] == 22.5
+    assert "75%" in plan.summary and camera.arm.batches == []
+    assert plan.args["spread_mm"] == 30  # approved effective targets, not mutated arguments
+
+
+async def test_disabled_shrink_refuses_instead_of_moving(tmp_path: Path, analytic_detector: None) -> None:
+    workspace = {**WORKCELL_YAML["workspace"], "bootstrap_box": {"x": [225, 275], "y": [-25, 25], "z": [120, 400]}}
+    runtime, camera = _cell(tmp_path, workcell=_workcell(EYE_TO_HAND, workspace=workspace, calibration={"ring_attempts": 1}))
+    outcome = await _refusal(runtime, "calib.handeye", FAST)
+    assert "reachable" in outcome.message and camera.arm.batches == []
+
+
+@pytest.mark.parametrize("change", [
+    {"ring_attempts": 1.5}, {"ring_attempts": 1000}, {"min_ring_scale": 1.1},
+    {"max_target_scale_error": float("nan")}, {"min_ring_scale": 0},
+])
+def test_adaptive_calibration_controls_are_validated(tmp_path: Path, change: Mapping[str, Any]) -> None:
+    runtime, _ = _cell(tmp_path, workcell=_workcell(EYE_TO_HAND, calibration=change))
+    assert WORKCELL_ID not in runtime._workcells
+    assert runtime.load_report.rejected
+
+
+@pytest.mark.parametrize(("poses", "settle", "advice"), [
+    (12, .2, "poses=16, settle_s=1"), (24, 3, "poses=24, settle_s=5"),
+])
+async def test_fit_advice_stays_within_declared_arguments(
+    tmp_path: Path, analytic_detector: None, poses: int, settle: float, advice: str,
+) -> None:
+    runtime, camera = _cell(tmp_path)
+    plan = await _plan(runtime, "calib.handeye", {"poses": poses, "settle_s": settle})
+    assert advice in calibration_module._fit_advice(plan)
+    assert camera.arm.batches == []
+
+
+async def test_combined_verification_refuses_actual_training_overlap(
+    tmp_path: Path, analytic_detector: None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _ = _cell(tmp_path)
+    original = calibration_module._sweep
+
+    async def repeated_capture(ctx, plan):
+        indexed, skipped = await original(ctx, plan)
+        boundary = plan.basis["training_samples"]
+        return [(index, indexed[0][1] if index == boundary else sample)
+                for index, sample in indexed], skipped
+
+    monkeypatch.setattr(calibration_module, "_sweep", repeated_capture)
+    outcome = await _run(runtime, "calib.handeye", FAST)
+    assert outcome.failure_code == FAILURE_CHECK_FAILED
+    assert outcome.result["problems"] == ["not held-out"]
+    store = _registry(runtime).calibration_store
+    assert store.latest(WORKCELL_ID, "camera.handeye") is None
+    assert store.latest(WORKCELL_ID, VERIFY_PROCEDURE) is None
 
 
 # ── Solver ───────────────────────────────────────────────────────────────────

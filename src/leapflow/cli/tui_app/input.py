@@ -1,7 +1,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Slash-command completion for the TUI input area.
+"""Draft layout and slash-command completion for the TUI input area.
 
-Provides interactive slash-command suggestions for the TextArea widget.
+Provides interactive slash-command suggestions for the draft buffer.
 The completer keeps command discovery read-only and lightweight: it only uses
 the static command registry entries already loaded by the CLI layer.
 """
@@ -11,7 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Sequence
 
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, Completion, ThreadedCompleter
+from prompt_toolkit.formatted_text.utils import fragment_list_to_text
+from prompt_toolkit.layout import BufferControl, Window
+from prompt_toolkit.layout.controls import UIContent
+from prompt_toolkit.layout.screen import Char
+from prompt_toolkit.utils import get_cwidth
 
 from leapflow.cli.commands.registry import command_action_entries, resolve_command
 
@@ -19,6 +25,64 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from prompt_toolkit.document import Document
+    from prompt_toolkit.layout.containers import GetLinePrefixCallable
+
+
+@dataclass(frozen=True)
+class DraftInput:
+    buffer: Buffer
+    window: Window
+
+
+def wrapped_display_rows(text: str, width: int) -> int:
+    """Count wraps by glyph boundaries, like Window does when copying cells."""
+    width = max(1, width)
+    rows = 1
+    used = 0
+    for char in text:
+        cells = get_cwidth(Char.display_mappings.get(char, char))
+        if used + cells > width:
+            rows += 1
+            used = 0
+        used += cells
+    return rows
+
+
+class _DraftContent(UIContent):
+    def get_height_for_line(
+        self,
+        lineno: int,
+        width: int,
+        get_line_prefix: GetLinePrefixCallable | None,
+        slice_stop: int | None = None,
+    ) -> int:
+        if get_line_prefix is not None or width <= 0:
+            return super().get_height_for_line(lineno, width, get_line_prefix, slice_stop)
+        text = fragment_list_to_text(self.get_line(lineno))
+        if slice_stop is not None:
+            # Window passes the cursor column as slice_stop. Include the cell
+            # it occupies: at a wrap boundary that cell is on the next row.
+            text = text[:slice_stop + 1]
+        return wrapped_display_rows(text, width)
+
+
+class DraftBufferControl(BufferControl):
+    """Keep wrapped scrolling in sync with the cells that Window paints.
+
+    prompt_toolkit estimates scroll offsets from ceil(total cells / width).
+    A wide glyph that won't fit leaves a gap, so that estimate can leave the
+    cursor below the viewport and cause Window to place it at screen (0, 0).
+    """
+
+    def create_content(self, width: int, height: int, preview_search: bool = False) -> UIContent:
+        content = super().create_content(width, height, preview_search)
+        return _DraftContent(
+            get_line=content.get_line,
+            line_count=content.line_count,
+            cursor_position=content.cursor_position,
+            menu_position=content.menu_position,
+            show_cursor=content.show_cursor,
+        )
 
 
 _MAX_DESCRIPTION_WIDTH = 88

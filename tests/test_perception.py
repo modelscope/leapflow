@@ -632,11 +632,14 @@ async def test_wrist_capture_uses_its_mount_and_checks_capture_drift(
             "parent": "flange", "procedure": "wrist.handeye",
         }},
     )
-    registry.calibrate(
+    version = registry.calibrate(
         "wrist.handeye",
         pose={"x": 10., "y": 20., "z": 30.},
         parameters={"target_mount": IDENTITY_MATRIX},
     )
+    registry.calibrate("camera.wrist.verify", parameters={
+        "p95_mm": .5, "training_disjoint": True, "depends_on": {"camera.wrist": version},
+    })
     scene = _scene(registry, spec=spec)
     reads = 0
 
@@ -743,11 +746,14 @@ async def test_propose_refuses_a_forgotten_id_and_an_ungraspable_object(tmp_path
     assert "gripper opening needs" in refused.message
 
 
-async def test_perception_skills_are_unavailable_without_the_camera_calibration(
-    tmp_path: Path,
+@pytest.mark.parametrize("unverified_mount", [False, True])
+async def test_perception_skills_are_unavailable_without_verified_camera_calibration(
+    tmp_path: Path, unverified_mount: bool,
 ) -> None:
     registry = perception_registry(tmp_path / "instrument.duckdb", (CUP,))
     registry.calibrate_cell()
+    if unverified_mount:
+        registry.calibrate("camera.handeye", pose=CAMERA_POSE, parameters={"target_mount": IDENTITY_MATRIX})
     runtime = _runtime(
         tmp_path, registry, PERCEPTION_WORKCELL_YAML, skills=(*scene_skills(), *camera_skills())
     )
@@ -757,3 +763,8 @@ async def test_perception_skills_are_unavailable_without_the_camera_calibration(
     # The refusal names the providing skill, and the readiness result says how to run it.
     first = refused.result["readiness"]["next_steps"][0]
     assert first["skill_id"].startswith("calib.") and first["skill_id"] in refused.message
+    if unverified_mount:
+        blockers = refused.result["readiness"]["blockers"]
+        assert any(blocker["status"] == "insufficient_accuracy" for blocker in blockers)
+        assert "checked independently" in refused.message
+    assert registry.sim.batches == []

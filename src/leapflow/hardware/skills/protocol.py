@@ -26,6 +26,7 @@ digests that bind an approval to one plan live in ``digest``.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Mapping
@@ -687,6 +688,16 @@ class TargetObservation:
     @property
     def center_in_camera(self) -> Vec3:
         return self.transform.apply(self.center)
+
+    @property
+    def depth_scale(self) -> float | None:
+        """Depth/PnP distance ratio: a coarse scale check, not accuracy certification."""
+        if self.depth_point is None:
+            return None
+        predicted, measured = math.hypot(*self.center_in_camera), math.hypot(*self.depth_point)
+        if not all(math.isfinite(v) and v > 0 for v in (predicted, measured)):
+            return None
+        return measured / predicted
 
     def to_dict(self) -> dict[str, Any]:
         return {
