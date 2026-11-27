@@ -1,0 +1,28 @@
+{
+  "ok": false,
+  "failure": {
+    "envelope_id": "757aeaa28347451eac8c0e249f83bfbc",
+    "source": "tool",
+    "category": "hardware",
+    "failure_class": "Refusal",
+    "failure_code": "piper_operations_refused",
+    "message": "existing node token is unavailable; supply --token-file",
+    "recoverability": "user_fixable",
+    "side_effect_state": "none",
+    "context": {
+      "tool_name": "",
+      "arguments": [],
+      "execution_id": "",
+      "trace_id": "",
+      "turn_id": 0,
+      "session_id": "",
+      "provider": "",
+      "model": "",
+      "attempt_number": 0,
+      "elapsed_ms": 0.0
+    },
+    "timestamp": 1795683497.9915452,
+    "provider_hint": null
+  },
+  "events": []
+}

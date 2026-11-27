@@ -17,7 +17,8 @@ async def preview(session: Session, operation: str, *, torque_release: bool = Fa
         return {"version": 1, "operation": "stop", "settings": asdict(session.settings),
                 "declaration_digest": unverified_digest(session.context), "steps": [],
                 "warning": "Damped halt; does not release torque; feedback may be unqualified"}
-    start = await session.snapshot(preflight=True, releasing=operation == "disable")
+    start = await session.snapshot(preflight=True, releasing=operation == "disable",
+                                  enabling=operation == "enable")
     if operation == "disable" and not torque_release:
         raise Refusal("disable releases torque and may drop the arm; explicit --torque-release-confirmed required")
     if operation not in ("enable", "resume", "disable", "stop"):
@@ -49,15 +50,16 @@ async def execute(session: Session, plan: dict[str, Any], *, torque_release: boo
     if operation == "disable" and not torque_release:
         raise Refusal("explicit torque-release confirmation required")
     releasing = operation == "disable"
+    enabling = operation == "enable"
     if releasing:
         # Torque release is the request itself; the exit must not undo it.
         session.leave_unheld = True
-    before = await session.snapshot(preflight=True, releasing=releasing)
+    before = await session.snapshot(preflight=True, releasing=releasing, enabling=enabling)
     check_start(plan, before)
     session.bind_steps(plan["steps"])
     row = plan["steps"][0]
     await session.command(row["label"], tuple((c, v) for c, v in row["commands"]), configure=True,
-                          releasing=releasing)
+                          releasing=releasing, enabling=enabling)
     if operation in ("enable", "resume"):
         final = await wait_arrived(session, row, before, plan["arrival"])
     else:

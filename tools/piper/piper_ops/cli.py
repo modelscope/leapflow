@@ -155,6 +155,23 @@ def approved(args: argparse.Namespace, settings: Settings, operation: str) -> di
     return plan
 
 
+def run_budget(args: argparse.Namespace, settings: Settings) -> float:
+    """How long this call may take: the approved plan's own budget when there is one.
+
+    The node holds a skill to ``limits.max_duration_s``, so an outer wait shorter than
+    the plan it approved kills a run that is still doing exactly what it was told --
+    and the operator loses the completed measurement. An unreadable preview is left for
+    ``approved`` to refuse, with its own message.
+    """
+    approved = None
+    if getattr(args, "execute", False) and getattr(args, "preview_file", None) is not None:
+        try:
+            approved = json.loads(args.preview_file.read_text()).get("preview")
+        except (OSError, ValueError):
+            approved = None
+    return calibration.execution_budget(settings, approved if isinstance(approved, dict) else None)
+
+
 def preview_result(plan: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "executed": False, "preview": plan, "plan_hash": motion.digest_plan(plan)}
 
@@ -363,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
                 or (args.group == "gripper" and args.operation == "qualify" and args.measurements)):
             result = local(args, settings, evidence)
         else:
-            result = asyncio.run(asyncio.wait_for(hardware(args, settings, evidence), settings.run_timeout_s))
+            result = asyncio.run(asyncio.wait_for(hardware(args, settings, evidence), run_budget(args, settings)))
         result = evidence.finish(result)
     except (Exception, KeyboardInterrupt) as exc:
         if not isinstance(exc, Refusal):

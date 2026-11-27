@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
 from leapflow.hardware.skills.frame_status import Accuracy, FrameStatus
-from leapflow.hardware.skills.protocol import METHOD_MARKERLESS_SCREW
+from leapflow.hardware.skills.protocol import METHOD_CARRIED_BALL, METHOD_MARKERLESS_SCREW
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,12 @@ METHOD_CANDIDATE_PROMOTION = "candidate_promotion"
 METHOD_BRIDGE_SHADOW = "stationary_board_bridge.v1"
 ACHIEVED_ACCURACY = "achieved_accuracy"
 MIN_SCREW_PAIRS = 3  # two rotations share the vertical, so no mount comes out of them
+# A carried ball fixes nine parameters, three of them the ball's own place in the
+# gripper: fewer poses than this leave a pose set that fits itself. The held-out
+# poses are what separates a measured mount from a fitted one, so a record that
+# kept none aside states no accuracy at all.
+MIN_CARRIED_BALL_SAMPLES = 6
+MIN_CARRIED_BALL_HELD_OUT = 3
 _MATRIX_TOLERANCE = 1e-6
 
 
@@ -190,11 +196,72 @@ def screw_evidence_problem(evidence: Any) -> str:
     return ""
 
 
+class CarriedBallEvidence:
+    """A carried-ball fit carries the residual it never trained on and its own bound.
+
+    The mount and the ball's place in the gripper are solved together from one
+    carried sphere, so the record is only a measurement if it still carries what
+    the held-out poses said afterwards. A record whose accuracy is missing is
+    refused rather than installed as an unquantified mount: an accuracy nobody
+    can state is exactly what a hand-edited matrix looks like.
+    """
+
+    name = METHOD_CARRIED_BALL
+
+    def applies(self, parameters: Mapping[str, Any]) -> bool:
+        return (
+            parameters.get("method") == METHOD_CARRIED_BALL
+            or "carried_ball_evidence" in parameters
+        )
+
+    def check(self, record: Any) -> ProvenanceVerdict:
+        parameters = record.parameters or {}
+        reason = carried_ball_problem(parameters.get("carried_ball_evidence"))
+        if reason:
+            return _unproven(reason, self.name)
+        achieved = Accuracy.from_mapping(parameters.get(ACHIEVED_ACCURACY))
+        if achieved is None:
+            return _unproven(
+                "the record states no accuracy for the pose set it was measured over",
+                self.name,
+            )
+        return ProvenanceVerdict(FrameStatus.VALID, method=self.name, achieved=achieved)
+
+
+def carried_ball_problem(evidence: Any) -> str:
+    """Why a carried-ball record's evidence is not a measurement; empty when it is."""
+    if not isinstance(evidence, Mapping):
+        return "the record carries no carried-ball evidence"
+    if evidence.get("method") != METHOD_CARRIED_BALL:
+        return "the record names no measurement method its evidence can be checked against"
+    if not isinstance(evidence.get("radius_mm"), (int, float)):
+        return "the record does not state the radius the ball was measured at"
+    samples = evidence.get("samples")
+    held_out = evidence.get("held_out")
+    if not isinstance(samples, int) or samples < MIN_CARRIED_BALL_SAMPLES:
+        return (
+            f"the record's fit covers {samples} poses "
+            f"(need {MIN_CARRIED_BALL_SAMPLES})"
+        )
+    if not isinstance(held_out, int) or held_out < MIN_CARRIED_BALL_HELD_OUT:
+        return (
+            f"the record's accuracy rests on {held_out} held-out poses "
+            f"(need {MIN_CARRIED_BALL_HELD_OUT})"
+        )
+    values = [evidence.get(key) for key in ("held_out_p95_mm", "held_out_max_mm", "residual_rms_mm")]
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+        return "the record's carried-ball evidence is missing its residuals"
+    if not all(math.isfinite(float(value)) for value in values):
+        return "the record's carried-ball evidence is not finite"
+    return ""
+
+
 BUILTIN_VALIDATORS: tuple[ProvenanceValidator, ...] = (
     BridgeShadowEvidence(),
     CandidatePromotionEvidence(),
     BoardTargetMountEvidence(),
     ScrewMotionEvidence(),
+    CarriedBallEvidence(),
 )
 
 

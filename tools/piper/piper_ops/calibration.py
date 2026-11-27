@@ -22,6 +22,25 @@ from .evidence import Evidence, Refusal
 from .session import Session, complete_cleanup, outcome_requires_stop
 
 
+def execution_budget(settings: Any, approved: dict[str, Any] | None) -> float:
+    """The longest a call may take before its outcome can no longer be read.
+
+    A plan declares ``limits.max_duration_s`` and the node holds the skill to exactly
+    that, so waiting less than the plan's own budget abandons a run that is still
+    legitimately working: the client stops renewing the lease, the completed
+    calibration is never collected, and the operator is told the result is
+    unreadable while the arm keeps moving. The allowance is therefore the plan's
+    declared budget plus the time the reply and the post-exit readback need.
+    """
+    declared = 0.0
+    plan = (approved or {}).get("skill_plan")
+    limits = plan.get("limits") if isinstance(plan, dict) else None
+    budget = limits.get("max_duration_s") if isinstance(limits, dict) else None
+    if isinstance(budget, (int, float)) and not isinstance(budget, bool) and budget > 0:
+        declared = float(budget)
+    return max(float(settings.run_timeout_s), declared + 6.0 * float(settings.request_timeout_s))
+
+
 async def reload_workcell(session: Session, *, workcell: str,
                           approved: dict[str, Any] | None = None) -> dict[str, Any]:
     """Preview or reload through the existing owner and exact one-shot approval."""
@@ -173,7 +192,7 @@ async def run(session: Session, *, workcell: str = "", skill: str = "", args: di
         result = await client.hw_skill_run(workcell=f"{settings.node_id}/{workcell}", skill=skill,
                                            args=args or {}, dry_run=approved is None,
                                            approved_plan=approved.get("skill_plan") if approved else None,
-                                           timeout_s=settings.run_timeout_s)
+                                           timeout_s=execution_budget(settings, approved))
         session.evidence.record("calibration_result", result=result)
         if approved is not None:
             session.touched |= result.get("side_effect_state", "unknown") != "none"

@@ -246,6 +246,37 @@ def test_a_check_coarser_than_required_leaves_the_frame_unusable(store: _Store) 
     assert "required 5.0 mm" in diagnosis.reason
 
 
+def test_a_frame_that_does_not_hold_remembers_the_geometry_it_measured(store: _Store) -> None:
+    """The last measurement survives a diagnosis that publishes no transform.
+
+    ``calib.ball`` is offered for an inaccurate or drifted camera and begins its
+    search where the previous measurement landed. Dropping that geometry along with
+    the transform left the skill that repairs this status with nothing to seed from,
+    so it refused on exactly the state it advertises.
+    """
+    spec = _cell()
+    version = _legacy_fixed(store)
+    store.put(f"{FIXED}.verify", {"passed": True, "training_disjoint": True, "p95_mm": 7.0,
+                                  "depends_on": {FIXED: version}})
+    coarse = FrameGraph.snapshot(spec, store.store)
+    assert coarse.diagnosis(FIXED).status is FrameStatus.INSUFFICIENT_ACCURACY
+    assert coarse.transform(FIXED) is None
+    assert coarse.measured(FIXED).translation == pytest.approx(FIXED_MOUNT.translation)
+
+    store.put(f"{FIXED}.attestation", {"passed": False, "reason": "moved 30 mm",
+                                       "depends_on": {FIXED: version}})
+    drifted = FrameGraph.snapshot(spec, store.store)
+    assert drifted.diagnosis(FIXED).status is FrameStatus.DRIFT_DETECTED
+    assert drifted.transform(FIXED) is None
+    assert drifted.measured(FIXED).translation == pytest.approx(FIXED_MOUNT.translation)
+
+
+def test_an_uncalibrated_frame_remembers_nothing(store: _Store) -> None:
+    frames = FrameGraph.snapshot(_cell(), store.store)
+    assert frames.diagnosis(FIXED).status is FrameStatus.MISSING
+    assert frames.transform(FIXED) is None and frames.measured(FIXED) is None
+
+
 def test_candidates_solved_through_a_replaced_frame_are_dropped(store: _Store) -> None:
     spec = _cell()
     _legacy_fixed(store)

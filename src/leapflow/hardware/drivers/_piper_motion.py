@@ -313,6 +313,29 @@ def enable_status(robot: Any) -> list[bool] | None:
     return flags
 
 
+DRIVE_FAULT_FLAGS = ("driver_overcurrent", "driver_error_status", "stall_status")
+"""Drive faults that keep a joint from accepting an enable.
+
+These are the drive's own protection latches. A latched drive reports
+``driver_enable_status`` false and ignores further enable frames, so no amount of
+re-sending energizes it: the firmware's clear command (0x475 ``clear_joint_err``) is
+the only way back short of dropping the arm's power. Over-temperature and low
+voltage are excluded because they clear as the hardware recovers, and a collision is
+excluded because it needs an inspection, not another enable.
+"""
+
+
+def latched_drive_faults(robot: Any) -> dict[int, list[str]]:
+    """Per-joint drive faults that hold a joint off; empty when every drive is clear."""
+    latched: dict[int, list[str]] = {}
+    for joint in range(1, 7):
+        foc = attr(sdk_message(robot.get_driver_states, joint), "foc_status")
+        flags = [name for name in DRIVE_FAULT_FLAGS if attr(foc, name) is True]
+        if flags:
+            latched[joint] = flags
+    return latched
+
+
 def firmware_version(robot: Any, timeout_s: float) -> str:
     """The main-controller software version (e.g. ``S-V1.9-0``); ``""`` when unanswered.
 

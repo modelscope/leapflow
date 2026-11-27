@@ -32,7 +32,9 @@ from dataclasses import dataclass, replace
 from typing import Any, Coroutine, Mapping, TypeVar
 
 from leapflow.engine.recovery.failure_envelope import SideEffectState
-from leapflow.hardware.arm_status import ARM_STATUS_EMERGENCY_STOP, ARM_STATUS_NORMAL
+from leapflow.hardware.arm_status import (
+    ARM_STATUS_EMERGENCY_STOP, is_arm_fault, status_name,
+)
 from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.context import HardwareContext, TransportRef
 from leapflow.hardware.drivers._piper_motion import CTRL_MODE_CAN, CTRL_MODE_TEACH, ctrl_mode_name
@@ -151,10 +153,12 @@ class Posture:
     """Whether the arm holds the posture it is in, from qualified samples.
 
     ``held`` needs all four at once: every drive enabled, CAN control selected, a
-    normal status word, and an unchanged joint vector between samples. Enable flags
-    keep reading true across an emergency stop and the status word recovers, so the
-    unchanged joint vector is the only part that cannot be reported while the arm
-    is drooping.
+    status word that is not a fault, and an unchanged joint vector between samples.
+    Enable flags keep reading true across an emergency stop and the status word
+    recovers, so the unchanged joint vector is the only part that cannot be reported
+    while the arm is drooping. A declined target (``TARGET_REFUSALS``) is not a fault
+    against a hold: the controller refused the plan and moved nothing, so the arm is
+    exactly where the last accepted command left it.
     """
 
     state: str
@@ -270,7 +274,8 @@ class Session:
         return context
 
     async def snapshot(self, *, ready: bool = False, preflight: bool = False,
-                       requalify: bool = False, releasing: bool = False) -> Snapshot:
+                       requalify: bool = False, releasing: bool = False,
+                       enabling: bool = False) -> Snapshot:
         """Read one qualified snapshot; ``requalify`` re-samples only a receive gap.
 
         A stale CAN sample describes the reception, not the arm, so an observation may
@@ -285,7 +290,8 @@ class Session:
         while True:
             try:
                 current = await read_snapshot(self.registry, self.settings, ready=ready,
-                                             preflight=preflight, releasing=releasing)
+                                             preflight=preflight, releasing=releasing,
+                                             enabling=enabling)
             except StaleFeedback as exc:
                 if not requalify:
                     raise
@@ -318,13 +324,14 @@ class Session:
         self._advisories = active
 
     async def command(self, label: str, commands: tuple[tuple[str, Any], ...], *, configure: bool = False,
-                      releasing: bool = False) -> None:
+                      releasing: bool = False, enabling: bool = False) -> None:
         """Send once through HardwareTools; a failed/uncertain result is never replayed."""
         assert self.tools and self.client and self.consent
         current = self._declaration(await self.client.request("list"))
         if self.execute and (unverified_digest(current) != self.digest or not current.provenance.is_verified):
             raise Refusal("declaration changed during execution")
-        await self.snapshot(ready=not configure, preflight=True, requalify=True, releasing=releasing)
+        await self.snapshot(ready=not configure, preflight=True, requalify=True, releasing=releasing,
+                            enabling=enabling)
         if self.execute:
             if not self._approved_steps or self._approved_steps[0] != (label, commands, configure):
                 raise Refusal("command differs from the complete approved preview")
@@ -379,10 +386,13 @@ class Session:
     async def posture(self) -> Posture:
         """Judge from two qualified samples whether the arm holds its posture.
 
-        ``held`` needs all four at once: every drive enabled, CAN control selected, a
-        normal status word, and an unchanged joint vector between the samples. Enable
-        flags keep reading true across an emergency stop and the status word recovers
-        by itself, so the joint vector is the part a drooping arm cannot satisfy.
+        ``held`` needs every drive enabled, CAN control selected, a status word that is
+        not a fault, and an unchanged joint vector between the samples. Enable flags
+        keep reading true across an emergency stop and the status word recovers by
+        itself, so the joint vector is the part a drooping arm cannot satisfy. A
+        declined target is not a fault against a hold -- nothing moved -- and treating
+        it as one turned a healthy, enabled arm into an "unheld" verdict whose only
+        advice was another enable, which cannot change the status word at all.
         Unreadable feedback is ``unverified``: never evidence of a hold, and never a
         reason to write.
         """
@@ -399,8 +409,8 @@ class Session:
             problem = "not every drive reports enabled"
         elif ctrl_mode != CTRL_MODE_CAN:
             problem = f"it is not in CAN control ({ctrl_mode_name(ctrl_mode) or ctrl_mode})"
-        elif arm_status != ARM_STATUS_NORMAL:
-            problem = f"its status word is not normal ({arm_status})"
+        elif is_arm_fault(arm_status):
+            problem = f"its status word reports {status_name(arm_status)} ({arm_status})"
         elif moved > self.settings.posture_still_deg:
             problem = f"it is still moving ({moved:.3f} deg between samples)"
         else:
@@ -473,7 +483,7 @@ class Session:
     def _only_moving(self, posture: Posture) -> bool:
         """Healthy, enabled and in CAN control, merely not yet at rest."""
         return (posture.enabled and posture.ctrl_mode == CTRL_MODE_CAN
-                and posture.arm_status == ARM_STATUS_NORMAL
+                and not is_arm_fault(posture.arm_status)
                 and posture.moved_deg > self.settings.posture_still_deg)
 
     async def _await_rest(self, posture: Posture) -> Posture:

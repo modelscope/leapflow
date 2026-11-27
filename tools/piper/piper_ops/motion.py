@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping
 
 from leapflow.engine.recovery.failure_envelope import SideEffectState
+from leapflow.hardware.arm_status import TARGET_REFUSALS, is_arm_fault, status_name
 from leapflow.hardware.context import HardwareContext
 from leapflow.hardware.skills.adapt.ik import solve_ik
 from leapflow.hardware.skills.adapt.spec import IkSettings
@@ -105,19 +106,49 @@ def bounds(context: HardwareContext, channel_id: str) -> tuple[float, float]:
     return number(channel.envelope.min_value), number(channel.envelope.max_value)
 
 
-def limits(context: HardwareContext, settings: Settings) -> tuple[tuple[float, float], ...]:
+def limits(context: HardwareContext, settings: Settings, *,
+           margin: float | None = None) -> tuple[tuple[float, float], ...]:
+    """The joint band a *computed* posture is judged against, inset by the planning margin.
+
+    The inset keeps a solved target off the declared limits, so a path does not ride one.
+    It belongs to targets only; ``_resting_check`` judges the posture the arm is already in
+    against the declared envelope, because the margin has no meaning there.
+    """
+    inset = settings.joint_margin_deg if margin is None else margin
     kin = context.kinematics
     if kin is None or kin.dof != 6 or len(kin.joint_limits) != 6:
         raise Refusal("six-axis declared kinematics required")
     result = []
     for channel, manual, radians in zip(JOINTS, settings.manual_joint_limits_deg, kin.joint_limits):
         declared = bounds(context, channel)
-        low = max(declared[0], manual[0], math.degrees(number(radians[0]))) + settings.joint_margin_deg
-        high = min(declared[1], manual[1], math.degrees(number(radians[1]))) - settings.joint_margin_deg
+        low = max(declared[0], manual[0], math.degrees(number(radians[0]))) + inset
+        high = min(declared[1], manual[1], math.degrees(number(radians[1]))) - inset
         if low >= high:
             raise Refusal("manual/SDK/declaration intersection is empty")
         result.append((low, high))
     return tuple(result)
+
+
+def _resting_check(context: HardwareContext, settings: Settings, joints: tuple[float, ...]) -> None:
+    """Refuse a posture the machine cannot legally be in; accept one resting on a limit.
+
+    The planning margin keeps a *computed* target off the declared limits. Applying it to
+    the posture the arm is already in turns a legal resting posture into one no command may
+    leave: an arm that stopped at j4 = 88.98 deg against a declared +-88.98 could plan no
+    motion at all, and the only escape was a full initialization. The envelope is therefore
+    judged as declared, widened by the system's own stillness threshold, because the encoder
+    resolves 0.001 deg and a reading a fraction of a step past the declaration is resting
+    against it rather than outside it. Every target still has to aim inside the margin, and
+    a straight interpolation between a posture inside the envelope and a target inside the
+    margin stays inside the envelope, so nothing drives back into the stop.
+    """
+    declared = limits(context, settings, margin=0.0)
+    slack = settings.posture_still_deg
+    outside = [f"{name} at {q:.2f} deg, declared [{low:.2f}, {high:.2f}]"
+               for name, q, (low, high) in zip(JOINTS, joints, declared)
+               if not low - slack <= q <= high + slack]
+    if outside:
+        raise Refusal("starting posture is outside the declared joint envelope: " + "; ".join(outside))
 
 
 def chain_for(context: HardwareContext, snapshot: Snapshot, settings: Settings) -> DhChain:
@@ -281,10 +312,8 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
         rows.append(step("initialize", tuple(zip(JOINTS, origin_q)), joints=origin_q, pose=origin_pose,
                          grip=start.gripper_mm))
     else:
-        if not start.enabled or start.status.get("ctrl_mode") != 1 or start.status.get("arm_status") != 0:
-            raise Refusal("movement requires healthy enabled CAN state; preview arm initialize first")
-        if any(not low <= q <= high for q, (low, high) in zip(origin_q, safe)):
-            raise Refusal("starting posture is outside conservative planning limits")
+        _motion_start(start)
+        _resting_check(context, settings, origin_q)
     maximum = None
     if operation in ("verify", "gripper", "grasp"):
         maximum = opening_max(context, settings)
@@ -395,6 +424,26 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
             "clearance": "Operator must confirm unobstructed swept volume, empty jaws and accessible physical emergency stop"}
 
 
+def _motion_start(start: Snapshot) -> None:
+    """Refuse a movement the arm cannot carry out yet, naming the one thing that blocks it.
+
+    A declined target is deliberately not a blocker: it means the last plan was refused
+    and nothing moved, and the target sent next is what replaces it. Requiring a normal
+    status word here instead deadlocked the arm -- the code clears only when the
+    controller accepts a target, which this gate was refusing to let anyone send.
+    """
+    code = start.status.get("arm_status")
+    if not start.enabled:
+        raise Refusal("movement needs every drive enabled; preview and approve `arm enable` first")
+    if start.status.get("ctrl_mode") != CTRL_MODE_CAN:
+        raise Refusal("movement needs CAN control, not "
+                      f"{ctrl_mode_name(start.status.get('ctrl_mode')) or start.status.get('ctrl_mode')}; "
+                      "preview and approve `arm enable` first")
+    if is_arm_fault(code):
+        raise Refusal(f"movement refuses a controller fault: {status_name(code)} ({code}); "
+                      "inspect the arm before commanding it")
+
+
 def check_return(plan: dict[str, Any], origin: Snapshot, current: Snapshot, settings: Settings) -> None:
     """Verify the return by the commanded flange pose, not by redundant-joint equality.
 
@@ -443,6 +492,13 @@ async def wait_arrived(session: Session, row: dict[str, Any], before: Snapshot,
             await asyncio.sleep(settings.poll_s)
             continue
         last = current.receipts
+        code = current.status.get("arm_status")
+        if code in TARGET_REFUSALS:
+            # The controller planned the waypoint and declined it: nothing moved, so
+            # waiting for arrival is waiting for a motion that was never going to start.
+            raise Refusal(f"the controller declined this waypoint: {TARGET_REFUSALS[code]} "
+                          f"({status_name(code)}); nothing moved -- the plan is what has to "
+                          "change, so re-plan that segment and approve a new plan")
         if q is not None and any(not min(a, b) - settings.deviation_deg <= c <= max(a, b) + settings.deviation_deg
                                  for a, b, c in zip(before.joints, q, current.joints)):
             raise Refusal("observed joint deviation exceeds planned segment", state=SideEffectState.UNKNOWN)

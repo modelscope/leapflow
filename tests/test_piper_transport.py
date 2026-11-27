@@ -119,6 +119,9 @@ class _FakeArm:
         self.fault_code = 0x05
         self.fault_err_code = 0x16
         self.flags: Any = [False] * 6
+        self.drive_faults: dict[int, tuple[str, ...]] = {}
+        self.clear_calls: list[int] = []
+        self.refuse_clear = False
         self.refuse_enable = self.refuse_reset = self.ignore_mode = False
         self.ignore_move_mode = False
         self.drop_mode_frames = 0
@@ -208,9 +211,13 @@ class _FakeArm:
     def get_driver_states(self, index: int) -> Any:
         if self.flags is None or len(self.flags) < index:
             return None
+        latched = self.drive_faults.get(index, ())
         return _message(SimpleNamespace(
-            foc_status=SimpleNamespace(driver_enable_status=self.flags[index - 1],
-                                      driver_error_status=False),
+            foc_status=SimpleNamespace(
+                driver_enable_status=self.flags[index - 1],
+                driver_overcurrent="driver_overcurrent" in latched,
+                driver_error_status="driver_error_status" in latched,
+                stall_status="stall_status" in latched),
             vol=24., motor_temp=26., foc_temp=32.))
 
     def get_motor_states(self, index: int) -> Any:
@@ -220,8 +227,20 @@ class _FakeArm:
         self.events.append("enable")
         self.enable_calls += 1
         if not self.refuse_enable:
-            self.flags = [True] * 6
+            # A drive holding a latched protection answers no enable frame.
+            self.flags = [not self.drive_faults.get(joint) for joint in range(1, 7)]
         return all(self.flags or [False])
+
+    def clear_joint_error(self, joint_index: int = 255, timeout: float = 1.0) -> bool:
+        self.events.append(f"clear:{joint_index}")
+        self.clear_calls.append(joint_index)
+        if self.refuse_clear:
+            return False
+        if joint_index == 255:
+            self.drive_faults.clear()
+        else:
+            self.drive_faults.pop(joint_index, None)
+        return True
 
     def disable(self) -> bool:
         self.disable_calls += 1
@@ -486,6 +505,55 @@ def test_idle_enable_never_resets(monkeypatch: pytest.MonkeyPatch) -> None:
     transport, arm, _ = _open_transport(monkeypatch)
     assert _write(transport, "arm.enable", 1).ok
     assert arm.reset_calls == 0 and arm.enable_calls == 1
+    assert arm.clear_calls == []
+
+
+def test_a_latched_drive_is_cleared_once_inside_the_governed_enable(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A drive that tripped its own protection is cleared by the enable that needs it.
+
+    Observed on a real cell: a target past j6's limit stalled the drive, which then
+    latched its own over-current/stall protection and stopped answering enable frames.
+    Every governed enable refused with "not every motor reports enabled" and the only
+    advice left was to power-cycle the arm. The firmware's clear command is the
+    drive-level counterpart of the controller reset this same path already sends.
+    """
+    transport, arm, _ = _open_transport(monkeypatch, {"enable_timeout_s": .6})
+    arm.drive_faults[6] = ("driver_overcurrent", "driver_error_status", "stall_status")
+    result = _write(transport, "arm.enable", 1)
+    assert result.ok, result.error
+    assert result.side_effect_state == SIDE_EFFECT_COMMITTED
+    assert arm.clear_calls == [255]
+    assert arm.flags == [True] * 6 and arm.ctrl_mode == 1
+
+
+def test_a_drive_protection_that_survives_the_clear_is_named(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A latch the firmware will not clear is reported with the joint and flags."""
+    transport, arm, _ = _open_transport(monkeypatch, {"enable_timeout_s": .3})
+    arm.drive_faults[6] = ("driver_overcurrent", "stall_status")
+    arm.refuse_clear = True
+    result = _write(transport, "arm.enable", 1)
+    assert not result.ok and result.failure_code == "piper_enable_refused"
+    assert result.side_effect_state == SIDE_EFFECT_COMMITTED
+    assert "joint 6 reports driver_overcurrent, stall_status" in (result.error or "")
+    assert arm.clear_calls == [255]
+
+
+def test_a_declined_target_never_makes_a_healthy_enable_look_unstable(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """arm_status 0x04 is the firmware's verdict on a plan, not a fault on the arm.
+
+    After a ring pose past a joint limit the status word stays 0x04 until a target it
+    accepts is sent; an enable sends none. Counting it as a fault made every later
+    enable retry into ``piper_enable_unstable`` and told the operator to power-cycle a
+    healthy arm.
+    """
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.arm_status = 0x04
+    result = _write(transport, "arm.enable", 1)
+    assert result.ok, result.error
+    assert arm.ctrl_mode == 1 and arm.enable_calls == 1
 
 
 @pytest.mark.parametrize("fault,code", [("refuse_enable", "piper_enable_refused"),

@@ -35,7 +35,7 @@ async def run(session: Session, *, workcell: str, skill: str, arguments: dict[st
         result = await service.hw_skill_run(
             workcell=f"{session.settings.node_id}/{workcell}", skill=skill, args=arguments,
             dry_run=approved is None, approved_plan=approved["skill_plan"] if approved else None,
-            timeout_s=session.settings.run_timeout_s,
+            timeout_s=calibration.execution_budget(session.settings, approved),
         )
         session.evidence.record("qualification_result", result=result)
         if approved is not None:

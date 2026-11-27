@@ -115,9 +115,11 @@ REQUIRE_PREFIXES = (
 
 # How a camera mount was measured. A calibration record names its method, and the
 # frame graph checks the evidence that method produces -- a board's measured mount
-# for the board path, per-joint screw agreement for the board-free one -- so a
-# record cannot borrow the standing of a method it was not measured by.
+# for the board path, per-joint screw agreement for the board-free one, and the
+# held-out residual of a carried ball for the one that needs no board and no TCP
+# -- so a record cannot borrow the standing of a method it was not measured by.
 METHOD_MARKERLESS_SCREW = "markerless_screw"
+METHOD_CARRIED_BALL = "carried_ball"
 
 # Who grounded a ``LocatedObject``: the workcell's locator model, or S2 itself
 # pointing into a shared frame (``perceive.lift``).

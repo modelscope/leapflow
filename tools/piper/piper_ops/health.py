@@ -11,6 +11,9 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any
 from urllib.parse import urlparse
 
+from leapflow.hardware.arm_status import (
+    ARM_STATUS_EMERGENCY_STOP, TARGET_REFUSALS, is_arm_fault, status_name,
+)
 from leapflow.hardware.drivers._piper_feedback import CAN_GROUPS, _FAULT_FLAGS
 from leapflow.hardware.providers import ProviderError
 from leapflow.hardware.providers.yaml_provider import YamlContextProvider
@@ -27,6 +30,15 @@ CHANNELS = ("arm.status", "arm.telemetry", "arm.enabled", "gripper.position", *J
 CAN_ERROR_STATS = ("restarts", "bus_error", "error_warning", "error_passive", "bus_off")
 ADVISORY_FLAGS = frozenset({"motor_overheating", "driver_overheating", "voltage_too_low"})
 """Firmware flags the drivers already act on; refusing on them is an opt-in."""
+DRIVE_REVERSIBLE_FLAGS = frozenset({"driver_overcurrent", "driver_error_status", "stall_status"})
+"""Faults an explicit re-enable may clear.
+
+A joint pushed against a target the controller declined stalls and latches over-current
+and a driver error. Those bits live in the driver, and re-energising the drive is the
+only path that resets them, so refusing the enable because of the latch leaves an arm
+that no command can recover without a power cycle. A collision is excluded: that is
+evidence of contact the operator must look at before the drive is re-energised.
+"""
 HARD_FAULT_FLAGS = tuple(key for key in _FAULT_FLAGS if key not in ADVISORY_FLAGS)
 
 
@@ -192,14 +204,18 @@ def _motor_advisories(motor: dict[str, Any], settings: Settings, *, preflight: b
 
 
 async def read_snapshot(registry: HardwareRegistry, settings: Settings, *, ready: bool = False,
-                        preflight: bool = False, releasing: bool = False) -> Snapshot:
+                        preflight: bool = False, releasing: bool = False,
+                        enabling: bool = False) -> Snapshot:
     """Read and qualify one controller sample.
 
-    Hard faults always refuse. Thermal, supply-voltage and the firmware-advisory flags
-    duplicate protection the drivers already enforce, so they refuse only when their
-    gate is enabled; otherwise a breach is returned in ``Snapshot.advisories``.
-    ``releasing`` marks a torque release: it can only shed heat, so an enabled thermal
-    gate must not block it — otherwise a hot arm holding a pose could never be let cool.
+    Hard faults always refuse, except where this command is itself their reset: a torque
+    release can only shed current and heat, and a re-enable of a disabled arm can only
+    hold it where it already lies. ``releasing`` marks the first, ``enabling`` the second.
+    ``releasing`` also marks a torque release, so an enabled thermal gate must not block
+    it — otherwise a hot arm holding a pose could never be let cool. A declined target
+    (``TARGET_REFUSALS``) never refuses a read: it is the controller's verdict on the
+    last plan, the drives are still enabled and holding, and it clears only once a
+    target they accept is sent -- which is exactly what ``ready`` sampling must allow.
     """
     batch = await registry.read_batch(settings.device_id, CHANNELS)
     readings = {r.channel_id: r for r in batch.readings}
@@ -219,9 +235,24 @@ async def read_snapshot(registry: HardwareRegistry, settings: Settings, *, ready
     for field in ("ctrl_mode", "motion_status"):
         if type(status.get(field)) is not int:
             raise Refusal("controller mode/arrival data are missing")
-    allowed = (0,) if ready else (0, 1)
-    if type(status.get("arm_status")) is not int or status["arm_status"] not in allowed:
+    code = status.get("arm_status")
+    if type(code) is not int:
         raise Refusal(f"controller fault; no reset or replay: {status}")
+    if is_arm_fault(code) and not (code == ARM_STATUS_EMERGENCY_STOP and not ready):
+        # Every fault refuses -- except an engaged stop on a plain read, which is how
+        # the operator learns it is engaged. A declined target is not a fault here.
+        raise Refusal(f"controller fault; no reset or replay: {status}")
+    declined = ""
+    if code in TARGET_REFUSALS:
+        # The firmware planned the target, declined it, and moved nothing: the arm is
+        # exactly where the command found it and the drives are still holding. Refusing
+        # to read the arm here would blind the operator in the one state where the
+        # reason matters, and an engaged fault would make the refusal indistinguishable
+        # from this. The decline is still reported, and the next accepted target clears it.
+        declined = (
+            f"the controller declined its last target: {TARGET_REFUSALS[code]}"
+            f" ({status_name(code)}); it did not move, and the next target sent "
+            "replaces it")
     motors = telemetry.get("motors")
     if not isinstance(motors, list):
         raise Refusal("controller telemetry payload is missing motors")
@@ -241,7 +272,7 @@ async def read_snapshot(registry: HardwareRegistry, settings: Settings, *, ready
                               for m in motors) or {
         m.get("motor") for m in motors} != set(range(1, 7)):
         raise Refusal("missing or duplicate motor records")
-    flags, advisories = [], []
+    flags, advisories = [], [declined] if declined else []
     for motor in motors:
         enabled, faults = motor.get("enabled"), motor.get("faults")
         if not isinstance(enabled, bool) or not isinstance(faults, dict) or any(
@@ -249,8 +280,22 @@ async def read_snapshot(registry: HardwareRegistry, settings: Settings, *, ready
         ):
             raise Refusal("unknown motor enable or fault fields")
         hard = [key for key in HARD_FAULT_FLAGS if faults[key]]
-        if hard:
+        if hard and (ready or preflight) and not (releasing or enabling):
             raise Refusal(f"motor {motor['motor']} reports a fault ({', '.join(hard)}); no motion")
+        if hard and enabling and not set(hard) <= DRIVE_REVERSIBLE_FLAGS:
+            raise Refusal(f"motor {motor['motor']} reports a fault this enable may not clear "
+                          f"({', '.join(sorted(set(hard) - DRIVE_REVERSIBLE_FLAGS))}); inspect the "
+                          "cell before re-energising it")
+        if hard:
+            # Three cases reach here, and all must still be readable. A plain read is how
+            # an operator finds out what is wrong, so it may never refuse; releasing
+            # torque is how a latched stall or over-current is cleared, because the
+            # drives are what keep the current on; and re-enabling a disabled arm is the
+            # driver's own reset for those same bits.
+            advisories.append(
+                f"motor {motor['motor']} reports a fault ({', '.join(hard)}); "
+                + ("this command releases it, the arm may fall" if releasing else
+                   "this enable clears it" if enabling else "no motion"))
         advisories.extend(_motor_advisories(motor, settings, preflight=preflight, releasing=releasing))
         flags.append(enabled)
     enabled = value["arm.enabled"]

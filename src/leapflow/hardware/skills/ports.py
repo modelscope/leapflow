@@ -108,6 +108,15 @@ class FrameView(Protocol):
         """``T_parent_frame`` for a declared frame, or None when uncalibrated."""
         ...
 
+    def measured(self, name: str) -> Transform | None:
+        """The last geometry recorded for *name*, whether or not the frame holds.
+
+        A frame that is inaccurate, drifted or unproven publishes nothing through
+        ``transform``. What its latest record still carries is where a refinement
+        of that measurement begins its search -- never geometry to act on.
+        """
+        ...
+
     def parent(self, name: str) -> str:
         """The frame *name* is expressed in: ``flange`` or ``base`` (``""`` if unknown)."""
         ...

@@ -100,9 +100,11 @@ class FrameGraph:
         records: Mapping[str, float] | None = None,
         diagnoses: Mapping[str, FrameDiagnosis] | None = None,
         record_problems: Mapping[str, str] | None = None,
+        measured: Mapping[str, Transform] | None = None,
     ) -> None:
         self._spec = spec
         self._transforms = dict(transforms)
+        self._measured = dict(measured or {})
         self._workspace = workspace
         self._versions = dict(versions)
         self._table = table
@@ -157,10 +159,21 @@ class FrameGraph:
             installed,
             resolved.diagnoses,
             problems,
+            resolved.measured,
         )
 
     def transform(self, name: str) -> Transform | None:
         return self._transforms.get(name)
+
+    def measured(self, name: str) -> Transform | None:
+        """The geometry *name*'s latest record carries, whether or not the frame holds.
+
+        This is the seed a re-measurement starts its search from, not geometry to
+        act on: a frame that is inaccurate, drifted or unproven publishes nothing
+        through ``transform``, yet the last measurement still says roughly where
+        the frame is -- and a refinement (``calib.ball``) begins exactly there.
+        """
+        return self._measured.get(name)
 
     def parent(self, name: str) -> str:
         decl = self._spec.frames.get(name)
@@ -245,6 +258,7 @@ class _Resolution:
         self.spec, self.store, self.candidates = spec, store, candidates
         self.records, self.superseded = records, superseded
         self.transforms: dict[str, Transform] = {}
+        self.measured: dict[str, Transform] = {}
         self.versions: dict[str, float] = {}
         self.parameters: dict[str, Mapping[str, Any]] = {}
         self.diagnoses: dict[str, FrameDiagnosis] = {}
@@ -261,15 +275,24 @@ class _Resolution:
         promotion = (record.parameters or {}).get("promotion")
         if isinstance(promotion, Mapping):  # an installed candidate is no longer on offer
             offered = tuple(c for c in offered if c.digest != promotion.get("candidate_digest"))
-        if superseded:
-            self._note(name, FrameStatus.DEPENDENCY_SUPERSEDED, superseded, version, required, offered)
-            return
         if name == WORKSPACE_FRAME:
+            if superseded:
+                self._note(
+                    name, FrameStatus.DEPENDENCY_SUPERSEDED, superseded, version, required, offered
+                )
+                return
             self._add_workspace(record, version)
             return
         transform = _record_transform(record)
         if transform is None:
             self._note(name, FrameStatus.UNPROVEN, "the record is malformed", version, required, offered)
+            return
+        # Kept even when the frame does not hold: the last measurement is where a
+        # refinement starts its search, and refusing to remember it leaves the skill
+        # that repairs this very status with nothing to seed from.
+        self.measured[name] = transform
+        if superseded:
+            self._note(name, FrameStatus.DEPENDENCY_SUPERSEDED, superseded, version, required, offered)
             return
         diagnosis = replace(self._diagnose(name, frozenset()), candidates=offered)
         self.diagnoses[name] = diagnosis

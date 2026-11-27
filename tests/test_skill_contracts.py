@@ -61,6 +61,9 @@ _ALLOWED = {
     # Measurement maths only -- clouds and screws in, a camera mount out -- and the
     # same rule as geometry: no transport, no device, no registry.
     "leapflow.hardware.skills.screw",
+    # A sphere out of a window of cloud: the target a carried-ball mount is solved
+    # from. Same rule again -- points in, a centre and a radius out.
+    "leapflow.hardware.skills.ball",
     # Typed frame diagnoses (statuses, accuracies): pure contract values, no device.
     "leapflow.hardware.skills.frame_status",
 }

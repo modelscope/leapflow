@@ -5,10 +5,12 @@ Bring-up builds the model/firmware-specific SDK arm, stamps receive receipts,
 connects, waits for complete feedback and checks the arm's own firmware
 against the declared profile; it never energizes anything. ``energize`` is the
 blocking body of the governed ``arm.enable=1`` write, in the order verified on
-a Piper X (S-V1.9): resume a latched stop, enable every driver, enter CAN
-control. Resuming a latched stop releases the drives, so it is gated by the
-device's ``TorqueReleasePolicy`` (``_piper_halt``). Nothing here maps channels
-or validates envelopes; the transport owns that.
+a Piper X (S-V1.9): resume a latched stop, clear a latched drive protection,
+enable every driver, enter CAN control. Both latches are the arm's own
+protection and both are cleared inside the one approved act, because nothing
+else re-energizes a latched drive. Resuming a latched stop releases the drives,
+so it is gated by the device's ``TorqueReleasePolicy`` (``_piper_halt``).
+Nothing here maps channels or validates envelopes; the transport owns that.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from leapflow.hardware.arm_status import (
     ARM_STATUS_EMERGENCY_STOP,
     ARM_STATUS_NAMES,
     ARM_STATUS_NORMAL,
+    TARGET_REFUSALS,
 )
 from leapflow.hardware.drivers._piper_feedback import (
     PiperFeedback,
@@ -35,6 +38,7 @@ from leapflow.hardware.drivers._piper_motion import (
     ctrl_mode_name,
     enable_status,
     firmware_version,
+    latched_drive_faults,
     numeric,
     read_joints,
     read_pose,
@@ -281,19 +285,57 @@ def energize(robot: Any, feedback: PiperFeedback, motion: PiperMotion,
 
 
 def _enable_drivers(robot: Any, feedback: PiperFeedback, deadline: float) -> None:
-    """Enable every motor, resending until the arm reports all six on."""
+    """Enable every motor, clearing a latched drive protection once, until all six answer.
+
+    A drive that tripped its own protection (over-current, stall, driver error) stops
+    answering the enable frame entirely, so re-sending it forever would end a governed
+    enable in a state nothing but a power cycle leaves. The firmware's clear command is
+    the drive-level counterpart of the controller ``reset()`` this path already sends
+    for a latched stop, so it is attempted once inside the same approved act; a latch
+    that survives it is named in the refusal instead of being retried.
+    """
+    attempted_clear = False
     while True:
         robot.enable()
         window = min(deadline, time.monotonic() + _ENABLE_RETRY_S)
         if wait_for(lambda: all(enable_status(robot) or [False]), window):
             feedback.require()
             return
+        if not attempted_clear:
+            attempted_clear = True
+            if _clear_latched_drives(robot):
+                continue  # the clear is what makes the next enable able to take
         if time.monotonic() >= deadline:
-            raise TransportError(
-                "the arm accepted the enable command but not every motor reports enabled; "
-                "check the emergency-stop button and the power switch",
-                failure_code="piper_enable_refused",
-            )
+            raise TransportError(_enable_refusal(robot), failure_code="piper_enable_refused")
+
+
+def _clear_latched_drives(robot: Any) -> bool:
+    """Ask the firmware to clear every joint's latched drive fault; True when it did.
+
+    The SDK call is ACK-only, so the caller re-reads the driver states: this only
+    reports whether the request was accepted and sent. A build without the call, or
+    one that rejects the index, leaves the enable with the refusal it already had.
+    """
+    clear = getattr(robot, "clear_joint_error", None)
+    if not callable(clear):
+        return False
+    try:
+        return bool(clear(255, 1.0))
+    except (TypeError, ValueError):
+        return False
+
+
+def _enable_refusal(robot: Any) -> str:
+    """Why not every motor reports enabled, naming the drive fault that held it off."""
+    latched = latched_drive_faults(robot)
+    if not latched:
+        return ("the arm accepted the enable command but not every motor reports enabled; "
+                "check the emergency-stop button and the power switch")
+    detail = "; ".join(f"joint {joint} reports {', '.join(flags)}"
+                       for joint, flags in sorted(latched.items()))
+    return (f"the arm accepted the enable command but not every motor reports enabled: {detail}, "
+            "and a firmware clear did not release it; inspect that joint and its cable, then "
+            "power-cycle the arm")
 
 
 def _unstable_reason(robot: Any, settle_s: float) -> str:
@@ -323,6 +365,12 @@ def _status_fault(status: Mapping[str, Any]) -> str:
     """Render one status word's fault, naming the joints it implicates."""
     code = status.get("arm_status")
     if not isinstance(code, int) or code == ARM_STATUS_NORMAL:
+        return ""
+    if code in TARGET_REFUSALS:
+        # A declined target is a verdict on the plan, not a fault: the firmware
+        # planned it, refused it and moved nothing. It clears when a target it
+        # accepts is sent -- and an enable sends none -- so counting it as a fault
+        # left the arm "unstable" after an out-of-range pose until a power cycle.
         return ""
     joints = status.get("joint_communication_errors")
     affected = f" (joints {', '.join(str(j) for j in joints)})" if joints else ""

@@ -885,12 +885,46 @@ class GovernedMotion:
     # ── Plumbing ──
 
     async def _read(self, device_id: str, channel_ids: Sequence[str]) -> dict[str, Any]:
-        batch = await self._registry.read_batch(device_id, tuple(channel_ids))
-        return {
-            reading.channel_id: reading.value
-            for reading in batch.readings
-            if getattr(reading, "is_trustworthy", True)
-        }
+        """Read a complete, trustworthy cohort, waiting out a reception dip.
+
+        One read can come back short for a reason that is not the arm: the Piper
+        ledger marks a channel stale when the CAN group carrying it was not
+        received inside the driver's freshness window, and a depth capture
+        decoded in the same interpreter starves the SDK read thread long enough
+        to cause exactly that. The driver requalifies a *write* for the same
+        reason; treating the first short read as a fault turned one such dip into
+        a non-retryable ``device_fault`` that halted the arm mid-swing and
+        aborted a multi-minute calibration (``calib.screws``, right after a
+        still, 2026-11-26).
+
+        A short cohort is a dip, not a verdict, so it is retried inside the
+        declared ``feedback_requalify_s`` budget. What is accepted is unchanged
+        -- every requested channel present and trustworthy -- so this never
+        reports a stale value as an observation. When the budget is spent the
+        short cohort is returned as it came back, and the caller raises its own
+        fault naming exactly what the arm did not report.
+        """
+        wanted = tuple(channel_ids)
+        budget = max(0.0, float(self._limits.get(
+            "feedback_requalify_s", DEFAULT_LIMITS["feedback_requalify_s"])))
+        poll_s = max(1e-3, self._poll_s)
+        attempts = max(1, int(budget / poll_s) + 1)
+        deadline = self._clock() + budget
+        while True:
+            batch = await self._registry.read_batch(device_id, wanted)
+            values = {
+                reading.channel_id: reading.value
+                for reading in batch.readings
+                if getattr(reading, "is_trustworthy", True)
+            }
+            if all(channel_id in values for channel_id in wanted):
+                return values
+            attempts -= 1
+            remaining = deadline - self._clock()
+            if attempts <= 0 or remaining <= 0.0:
+                return values
+            self._checkpoint()
+            await self._sleep(min(poll_s, remaining))
 
     def _checkpoint(self) -> None:
         """Raise when the run was stopped or ran out of time."""

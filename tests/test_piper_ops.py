@@ -162,6 +162,49 @@ async def test_calibration_execution_binds_the_declared_request_not_the_plan_def
     assert len(skill_owner) == 1, "a request the operator did not approve never reaches the node"
 
 
+def test_execution_budget_never_undercuts_the_approved_plan(settings):
+    assert calibration.execution_budget(settings, None) == settings.run_timeout_s
+    empty = {"skill_plan": {"skill_id": "calib.ball"}}
+    assert calibration.execution_budget(settings, empty) == settings.run_timeout_s
+    brief = {"skill_plan": {"limits": {"max_duration_s": 60.0}}}
+    assert calibration.execution_budget(settings, brief) == settings.run_timeout_s, (
+        "a plan that asks for less than the configured ceiling keeps the ceiling")
+    sweep = {"skill_plan": {"limits": {"max_duration_s": 420.0}}}
+    assert calibration.execution_budget(settings, sweep) == 420.0 + 6 * settings.request_timeout_s
+
+
+async def test_an_approved_run_waits_for_the_plans_own_budget(settings, tmp_path, skill_owner):
+    declared = {"poses": 14}
+    approved = {
+        "node_id": settings.node_id, "workcell": "piper_cell", "skill_id": "calib.ball",
+        "request_args": declared, "plan_digest": "digest", "args": declared,
+        "skill_plan": {"skill_id": "calib.ball", "limits": {"max_duration_s": 420.0}},
+    }
+    run = _CalibrationSession(settings, Evidence(tmp_path / "ball.json"))
+    await calibration.run(run, workcell="piper_cell", skill="calib.ball",
+                          args=declared, approved=approved)
+    assert skill_owner[-1]["timeout_s"] == 420.0 + 6 * settings.request_timeout_s, (
+        "the node holds the skill to the plan's budget; waiting less reports a finished run as unreadable")
+
+
+@pytest.mark.parametrize("limits,expected", [
+    ({"max_duration_s": 420.0}, 420.0 + 60.0), ({}, 300.0), (None, 300.0)])
+def test_cli_outer_wait_follows_the_approved_preview(tmp_path, limits, expected):
+    plan = {"operation": "run"}
+    if limits is not None:
+        plan["skill_plan"] = {"limits": limits}
+    preview = tmp_path / "preview.json"
+    preview.write_text(json.dumps({"ok": True, "executed": False, "preview": plan}))
+    args = cli.parser().parse_args(["calibration", "run", "--workcell", "piper_cell", "--skill",
+                                    "calib.ball", "--args-file", str(preview), "--execute",
+                                    "--preview-file", str(preview)])
+    assert cli.run_budget(args, Settings()) == expected
+    read_only = cli.parser().parse_args(["calibration", "run", "--workcell", "piper_cell", "--skill",
+                                         "calib.ball", "--args-file", str(preview)])
+    assert cli.run_budget(read_only, Settings()) == Settings().run_timeout_s, (
+        "a preview nobody approved cannot extend the wait")
+
+
 @pytest.mark.parametrize("fault", ["nonboolean", "fault", "missing", "duplicate", "id_list", "enable", "thermal", "voltage", "receipt"])
 async def test_fail_closed_feedback(settings, fault):
     state = snapshot()
@@ -352,6 +395,28 @@ def test_joint_space_return_is_stepped_and_swept(settings):
     assert args.target == goal
     with pytest.raises(SystemExit):
         cli.parser().parse_args(["arm", "joints", "--target", "1,2,3"])
+
+
+def test_a_posture_resting_on_a_declared_limit_can_still_plan_inward_motion(settings):
+    """The planning margin binds targets, never the posture the arm already holds.
+
+    A wrist joint that stopped against its declared limit leaves no room for the margin.
+    Judging the resting posture by the inset band made every command refuse, so the arm
+    could not be moved away from the limit it had reached -- a sweep was lost to it.
+    """
+    resting = snapshot((-8.976, 78.924, -58.582, 88.98, 0., -2.7))
+    inward = (-8.976, 78.924, -58.582, 74.61, 0., -2.7)
+    plan = motion.preview(context(), resting, settings, operation="joints", target=inward)
+    rows = [r for r in plan["steps"] if r.get("joint_space")]
+    assert rows[-1]["joints"] == pytest.approx(inward)
+    assert all(abs(row["joints"][3]) <= 88.98 for row in rows), (
+        "the path leaves the stop and never rides back onto it")
+    with pytest.raises(Refusal, match="conservative intervals"):
+        motion.preview(context(), resting, settings, operation="joints",
+                       target=(-8.976, 78.924, -58.582, 88.5, 0., -2.7))
+    past = snapshot((-8.976, 78.924, -58.582, 89.4, 0., -2.7))
+    with pytest.raises(Refusal, match=r"joint\.j4\.position at 89\.40 deg, declared"):
+        motion.preview(context(), past, settings, operation="joints", target=inward)
 
 
 def test_bind_steps_skips_dwell(settings, tmp_path):

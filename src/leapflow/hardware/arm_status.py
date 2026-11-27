@@ -59,6 +59,21 @@ ARM_FAULTS: dict[int, str] = {
 }
 """Codes that mean the arm stopped carrying commands out: it may have moved."""
 
+
+def is_arm_fault(code: int) -> bool:
+    """Whether a status word means the arm stopped for a reason other than the target.
+
+    ``NORMAL`` and the ``TARGET_REFUSALS`` both say the drives are sound and the arm
+    stands where the last accepted command put it; anything else -- including a code
+    this vocabulary does not name -- is fail-closed a fault. Gates that decide whether
+    the arm may be commanded, or whether it is still holding its posture, must ask this
+    instead of comparing against ``NORMAL``: a declined target is the controller's
+    verdict on a plan, and a target it accepts is the only thing that clears the code,
+    so such a gate otherwise locks the arm in the one state motion is the way out of.
+    """
+    return code != ARM_STATUS_NORMAL and code not in TARGET_REFUSALS
+
+
 # Byte 6 of the fault word flags joints pushed past their angle limit; byte 7
 # flags joints whose motor stopped answering on the controller's internal bus.
 LIMIT_FAULT_SHIFT = 8

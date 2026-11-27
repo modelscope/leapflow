@@ -25,12 +25,14 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pytest
 
+from leapflow.hardware.context import Quality
 from leapflow.hardware.skills import vision as vision_module
 from leapflow.hardware.skills.builtin.camera_calibration import (
     METHOD_SCREW,
@@ -68,6 +70,7 @@ from leapflow.hardware.skills.screw import (
     screw_from_poses,
     solve_vertical,
 )
+from leapflow.hardware.transport import BatchReading
 from tests._harness.skill_stubs import (
     CAMERA_ID,
     LOCATOR_ID,
@@ -256,6 +259,54 @@ class SimCell:
             intrinsics=SIM_INTRINSICS,
             observed_at=time.time(),
         )
+
+
+class _StarvedArm(SimArmTransport):
+    """An arm whose next read comes back stale, as a depth capture leaves it.
+
+    ``PiperFeedback`` certifies each channel from the CAN group that carries it,
+    and a depth frame decoded in the same interpreter leaves one group a fraction
+    of a second behind: the first read after a still can therefore be
+    untrustworthy for every channel even though the bus is carrying feedback. It
+    heals on the next read, which is exactly what the skill has to distinguish
+    from a device fault.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.dips = 0
+        self._dip = False
+
+    def starve_next_read(self) -> None:
+        self._dip = True
+
+    async def read_batch(self, channel_ids: tuple[str, ...]) -> BatchReading:
+        batch = await super().read_batch(channel_ids)
+        if not self._dip:
+            return batch
+        self._dip = False
+        self.dips += 1
+        return BatchReading(
+            device_id=batch.device_id,
+            readings=tuple(
+                replace(reading, quality=Quality.STALE.value) for reading in batch.readings
+            ),
+        )
+
+
+class _StarvingCell(SimCell):
+    """A cell whose every depth capture starves one feedback read afterwards."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.arm = _StarvedArm(joints=START_JOINTS, forward=CHAIN.forward, travel_reads=1)
+
+    async def observe(
+        self, *, near_mm: float | None = None, far_mm: float | None = None
+    ) -> CloudObservation:
+        observation = await super().observe(near_mm=near_mm, far_mm=far_mm)
+        self.arm.starve_next_read()
+        return observation
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, sim: SimCell) -> None:
@@ -511,6 +562,25 @@ async def test_screws_averages_several_frames_per_still(
     assert outcome.ok, outcome
     assert outcome.result["frames"] == 3 and outcome.result["captures"] == 7
     assert sim.captures == 21
+
+
+async def test_screws_survives_a_reception_dip_after_every_still(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One stale read after a capture is a dip, not a device fault.
+
+    On 2026-11-26 the real node reported ``device_fault`` -- "did not report
+    joint.j1.position ... joint.j6.position" -- 27.8 s into ``calib.screws``,
+    immediately after a j3 still, and halted the arm mid-swing: one read whose
+    CAN groups lagged the capture was taken as the arm's final word. The run here
+    is the same plan over a cell that starves exactly one read after every depth
+    capture, and it has to measure the mount it is shown.
+    """
+    runtime, sim = _cell(tmp_path, monkeypatch, sim=_StarvingCell())
+    outcome = await _run(runtime, FAST)
+    assert outcome.ok, outcome
+    assert sim.arm.dips == sim.captures >= 7
+    assert outcome.result["captures"] == 7
 
 
 async def test_screws_solves_off_the_event_loop(

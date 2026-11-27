@@ -14,7 +14,12 @@ frame, so a camera is usable only once that frame is measured:
 2. ``calib.screws`` -- the same mount with no board at all: the arm moves one
    joint at a time, and the surfaces that joint carries must land where the
    firmware's own rotation says they went. See ``screw`` for why that is enough.
-3. ``calib.verify`` -- the arm moves over a small grid; at every stop the arm
+3. ``calib.ball`` -- the same mount again with nothing in the cell cooperating:
+   the gripper carries a ball whose radius the jaws measured, and the camera's
+   fit of that ball at a ring of poses fixes the mount *and* the ball's place in
+   the gripper together. See ``ball`` for why a sphere is the cheapest target
+   that can measure a mount to a millimetre.
+4. ``calib.verify`` -- the arm moves over a small grid; at every stop the arm
    predicts where the board centre is, and the camera measures it through the
    depth image and the hand-eye mount -- the same chain ``perceive.locate``
    uses. The 95th-percentile disagreement is the accuracy perception has.
@@ -30,6 +35,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from leapflow.hardware.skills.ball import fit_ball, residual_mm
+from leapflow.hardware.skills.frame_status import Accuracy, FrameStatus
 from leapflow.hardware.skills.geometry import (
     Mat3,
     Pose,
@@ -42,6 +49,7 @@ from leapflow.hardware.skills.geometry import (
     norm,
     rpy_to_matrix,
     solve_hand_eye,
+    solve_tool_hand_eye,
     sub,
     tool_cone_deg,
 )
@@ -61,6 +69,7 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_SKILL_UNAVAILABLE,
     FAILURE_TARGET_NOT_FOUND,
     FAILURE_UNREACHABLE,
+    METHOD_CARRIED_BALL,
     METHOD_MARKERLESS_SCREW,
     REGION_BOOTSTRAP_UNTIL_MEASURED,
     REQUIRE_CALIBRATION,
@@ -896,6 +905,471 @@ class Screws:
         )
 
 
+# ── calib.ball ───────────────────────────────────────────────────────────────
+
+
+class CarriedBall:
+    """Measure a fixed camera's mount from a ball the arm carries."""
+
+    spec = SkillSpec(
+        skill_id="calib.ball",
+        version="1.0.0",
+        card=(
+            "Calibrate where a fixed camera sits by carrying a ball of known radius -- no "
+            "board, no table in view, and no TCP measurement. The gripper must already "
+            "hold the ball, and `radius_mm` is the radius the jaws measured, not a nominal "
+            "one. The arm visits `poses` poses around the current one -- tilted up to "
+            "tilt_deg, yawed up to yaw_deg, shifted up to spread_mm, lifted up to "
+            "lift_mm -- and at every stop the camera fits the ball's surface to a sphere. "
+            "The mount is then the motion that carries every measured centre onto the "
+            "centre the arm is holding, with the ball's own place in the gripper solved as "
+            "the ninth unknown. The `heldout` poses are measured but kept out of the "
+            "solve: what the fitted mount misses them by is the accuracy the record "
+            "carries. The ball has to stay in the camera's view throughout, so sweep "
+            "where it is already visible."
+        ),
+        args_schema={
+            "type": "object",
+            "properties": {
+                "poses": {"type": "integer", "minimum": 9, "maximum": 24, "default": 14},
+                "heldout": {"type": "integer", "minimum": 3, "maximum": 8, "default": 4},
+                "radius_mm": _number(10, 80, 30.0),
+                "tilt_deg": _number(0, 30, 15.0),
+                "yaw_deg": _number(0, 60, 25.0),
+                "spread_mm": _number(0, 80, 50.0),
+                "lift_mm": _number(0, 50, 10.0),
+                "camera": {"type": "string", "pattern": "^camera(\\.[a-z0-9_]+)*$", "default": CAMERA_FRAME},
+                "frames": _number(1, 6, 3),
+                "settle_s": _number(0, 5, 0.5),
+                "speed_pct": _number(1, 100, 10.0),
+            },
+        },
+        effect=EFFECT_ACTUATE,
+        requires=(f"{REQUIRE_ROLE}arm",),
+        consent=CONSENT_EACH_RUN,
+        region=REGION_BOOTSTRAP_UNTIL_MEASURED,
+        provides=(f"{REQUIRE_CALIBRATION}{{camera}}",),
+        # The sweep starts from the mount that is already measured: it tightens a
+        # measurement, it does not create the first one. Advertising it for a
+        # missing or unproven frame would point a caller at a skill that refuses on
+        # its first line, so only the states that carry a measured mount it could
+        # improve are offered here. A merely inaccurate or drifted frame still has
+        # that mount in its latest record, which is what seeds the search.
+        provides_when=(
+            FrameStatus.INSUFFICIENT_ACCURACY.value,
+            FrameStatus.DRIFT_DETECTED.value,
+        ),
+    )
+
+    def provides_in(self, workcell: WorkcellView, frames: FrameView) -> tuple[str, ...]:
+        """The fixed cameras of *workcell*: only a camera on the base can be measured here."""
+        return tuple(
+            f"{REQUIRE_CALIBRATION}{role}"
+            for role in workcell.roles
+            if role.split(".", 1)[0] == CAMERA_FRAME and frames.parent(role) == "base"
+        )
+
+    async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
+        role = _camera(ctx, args)
+        if _mounting(ctx, role) != EYE_TO_HAND:
+            raise SkillError(
+                FAILURE_SKILL_UNAVAILABLE,
+                "calib.ball measures a camera fixed to the cell; a wrist camera rides the "
+                "arm it would be watching, so carrying a ball past it measures nothing",
+            )
+        procedure = _procedure(ctx, role)
+        seed = _ball_seed(ctx.frames, role)
+        if seed is None:
+            raise SkillError(
+                FAILURE_SKILL_UNAVAILABLE,
+                f"{role} has no measured mount to start the search from; measure it "
+                "once with calib.handeye or calib.screws, and use calib.ball to tighten it",
+            )
+        state = await _ready_state(ctx)
+        accept = ctx.workcell.calibration
+        total, held_out = int(args["poses"]), int(args["heldout"])
+        need_train = int(accept["min_ball_poses"])
+        need_held = int(accept["min_ball_held_out"])
+        if total - held_out < need_train or held_out < need_held:
+            raise SkillError(
+                FAILURE_INVALID_ARGS,
+                f"{total} poses with {held_out} held out leaves {total - held_out} to fit "
+                f"the mount (need {need_train}) and {held_out} to check it (need {need_held}); "
+                "raise poses or lower heldout",
+            )
+        # The ring turns the tool about the *flange*, not about the TCP. A carried
+        # ball hangs between 30 and 60 mm past the jaws, so turning about the TCP
+        # moves it a few millimetres while the tool turns -- and the mount is read
+        # off exactly that travel, against a cloud noisy to several millimetres. On
+        # the 24-pose sweep of 2026-11-26 the TCP pivot left 3 sigma at 171 mm for
+        # a ball that moved 85 mm; turning about the flange puts the ball on its
+        # full 156 mm lever (175 mm of travel at 30 deg) and the same noise then
+        # supports a 3 mm bound. Reachability is unchanged in kind, only in range.
+        ring = _ring(state.tcp, state.flange.position, total,
+                     tilt=float(args["tilt_deg"]), args=args)
+        kept: list[Pose] = []
+        reason = ""
+        for pose in ring:
+            try:
+                ctx.motion.check_target(pose)
+            except SkillError as error:
+                reason = reason or error.message
+                continue
+            kept.append(pose)
+        marks = _spread_marks(len(kept), held_out)
+        fitted_poses = sum(1 for mark in marks if not mark)
+        if fitted_poses < need_train or len(kept) - fitted_poses < need_held:
+            raise SkillError(
+                FAILURE_OUT_OF_WORKSPACE,
+                f"only {len(kept)} of {total} poses are reachable, leaving {fitted_poses} to "
+                f"fit and {len(kept) - fitted_poses} to check (need {need_train} and "
+                f"{need_held}): {reason}. Start nearer the middle of the workspace, or "
+                "lower spread_mm / tilt_deg",
+            )
+        radius = float(args["radius_mm"])
+        start = state.tcp
+        marks_label = sum(1 for mark in marks if mark)
+        return SkillPlan(
+            skill_id=self.spec.skill_id,
+            args=args,
+            summary=(
+                f"Measure the fixed camera with a ball of radius {radius:.1f} mm the gripper "
+                f"is holding: visit {len(kept)} poses around {_fmt(start.position)} mm "
+                f"(tilt up to {float(args['tilt_deg']):.0f} deg, spread up to "
+                f"{float(args['spread_mm']):.0f} mm), sphere-fit it at each, and keep "
+                f"{marks_label} of them out of the fit as the accuracy check; the ball must "
+                "stay in the camera's view the whole way"
+            ),
+            targets=_with_return(ctx, kept, start),
+            limits={"speed_pct": float(args["speed_pct"])},
+            basis={
+                "procedure": procedure,
+                "camera_role": role,
+                "camera_device": ctx.workcell.role(role),
+                "mounting": EYE_TO_HAND,
+                "seed_unproven": ctx.frames.transform(role) is None,
+                "seed_translation_mm": [round(float(value), 3) for value in seed.translation],
+                "start": start.to_dict(),
+                "radius_mm": radius,
+                "poses": [
+                    {"tcp": pose.to_dict(), "heldout": bool(mark)}
+                    for pose, mark in zip(kept, marks, strict=True)
+                ],
+                "collect": len(kept),
+                "min_train": need_train,
+                "min_held_out": need_held,
+                "settle_s": float(args["settle_s"]),
+                "frames": int(args["frames"]),
+                "depth_margin_mm": accept["ball_depth_margin_mm"],
+                "window_extra_mm": accept["ball_window_extra_mm"],
+                "max_fit_rms_mm": accept["max_ball_fit_rms_mm"],
+                "max_radius_error_mm": accept["max_ball_radius_error_mm"],
+                "max_residual_mm": accept["max_ball_residual_mm"],
+            },
+        )
+
+    async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
+        await _check_start(ctx, Pose.from_mapping(plan.basis["start"]))
+        role = str(plan.basis["camera_role"])
+        vision = _vision(ctx, role)
+        seed = _ball_seed(ctx.frames, role)
+        if seed is None:
+            raise SkillError(FAILURE_PLAN_STALE, f"{role} was uninstalled inside the run; plan again")
+        radius = float(plan.basis["radius_mm"])
+        settle, speed = float(plan.basis["settle_s"]), plan.limits.get("speed_pct")
+        frames = int(plan.basis["frames"])
+        margin, extra = float(plan.basis["depth_margin_mm"]), float(plan.basis["window_extra_mm"])
+        max_rms = float(plan.basis["max_fit_rms_mm"])
+        max_radius = float(plan.basis["max_radius_error_mm"])
+        samples: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        hint: Any = None
+        for entry in plan.basis["poses"]:
+            pose = Pose.from_mapping(entry["tcp"])
+            await ctx.motion.move_tcp(pose, speed_pct=speed)
+            if settle > 0:
+                await asyncio.sleep(settle)
+            # Each still is predicted from the recorded mount, which is wrong by the
+            # amount this run exists to remove -- tens of millimetres -- while the
+            # previous still's centre is wrong by wherever the arm went since, which
+            # on a ring about the flange is most of the lever. The mount is the
+            # better guess, and the previous centre is kept as the second try.
+            predicted = _as_seen(seed, pose.position)
+            reach = norm(predicted)
+            still = await _still(
+                ctx,
+                vision,
+                "ball",
+                near_mm=max(50.0, reach - radius - margin),
+                far_mm=reach + radius + margin,
+                frames=frames,
+            )
+            reason = ""
+            guesses = [predicted] + ([hint] if hint is not None and hint != predicted else [])
+            ball = None
+            for guess in guesses:
+                try:
+                    ball = fit_ball(
+                        still.cloud, radius_mm=radius, hint=guess, window_mm=radius + extra
+                    )
+                    break
+                except ValueError as error:
+                    reason = str(error)
+            if ball is None:
+                # A mount the workcell calls inaccurate may sit far enough out that
+                # no ordinary window sees the ball at all. Searching the still's
+                # whole depth shell costs one pass and admits nothing: the radius,
+                # the fit and the radius agreement still decide what may be used.
+                try:
+                    ball = fit_ball(
+                        still.cloud, radius_mm=radius, hint=predicted,
+                        window_mm=radius + margin,
+                    )
+                    reason = ""
+                except ValueError as wider:
+                    reason = str(wider)
+            if ball is not None:
+                if ball.rms_mm > max_rms:
+                    reason = (
+                        f"its surface fits a sphere to {ball.rms_mm:.1f} mm (limit {max_rms:g})"
+                    )
+                    ball = None
+                elif abs(ball.fitted_radius_mm - radius) > max_radius:
+                    reason = (
+                        f"the ball measures {ball.fitted_radius_mm:.1f} mm where the jaws "
+                        f"said {radius:.1f} mm (limit {max_radius:g}); it is deforming or slipping"
+                    )
+                    ball = None
+            if ball is None:
+                skipped.append({"pose": pose.to_dict(), "reason": reason})
+                continue
+            hint = ball.centre
+            samples.append(
+                {
+                    "tcp": pose.to_dict(),
+                    "flange": still.flange.to_dict(),
+                    "centre": list(ball.centre),
+                    "ball": ball.to_dict(),
+                    "intrinsics": dict(still.intrinsics),
+                    "heldout": bool(entry["heldout"]),
+                }
+            )
+        # The joint solve is seconds of numpy over every pose, and running it on the
+        # event loop starves the node's RPC plane and the lease watchdog together.
+        solved = await asyncio.to_thread(self._solve, plan, samples, skipped)
+        return self._record(ctx, plan, role, solved)
+
+    def _solve(
+        self, plan: SkillPlan, samples: Sequence[Mapping[str, Any]], skipped: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any]:
+        """The mount and the ball's place in the gripper, with what the held-out poses say."""
+        train = [sample for sample in samples if not sample["heldout"]]
+        held = [sample for sample in samples if sample["heldout"]]
+        basis = plan.basis
+        if len(train) < int(basis["min_train"]) or len(held) < int(basis["min_held_out"]):
+            raise _check_failed(
+                f"{len(train)} poses could be fitted and {len(held)} held out (need "
+                f"{int(basis['min_train'])} and {int(basis['min_held_out'])}; {len(skipped)} "
+                "skipped); keep the ball in the camera's view and run it again",
+                problems=["too few usable stills"],
+                skipped=list(skipped),
+            )
+        intrinsics = samples[0]["intrinsics"]
+        if any(sample["intrinsics"] != intrinsics for sample in samples):
+            raise _check_failed(
+                "the camera stream changed during the sweep; run it again",
+                problems=["intrinsics changed"],
+            )
+        try:
+            fit = solve_tool_hand_eye(
+                [Pose.from_mapping(sample["flange"]) for sample in samples],
+                [tuple(sample["centre"]) for sample in samples],
+            )
+            training = solve_tool_hand_eye(
+                [Pose.from_mapping(sample["flange"]) for sample in train],
+                [tuple(sample["centre"]) for sample in train],
+            )
+        except ValueError as error:
+            raise _check_failed(
+                f"the carried ball does not determine the mount ({error}); sweep with more "
+                "tilt and spread",
+                problems=["degenerate poses"],
+            ) from error
+        errors = [
+            residual_mm(training, Pose.from_mapping(sample["flange"]), tuple(sample["centre"]))
+            for sample in held
+        ]
+        stats = _stats(errors, prefix="held_out_")
+        sigma_mm = max(fit.translation_sigma_mm, training.translation_sigma_mm)
+        sigma_deg = max(fit.rotation_sigma_deg, training.rotation_sigma_deg)
+        achieved = Accuracy(
+            max(float(stats["held_out_p95_mm"]), 3.0 * sigma_mm),
+            max(3.0 * sigma_deg, 1e-3),
+        )
+        limit = float(basis["max_residual_mm"])
+        if not achieved.translation_mm <= limit:
+            # The bound is the larger of the held-out p95 and three sigma, and the two
+            # say different things: a small p95 with a large sigma is a well-measured
+            # sweep whose geometry hardly constrains the mount, while a large p95 with
+            # a small sigma is a bad still. Both are reported with every centre and
+            # every skip, because the verdict alone leaves the operator guessing which
+            # of the two happened -- and the arm cannot be re-swept cheaply.
+            raise _check_failed(
+                f"the held-out poses miss by {achieved.translation_mm:.1f} mm (ceiling {limit:g}): "
+                f"p95 {float(stats['held_out_p95_mm']):.1f} mm over {len(held)} held-out "
+                f"poses and 3 sigma {3.0 * sigma_mm:.1f} mm from {len(train)} fitted ones; "
+                "the sweep did not measure this camera -- check the ball is rigidly held, "
+                "that nothing touched the camera, and that the arm is the same arm",
+                problems=["held-out residual above the ceiling"],
+                **stats,
+                sigma_mm=round(sigma_mm, 3),
+                residual_max_mm=round(fit.residual_max_mm, 3),
+                condition_number=round(fit.condition_number, 3),
+                outliers=int(fit.outliers),
+                samples=[
+                    {"tcp": sample["tcp"], "centre": sample["centre"],
+                     "heldout": bool(sample["heldout"]),
+                     "radius_mm": sample["ball"]["fitted_radius_mm"],
+                     "rms_mm": sample["ball"]["rms_mm"]}
+                    for sample in samples
+                ],
+                skipped=list(skipped),
+            )
+        radii = sorted(float(sample["ball"]["fitted_radius_mm"]) for sample in samples)
+        evidence = {
+            "method": METHOD_CARRIED_BALL,
+            "radius_mm": float(basis["radius_mm"]),
+            "samples": len(samples),
+            "held_out": len(held),
+            "skipped": len(skipped),
+            **stats,
+            "residual_rms_mm": round(fit.residual_rms_mm, 3),
+            "residual_max_mm": round(fit.residual_max_mm, 3),
+            "leave_one_out_max_mm": round(fit.held_out_max_mm, 3),
+            "condition_number": round(fit.condition_number, 3),
+            "translation_sigma_mm": round(fit.translation_sigma_mm, 3),
+            "rotation_sigma_deg": round(fit.rotation_sigma_deg, 4),
+            "ball_sigma_mm": round(fit.tool_sigma_mm, 3),
+            "outliers": int(fit.outliers),
+            "fitted_radius_mm": {
+                "min": round(radii[0], 3),
+                "max": round(radii[-1], 3),
+            },
+            "poses": [
+                {
+                    "tcp": sample["tcp"],
+                    "flange": sample["flange"],
+                    "centre": sample["centre"],
+                    "heldout": bool(sample["heldout"]),
+                    "ball": sample["ball"],
+                }
+                for sample in samples
+            ],
+            "skipped_poses": list(skipped),
+        }
+        return {
+            "matrix": fit.mount.inverse().to_matrix(),
+            "camera": fit.mount.inverse().to_pose(),
+            "ball_in_flange_mm": [round(float(value), 3) for value in fit.tool],
+            "achieved": achieved,
+            "intrinsics": dict(intrinsics),
+            "evidence": evidence,
+            "training_flanges": [sample["flange"] for sample in train],
+        }
+
+    def _record(
+        self, ctx: SkillContext, plan: SkillPlan, role: str, solved: Mapping[str, Any]
+    ) -> SkillOutcome:
+        achieved: Accuracy = solved["achieved"]
+        camera: Pose = solved["camera"]
+        evidence = dict(solved["evidence"])
+        recorded_at = ctx.record_calibration(
+            str(plan.basis["procedure"]),
+            matrix=solved["matrix"],
+            parameters={
+                "mounting": EYE_TO_HAND,
+                "camera_role": role,
+                "camera_device": plan.basis["camera_device"],
+                "method": METHOD_CARRIED_BALL,
+                "seed_unproven": bool(plan.basis.get("seed_unproven", False)),
+                "units": "mm",
+                "orientation_convention": "Rz@Ry@Rx;degrees",
+                "intrinsics": solved["intrinsics"],
+                "ball_in_flange_mm": solved["ball_in_flange_mm"],
+                "training_poses": list(solved["training_flanges"]),
+                "captures": int(evidence["samples"]) * int(plan.basis["frames"]),
+                "carried_ball_evidence": evidence,
+                "achieved_accuracy": achieved.to_dict(),
+            },
+        )
+        return SkillOutcome.succeeded(
+            {
+                "camera": camera.to_dict(),
+                "mounting": EYE_TO_HAND,
+                "method": METHOD_CARRIED_BALL,
+                "radius_mm": evidence["radius_mm"],
+                "ball_in_flange_mm": solved["ball_in_flange_mm"],
+                "samples": evidence["samples"],
+                "held_out": evidence["held_out"],
+                "skipped": evidence["skipped"],
+                "held_out_p95_mm": evidence["held_out_p95_mm"],
+                "held_out_max_mm": evidence["held_out_max_mm"],
+                "residual_rms_mm": evidence["residual_rms_mm"],
+                "rotation_sigma_deg": evidence["rotation_sigma_deg"],
+                "achieved": achieved.to_dict(),
+                "recorded_at": recorded_at,
+            },
+            message=(
+                f"The camera sits at {_fmt(camera.position)} mm in the base frame, measured "
+                f"from a ball of radius {float(evidence['radius_mm']):.1f} mm the arm "
+                f"carried; the {evidence['held_out']} held-out poses miss it by "
+                f"{float(evidence['held_out_p95_mm']):.1f} mm at p95 (worst "
+                f"{float(evidence['held_out_max_mm']):.1f} mm), and the bound the record "
+                f"carries is {achieved.describe()}"
+            ),
+        )
+
+
+def _ball_seed(frames: FrameView, role: str) -> Transform | None:
+    """Where the carried-ball sweep starts searching for *role*.
+
+    The installed mount when it holds, else the geometry the last record carries.
+    ``calib.ball`` exists to tighten a mount the workcell calls inaccurate or
+    drifted, and such a frame publishes no transform -- so falling back to the
+    record's geometry is the difference between the skill working on the state it
+    advertises and refusing on it. The seed is only a search hint: every measured
+    centre is fitted independently inside a window far wider than the worst seed
+    error, so where the seed lands never enters the solved mount.
+    """
+    return frames.transform(role) or frames.measured(role)
+
+
+def _as_seen(mount: Transform, position: Sequence[float]) -> Vec3:
+    """Where a point the arm reports in the base frame appears in the camera frame.
+
+    ``frames.transform`` publishes ``T_base_camera`` -- camera points into the base,
+    the direction ``calib.verify`` reads it -- so a TCP the arm reports is carried
+    into the camera by the inverse. Applying the mount forwards puts the guess
+    hundreds of millimetres away, outside any window, and no still is ever found.
+    """
+    return mount.inverse().apply(position)
+
+
+def _spread_marks(count: int, marked: int) -> list[bool]:
+    """*count* flags with *marked* of them spread through it, never two adjacent.
+
+    The held-out poses have to be *drawn from* the sweep rather than appended to
+    it: a ring whose last four poses are the check would leave the fit untested
+    exactly where the ring ends.
+    """
+    flags = [False] * max(0, count)
+    if marked <= 0 or count <= 0:
+        return flags
+    for step in range(min(marked, count)):
+        flags[int((step + 0.5) * count / marked) % count] = True
+    return flags
+
+
 # ── calib.verify ─────────────────────────────────────────────────────────────
 
 
@@ -1079,9 +1553,9 @@ def _stats(errors: Sequence[float], *, prefix: str) -> dict[str, float | None]:
     }
 
 
-def skills() -> tuple[HandEye, Screws, VerifyCamera]:
+def skills() -> tuple[HandEye, Screws, CarriedBall, VerifyCamera]:
     """Entry point for ``leapflow.hardware.skills``."""
-    return (HandEye(), Screws(), VerifyCamera())
+    return (HandEye(), Screws(), CarriedBall(), VerifyCamera())
 
 
 __all__ = [
@@ -1089,6 +1563,7 @@ __all__ = [
     "EYE_TO_HAND",
     "METHOD_SCREW",
     "VERIFY_PROCEDURE",
+    "CarriedBall",
     "HandEye",
     "Screws",
     "VerifyCamera",

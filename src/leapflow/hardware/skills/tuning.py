@@ -41,6 +41,19 @@ DEFAULT_LIMITS: Mapping[str, float] = {
     "reach_envelope_ik_iterations": 16.0,  # guidance only; missed samples remain unknown
     "max_steps": 16.0,  # steps one motion.sequence may carry
     "max_wait_s": 10.0,  # longest single ``wait`` step
+    # How long a read may keep retrying for a complete, trustworthy cohort of the
+    # channels it is about to judge (the pose and joints a joint move is checked
+    # against, the width a gripper settle is scored by). One read can come back
+    # short for a reason that is not the arm: the Piper ledger marks a channel
+    # stale when the CAN group carrying it was not received inside the driver's
+    # freshness window, and a depth capture decoded in the same interpreter
+    # starves the SDK read thread for long enough to do exactly that -- which is
+    # why the driver itself requalifies a write for up to
+    # ``receive_requalify_s`` (default 1.0 s). A short window is a reception
+    # *dip*, so it is retried within this budget; the accepted cohort is still
+    # every requested channel present and trustworthy, so nothing stale is ever
+    # reported as an observation.
+    "feedback_requalify_s": 1.0,
 }
 
 REACH_ENVELOPE_MAX_TIMEOUT_S = 9.0
@@ -103,6 +116,28 @@ DEFAULT_CALIBRATION: Mapping[str, float] = {
     "max_screw_shift_gap_mm": 20.0,
     "min_screw_agreement": 0.35,
     "max_vertical_axis_deg": 1.0,
+    # calib.ball: the mount from a ball the arm carries. The radius is measured
+    # with the jaws, so the solve only has to trust the *centre* of the surface it
+    # fits. A still whose spheres are not spherical is not a still: the residual of
+    # the declared-radius fit and the radius it prefers when left free both have to
+    # land inside these bands before the pose is allowed into the fit.
+    #
+    # ``max_ball_residual_mm`` is the ceiling on what may be *installed*. It is not
+    # the acceptance limit -- the frame's own required accuracy is, and the record
+    # carries the measured number for the frame graph to judge -- it is the point
+    # past which the sweep did not measure a mount at all and installing it would
+    # only trade a known error for an unknown one.
+    "min_ball_poses": 6.0,
+    "min_ball_held_out": 3.0,
+    "max_ball_fit_rms_mm": 2.0,
+    "max_ball_radius_error_mm": 4.0,
+    "max_ball_residual_mm": 15.0,
+    # How far either side of the predicted distance the depth window reaches, past
+    # the ball's own radius. It only has to absorb a stale mount and a wrong guess
+    # at where the ball sits in the gripper; the sphere search inside the window is
+    # what rejects everything else.
+    "ball_depth_margin_mm": 250.0,
+    "ball_window_extra_mm": 90.0,
 }
 
 DEFAULT_GRASP_VERIFY: Mapping[str, float] = {
